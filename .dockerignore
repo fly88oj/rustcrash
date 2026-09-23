@@ -1,0 +1,8 @@
+target/
+.git/
+*.md
+scripts/
+.env
+*.log
+.mimosa/
+.planning/

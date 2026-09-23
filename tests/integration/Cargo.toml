@@ -1,0 +1,16 @@
+[package]
+name = "integration-tests"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+
+[[test]]
+name = "e2e"
+path = "e2e.rs"
+
+[dependencies]
+rustcrash-core = { path = "../../core" }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde_yaml = { workspace = true }

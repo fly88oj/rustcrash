@@ -1,0 +1,66 @@
+[workspace]
+resolver = "2"
+members = [
+    "core",
+    "cmd/crash",
+    "tests/integration",
+]
+
+[profile.release]
+strip = true
+lto = "thin"
+opt-level = "z"
+codegen-units = 1
+panic = "abort"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/fly88oj/rustcrash"
+authors = ["RustCrash Team"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "multipart"], default-features = false }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.30"
+crossterm = "0.27"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Process & system
+nix = { version = "0.27", features = ["process", "fs"] }
+
+# Time & scheduling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Compression
+flate2 = "1"
+base64 = "0.21"
+urlencoding = "2"
+
+# Unix-specific
+libc = "0.2"
+
+# Hashing (integrity verification)
+sha2 = "0.10"
+
+# Testing
+tempfile = "3"

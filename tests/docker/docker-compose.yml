@@ -1,0 +1,41 @@
+services:
+  # Mock subscription server: python http.server on the fixtures directory.
+  mock-sub:
+    image: python:3-alpine
+    working_dir: /srv
+    command: python -m http.server 80 --bind 0.0.0.0
+    volumes:
+      - ./fixtures:/srv:ro
+    networks:
+      - rustcrash-net
+
+  # The system under test: the real crash binary in a real container.
+  rustcrash:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    depends_on:
+      - mock-sub
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - rustcrash-net
+    environment:
+      CRASHDIR: /tmp/rustcrash
+    entrypoint: sh
+    command: -c "sleep infinity"
+
+  # Prober: exercises the REST API from a second container (proves the
+  # supervisor really serves on the network).
+  prober:
+    image: alpine:3.21
+    depends_on:
+      - rustcrash
+    networks:
+      - rustcrash-net
+    entrypoint: sh
+    command: -c "sleep 600"
+
+networks:
+  rustcrash-net:
+    driver: bridge

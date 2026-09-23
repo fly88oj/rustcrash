@@ -1,0 +1,33 @@
+[package]
+name = "rustcrash-crash"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The single published binary.
+[[bin]]
+name = "crash"
+path = "src/main.rs"
+
+[[test]]
+name = "tui_test"
+path = "tests/tui_test.rs"
+
+[dev-dependencies]
+ratatui-testlib = { version = "0.1", features = ["mvp"] }
+portable-pty = "0.8"
+tempfile = { workspace = true }
+
+[dependencies]
+rustcrash-core = { path = "../../core" }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+ratatui = "0.30"
+crossterm = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+serde_json = { workspace = true }
+tracing-subscriber = { workspace = true }
+tempfile = { workspace = true }
+chrono = { workspace = true }
