@@ -391,6 +391,9 @@ fn parse_proxy_servers(
             "shadowsocks" => ServerProtocol::Shadowsocks {
                 method: yaml_str(entry, "cipher").unwrap_or_default(),
                 password: yaml_str(entry, "password").unwrap_or_default(),
+                // SIP023 multi-user `users:` parsing is wired by the
+                // integrator; the single-PSK shape stays as-is.
+                users: Vec::new(),
             },
             "trojan" => ServerProtocol::Trojan {
                 password: user_field("password")
@@ -944,8 +947,74 @@ fn parse_proxy(
                     .unwrap_or(true),
             })
         }
+        "snell" => OutboundKind::Snell(crate::proto::snell::SnellOut {
+            psk: yaml_str(entry, "psk").unwrap_or_default(),
+            version: entry
+                .get("version")
+                .and_then(Yaml::as_u64)
+                .map(|v| v as u8)
+                .unwrap_or(4),
+            udp,
+            server,
+            port,
+        }),
+        "anytls" => OutboundKind::AnyTls(crate::proto::anytls::AnyTlsOut {
+            password: yaml_str(entry, "password").unwrap_or_default(),
+            sni: yaml_str(entry, "sni").unwrap_or_default(),
+            skip_verify: entry
+                .get("skip-cert-verify")
+                .and_then(Yaml::as_bool)
+                .unwrap_or(false),
+            udp,
+            server,
+            port,
+        }),
+        "mieru" => {
+            let transport = crate::proto::mieru::MieruTransport::parse(
+                &yaml_str(entry, "transport").unwrap_or_else(|| "TCP".into()),
+            )?;
+            if matches!(transport, crate::proto::mieru::MieruTransport::Udp) {
+                return Err(Error::config(format!(
+                    "proxy {name:?}: mieru UDP transport is not implemented yet \
+                     (the TCP session path is)"
+                )));
+            }
+            OutboundKind::Mieru(crate::proto::mieru::MieruOut {
+                username: yaml_str(entry, "username").unwrap_or_default(),
+                password: yaml_str(entry, "password").unwrap_or_default(),
+                transport,
+                server,
+                port,
+            })
+        }
+        "restls" => OutboundKind::Restls {
+            cfg: crate::proto::restls::RestlsOut {
+                password: yaml_str(entry, "password").unwrap_or_default(),
+                sni: yaml_str(entry, "sni").unwrap_or_default(),
+                version: {
+                    let v = yaml_str(entry, "version-hint")
+                        .or_else(|| yaml_str(entry, "version"))
+                        .unwrap_or_else(|| "tls13".into());
+                    if v.eq_ignore_ascii_case("tls12") {
+                        return Err(Error::config(format!(
+                            "proxy {name:?}: restls version-hint tls12 is not \
+                             implementable over rustls yet"
+                        )));
+                    }
+                    v
+                },
+                restls_script: yaml_str(entry, "restls-script").filter(|s| !s.is_empty()),
+                skip_cert_verify: entry
+                    .get("skip-cert-verify")
+                    .and_then(Yaml::as_bool)
+                    .unwrap_or(false),
+                udp,
+            },
+            server,
+            port,
+        },
         other => {
-            let supported = "ss, vmess, vless, trojan, socks5, http, hysteria2, tuic, wireguard";
+            let supported = "ss, vmess, vless, trojan, socks5, http, hysteria2, tuic, wireguard, snell, anytls, mieru, restls";
             return Err(Error::config(format!(
                 "proxy {name:?}: type {other:?} is not supported by the Rust engine yet \
                  (supported: {supported})"
@@ -1337,6 +1406,60 @@ rules:
     }
 
     #[test]
+    fn wave6_transports_parse() {
+        let cfg = r#"
+mixed-port: 7890
+proxies:
+  - {name: sn, type: snell, server: s.example, port: 443, psk: pk, version: 4}
+  - {name: at, type: anytls, server: a.example, port: 443, password: pw, sni: a.example}
+  - {name: mi, type: mieru, server: m.example, port: 8964, username: u, password: p, transport: TCP}
+  - {name: rl, type: restls, server: r.example, port: 443, password: pw, sni: r.example,
+     version-hint: tls13}
+rules:
+  - MATCH,sn
+"#;
+        let parsed = load(cfg).unwrap();
+        let sn = parsed.outbounds.iter().find(|o| o.name == "sn").unwrap();
+        assert!(matches!(&sn.kind, OutboundKind::Snell(c) if c.version == 4 && c.psk == "pk"));
+        let at = parsed.outbounds.iter().find(|o| o.name == "at").unwrap();
+        assert!(matches!(&at.kind, OutboundKind::AnyTls(c) if c.sni == "a.example"));
+        let mi = parsed.outbounds.iter().find(|o| o.name == "mi").unwrap();
+        assert!(matches!(&mi.kind, OutboundKind::Mieru(c) if c.username == "u"));
+        let rl = parsed.outbounds.iter().find(|o| o.name == "rl").unwrap();
+        assert!(matches!(
+            &rl.kind,
+            OutboundKind::Restls { cfg: c, .. } if c.version == "tls13"
+        ));
+
+        // Deferred surfaces fail loudly.
+        let bad = |extra: &str| {
+            let cfg = format!(
+                "mixed-port: 7890\nproxies:\n  - name: b\n    type: {{t}}\n    server: x\n    port: 1\n{extra}\nrules:\n  - MATCH,b\n"
+            );
+            cfg
+        };
+        let _ = bad;
+        let mieru_udp = r#"
+mixed-port: 7890
+proxies:
+  - {name: b, type: mieru, server: x, port: 1, username: u, password: p, transport: UDP}
+rules:
+  - MATCH,b
+"#;
+        let err = load(mieru_udp).err().unwrap().to_string();
+        assert!(err.contains("UDP transport is not implemented yet"), "{err}");
+        let restls12 = r#"
+mixed-port: 7890
+proxies:
+  - {name: b, type: restls, server: x, port: 1, password: p, version-hint: tls12}
+rules:
+  - MATCH,b
+"#;
+        let err = load(restls12).err().unwrap().to_string();
+        assert!(err.contains("tls12"), "{err}");
+    }
+
+    #[test]
     fn hysteria2_tuic_listeners_parse() {
         let cfg = r#"
 mixed-port: 7890
@@ -1591,7 +1714,7 @@ rules:
         assert_eq!(ss.port, 38388);
         assert!(matches!(
             &ss.protocol,
-            crate::inbound::proxy_server::ServerProtocol::Shadowsocks { method, password }
+            crate::inbound::proxy_server::ServerProtocol::Shadowsocks { method, password, .. }
                 if method == "aes-256-gcm" && password == "pw"
         ));
         let tr = &parsed.proxy_servers[1];

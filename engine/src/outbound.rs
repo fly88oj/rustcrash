@@ -158,6 +158,14 @@ pub enum OutboundKind {
         inner: Box<OutboundKind>,
     },
     Wireguard(crate::proto::wireguard::WgOut),
+    Snell(crate::proto::snell::SnellOut),
+    AnyTls(crate::proto::anytls::AnyTlsOut),
+    Mieru(crate::proto::mieru::MieruOut),
+    Restls {
+        server: String,
+        port: u16,
+        cfg: crate::proto::restls::RestlsOut,
+    },
 }
 
 /// Shared, lazily-dialed QUIC connection for the hysteria2/tuic outbounds
@@ -216,6 +224,10 @@ impl Outbound {
             OutboundKind::Ssh { .. } => "Ssh",
             OutboundKind::ShadowTls { .. } => "ShadowTls",
             OutboundKind::Wireguard(_) => "Wireguard",
+            OutboundKind::Snell(_) => "Snell",
+            OutboundKind::AnyTls(_) => "AnyTls",
+            OutboundKind::Mieru(_) => "Mieru",
+            OutboundKind::Restls { .. } => "Restls",
         }
     }
 
@@ -619,6 +631,22 @@ async fn vless_front(
             OutboundKind::Wireguard(cfg) => {
                 crate::proto::wireguard::connect(cfg, target).await
             }
+            OutboundKind::Snell(cfg) => {
+                let tcp = Self::dial_transport(&cfg.server, cfg.port, &TransportKind::Tcp, &TlsSettings::default()).await?;
+                let s = crate::proto::snell::handshake(tcp, cfg, target, false).await?;
+                Ok(s)
+            }
+            OutboundKind::AnyTls(cfg) => {
+                let tcp = Self::dial_transport(&cfg.server, cfg.port, &TransportKind::Tcp, &TlsSettings::default()).await?;
+                crate::proto::anytls::connect(cfg, tcp, target).await
+            }
+            OutboundKind::Mieru(cfg) => {
+                crate::proto::mieru::connect(cfg, target).await
+            }
+            OutboundKind::Restls { server, port, cfg } => {
+                let tcp = Self::dial_transport(server, *port, &TransportKind::Tcp, &TlsSettings::default()).await?;
+                crate::proto::restls::connect(cfg, tcp).await
+            }
         }
     }
 
@@ -850,6 +878,23 @@ async fn vless_front(
                 let wg = crate::proto::wireguard::WgUdp::bind(cfg).await?;
                 Ok(UdpChannel::Wg(wg))
             }
+            // Snell UDP: the session stream merges decrypted AEAD
+            // frames, so packet edges are not recoverable through
+            // BoxProxyStream yet — refused loudly (tracked in the
+            // audit) rather than corrupting datagrams.
+            OutboundKind::AnyTls(cfg) if cfg.udp => {
+                let tcp = Self::dial_transport(&cfg.server, cfg.port, &TransportKind::Tcp, &TlsSettings::default()).await?;
+                let udp = crate::proto::anytls::udp_stream(cfg, tcp).await?;
+                Ok(UdpChannel::AnyTls(udp))
+            }
+            OutboundKind::Snell(_) => Err(Error::protocol(
+                "snell UDP is not wired yet (frame-boundary reader pending)",
+            )),
+            OutboundKind::AnyTls(_) | OutboundKind::Mieru(_)
+            | OutboundKind::Restls { .. } => Err(Error::protocol(format!(
+                "{} does not support UDP",
+                self.kind_name()
+            ))),
             OutboundKind::Reject
             | OutboundKind::Http { .. }
             | OutboundKind::Ssh { .. }
@@ -928,6 +973,10 @@ fn other_kind_name(kind: &OutboundKind) -> &'static str {
         OutboundKind::Ssh { .. } => "Ssh",
         OutboundKind::ShadowTls { .. } => "ShadowTls",
         OutboundKind::Wireguard(_) => "Wireguard",
+        OutboundKind::Snell(_) => "Snell",
+        OutboundKind::AnyTls(_) => "AnyTls",
+        OutboundKind::Mieru(_) => "Mieru",
+        OutboundKind::Restls { .. } => "Restls",
     }
 }
 
@@ -976,6 +1025,8 @@ pub enum UdpChannel {
     Quic(QuicUdp),
     /// WireGuard userspace-stack UDP.
     Wg(crate::proto::wireguard::WgUdp),
+    /// AnyTLS UDP-over-TCP (uot v2).
+    AnyTls(crate::proto::anytls::AnyTlsUdp),
 }
 
 impl UdpChannel {
@@ -1000,6 +1051,7 @@ impl UdpChannel {
             }
             UdpChannel::Ss(ss) => ss.send(target, data).await,
             UdpChannel::Wg(w) => w.send(target, data).await,
+            UdpChannel::AnyTls(a) => a.send_to(target, data).await,
             UdpChannel::Quic(q) => {
                 q.packet_seq = q.packet_seq.wrapping_add(1);
                 match q.kind {
@@ -1125,6 +1177,11 @@ impl UdpChannel {
                     .ok_or_else(|| Error::network("quic udp channel closed"))
             }
             UdpChannel::Wg(w) => w.recv().await,
+            UdpChannel::AnyTls(a) => {
+                let mut buf = vec![0u8; 65536];
+                let (addr, n) = a.recv_from(&mut buf).await?;
+                Ok((addr, buf[..n].to_vec()))
+            }
         }
     }
 }

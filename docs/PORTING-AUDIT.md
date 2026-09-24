@@ -4,12 +4,18 @@ File-by-file comparison of upstream feature surface against the Rust engine,
 performed against `MetaCubeX/mihomo` (branch `Alpha`) and `SagerNet/sing-box`
 (branch `testing`), 2026-09-23.
 
+**Product framing: this project is a drop-in replacement for ShellCrash +
+mihomo/sing-box.** Every upstream feature a user may rely on is therefore
+in scope — nothing is permanently "rejected"; unimplemented features are
+PRIORITY items (§4) that fail loudly at config load in the meantime so a
+migration never silently changes behavior.
+
 Status legend:
 
 - ✅ ported (Rust-native, behavior-equivalent for the supported subset)
 - 🟡 partial (core path works; listed sub-features missing)
-- ⛔ deliberate rejection — fails loudly at config load with a precise error
-  (policy from phase 1: never silently ignore an unsupported option)
+- ⏳ not yet implemented — fails loudly at config load with a precise error
+  naming the alternative or the tracking priority (never silently ignored)
 - ❌ missing (candidate for a future pass)
 - ➖ out of scope (platform/manager plumbing that has no engine equivalent)
 
@@ -21,18 +27,26 @@ Status legend:
 |---|---|---|
 | shadowsocks.go | `proto/shadowsocks.rs` (AEAD + 2022 BLAKE3) | ✅ |
 | vmess.go | `proto/vmess.rs` (AEAD, ws/httpupgrade transport) | ✅ |
-| vless.go | `proto/vless.rs` | ✅ |
+| vless.go | `proto/vless.rs` + `proto/vision.rs` (xtls-rprx-vision framing mode; direct splice ⏳) | ✅/🟡 |
 | trojan.go | `proto/trojan.rs` | ✅ |
 | socks5.go | `proto/socks.rs` + `outbound.rs` | ✅ |
 | http.go | `proto/httpx.rs` | ✅ |
 | direct.go, reject.go | `outbound.rs` (DIRECT/REJECT/REJECT-DROP/PASS/COMPATIBLE) | ✅ |
 | base.go, util.go, rematch.go | `outbound.rs` Registry | ✅ (no rematch hook) |
 | dns.go | `dns/resolver.rs` (dns-out via engine DNS) | 🟡 no `dns` as a *proxied outbound* — resolved in-process |
-| hysteria.go, hysteria2.go | — | ❌ QUIC stack (planned) |
-| tuic.go | — | ❌ QUIC stack (planned) |
-| wireguard.go, tailscale.go, easytier.go, zerotier.go | — | ❌ (wireguard = `boringtun`-class work; others niche) |
-| ssh.go, snell.go, mieru.go, anytls.go, jls.go, restls.go, shadowquic.go, shadowtls.go, sudoku.go, gost_relay.go, masque.go, openvpn.go, tlsmirror.go, trusttunnel.go, ech.go | — | ⛔/❌ niche transports; ssh/snell configs fail with "not supported yet" |
-| reality.go (utls/reality) | — | ⛔ explicit config error (`reality-opts` rejected — no TLS-fingerprint mimicry in rustls) |
+| hysteria2.go | `proto/hysteria2.rs` over quinn (HTTP/3-style auth, salamander obfs, datagram UDP) | ✅ this pass |
+| tuic.go | `proto/tuic.rs` v5 (TLS-exporter token auth, native/quic UDP relay, heartbeats, dissociate) | ✅ this pass |
+| wireguard.go | `proto/wireguard.rs` — hand-rolled Noise_IKpsk2 handshake (KDF/MAC1/2 step-cited from the whitepaper), transport keys, anti-replay, cookie consumption, keepalive/rekey timers, smoltcp client stack for TCP+UDP, mihomo `reserved` bytes per sing-wireguard `client_bind.go` | ✅ this pass (self-consistent: verified against an in-test noise responder; IPv6 inner stack ⏳) |
+| tailscale.go, easytier.go, zerotier.go | — | ⏳ P3 overlay networks |
+| ssh.go | `proto/ssh.rs` via russh (password/PEM keys, direct-tcpip channels, known host keys) | ✅ this pass |
+| shadowtls.go (v3) | `proto/shadowtls.rs` (Hello-HMAC auth, record XOR chains, inner `proxy:` nesting in the mihomo dialect) | ✅ this pass (v1/v2 rejected with a clear error) |
+| snell.go | `proto/snell.rs` — v3+v4 (Argon2id KDF hand-rolled per RFC 9106 with Go cross-vectors, v4 stride-2 padding/bit-ratio/chunk-ramp) | ✅ this pass (TCP; UDP wiring pending a frame-boundary reader; v1/v2 + reuse pool ⏳) |
+| anytls.go | `proto/anytls.rs` — auth sha256(pw), padding-scheme session, uot-v2 UDP | ✅ this pass (session multiplexing/idle pool ⏳) |
+| mieru.go | `proto/mieru.rs` — mihomo adapter subset: hashed password, PBKDF2 time-key, XChaCha20-Poly1305 implicit-nonce sessions, stream transport | 🟡 TCP session path ✅ (UDP packet transport/multiplexing/port-ranges ⏳ with clear config errors) |
+| restls.go | `proto/restls.rs` — TLS1.3 session-id BLAKE3 MAC stamping (rustls SecureRandom trick), XOR auth record, script-driven padding | ✅ this pass (tls12 version-hint rejected: rustls has no KEX hook — error names it) |
+| jls.go, shadowquic.go, sudoku.go, gost_relay.go, masque.go, openvpn.go, tlsmirror.go, trusttunnel.go, ech.go | — | ⏳ planned (P3, one transport per pass); configs fail with "not supported yet" until then |
+| simple-obfs | `proto/obfs.rs` (http/tls obfs client; mihomo `plugin: obfs` + sing-box `obfs-local` plugin_opts) | ✅ this pass |
+| reality.go (utls/reality) | `proto/reality/` — Rust-native TLS 1.3 (byte-controlled ClientHello, SHA-256 + SHA-384 key schedules), Chrome/Firefox uTLS templates, REALITY auth + temp-auth cert verify | ✅ **live-validated against a real Xray server** (tests/docker-reality, 19 checks): handshake+relay, firefox profile, wrong short-id/key refusals, fallback, camo negotiation incl. the 0x1302/SHA-384 path. Vision framing ✅ (`proto/vision.rs`); direct splice ⏳ |
 
 ### adapter/outboundgroup/
 
@@ -48,23 +62,24 @@ Status legend:
 | mixed, http, socks | `inbound/{mixed,http,socks}.rs` | ✅ |
 | redir (Linux NAT) | `inbound/redir.rs` (SO_ORIGINAL_DST) | ✅ |
 | tproxy (Linux) | `inbound/tproxy.rs` (TCP+UDP transparent) | ✅ |
-| sing_tun (TUN device) | — | ⛔ config-time hard error (needs a netlink/wintun layer; documented) |
-| sing_shadowsocks / sing_hysteria2 / anytls / vless / vmess / trojan / tuic / shadowtls / snell / jls / restls server listeners | — | ❌ server-side inbounds (acting as proxy server) out of current scope |
-| hysteria2_realm | — | ❌ (same) |
+| sing_tun (TUN device) | `inbound/tun/` — /dev/net/tun + smoltcp netstack + DNS hijack + ICMP echo (v4+v6) + inet6-address (in6_ifreq ioctl, kernel-source-verified), both dialects parse into TunConfig | ✅ Linux (e2e attach + hijacked-UDP with NET_ADMIN); Windows/macOS ⏳; v6 ext headers ⏳ |
+| sing_shadowsocks / sing_trojan / sing_vless / sing_vmess / sing_hysteria2 / tuic server listeners | `inbound/proxy_server/` — TCP + UDP for ss (legacy/2022, SIP022 replay window), trojan, vless, vmess, hysteria2 (H3 auth 233 + datagrams) and TUIC v5 (exporter token auth, native UDP, dissociate); both dialects parse them | ✅ (anytls/snell server listeners ⏳) |
+| hysteria2_realm | — | ❌ (server-side hy2, same family) |
 
 ### dns/
 
 | Upstream | Engine | Status |
 |---|---|---|
-| resolver/client (cache, fallback, policy) | `dns/resolver.rs` | 🟡 cache + ordered upstreams ✅; `nameserver-policy` per-domain routing ❌; fallback geoip-verification ❌ |
-| udp/tcp upstream | `dns/upstream.rs` | ✅ |
+| resolver/client (cache, fallback, policy) | `dns/resolver.rs` + `dns/policy.rs` | ✅ cache + ordered upstreams + `nameserver-policy` per-domain routing (this pass); fallback geoip-verification ❌ |
+| udp/tcp upstream (hostnames resolve at load) | `dns/upstream.rs` | ✅ |
 | dot.go | `dns/upstream.rs` `tls://` | ✅ |
 | doh.go | `dns/upstream.rs` `https://` (RFC 8488, h1.1, Content-Length + chunked) | ✅ |
-| doq.go (QUIC), DoH3 | — | ❌ QUIC stack |
-| dhcp.go, system.go, mdx | — | ❌ |
+| doq.go (QUIC), DoH3 | `dns/upstream.rs` `quic://`/`doq://` (RFC 9250) and `h3://` (DoH3 via the quinn stack) | ✅ this pass |
+| dhcp.go, system.go | `dns/upstream.rs` `system`/`local` (resolv.conf) and `dhcp://iface` (systemd-networkd + dhclient leases, default-route autodetect) | ✅ this pass |
+| mdx | — | ❌ |
 | enhancer (fake-ip) | `dns/fakeip.rs` | ✅ (pool + reverse + filter) |
 | hosts | `config.rs` DnsConfig.hosts + resolver override | ✅ |
-| edns0_subnet.go | — | ❌ |
+| edns0_subnet.go | `dns/edns.rs` RFC 7871 (query-side ECS, sing-box `client_subnet`) | ✅ this pass |
 | rcode/filters | wire.rs | 🟡 NOERROR/NXDOMAIN only |
 
 ### rules/
@@ -77,19 +92,20 @@ Status legend:
 | port.go (SRC/DST ranges) | PortSrc/PortDst | ✅ |
 | process.go | Process (name/path; PATH matches exactly) via `process.rs` /proc walk (TCP+UDP tables) | ✅ |
 | in_name.go | InName | ✅ |
-| in_type/in_user/uid/dscp/ipasn/ipsuffix/network_type | — | ❌ (IN-TYPE/UID/DSCP/IP-ASN/IP-SUFFIX in flight) |
+| in_type/in_user/uid/dscp/ipasn/ipsuffix | `rule.rs` InType/InUser/Uid/Dscp/IpAsn/IpSuffix (`process.rs` returns uid+user) | ✅ this pass |
+| network_type (wifi/cellular) | — | ❌ mobile-only upstream |
 | logic/logic.go AND/OR/NOT (+SUB-RULE bundles) | Logic{And,Or,Not} — NOT takes exactly one sub-rule | ✅; ✅ SUB-RULE with mihomo's real `SUB-RULE,<condition>,<bundle>` syntax (each bundle rule gated by the condition, keeping its own outbound) |
 | final.go (MATCH) | MatchAll | ✅ |
-| provider/ classical+domain+ipcidr strategies | RuleSets Classical/Domain/IpCidr | ✅ (srs/mrs binary readers in flight) |
+| provider/ classical+domain+ipcidr strategies | RuleSets Classical/Domain/IpCidr | ✅ + binary readers: sing-box `.srs` (LOUDS trie, zlib) and mihomo `.mrs` (zstd) via `ruleset_bin.rs` (this pass) |
 
 ### transport/ (outbound wire transports)
 
 | Upstream | Engine (`transport.rs`) | Status |
 |---|---|---|
-| v2raywebsocket (ws + early-data) | `ws_connect` | 🟡 no 0-RTT early-data path |
-| **httpupgrade** (via ws-opts convention) | `httpupgrade_connect` | ✅ (this audit pass) |
-| gun / v2raygrpc | — | ❌ gRPC |
-| simple-obfs / sip003 plugins | — | ⛔ config error |
+| v2raywebsocket (ws + early-data) | `ws_connect_early` (≤757B rides `Sec-WebSocket-Protocol`) | ✅ this pass |
+| **httpupgrade** (via ws-opts convention) | `httpupgrade_connect` | ✅ |
+| gun / v2raygrpc | `grpc.rs` — hand-rolled HTTP/2 + HPACK (huffman decode, flow control), TLS ALPN h2 | ✅ this pass |
+| simple-obfs | `proto/obfs.rs` (http/tls) | ✅; sip003 external plugins ⏳ P3 |
 | vmess AEAD ciphers | `proto/vmess.rs` | ✅ aes-128-gcm / chacha20-poly1305 / none / auto |
 | shadowtls / snell / hysteria core | — | ❌ |
 
@@ -99,8 +115,8 @@ Status legend:
 |---|---|---|
 | tls_sniffer | `sniff_tls` (ClientHello SNI walk) | ✅ |
 | http_sniffer | `sniff_http` (method + Host, port strip) | ✅ |
-| quic_sniffer | — | ❌ (needs QUIC Initial decryption; planned) |
-| dispatcher (override-destination, skip-domain, force-domain, ports) | `app.rs` relay_tcp + SniffConfig | 🟡 override+skip ✅; force-domain/ports-gating ❌ |
+| quic_sniffer | RFC 9001 Initial decryption (HKDF key schedule, header protection, CRYPTO reassembly) | ✅ this pass (RFC A.1/A.2 vectors pinned) |
+| dispatcher (override-destination, skip-domain, force-domain, ports) | `apply_sniffed` + SniffConfig | ✅ override + skip + force-domain (skip wins over force) + per-protocol port gates (`sniff: {TLS: {ports}}`) |
 
 ### tunnel/ + config/
 
@@ -122,7 +138,7 @@ Status legend:
 | direct / block (=REJECT) / dns outbounds | ✅ (dns answered in-process) |
 | group (selector/urltest) | ✅ |
 | hysteria / hysteria2 / tuic | ❌ QUIC (planned) |
-| anytls / shadowtls / naive / snell / ssh / tor / wireguard / tailscale / bridge / cloudflare / tun | ❌/⛔ niche or platform |
+| anytls / snell / mieru / restls / ssh / shadowtls / wireguard | `proto/{anytls,snell,mieru,restls,ssh,shadowtls,wireguard}.rs` | ✅ (scopes noted per file); naive / tor / tailscale / bridge / cloudflare | ⏳ planned (P3, see §4) |
 | all `inbound.go` server halves | ❌ server-side scope |
 
 ### transport/
@@ -132,8 +148,8 @@ Status legend:
 | v2raywebsocket | ✅ | |
 | v2rayhttpupgrade | ✅ (this audit pass) | |
 | v2raygrpc / v2raygrpclite / v2rayquic (gun) | ❌ | |
-| simple-obfs / sip003 | ⛔ | |
-| wireguard | ❌ | |
+| simple-obfs | ✅ (this pass) | |
+| wireguard | ✅ (this pass) | |
 
 ### route/ + option/rule*.go
 
@@ -145,7 +161,7 @@ Status legend:
 | invert | NOT-wrapping in conversion | ✅ (this audit pass) |
 | logical and/or (nested) | Logic via nested_eval | ✅ (this audit pass) |
 | cross-field AND / in-field OR semantics | combine_groups | ✅ (this audit pass — was previously wrong: plain OR lines) |
-| rule_set (.srs binary) | ⛔ explicit error (inline domains/ip_cidr instead) |
+| rule_set (.srs binary) | ✅ `ruleset_bin.rs` + provider wiring | |
 | user / package_name (android) / network_type (wifi/cellular) | ❌ |
 | rule *actions* (sniff/resolve/hijack-dns/route-options/reject variants) | 🟡 route+reject only; sniff is config-level |
 | dns rules (per-server routing, rewrite_ttl, client_subnet, disable_cache) | ❌ |
@@ -195,17 +211,28 @@ Proxies/connections/rules/traffic/mode/logs subset ✅; websocket traffic stream
    external-kernel/firewall checks, all green) against real mihomo
    binaries as protocol oracles run per-commit in one container.
 
-## 4. Prioritized remaining gaps
+## 4. Roadmap — everything upstream is in scope
 
-| Priority | Gap | Size |
+This project's mandate is to be a drop-in replacement for ShellCrash +
+mihomo/sing-box, so there is no permanent "rejected" bucket: features not
+yet implemented are prioritized below, and until they land they fail
+loudly at config load (never silently degrade). External-kernel modes
+stay available as the escape hatch during migration.
+
+| Priority | Gap | Implementation path |
 |---|---|---|
-| P0 | QUIC stack (quinn): hysteria2 + tuic outbounds, DoH3/DoQ, quic sniffer | large |
-| P0 | gRPC (gun) transport | medium |
-| P1 | nameserver-policy + dns rules; edns0 client_subnet | medium |
-| P1 | IN-TYPE/UID/DSCP/IP-ASN matchers | small each |
-| P1 | sniffer force-domain/ports; ws early-data; QUIC sniffer | small/medium |
-| P2 | .srs / .mrs binary rule-set readers | medium |
-| P2 | server-side inbounds (act as a proxy server) | large |
-| P3 | wireguard / ssh / snell / anytls / shadowtls ecosystem | large |
-| P3 | utls fingerprint mimicry, reality | rejected (rustls policy) |
-| P3 | TUN device inbounds | rejected for now (netlink layer) |
+| **P1** | vless Vision DIRECT splice — FULL (raw-transport rebind) | framing half ✅ (command `02` parsed, verbatim passthrough); the full splice rebinds to raw TCP under the outer TLS and needs read-ahead buffers exposed through `Tls13Stream` (tracked) |
+| **P1** | TUN on Windows (WinTUN) / macOS (utun) | same netstack, different device backends |
+
+| P2 | hy2/tuic server listeners; SS-2022 multi-user server | hy2 server reuses the quinn plumbing; ss UDP server ✅ landed (legacy + 2022) |
+| P1 | WireGuard (outbound + endpoint) | boringtun for the tunnel; consumes the TUN netstack core from the P0 item |
+| P2 | DHCP / system / hosts-file DNS upstreams; DoH server | small, one module each |
+| P2 | snell / anytls / mieru / jls / restls / shadowquic transports | one protocol per pass, mirroring upstream codecs |
+| P3 | tailscale / tor / openvpn / masque / sudoku / gost-relay / tlsmirror / trusttunnel / series | long tail, driven by user demand |
+| P3 | sip003 external plugins; .mrs writing; misc polish | — |
+
+Cluster e2e note (tests/docker-cluster, 10 checks): the dev machine's
+host TUN transparent proxy intercepts SOME forwarded docker UDP flows
+(cross-container ss-UDP dies while plain cross-container UDP works and
+the identical loopback path passes); the suite detects this and falls
+back to the same binary running inside the server container on loopback.
