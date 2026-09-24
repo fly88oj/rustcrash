@@ -1,8 +1,8 @@
 # RustCrash
 
-[![CI](https://img.shields.io/badge/tests-500%2B-green)]() [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)]() [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange)]()
+[![CI](https://img.shields.io/badge/tests-600%2B-green)]() [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)]() [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange)]()
 
-**A single-binary, cross-platform manager for [mihomo](https://github.com/MetaCubeX/mihomo) and [sing-box](https://github.com/SagerNet/sing-box) proxy kernels — a Rust rewrite of [ShellCrash](https://github.com/juewuy/ShellCrash).**
+**A single-binary, cross-platform manager for [mihomo](https://github.com/MetaCubeX/mihomo) and [sing-box](https://github.com/SagerNet/sing-box) proxy kernels — a Rust rewrite of [ShellCrash](https://github.com/juewuy/ShellCrash) — now with an integrated Rust-native proxy engine.**
 
 English | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [日本語](README.ja.md) | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [Português](README.pt.md) | [Русский](README.ru.md)
 
@@ -15,6 +15,11 @@ and a full test suite.
 
 - **One binary** — every function (init, install, firewall, lifecycle,
   subscriptions, scheduling, bot, API) is a subcommand of `crash`.
+- **Three engine editions, your choice** — run the classic build that
+  manages external mihomo/sing-box binaries (unchanged default), or a
+  build with the integrated Rust engine that speaks the mihomo
+  (Clash YAML) or sing-box (JSON) config dialect natively — no kernel
+  binary to download.
 - **Real platforms** — Linux x86_64/ARM64/ARMv6/ARMv7/MIPS (musl, static)
   for routers and Raspberry Pi, OpenWrt, Docker; iptables and nftables;
   systemd, OpenWrt init and OpenRC.
@@ -26,6 +31,40 @@ and a full test suite.
   no external subconverter binary.
 - **Remote management** — Telegram bot with inline menus, REST API with
   token auth, push notifications to 7 providers.
+
+## The integrated Rust engine
+
+The `engine/` crate is a from-scratch Rust rewrite of the proxy data
+plane, verified byte-for-byte against a **real mihomo binary** in the
+Docker interop suite (26 checks: every protocol round-trips through
+mihomo listeners):
+
+| Area | Implemented |
+|------|-------------|
+| Outbounds | Shadowsocks (AEAD + 2022), VMess (AEAD, tcp + WebSocket), VLESS, Trojan (TLS), SOCKS5, HTTP, DIRECT/REJECT |
+| Inbounds | mixed / SOCKS5 (with UDP ASSOCIATE) / HTTP / Linux redir / tproxy (TCP + UDP) |
+| DNS | hijack server, fake-IP pool with LRU, redir-host, UDP/TCP upstreams, caching |
+| Routing | DOMAIN/SUFFIX/KEYWORD/REGEX, IP-CIDR(v6), GEOIP (mmdb), GEOSITE (dat), rule-sets, ports, MATCH |
+| Groups | select / url-test / fallback / load-balance with health checks |
+| API | Clash RESTful subset (proxies, selection, delay test, connections, traffic, rules, mode) |
+
+Switch at runtime by setting `kernel:` in `config.yaml`:
+`mihomo` / `sing-box` (external binaries) or `rust-mihomo` /
+`rust-sing-box` (integrated engine — the same kernel config files).
+Build the edition you want:
+
+```bash
+cargo build --release --bin crash                          # classic: external kernels only
+cargo build --release --bin crash --features engine-mihomo # + Clash YAML dialect
+cargo build --release --bin crash --features engine-singbox # + sing-box JSON dialect
+cargo build --release --bin crash --features engine-full   # both dialects
+```
+
+Crypto is RustCrypto/rustls throughout (constant-time, audited);
+wire formats follow the v2fly/sing-vmess/ss2022 specs and are pinned by
+upstream test vectors plus the mihomo interop suite. Not yet in the
+engine: hysteria2/TUIC/WireGuard, gRPC transport, TUN device — configs
+using them fail with a precise error at `crash engine test`.
 
 ## Quick start
 
@@ -82,11 +121,12 @@ secrets from config/env only. See [docs/SECURITY.md](docs/SECURITY.md).
 ## Building & testing
 
 ```bash
-cargo test --workspace                 # 500+ tests, no network required
+cargo test --workspace                 # 600+ tests, no network required
 cargo clippy --workspace --all-targets
 bash scripts/cross-compile.sh          # 6 targets: ARM/ARM64/MIPS routers, Pi, x86
 bash scripts/release.sh                # release dir: tar.gz per target + SHA256SUMS
-bash tests/docker/run.sh               # multi-container e2e (real binary)
+bash tests/docker/run.sh               # external-kernel e2e (35 checks)
+bash tests/docker-engine/run.sh        # Rust-engine interop vs real mihomo (26 checks)
 ```
 
 ## Project layout
@@ -94,8 +134,10 @@ bash tests/docker/run.sh               # multi-container e2e (real binary)
 ```
 core/            rustcrash-core library (platform, service, bot, notify,
                  api, geo, rules, firewall, subconverter, …)
+engine/          the integrated Rust proxy engine (protocols, DNS,
+                 routing, inbounds, Clash API; feature-gated dialects)
 cmd/crash/       the single crash binary (CLI + TUI)
-tests/           integration + Docker e2e suites
+tests/           integration + Docker e2e suites (external + engine)
 docs/            CLI / API / bot / config / architecture / security docs
 ```
 

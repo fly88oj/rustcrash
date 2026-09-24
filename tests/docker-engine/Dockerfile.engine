@@ -1,0 +1,27 @@
+# RustCrash engine-full interop image: the crash binary (both Rust engine
+# dialects) plus a real mihomo binary for protocol interop — everything
+# runs inside ONE container's network namespace on loopback so the suite
+# is hermetic (no host interference, no port collisions).
+FROM rust:1.98-slim AS builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock* ./
+COPY core/ core/
+COPY engine/ engine/
+COPY cmd/ cmd/
+COPY tests/ tests/
+RUN cargo build --release --bin crash --features engine-full
+
+# The real mihomo kernel: the interop oracle.
+FROM metacubex/mihomo:v1.19.13 AS mihomo
+
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl bash dnsutils iproute2 nftables iptables python3 procps \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/target/release/crash /usr/local/bin/
+COPY --from=mihomo /mihomo /usr/local/bin/mihomo
+RUN chmod +x /usr/local/bin/crash /usr/local/bin/mihomo
+# Interop fixtures: mihomo server config, engine template, web root, UDP
+# probe, and the DNS upstream responder.
+COPY tests/docker-engine/fixtures/ /fixtures/
+ENTRYPOINT ["/usr/local/bin/crash"]

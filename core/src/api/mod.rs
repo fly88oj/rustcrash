@@ -147,17 +147,17 @@ impl ApiServer {
         // every request otherwise (~24µs of YAML parsing each). Writes
         // through this server bump the mtime, so the cache self-invalidates.
         let config = self.cached_config();
-        let kernel = config.active_kernel();
+        let selection = config.kernel_selection();
         let sm = ServiceManager::new(&self.platform);
 
         match (req.method.as_str(), path.as_str()) {
             ("GET", "/api/status") => {
-                let st = sm.status(kernel);
+                let st = sm.status_selection(selection);
                 (
                     200,
                     json!({
                         "version": env!("CARGO_PKG_VERSION"),
-                        "kernel": kernel.binary_name(),
+                        "kernel": selection.display_name(),
                         "kernel_version": config.kernel_version,
                         "running": st.running,
                         "pid": st.pid,
@@ -185,7 +185,7 @@ impl ApiServer {
                     Err(e) => (400, json!({"error": format!("invalid config: {e}")})),
                 }
             }
-            ("POST", "/api/start") => match sm.start(kernel).await {
+            ("POST", "/api/start") => match sm.start_selection(selection).await {
                 Ok(pid) => (200, json!({"status": "started", "pid": pid})),
                 Err(e) => (500, json!({"error": e.to_string()})),
             },
@@ -198,7 +198,7 @@ impl ApiServer {
                     Err(e) => (500, json!({"error": e.to_string()})),
                 }
             }
-            ("POST", "/api/restart") => match sm.restart(kernel).await {
+            ("POST", "/api/restart") => match sm.restart_selection(selection).await {
                 Ok(pid) => (200, json!({"status": "restarted", "pid": pid})),
                 Err(e) => (500, json!({"error": e.to_string()})),
             },

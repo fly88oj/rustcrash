@@ -7,7 +7,14 @@ license.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Integrated Rust engine (mihomo YAML dialect).
+engine-mihomo = ["dep:rustcrash-engine", "rustcrash-engine/mihomo"]
+# Integrated Rust engine (sing-box JSON dialect).
+engine-singbox = ["dep:rustcrash-engine", "rustcrash-engine/singbox"]
+
 [dependencies]
+rustcrash-engine = { path = "../engine", optional = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

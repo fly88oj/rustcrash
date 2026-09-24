@@ -91,11 +91,52 @@ jobs:
         with:
           components: clippy
       - run: cargo test --workspace
+      # The integrated engine: unit tests for both dialects, then clippy on
+      # the engine-full feature set (default build is covered above).
+      - run: cargo test -p rustcrash-engine --features mihomo,singbox
+      - run: cargo test -p rustcrash-core --features engine-mihomo,engine-singbox
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy -p rustcrash-crash --features engine-full -- -D warnings
+
+  engine-build:
+    # x86_64 engine-full binary: the same crash binary with both Rust
+    # engine dialects compiled in, for users who want the integrated
+    # kernel instead of managing external binaries.
+    name: build engine-full (x86_64 musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --target x86_64-unknown-linux-musl --bin crash --features engine-full
+      - name: Verify ELF
+        run: |
+          file_output="$(file target/x86_64-unknown-linux-musl/release/crash)"
+          echo "$file_output"
+          [[ "$file_output" == *"x86-64"* ]] || { echo "wrong architecture"; exit 1; }
+          [[ "$file_output" == *"statically linked"* || "$file_output" == *"static-pie linked"* ]] || { echo "not static"; exit 1; }
+      - name: Package
+        run: |
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          DIR="rustcrash-${VERSION}-engine-full-x86_64-unknown-linux-musl"
+          mkdir -p "$DIR"
+          cp target/x86_64-unknown-linux-musl/release/crash "$DIR/crash"
+          cp LICENSE "$DIR/" || true
+          tar -czf "rustcrash-${VERSION}-engine-full-x86_64-unknown-linux-musl.tar.gz" "$DIR"
+          sha256sum "rustcrash-${VERSION}-engine-full-x86_64-unknown-linux-musl.tar.gz" > "SHA256SUMS-engine-full"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustcrash-engine-full-x86_64
+          path: |
+            *.tar.gz
+            SHA256SUMS-engine-full
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, tests]
+    needs: [build, tests, engine-build]
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -1,11 +1,12 @@
 # Architecture
 
-RustCrash is a Cargo workspace with one library and one binary:
+RustCrash is a Cargo workspace with two libraries and one binary:
 
 ```
 ┌────────────────────────────────────────────┐
 │ cmd/crash         the single `crash` binary │
 │  CLI (clap) + TUI (ratatui)                 │
+│  + `crash engine run|test|version`          │
 └───────────────┬────────────────────────────┘
                 │ depends on
 ┌───────────────▼────────────────────────────┐
@@ -14,6 +15,17 @@ RustCrash is a Cargo workspace with one library and one binary:
 │ platform ─ config ─ service ─ bot ─ notify  │
 │     └────── firewall / geo / rules ─ api    │
 │            subconverter (uri/filters/fmts)  │
+│            engine (KernelSelection bridge)  │
+└───────────────┬─────────────────────────────┘
+                │ optional dep, feature-gated
+┌───────────────▼─────────────────────────────┐
+│ engine (rustcrash-engine)                   │
+│  protocols (ss/2022, vmess, vless, trojan,  │
+│   socks, http) ─ TLS/WS transports          │
+│  inbounds (mixed/socks/http/redir/tproxy)   │
+│  dns (wire, fake-IP, resolver) ─ rules       │
+│  geoip/geosite ─ app (Engine) ─ clash api   │
+│  dialects: mihomo YAML / sing-box JSON      │
 └─────────────────────────────────────────────┘
 ```
 
@@ -37,6 +49,21 @@ RustCrash is a Cargo workspace with one library and one binary:
 | `task` | `CronExpr`, `TaskManager`, updaters | cron parsing, hooks, scheduled sub/kernel updates |
 | `init` | init-system integrations | systemd/OpenWrt/OpenRC generation, container detection |
 | `backup`, `template`, `validate`, `import_export` | backup tarballs, config templates, validation | |
+| `engine` (core) | `KernelSelection`, `EngineFlavor`, `engine::{run,test,version}` | feature-gated bridge into the engine crate; geo-path wiring; builds without engine features get precise errors |
+| `engine` (crate) | `Engine::build/run`, `EngineConfig`, `RelayHandler` | the integrated data plane: protocol codecs, transports, inbounds, DNS/fake-IP, rules, groups, Clash API, dialect loaders |
+
+The engine crate's own seams:
+
+- **`BoxProxyStream`** — every protocol handshake returns the same boxed
+  duplex stream, so relays and transports compose without knowing the
+  protocol.
+- **`RelayHandler`** — inbounds hand `(meta, stream)` or UDP channel
+  pairs to the engine core; the app layer routes and relays.
+- **dialect loaders** (`config_mihomo` / `config_singbox`, cargo
+  features) — both produce the same normalized `EngineConfig`; the app
+  layer is dialect-agnostic.
+- **wire formats pinned by vectors** — v2fly KDF, RFC 5869 HKDF,
+  upstream mihomo binary interop (tests/docker-engine).
 
 ## Key seams
 
@@ -78,7 +105,20 @@ RustCrash is a Cargo workspace with one library and one binary:
 
 ## Data flow (supervisor)
 
-`crash start serve` → loads config → optional `ApiServer` (loopback) →
-optional `TelegramBot` (poll loop) → watchdog ticks every N seconds →
-`ServiceManager::status`/`start` → kernel process; events fan out through
-`NotificationManager`.
+`crash start serve` → loads config → `KernelSelection` (external kernel
+or integrated engine) → optional `ApiServer` (loopback) → optional
+`TelegramBot` (poll loop) → watchdog ticks every N seconds →
+`ServiceManager::is_running_selection`/`start_selection` → kernel process
+or self-spawned engine worker (`crash engine run`, anti-loop gid, pid
+file); events fan out through `NotificationManager`.
+
+## Data flow (engine, integrated mode)
+
+`crash engine run` → dialect loader (Clash YAML / sing-box JSON) →
+normalized `EngineConfig` → `Engine::build` (registry, rules, geo,
+DNS/fake-IP) → inbounds (mixed/socks/http/redir/tproxy) + DNS server +
+Clash API → per connection: inbound parses target → `route()` (fake-IP
+reversed first, rules, lazy resolve for IP rules) → outbound handshake
+(ss/vmess/vless/trojan/socks/http/direct) → bidirectional copy with
+per-connection counters feeding the connection table and traffic
+channels.

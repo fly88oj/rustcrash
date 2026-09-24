@@ -259,6 +259,12 @@ impl Config {
         }
     }
 
+    /// The full data-plane selection: external kernel or the integrated
+    /// Rust engine (`rust-mihomo` / `rust-sing-box`).
+    pub fn kernel_selection(&self) -> crate::engine::KernelSelection {
+        crate::engine::KernelSelection::parse(&self.kernel)
+    }
+
     pub fn to_firewall_config(&self) -> Result<FirewallConfig> {
         let macfilter = self.macfilter_type.as_ref().map(|t| {
             if t == "whitelist" {

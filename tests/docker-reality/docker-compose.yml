@@ -1,0 +1,29 @@
+# REALITY interop e2e: the Rust engine's REALITY client against a REAL Xray
+# server.
+#
+# One container, everything on internal loopback 127.0.0.1: the Xray server
+# (REALITY inbounds + the camo TLS site), the engine client, the HTTP target
+# and the probes. The image is the SAME engine-full image the
+# tests/docker-engine suite builds (tests/docker-engine/Dockerfile.engine) —
+# this suite adds nothing to it; the real Xray binary is fetched at test time
+# inside the container (run.sh marks that step network-dependent).
+services:
+  rustcrash:
+    build:
+      context: ../..
+      dockerfile: tests/docker-engine/Dockerfile.engine
+    image: docker-engine-rustcrash
+    networks:
+      - realitynet
+    cap_add:
+      - NET_ADMIN
+    environment:
+      CRASHDIR: /tmp/rustcrash
+    volumes:
+      - ./fixtures:/reality-fixtures:ro
+    entrypoint: bash
+    command: -c "sleep infinity"
+
+networks:
+  realitynet:
+    driver: bridge

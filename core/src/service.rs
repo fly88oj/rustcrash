@@ -113,6 +113,12 @@ impl ServiceManager {
         format!("{}/{}.pid", self.run_dir(), kernel.binary_name())
     }
 
+    /// The integrated Rust engine runs as a supervised self-spawn of this
+    /// binary (`crash engine run …`), so its lifecycle mirrors a kernel's.
+    fn engine_pid_file(&self) -> String {
+        format!("{}/rustcrash-engine.pid", self.run_dir())
+    }
+
     fn start_time_file(&self) -> String {
         format!("{}/crash_start_time", self.run_dir())
     }
@@ -247,6 +253,22 @@ impl ServiceManager {
             }
             let _ = fs::remove_file(self.pid_file(kernel));
         }
+        // The integrated engine stops with the same handshake (it exits on
+        // SIGTERM; the run loop's signal handler completes the shutdown).
+        if let Some(pid) = self.read_engine_pid() {
+            send_signal(pid, libc::SIGTERM);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                if !send_signal(pid, 0) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if send_signal(pid, 0) {
+                send_signal(pid, libc::SIGKILL);
+            }
+        }
+        let _ = fs::remove_file(self.engine_pid_file());
         let _ = fs::remove_file(self.start_time_file());
         if notify {
             // A restart emits its own single "restart" event, not stop+restart.
@@ -268,6 +290,178 @@ impl ServiceManager {
         let pid = self.start_inner(kernel, false).await?;
         self.notify_best_effort("restart", &format!("kernel restarted (PID {pid})"));
         Ok(pid)
+    }
+
+    // -- Integrated Rust engine lifecycle --------------------------------
+
+    /// Whether the engine selection (external kernel or integrated Rust
+    /// engine) has a live process.
+    pub fn is_running_selection(&self, selection: crate::engine::KernelSelection) -> bool {
+        match selection {
+            crate::engine::KernelSelection::External(kernel) => self.is_running(kernel),
+            crate::engine::KernelSelection::Engine(_) => self
+                .read_engine_pid()
+                .map(|pid| send_signal(pid, 0))
+                .unwrap_or(false),
+        }
+    }
+
+    fn read_engine_pid(&self) -> Option<u32> {
+        let content = fs::read_to_string(self.engine_pid_file()).ok()?;
+        content.trim().parse::<u32>().ok()
+    }
+
+    /// Start whatever the config selects (external kernel or the Rust
+    /// engine self-spawn). Returns the new PID.
+    pub async fn start_selection(
+        &self,
+        selection: crate::engine::KernelSelection,
+    ) -> Result<u32> {
+        match selection {
+            crate::engine::KernelSelection::External(kernel) => self.start(kernel).await,
+            crate::engine::KernelSelection::Engine(flavor) => {
+                self.start_engine(flavor, true).await
+            }
+        }
+    }
+
+    /// Restart the selection (single "restart" notification).
+    pub async fn restart_selection(
+        &self,
+        selection: crate::engine::KernelSelection,
+    ) -> Result<u32> {
+        let stopper = ServiceManager {
+            platform: self.platform.clone(),
+        };
+        tokio::task::spawn_blocking(move || stopper.stop_inner(false))
+            .await
+            .map_err(|e| Error::Process(format!("restart join failed: {e}")))??;
+        let pid = match selection {
+            crate::engine::KernelSelection::External(kernel) => self.start_inner(kernel, false).await?,
+            crate::engine::KernelSelection::Engine(flavor) => self.start_engine(flavor, false).await?,
+        };
+        self.notify_best_effort("restart", &format!("kernel restarted (PID {pid})"));
+        Ok(pid)
+    }
+
+    /// Spawn the engine as a child of this same binary: config is
+    /// validated first (fail fast, like `mihomo -t`), the process gets the
+    /// anti-loop supplementary gid, and logs land in the log dir.
+    async fn start_engine(&self, flavor: crate::engine::EngineFlavor, notify: bool) -> Result<u32> {
+        crate::engine::ensure_supported(flavor)?;
+        if let Some(pid) = self.read_engine_pid() {
+            if send_signal(pid, 0) {
+                return Ok(pid);
+            }
+        }
+        fs::create_dir_all(self.run_dir())?;
+
+        let config_path =
+            crate::config::ConfigManager::new(&self.platform).kernel_config_path(flavor.kernel());
+        let cfg_path = validated_config(&config_path)?;
+        // Fail fast on a broken config (the engine has no supervisor to
+        // hide behind at this point).
+        #[cfg(any(feature = "engine-mihomo", feature = "engine-singbox"))]
+        {
+            let warnings = crate::engine::test(flavor, cfg_path.to_str().unwrap_or(""), &self.platform)?;
+            for w in warnings {
+                tracing::warn!("engine config: {w}");
+            }
+        }
+
+        let exe = validated_executable(
+            std::env::current_exe()
+                .map_err(|e| Error::Process(format!("current_exe: {e}")))?
+                .to_str()
+                .ok_or_else(|| Error::Process("current_exe not utf-8".into()))?,
+        )?;
+
+        // Anti-loop gid, identical to the external-kernel path.
+        ensure_crash_group();
+        let crash_gid = lookup_group_name_by_gid(CRASH_GID)
+            .map(|_| CRASH_GID)
+            .or_else(|| lookup_group_gid(CRASH_GID_NAME));
+
+        // Engine logs go to their own file (the kernel binaries write
+        // their own logs under -d too).
+        let log_dir = self.platform.log_dir();
+        fs::create_dir_all(&log_dir)?;
+        let engine_log = std::path::Path::new(&log_dir).join("rustcrash-engine.log");
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&engine_log)
+            .map_err(|e| Error::Process(format!("open {}: {e}", engine_log.display())))?;
+
+        let dup_fd = log_file
+            .try_clone()
+            .map_err(|e| Error::Process(format!("dup log fd: {e}")))?;
+        let mut cmd = tokio::process::Command::new(exe.as_os_str());
+        cmd.arg("engine")
+            .arg("run")
+            .arg("--flavor")
+            .arg(flavor.as_str())
+            .arg("--config")
+            .arg(cfg_path.as_os_str())
+            .stdout(std::process::Stdio::from(dup_fd))
+            .stderr(std::process::Stdio::from(log_file));
+        #[cfg(unix)]
+        if let Some(gid) = crash_gid {
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::setgroups(1, [gid as libc::gid_t].as_ptr()) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let child = cmd.spawn().map_err(|e| {
+            Error::Process(format!("failed to start the rust engine: {e}"))
+        })?;
+        let pid = child.id();
+
+        if let Some(pid) = pid {
+            fs::write(self.engine_pid_file(), pid.to_string())?;
+            fs::write(self.start_time_file(), now_secs().to_string())?;
+        }
+        if notify {
+            let nm = crate::notify::NotificationManager::from_platform(&self.platform);
+            let pid_text = pid.unwrap_or(0).to_string();
+            let flavor_text = flavor.as_str().to_string();
+            tokio::spawn(async move {
+                nm.notify_event(
+                    "start",
+                    &format!("rust engine ({flavor_text}) started (PID {pid_text})"),
+                )
+                .await;
+            });
+        }
+        Ok(pid.unwrap_or(0))
+    }
+
+    /// Status for either selection. The engine's `kernel` field carries the
+    /// flavor's external-kernel counterpart purely as a label.
+    pub fn status_selection(&self, selection: crate::engine::KernelSelection) -> ServiceStatus {
+        match selection {
+            crate::engine::KernelSelection::External(kernel) => self.status(kernel),
+            crate::engine::KernelSelection::Engine(flavor) => {
+                let pid = self.read_engine_pid();
+                let running = pid.map(|p| send_signal(p, 0)).unwrap_or(false);
+                let (memory_mb, uptime_secs) = if running {
+                    (read_vm_rss_mb(pid.unwrap()), self.read_start_time())
+                } else {
+                    (None, None)
+                };
+                ServiceStatus {
+                    kernel: flavor.kernel(),
+                    running,
+                    pid,
+                    memory_mb,
+                    uptime_secs,
+                }
+            }
+        }
     }
 
     /// Fire a notification event when a tokio runtime is available; silently
@@ -423,7 +617,7 @@ pub async fn serve(
     config: &crate::config::Config,
     interval: u64,
 ) -> Result<()> {
-    let kernel = config.active_kernel();
+    let selection = config.kernel_selection();
     let sm = std::sync::Arc::new(ServiceManager::new(platform));
 
     if config.api_enabled {
@@ -466,10 +660,10 @@ pub async fn serve(
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
         rotate_kernel_logs(platform);
-        if !sm.is_running(kernel) {
+        if !sm.is_running_selection(selection) {
             tracing::warn!("kernel stopped, watchdog restarting...");
-            // start() fires the "start" event itself — no duplicate here.
-            if let Err(e) = sm.start(kernel).await {
+            // start_selection() fires the "start" event itself — no duplicate here.
+            if let Err(e) = sm.start_selection(selection).await {
                 tracing::error!("watchdog failed to restart: {e}");
                 let nm = crate::notify::NotificationManager::from_platform(platform);
                 nm.notify_event("error", &format!("watchdog restart failed: {e}"))
