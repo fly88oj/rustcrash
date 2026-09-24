@@ -16,6 +16,9 @@
 //!   `2022-blake3-aes-256-gcm`) streams, including the SIP022 timestamp,
 //!   replay and padding-length checks — plus a UDP relay socket
 //!   ([`ss::SsUdpServer`]) on the listener port for the same methods.
+//!   2022 listeners additionally support SIP023 multi-user: per-user PSKs
+//!   selected through the Extended Identity Header on both TCP and UDP
+//!   (see [`ss`] for the wire details).
 //! * Trojan: TLS (when configured) then SHA-224 password hex, command and
 //!   the SOCKS address; plain TCP relay for `CONNECT`, and for the UDP
 //!   command a `socks-addr || len-be16 || payload` frame relay.
@@ -118,7 +121,17 @@ pub enum ServerProtocol {
     /// Shadowsocks: `method` is any supported [`crate::proto::shadowsocks::SsMethod`]
     /// name; the legacy methods derive the key from `password`, the 2022
     /// methods expect the base64 PSK in `password`.
-    Shadowsocks { method: String, password: String },
+    ///
+    /// `users` enables SIP023 multi-user (EIH) on a 2022 listener:
+    /// `(username, base64 user PSK)` pairs in addition to the server-level
+    /// PSK in `password` (mihomo `listeners[].users` / sing-box inbound
+    /// `users`). Empty keeps the single-user path unchanged; the dialect
+    /// layer fills it from config, never the wire.
+    Shadowsocks {
+        method: String,
+        password: String,
+        users: Vec<(String, String)>,
+    },
     /// Trojan with SHA-224 password hex auth. `tls: None` serves plain
     /// (`trojanc://`) and is intended for tests and trusted transports.
     Trojan {
@@ -776,6 +789,7 @@ mod tests {
         let ss = cfg(ServerProtocol::Shadowsocks {
             method: "aes-128-gcm".into(),
             password: "x".into(),
+            users: Vec::new(),
         });
         let trojan = cfg(ServerProtocol::Trojan {
             password: "x".into(),
@@ -817,6 +831,7 @@ mod tests {
         let bad_method = cfg(ServerProtocol::Shadowsocks {
             method: "rc4-md5".into(),
             password: "x".into(),
+            users: Vec::new(),
         });
         assert!(serve(&bad_method, capture.clone()).await.is_err());
 

@@ -347,6 +347,29 @@ pub fn load(text: &str) -> Result<EngineConfig> {
                     },
                 })
             }
+            "anytls" => {
+                let mut tls = tls_of(outbound)?;
+                if !tls.enabled {
+                    // anytls is TLS-by-definition upstream.
+                    tls.enabled = true;
+                }
+                outbounds.push(OutboundConfig {
+                    name: tag.clone(),
+                    udp: true,
+                    kind: OutboundKind::AnyTls(crate::proto::anytls::AnyTlsOut {
+                        password: json_str(outbound, "password").unwrap_or_default(),
+                        sni: json_tls_name(outbound).unwrap_or_default(),
+                        skip_verify: outbound
+                            .get("tls")
+                            .and_then(Json::as_object)
+                            .and_then(|t| t.get("insecure").and_then(Json::as_bool))
+                            .unwrap_or(false),
+                        udp: true,
+                        server: server_of(outbound, &tag)?,
+                        port: port_of(outbound, &tag)?,
+                    }),
+                })
+            }
             "wireguard" => {
                 let local_ip = outbound
                     .get("local_address")
@@ -652,6 +675,9 @@ fn parse_server_inbound(
         "shadowsocks" => ServerProtocol::Shadowsocks {
             method: json_str(inbound, "method").unwrap_or_default(),
             password: json_str(inbound, "password").unwrap_or_default(),
+            // SIP023 multi-user `users` parsing is wired by the
+            // integrator; the single-PSK shape stays as-is.
+            users: Vec::new(),
         },
         "trojan" => ServerProtocol::Trojan {
             password: first_user_field("password")
@@ -1427,6 +1453,27 @@ mod tests {
         assert_eq!(dns.rules[0].rewrite_ttl, Some(300));
         assert_eq!(dns.rules[1].server_urls, vec!["udp://1.1.1.1"]);
         assert!(dns.rules[1].disable_cache);
+    }
+
+    #[test]
+    fn anytls_outbound_parses() {
+        let cfg = r#"
+{"inbounds": [{"type": "mixed", "listen_port": 1}],
+ "outbounds": [
+   {"type": "anytls", "tag": "a", "server": "a.example", "server_port": 443,
+    "password": "pw",
+    "tls": {"enabled": true, "server_name": "a.example", "insecure": true}},
+   {"type": "direct", "tag": "direct"}]}
+"#;
+        let parsed = load(cfg).unwrap();
+        let a = parsed.outbounds.iter().find(|o| o.name == "a").unwrap();
+        match &a.kind {
+            crate::outbound::OutboundKind::AnyTls(c) => {
+                assert_eq!(c.sni, "a.example");
+                assert!(c.skip_verify);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]
