@@ -1,0 +1,24 @@
+# Engine interop e2e.
+#
+# Everything (mihomo, HTTP target, DNS upstream, the engine, the probes)
+# runs INSIDE one container on its internal loopback. This host machine
+# runs its own transparent proxy whose policy routing mangles forwarded
+# docker traffic; an isolated netns keeps the suite hermetic and free of
+# host port collisions.
+services:
+  rustcrash:
+    build:
+      context: ../..
+      dockerfile: tests/docker-engine/Dockerfile.engine
+    networks:
+      - engnet
+    cap_add:
+      - NET_ADMIN
+    environment:
+      CRASHDIR: /tmp/rustcrash
+    entrypoint: bash
+    command: -c "sleep infinity"
+
+networks:
+  engnet:
+    driver: bridge

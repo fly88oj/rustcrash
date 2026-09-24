@@ -2,3 +2,5 @@
 /dist
 /.planning
 .mimosa/
+tests/docker-engine/fixtures/certs/
+tests/docker-cluster/fixtures/certs/

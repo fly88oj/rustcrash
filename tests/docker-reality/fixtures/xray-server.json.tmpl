@@ -1,0 +1,83 @@
+{
+  "log": { "loglevel": "debug", "access": "", "error": "" },
+  "inbounds": [
+    {
+      "tag": "reality-novision",
+      "listen": "127.0.0.1",
+      "port": __SERVER_PORT_NOVISION__,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          { "id": "__UUID__", "email": "engine-novision@test", "flow": "" }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "127.0.0.1:__CAMO_PORT__",
+          "xver": 0,
+          "serverNames": ["camo.test"],
+          "privateKey": "__PRIVATE_KEY__",
+          "shortIds": ["__SHORT_ID__"]
+        }
+      },
+      "sniffing": { "enabled": false }
+    },
+    {
+      "tag": "reality-vision",
+      "listen": "127.0.0.1",
+      "port": __SERVER_PORT_VISION__,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          { "id": "__UUID__", "email": "engine-vision@test", "flow": "xtls-rprx-vision" }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "127.0.0.1:__CAMO_PORT__",
+          "xver": 0,
+          "serverNames": ["camo.test"],
+          "privateKey": "__PRIVATE_KEY__",
+          "shortIds": ["__SHORT_ID__"]
+        }
+      },
+      "sniffing": { "enabled": false }
+    },
+    {
+      "tag": "reality-1301dest",
+      "listen": "127.0.0.1",
+      "port": __SERVER_PORT_1301__,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          { "id": "__UUID__", "email": "engine-1301@test", "flow": "" }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "127.0.0.1:__CAMO_1301_PORT__",
+          "xver": 0,
+          "serverNames": ["camo.test"],
+          "privateKey": "__PRIVATE_KEY__",
+          "shortIds": ["__SHORT_ID__"]
+        }
+      },
+      "sniffing": { "enabled": false }
+    }
+  ],
+  "outbounds": [
+    { "tag": "direct", "protocol": "freedom", "settings": {} }
+  ]
+}

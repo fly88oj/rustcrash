@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y \
 # Copy workspace files
 COPY Cargo.toml Cargo.lock* ./
 COPY core/ core/
+COPY engine/ engine/
 COPY cmd/ cmd/
 COPY tests/ tests/
 

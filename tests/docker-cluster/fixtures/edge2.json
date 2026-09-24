@@ -1,0 +1,18 @@
+{
+  "inbounds": [
+    {"type": "mixed", "tag": "in2", "listen": "0.0.0.0", "listen_port": 7891}
+  ],
+  "outbounds": [
+    {"type": "shadowsocks", "tag": "sb-ss", "server": "server", "server_port": 28388,
+     "method": "aes-256-gcm", "password": "interop-ss-psk-123456"},
+    {"type": "socks", "tag": "via-edge1", "server": "edge1", "server_port": 7890},
+    {"type": "direct", "tag": "direct"}
+  ],
+  "route": {
+    "rules": [
+      {"port": 38081, "outbound": "via-edge1"}
+    ],
+    "final": "sb-ss"
+  },
+  "dns": {"servers": [{"tag": "u", "address": "udp://server:35353"}]}
+}

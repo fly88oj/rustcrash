@@ -1,0 +1,45 @@
+# Cluster e2e: four containers on one bridge network.
+#
+#   client ──> edge1 (crash, mihomo dialect, :7890 mixed / :7892 dns)
+#          ──> edge2 (crash, sing-box dialect, :7891 mixed)
+#              edge2 chains to edge1 via a socks5 outbound for some rules
+#                                 │
+#                                 ▼
+#              server (real mihomo binary: ss :28388 / vmess-ws :28401 /
+#                      trojan :28403, web :38080, dns :35353)
+#
+# Unlike tests/docker-engine (one container, loopback only), traffic here
+# crosses the docker bridge: container-name resolution, real hops.
+x-base: &base
+  build:
+    context: ../..
+    dockerfile: tests/docker-cluster/Dockerfile.cluster
+  image: rustcrash-cluster
+  networks:
+    - clnet
+
+services:
+  server:
+    <<: *base
+    command: -c "bash /fixtures/server-boot.sh"
+  edge1:
+    <<: *base
+    depends_on:
+      - server
+    command: -c "crash engine run --flavor rust-mihomo --config /fixtures/edge1.yaml"
+  edge2:
+    <<: *base
+    depends_on:
+      - server
+    command: -c "crash engine run --flavor rust-sing-box --config /fixtures/edge2.json"
+  client:
+    <<: *base
+    depends_on:
+      - server
+      - edge1
+      - edge2
+    command: -c "sleep infinity"
+
+networks:
+  clnet:
+    driver: bridge

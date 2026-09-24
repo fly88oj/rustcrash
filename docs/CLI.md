@@ -19,6 +19,7 @@ environment variable works too).
 | `crash config …` | Configuration and subscription management |
 | `crash firewall …` | Firewall rule management |
 | `crash start …` | Kernel lifecycle, bot, supervisor |
+| `crash engine …` | Integrated Rust engine (run/test/version) |
 | `crash task …` | Scheduled tasks, geo data, rule providers |
 | `crash install` | Download and install a proxy kernel |
 | `crash setboot …` | Boot-time autostart |
@@ -71,6 +72,27 @@ systems. It starts:
 Geo data defaults to the
 [`MetaCubeX/meta-rules-dat`](https://github.com/MetaCubeX/meta-rules-dat)
 release; `--mirror` prefixes GitHub download URLs with a CDN proxy.
+
+## crash engine
+
+```
+crash engine run  --flavor rust-mihomo|rust-sing-box [--config PATH] [--dir DIR]
+crash engine test --flavor rust-mihomo|rust-sing-box [--config PATH]
+crash engine version
+```
+
+The integrated Rust proxy engine (only in builds with the
+`engine-mihomo` / `engine-singbox` cargo features). `run` executes the
+engine in the foreground (used by the supervisor); `test` validates the
+kernel config like `mihomo -t` and prints warnings; `version` prints the
+engine version and which flavors the binary contains.
+
+Select it as the managed kernel by setting `kernel: rust-mihomo` (or
+`rust-sing-box`) in `config.yaml` — the same `configs/mihomo.yaml` /
+`configs/sing-box.json` files the external kernels use, so switching
+editions is a one-line change. `crash start start/stop/status/serve` and
+the REST API treat the engine like any kernel: pid file, watchdog,
+notifications, anti-loop gid.
 
 ## crash install
 

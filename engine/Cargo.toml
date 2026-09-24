@@ -1,0 +1,70 @@
+[package]
+name = "rustcrash-engine"
+description = "Rust-native proxy engine: a Rust rewrite of the mihomo/sing-box data plane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+# Clash (mihomo) YAML config dialect.
+mihomo = ["dep:serde_yaml"]
+# sing-box JSON config dialect.
+singbox = []
+
+[dependencies]
+tokio = { workspace = true }
+bytes = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+libc = { workspace = true }
+socket2 = { version = "0.5", features = ["all"] }
+rand = "0.8"
+
+# TLS (rustls with the ring backend: builds cleanly for musl targets,
+# unlike aws-lc-rs which drags in cmake).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
+rustls-native-certs = "0.7"
+webpki-roots = "0.26"
+# PEM loading for server-side TLS (trojan/vless listeners).
+rustls-pemfile = "2"
+
+# Symmetric crypto (RustCrypto: constant-time, audited).
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+aes = "0.8"
+blake3 = "1"
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = { workspace = true }
+hmac = "0.12"
+crc32fast = "1"
+uuid = { version = "1", features = ["v4"] }
+
+base64 = { workspace = true }
+
+# GeoIP database reader (MaxMind mmdb).
+maxminddb = "0.24"
+regex = "1"
+
+serde_yaml = { workspace = true, optional = true }
+quinn = { version = "0.11.12", features = ["rustls-ring", "runtime-tokio"] }
+flate2 = { workspace = true, features = ["rust_backend"] }
+ruzstd = "0.9.0"
+hkdf = "0.12"
+russh = { version = "0.63.3", default-features = false, features = ["ring", "rsa"] }
+curve25519-dalek = { version = "5", default-features = false }
+smoltcp = { version = "0.14.0", default-features = false, features = ["std", "alloc", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }
+ring = "0.17"
+
+[dev-dependencies]
+# Self-signed certificate generation for the server-protocol TLS tests
+# (hermetic: nothing is committed and nothing leaves loopback).
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+tempfile = { workspace = true }

@@ -4,6 +4,50 @@ All notable changes to RustCrash. Format based on
 [Keep a Changelog](https://keepachangelog.com/); versioning follows
 [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Integrated Rust proxy engine
+
+- New `engine/` crate: a from-scratch Rust rewrite of the mihomo/sing-box
+  data plane, selected at runtime via `kernel: rust-mihomo` /
+  `rust-sing-box` in `config.yaml` (the classic external-kernel modes are
+  unchanged).
+- Outbounds: Shadowsocks AEAD (aes-128/256-gcm, chacha20-ietf-poly1305)
+  and Shadowsocks 2022 (2022-blake3-aes-128/256-gcm), VMess AEAD (tcp and
+  WebSocket transports), VLESS, Trojan (TLS via rustls, skip-cert-verify
+  supported), SOCKS5 (TCP + UDP ASSOCIATE), HTTP CONNECT, DIRECT/REJECT.
+- Inbounds: mixed (auto SOCKS5/HTTP), SOCKS5 with UDP ASSOCIATE, HTTP
+  proxy (CONNECT + absolute-form replay), Linux REDIRECT (SO_ORIGINAL_DST)
+  and TPROXY (TCP + UDP with IP_TRANSPARENT/RECVORIGDSTADDR).
+- DNS subsystem: hijack server (UDP + TCP), fake-IP pool with LRU
+  eviction and reverse mapping, redir-host forwarding, answer caching.
+- Routing rules: DOMAIN/-SUFFIX/-KEYWORD/-REGEX, IP-CIDR/IP-CIDR6,
+  SRC-IP-CIDR, DST/SRC-PORT, GEOIP (MaxMind mmdb), GEOSITE (v2ray dat),
+  RULE-SET (text/yaml providers), MATCH; rule/global/direct modes.
+- Proxy groups: select, url-test, fallback, load-balance with background
+  health checks.
+- Clash RESTful API subset: version, proxies (list/select/delay),
+  connections, traffic (websocket), rules, configs (mode patch).
+- Config dialects behind cargo features: `engine-mihomo` (Clash YAML),
+  `engine-singbox` (sing-box JSON); default build ships neither.
+- Wire-format fidelity pinned by upstream vectors (v2fly KDF, RFC 5869
+  HKDF) and a Docker interop suite (`tests/docker-engine/run.sh`, 26
+  checks) that round-trips every protocol through a real mihomo binary.
+- Unsupported features (hysteria2, TUIC, WireGuard, gRPC, TUN,
+  REALITY/vision) fail with precise errors at `crash engine test`.
+
+### Manager integration
+
+- `KernelSelection` (external vs integrated engine) through config,
+  ServiceManager (self-spawned engine worker with the anti-loop gid,
+  pid file, watchdog restart, notifications), REST API, and the CLI.
+- New `crash engine run|test|version` subcommand; `crash --exec version`
+  reports the engine version in-process for engine selections.
+- ConfigValidator rejects engine selections in builds without the
+  matching feature, naming the build flag to use.
+- Docker e2e split: `tests/docker/run.sh` (external kernels, 35 checks)
+  and `tests/docker-engine/run.sh` (engine interop, 26 checks).
+
 ## [0.1.0] — 2026-09-23
 
 Initial release.

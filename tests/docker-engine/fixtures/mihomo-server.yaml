@@ -1,0 +1,68 @@
+# Real mihomo server for interop testing: one listener per protocol the
+# Rust engine implements, everything outbound direct.
+mode: direct
+log-level: debug
+
+listeners:
+  - name: ss-in
+    type: shadowsocks
+    listen: 0.0.0.0
+    port: 28388
+    cipher: aes-256-gcm
+    password: interop-ss-psk-123456
+    udp: true
+
+  - name: ss2022-in
+    type: shadowsocks
+    listen: 0.0.0.0
+    port: 28389
+    cipher: 2022-blake3-aes-256-gcm
+    password: c3MyMDIyLWludGVyb3AtdGVzdC0zMmJ5dGUta2V5ISE=
+    udp: true
+
+  - name: vmess-in
+    type: vmess
+    listen: 0.0.0.0
+    port: 28400
+    users:
+      - uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+        alterId: 0
+
+  - name: vmess-ws-in
+    type: vmess
+    listen: 0.0.0.0
+    port: 28401
+    users:
+      - uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+        alterId: 0
+    ws-path: /ws
+
+  - name: vless-in
+    type: vless
+    listen: 0.0.0.0
+    port: 28402
+    users:
+      - uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    certificate: /fixtures/certs/server.crt
+    private-key: /fixtures/certs/server.key
+
+  - name: trojan-in
+    type: trojan
+    listen: 0.0.0.0
+    port: 28403
+    udp: true
+    users:
+      - password: interop-trojan-pw-123456
+    certificate: /fixtures/certs/server.crt
+    private-key: /fixtures/certs/server.key
+
+  - name: socks-in
+    type: socks
+    listen: 0.0.0.0
+    port: 28405
+    udp: true
+
+  - name: http-in
+    type: http
+    listen: 0.0.0.0
+    port: 28406

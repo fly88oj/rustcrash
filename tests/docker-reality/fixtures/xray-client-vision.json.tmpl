@@ -1,0 +1,34 @@
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    { "tag": "socks-in", "listen": "127.0.0.1", "port": __SOCKS_PORT__, "protocol": "socks" }
+  ],
+  "outbounds": [
+    {
+      "tag": "reality-vision-out",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "127.0.0.1",
+            "port": __SERVER_PORT_VISION__,
+            "users": [
+              { "id": "__UUID__", "encryption": "none", "flow": "xtls-rprx-vision" }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "serverName": "camo.test",
+          "fingerprint": "chrome",
+          "publicKey": "__PUBLIC_KEY__",
+          "shortId": "__SHORT_ID__",
+          "spiderX": "/"
+        }
+      }
+    }
+  ]
+}

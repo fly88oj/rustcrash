@@ -64,6 +64,22 @@ cargo build --release --bin crash
 install -m 755 target/release/crash /usr/local/bin/crash
 ```
 
+That builds the **classic edition** — it manages external mihomo/sing-box
+kernel binaries. To compile in the **integrated Rust proxy engine**
+(no kernel download needed; choose the config dialect you use):
+
+```bash
+cargo build --release --bin crash --features engine-mihomo  # Clash YAML
+cargo build --release --bin crash --features engine-singbox # sing-box JSON
+cargo build --release --bin crash --features engine-full   # both
+```
+
+Engine editions additionally need `cmake`/`perl` only if ring's build
+script requires them on your platform (release builds of the engine
+features are exercised in CI). Select the engine at runtime with
+`kernel: rust-mihomo` (or `rust-sing-box`) in `config.yaml` — see
+[docs/CLI.md](CLI.md#crash-engine).
+
 ## Cross-compiling for a router or Raspberry Pi
 
 The bundled script builds every target (tier-2 targets in Docker via

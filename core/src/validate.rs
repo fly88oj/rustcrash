@@ -212,9 +212,26 @@ impl ConfigValidator {
             result.add_error("kernel", "Kernel cannot be empty");
         }
 
-        let valid_kernels = ["mihomo", "sing-box", "meta", "clash"];
-        if !valid_kernels.contains(&config.kernel.as_str()) {
-            result.add_warning(format!("Unknown kernel: {}", config.kernel));
+        match crate::engine::KernelSelection::parse(&config.kernel) {
+            crate::engine::KernelSelection::Engine(flavor) => {
+                if !crate::engine::flavor_supported(flavor) {
+                    result.add_error(
+                        "kernel",
+                        format!(
+                            "{} was not compiled into this binary; rebuild with \
+                             `cargo build --features {}` or use mihomo/sing-box",
+                            config.kernel,
+                            flavor.feature_name()
+                        ),
+                    );
+                }
+            }
+            crate::engine::KernelSelection::External(_) => {
+                let valid_kernels = ["mihomo", "sing-box", "meta", "clash"];
+                if !valid_kernels.contains(&config.kernel.as_str()) {
+                    result.add_warning(format!("Unknown kernel: {}", config.kernel));
+                }
+            }
         }
 
         if config.variant.is_empty() {

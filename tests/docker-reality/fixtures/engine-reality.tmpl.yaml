@@ -1,0 +1,29 @@
+# The Rust engine as a REALITY CLIENT (mihomo dialect). Every value marked
+# __X__ is substituted by run.sh from the live `xray x25519` output.
+#
+# This is the config under test: type vless + reality-opts is the mihomo
+# dialect's REALITY spelling; `client-fingerprint` selects the uTLS
+# ClientHello the engine emits. The mixed port is the local entry point the
+# curl probes use.
+mixed-port: __MIXED_PORT__
+allow-lan: false
+mode: rule
+log-level: debug
+
+proxies:
+  - name: reality-node
+    type: vless
+    server: 127.0.0.1
+    port: __SERVER_PORT__
+    uuid: __UUID__
+    tls: true
+    network: tcp
+    servername: camo.test
+    client-fingerprint: __FINGERPRINT__
+    skip-cert-verify: true
+    reality-opts:
+      public-key: __PUBLIC_KEY__
+      short-id: __SHORT_ID__
+
+rules:
+  - MATCH,reality-node

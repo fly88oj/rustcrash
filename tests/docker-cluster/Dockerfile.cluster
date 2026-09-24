@@ -1,0 +1,25 @@
+# RustCrash CLUSTER image: same binary payload as the interop image, but
+# the suite runs MULTIPLE containers (client / edge engines / upstream
+# mihomo) bridged by a compose network, so traffic really crosses the
+# docker bridge — container-name DNS, NAT'd hops, real neighbor sockets.
+FROM rust:1.98-slim AS builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock* ./
+COPY core/ core/
+COPY engine/ engine/
+COPY cmd/ cmd/
+COPY tests/ tests/
+RUN cargo build --release --bin crash --features engine-full
+
+FROM metacubex/mihomo:v1.19.13 AS mihomo
+
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl bash dnsutils python3 procps \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/target/release/crash /usr/local/bin/
+COPY --from=mihomo /mihomo /usr/local/bin/mihomo
+RUN chmod +x /usr/local/bin/crash /usr/local/bin/mihomo
+COPY tests/docker-cluster/fixtures/ /fixtures/
+# Long-lived containers driven by compose commands, not the entrypoint.
+ENTRYPOINT ["bash"]

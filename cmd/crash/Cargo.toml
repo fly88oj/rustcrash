@@ -18,6 +18,13 @@ ratatui-testlib = { version = "0.1", features = ["mvp"] }
 portable-pty = "0.8"
 tempfile = { workspace = true }
 
+[features]
+# Integrated Rust engine editions (mihomo YAML / sing-box JSON dialects).
+# Default build keeps the classic external-kernel-only behaviour.
+engine-mihomo = ["rustcrash-core/engine-mihomo"]
+engine-singbox = ["rustcrash-core/engine-singbox"]
+engine-full = ["engine-mihomo", "engine-singbox"]
+
 [dependencies]
 rustcrash-core = { path = "../../core" }
 anyhow = { workspace = true }

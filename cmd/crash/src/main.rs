@@ -68,6 +68,12 @@ enum Commands {
         action: StartAction,
     },
 
+    /// Integrated Rust proxy engine (rust-mihomo / rust-sing-box)
+    Engine {
+        #[command(subcommand)]
+        action: EngineAction,
+    },
+
     /// Task scheduling
     Task {
         #[command(subcommand)]
@@ -199,26 +205,52 @@ pub enum StartAction {
     Restart,
     /// Show kernel status
     Status,
-    /// View kernel logs
+    /// Follow kernel logs
     Logs {
         /// Follow log output
         #[arg(short, long)]
         follow: bool,
     },
-    /// Watch kernel and restart on crash
+    /// Run the watchdog loop (deprecated: use `start serve`)
     Watchdog {
-        /// Check interval in seconds
+        /// Watchdog interval in seconds
         #[arg(short, long, default_value = "30")]
         interval: u64,
     },
-    /// Run the Telegram bot (foreground, long-running)
+    /// Start the Telegram bot
     Bot,
-    /// Supervisor: REST API + Telegram bot + watchdog in one process
+    /// Start the supervisor (API + bot + watchdog)
     Serve {
-        /// Watchdog check interval in seconds
+        /// Watchdog interval in seconds
         #[arg(short, long, default_value = "30")]
         interval: u64,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum EngineAction {
+    /// Run the engine in the foreground (used by the supervisor)
+    Run {
+        /// Engine flavor (config dialect)
+        #[arg(long)]
+        flavor: String,
+
+        /// Kernel config file (defaults to the install's config for the flavor)
+        #[arg(long)]
+        config: Option<String>,
+    },
+    /// Validate the engine config (like `mihomo -t`)
+    Test {
+        /// Engine flavor (config dialect)
+        #[arg(long)]
+        flavor: String,
+
+        /// Kernel config file (defaults to the install's config for the flavor)
+        #[arg(long)]
+        config: Option<String>,
+    },
+    /// Print the engine version
+    Version,
 }
 
 #[derive(Subcommand, Debug)]
@@ -442,14 +474,24 @@ fn handle_exec(cmd: &str, platform: &Platform) {
         }
         "version" => {
             let config = ConfigManager::new(platform).load().unwrap_or_default();
-            let kernel = config.active_kernel();
-            let probed = tokio::runtime::Runtime::new().ok().and_then(|rt| {
-                rt.block_on(KernelManager::new(platform).get_kernel_version(kernel))
-                    .ok()
-            });
-            match probed {
-                Some(v) => println!("{} version: {v}", kernel.binary_name()),
-                None => println!("Kernel not installed"),
+            match config.kernel_selection() {
+                rustcrash_core::engine::KernelSelection::Engine(_) => {
+                    // In-process version — no kernel binary to spawn.
+                    println!("rust engine version: {}", rustcrash_core::engine::version());
+                }
+                sel @ rustcrash_core::engine::KernelSelection::External(_) => {
+                    let rustcrash_core::engine::KernelSelection::External(kernel) = sel else {
+                        unreachable!()
+                    };
+                    let probed = tokio::runtime::Runtime::new().ok().and_then(|rt| {
+                        rt.block_on(KernelManager::new(platform).get_kernel_version(kernel))
+                            .ok()
+                    });
+                    match probed {
+                        Some(v) => println!("{} version: {v}", kernel.binary_name()),
+                        None => println!("Kernel not installed"),
+                    }
+                }
             }
         }
         _ => {
@@ -472,6 +514,9 @@ fn handle_command(cmd: Commands, platform: &Platform) -> Result<()> {
         }
         Commands::Start { action } => {
             handle_start(platform, action)?;
+        }
+        Commands::Engine { action } => {
+            handle_engine(platform, action)?;
         }
         Commands::Task { action } => {
             handle_task(platform, action)?;
@@ -881,18 +926,18 @@ fn handle_firewall(platform: &Platform, action: FirewallAction) -> Result<()> {
 
 fn handle_start(platform: &Platform, action: StartAction) -> Result<()> {
     let config = ConfigManager::new(platform).load()?;
-    let kernel = config.active_kernel();
+    let selection = config.kernel_selection();
 
     match action {
         StartAction::Start => {
-            start_kernel(platform, kernel)?;
+            start_selection(platform, selection)?;
         }
         StartAction::Stop => {
             stop_kernel(platform)?;
         }
         StartAction::Restart => {
             stop_kernel(platform)?;
-            start_kernel(platform, kernel)?;
+            start_selection(platform, selection)?;
         }
         StartAction::Status => {
             show_status(platform)?;
@@ -901,7 +946,7 @@ fn handle_start(platform: &Platform, action: StartAction) -> Result<()> {
             show_kernel_logs(platform, follow)?;
         }
         StartAction::Watchdog { interval } => {
-            watchdog(platform, kernel, interval)?;
+            watchdog_selection(platform, selection, interval)?;
         }
         StartAction::Bot => {
             let bot = rustcrash_core::TelegramBot::from_config(
@@ -920,6 +965,47 @@ fn handle_start(platform: &Platform, action: StartAction) -> Result<()> {
             tokio::runtime::Runtime::new()?.block_on(async {
                 rustcrash_core::serve_supervisor(platform, &config, interval).await
             })?;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Engine Handler
+// ---------------------------------------------------------------------------
+
+fn handle_engine(platform: &Platform, action: EngineAction) -> Result<()> {
+    use rustcrash_core::engine::{self, EngineFlavor};
+
+    match action {
+        EngineAction::Version => {
+            println!("{}", engine::version());
+            println!(
+                "available flavors: {}",
+                if engine::available_flavors().is_empty() {
+                    "none (rebuild with --features engine-mihomo,engine-singbox)".to_string()
+                } else {
+                    engine::available_flavors().join(", ")
+                }
+            );
+        }
+        EngineAction::Run { flavor, config } => {
+            let (flavor, config_path) =
+                EngineFlavor::resolve(&flavor, config.as_deref(), platform)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            engine::run(flavor, &config_path, platform)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        EngineAction::Test { flavor, config } => {
+            let (flavor, config_path) =
+                EngineFlavor::resolve(&flavor, config.as_deref(), platform)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let warnings = engine::test(flavor, &config_path, platform)
+                .map_err(|e| anyhow::anyhow!("config test failed: {e}"))?;
+            for w in warnings {
+                println!("[WARN] {w}");
+            }
+            println!("[OK] config is valid: {config_path}");
         }
     }
     Ok(())
@@ -1359,6 +1445,16 @@ fn start_kernel(platform: &Platform, kernel: ProxyKernel) -> Result<()> {
     Ok(())
 }
 
+fn start_selection(
+    platform: &Platform,
+    selection: rustcrash_core::engine::KernelSelection,
+) -> Result<()> {
+    let sm = rustcrash_core::ServiceManager::new(platform);
+    let pid = tokio::runtime::Runtime::new()?.block_on(sm.start_selection(selection))?;
+    println!("Started {} (PID: {pid})", selection.display_name());
+    Ok(())
+}
+
 fn stop_kernel(platform: &Platform) -> Result<()> {
     let sm = rustcrash_core::ServiceManager::new(platform);
     sm.stop()?;
@@ -1405,17 +1501,20 @@ fn show_status(platform: &Platform) -> Result<()> {
     Ok(())
 }
 
-fn watchdog(platform: &Platform, kernel: ProxyKernel, interval: u64) -> Result<()> {
-    println!("Starting watchdog (interval: {interval}s, Ctrl+C to stop)");
 
+fn watchdog_selection(
+    platform: &Platform,
+    selection: rustcrash_core::engine::KernelSelection,
+    interval: u64,
+) -> Result<()> {
+    println!("Starting watchdog (interval: {interval}s, Ctrl+C to stop)");
     let sm = rustcrash_core::ServiceManager::new(platform);
     let runtime = tokio::runtime::Runtime::new()?;
     loop {
         std::thread::sleep(std::time::Duration::from_secs(interval));
-
-        if !sm.is_running(kernel) {
+        if !sm.is_running_selection(selection) {
             println!("[WATCHDOG] Kernel stopped, restarting...");
-            if let Err(e) = runtime.block_on(sm.start(kernel)) {
+            if let Err(e) = runtime.block_on(sm.start_selection(selection)) {
                 eprintln!("[WATCHDOG] Failed to restart: {e}");
             }
         }

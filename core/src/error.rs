@@ -13,6 +13,7 @@ pub enum Error {
     Config(String),
     Subscription(String),
     Process(String),
+    Engine(String),
     Init(String),
     InitSystem(String),
     NotSupported(String),
@@ -31,6 +32,7 @@ impl fmt::Display for Error {
             Error::Config(s) => write!(f, "Config error: {s}"),
             Error::Subscription(s) => write!(f, "Subscription error: {s}"),
             Error::Process(s) => write!(f, "Process error: {s}"),
+            Error::Engine(s) => write!(f, "Engine error: {s}"),
             Error::Init(s) => write!(f, "Init error: {s}"),
             Error::InitSystem(s) => write!(f, "Init system error: {s}"),
             Error::NotSupported(s) => write!(f, "Not supported: {s}"),
@@ -65,5 +67,12 @@ impl From<serde_yaml::Error> for Error {
 impl From<serde_json::Error> for Error {
     fn from(e: serde_json::Error) -> Self {
         Error::Config(format!("JSON error: {}", e))
+    }
+}
+
+#[cfg(any(feature = "engine-mihomo", feature = "engine-singbox"))]
+impl From<rustcrash_engine::Error> for Error {
+    fn from(e: rustcrash_engine::Error) -> Self {
+        Error::Engine(e.to_string())
     }
 }

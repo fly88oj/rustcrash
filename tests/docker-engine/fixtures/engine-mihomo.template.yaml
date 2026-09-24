@@ -1,0 +1,103 @@
+# The Rust engine's kernel config (mihomo dialect) for the interop suite.
+# Everything runs inside one container: the mihomo server, the HTTP target
+# and the DNS upstream all live on 127.0.0.1. DNS_UPSTREAM is substituted
+# by the test script.
+mixed-port: 27890
+redir-port: 27891
+allow-lan: true
+mode: rule
+log-level: debug
+external-controller: 0.0.0.0:29090
+
+dns:
+  enable: true
+  listen: 0.0.0.0:27892
+  enhanced-mode: fake-ip
+  nameserver:
+    - udp://DNS_UPSTREAM
+  fake-ip-range: 198.18.0.1/15
+  fake-ip-filter:
+    - '*.lan'
+
+proxies:
+  - name: node-ss
+    type: ss
+    server: 127.0.0.1
+    port: 28388
+    cipher: aes-256-gcm
+    password: interop-ss-psk-123456
+    udp: true
+
+  - name: node-ss2022
+    type: ss
+    server: 127.0.0.1
+    port: 28389
+    cipher: 2022-blake3-aes-256-gcm
+    password: c3MyMDIyLWludGVyb3AtdGVzdC0zMmJ5dGUta2V5ISE=
+    udp: true
+
+  - name: node-vmess
+    type: vmess
+    server: 127.0.0.1
+    port: 28400
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    alterId: 0
+    cipher: aes-128-gcm
+
+  - name: node-vmess-ws
+    type: vmess
+    server: 127.0.0.1
+    port: 28401
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    alterId: 0
+    cipher: auto
+    network: ws
+    ws-opts:
+      path: /ws
+
+  - name: node-vless
+    type: vless
+    server: 127.0.0.1
+    port: 28402
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    sni: tls.test
+    skip-cert-verify: true
+
+  - name: node-trojan
+    type: trojan
+    server: 127.0.0.1
+    port: 28403
+    password: interop-trojan-pw-123456
+    sni: tls.test
+    skip-cert-verify: true
+    udp: true
+
+  - name: node-socks
+    type: socks5
+    server: 127.0.0.1
+    port: 28405
+    udp: true
+
+  - name: node-http
+    type: http
+    server: 127.0.0.1
+    port: 28406
+
+proxy-groups:
+  - name: Auto
+    type: select
+    proxies:
+      - node-ss
+      - node-ss2022
+      - node-vmess
+      - node-vmess-ws
+      - node-vless
+      - node-trojan
+      - node-socks
+      - node-http
+      - DIRECT
+
+rules:
+  - DOMAIN-SUFFIX,internal.test,DIRECT
+  - MATCH,Auto
