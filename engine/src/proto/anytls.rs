@@ -104,6 +104,12 @@ pub struct AnyTlsOut {
     pub skip_verify: bool,
     /// Whether the outbound advertises UDP (via [`udp_stream`]).
     pub udp: bool,
+    /// mihomo `jls-opts` on anytls: the JLS cover replaces the plain TLS
+    /// handshake (wired in [`open_session`]).
+    pub jls: Option<crate::proto::jls::JlsUser>,
+    /// mihomo `ech-opts` on anytls — carried; enabling fails at session
+    /// open with the precise blocker (see [`open_session`]).
+    pub ech: Option<crate::proto::ech::EchOptions>,
 }
 
 // ---------------------------------------------------------------------------
@@ -583,6 +589,15 @@ async fn open_session(cfg: &AnyTlsOut, transport: BoxProxyStream) -> Result<AnyT
     if cfg.password.is_empty() {
         return Err(Error::config("anytls: password is required"));
     }
+    if let Some(opts) = &cfg.ech {
+        if opts.enable {
+            return Err(Error::config(
+                "anytls ech-opts.enable: ECH needs a TLS-layer hook neither rustls nor \
+                 quinn provides; the engine's own TLS 1.3 stack wiring is staged next (the \
+                 HPKE + ECHConfig core is complete in proto::ech)",
+            ));
+        }
+    }
     let server_name = if cfg.sni.is_empty() {
         cfg.server.clone()
     } else {
@@ -590,20 +605,34 @@ async fn open_session(cfg: &AnyTlsOut, transport: BoxProxyStream) -> Result<AnyT
     };
     debug!(
         target: "engine",
-        server = %cfg.server, port = cfg.port, sni = %server_name, skip_verify = cfg.skip_verify,
+        server = %cfg.server, port = %cfg.port, sni = %server_name, skip_verify = cfg.skip_verify,
         "anytls: opening session"
     );
-    let tls = tls_connect(
-        transport,
-        &server_name,
-        &TlsSettings {
-            enabled: true,
-            server_name: Some(server_name.clone()),
-            skip_cert_verify: cfg.skip_verify,
-            alpn: Vec::new(),
-        },
-    )
-    .await?;
+    let tls = if let Some(user) = &cfg.jls {
+        crate::proto::jls::connect(
+            &crate::proto::jls::JlsOut {
+                username: user.username.clone(),
+                password: user.password.clone(),
+                sni: server_name.clone(),
+                alpn: Vec::new(),
+                skip_cert_verify: cfg.skip_verify,
+            },
+            transport,
+        )
+        .await?
+    } else {
+        tls_connect(
+            transport,
+            &server_name,
+            &TlsSettings {
+                enabled: true,
+                server_name: Some(server_name.clone()),
+                skip_cert_verify: cfg.skip_verify,
+                alpn: Vec::new(),
+            },
+        )
+        .await?
+    };
 
     let mut stream = AnyTlsStream::new(tls);
     // 1. Auth (client.go:77-97): one TLS write.
@@ -782,6 +811,8 @@ mod tests {
             sni: "anytls.test".into(),
             skip_verify: true,
             udp: true,
+            jls: None,
+            ech: None,
         }
     }
 

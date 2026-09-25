@@ -22,10 +22,16 @@
 //!   single-owner design. TCP dials become [`WgStream`] (an
 //!   `AsyncRead + AsyncWrite` bridge over two bounded queues plus wakers),
 //!   UDP dials become [`WgUdp`].
-//! * **IPv4 only for now**: the smoltcp feature set in this crate is
-//!   `proto-ipv4` (same as the TUN inbound), so the userspace stack routes
-//!   IPv4 targets; `local_ipv6` is carried for the integrator and the
-//!   handshake crypto is address-agnostic.
+//! * **Dual-stack inner addresses**: the stack routes IPv4 always
+//!   (`local_ip`) and IPv6 when `local_ipv6` is configured — the exact
+//!   addresses the provider assigned, never derived (sing-wireguard's
+//!   `StackDevice` adds precisely the configured prefixes, `device_stack.go`
+//!   `NewStackDevice`/`AddProtocolAddress`, and dials bound to the family's
+//!   own address, `DialContext`'s `addr4`/`addr6` choice). IPv6 targets are
+//!   refused with a clear error when no inner v6 address is configured.
+//!   Domain targets stay refused: mihomo/sing-box resolve the destination
+//!   *outside* the tunnel and hand the stack an IP (the netstack routes IPs
+//!   only) — the integrator resolves before dialing.
 //!
 //! # The `reserved` bytes (mihomo/sing-box compatibility)
 //!
@@ -45,7 +51,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::{Context, Poll, Waker};
@@ -91,10 +97,14 @@ pub struct WgOut {
     pub pre_shared_key: Option<String>,
     /// Our address inside the tunnel (mihomo `ip`).
     pub local_ip: Ipv4Addr,
-    /// Our IPv6 address inside the tunnel, if assigned. Carried for
-    /// completeness; the userspace stack is built IPv4-only (see module
-    /// docs).
-    pub local_ipv6: Option<std::net::Ipv6Addr>,
+    /// Our IPv6 address inside the tunnel, if the provider assigned one
+    /// (mihomo `ipv6`, sing-box `local_address` v6 entries). When set, the
+    /// stack carries the address with a /128 and a default v6 route, dials
+    /// v6 targets with it as the source, and accepts v6 UDP replies;
+    /// sing-wireguard assigns exactly the configured addresses and derives
+    /// nothing (`device_stack.go` `NewStackDevice`), so an absent v6 address
+    /// means v6 targets are refused.
+    pub local_ipv6: Option<Ipv6Addr>,
     /// Inner (TUN-side) MTU. 0 selects mihomo's default (1408).
     pub mtu: u16,
     /// Provider-specific bytes smuggled into the reserved header field of
@@ -1212,7 +1222,7 @@ type UdpDownlink = mpsc::Receiver<(NetAddr, Vec<u8>)>;
 /// Commands from the public API to the tunnel task.
 enum Cmd {
     Connect {
-        remote: SocketAddrV4,
+        remote: SocketAddr,
         reply: oneshot::Sender<Result<Arc<StreamShared>>>,
     },
     UdpOpen {
@@ -1220,7 +1230,7 @@ enum Cmd {
     },
     UdpSend {
         id: u32,
-        dst: SocketAddrV4,
+        dst: SocketAddr,
         data: Vec<u8>,
     },
     UdpClose {
@@ -1250,6 +1260,7 @@ struct Stack {
     peer_pk: [u8; 32],
     psk: [u8; 32],
     local_ip: Ipv4Addr,
+    local_ipv6: Option<Ipv6Addr>,
     reserved: [u8; 3],
     udp_enabled: bool,
     endpoint: SocketAddr,
@@ -1288,13 +1299,29 @@ impl Stack {
         iface_cfg.random_seed = rand::random();
         let mut iface = Interface::new(iface_cfg, &mut shim, SmolInstant::ZERO);
         iface.update_ip_addrs(|addrs| {
+            // Point-to-point /32 (and /128): the peer is reached through the
+            // default routes below, and the local address doubles as the
+            // route gateway — the same shape the TUN netstack uses. The v6
+            // address is exactly what the provider assigned (sing-wireguard
+            // `device_stack.go` `NewStackDevice` adds the configured
+            // prefixes verbatim and derives nothing).
             let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(cfg.local_ip), 32));
+            if let Some(v6) = cfg.local_ipv6 {
+                let _ = addrs.push(IpCidr::new(IpAddress::Ipv6(v6), 128));
+            }
         });
         iface
             .routes_mut()
             .add_default_ipv4_route(cfg.local_ip)
             .map_err(|_| Error::network("wg: route table full"))?;
-        let _ = cfg.local_ipv6; // carried for the integrator; stack is IPv4 (see module docs)
+        // A default route per family in use (smoltcp's any_ip/route coupling,
+        // as in the TUN netstack).
+        if let Some(v6) = cfg.local_ipv6 {
+            iface
+                .routes_mut()
+                .add_default_ipv6_route(v6)
+                .map_err(|_| Error::network("wg: route table full"))?;
+        }
 
         Ok(Stack {
             iface,
@@ -1304,6 +1331,7 @@ impl Stack {
             peer_pk,
             psk,
             local_ip: cfg.local_ip,
+            local_ipv6: cfg.local_ipv6,
             reserved: cfg.reserved,
             udp_enabled: cfg.udp,
             endpoint,
@@ -1337,6 +1365,28 @@ impl Stack {
             let port = 32768 + rand::random::<u16>() % 28_000;
             if self.used_ports.insert(port) {
                 return port;
+            }
+        }
+    }
+
+    /// The socket endpoint for a target, as smoltcp wants it.
+    fn ip_endpoint(dst: &SocketAddr) -> IpEndpoint {
+        match dst {
+            SocketAddr::V4(v4) => IpEndpoint::new(IpAddress::Ipv4(*v4.ip()), v4.port()),
+            SocketAddr::V6(v6) => IpEndpoint::new(IpAddress::Ipv6(*v6.ip()), v6.port()),
+        }
+    }
+
+    /// Source-address selection: each dial binds to the configured address
+    /// of the *destination's family* — sing-wireguard's `DialContext` does
+    /// exactly this with its `addr4`/`addr6` (`device_stack.go:104-119`).
+    fn local_address_for(&self, dst: &SocketAddr) -> IpAddress {
+        match dst {
+            SocketAddr::V4(_) => IpAddress::Ipv4(self.local_ip),
+            // target_addr already refused v6 targets when no v6 address is
+            // configured; the mirror keeps the lookup total.
+            SocketAddr::V6(_) => {
+                IpAddress::Ipv6(self.local_ipv6.unwrap_or(Ipv6Addr::UNSPECIFIED))
             }
         }
     }
@@ -1522,15 +1572,11 @@ impl Stack {
                 );
                 let port = self.ephemeral_port();
                 let local = IpListenEndpoint {
-                    addr: Some(IpAddress::Ipv4(self.local_ip)),
+                    addr: Some(self.local_address_for(&remote)),
                     port,
                 };
                 let cx = self.iface.context();
-                let res = sock.connect(
-                    cx,
-                    IpEndpoint::new(IpAddress::Ipv4(*remote.ip()), remote.port()),
-                    local,
-                );
+                let res = sock.connect(cx, Self::ip_endpoint(&remote), local);
                 if let Err(e) = res {
                     let _ = reply.send(Err(Error::network(format!("wg: connect: {e:?}"))));
                     return;
@@ -1589,12 +1635,9 @@ impl Stack {
                     return;
                 };
                 self.ensure_session(socket).await;
+                let mut meta = udp::UdpMetadata::from(Self::ip_endpoint(&dst));
+                meta.local_address = Some(self.local_address_for(&dst));
                 let sock = self.sockets.get_mut::<udp::Socket>(handle);
-                let mut meta = udp::UdpMetadata::from(IpEndpoint::new(
-                    IpAddress::Ipv4(*dst.ip()),
-                    dst.port(),
-                ));
-                meta.local_address = Some(IpAddress::Ipv4(self.local_ip));
                 if let Err(e) = sock.send_slice(&data, meta) {
                     tracing::debug!(target: "engine", "wg: udp send to {dst}: {e:?}");
                 }
@@ -1745,10 +1788,10 @@ impl Stack {
                     Ok(v) => v,
                     Err(_) => break,
                 };
-                let IpAddress::Ipv4(src) = meta.endpoint.addr else {
-                    continue;
+                let from = match meta.endpoint.addr {
+                    IpAddress::Ipv4(src) => NetAddr::ip(IpAddr::V4(src), meta.endpoint.port),
+                    IpAddress::Ipv6(src) => NetAddr::ip(IpAddr::V6(src), meta.endpoint.port),
                 };
-                let from = NetAddr::ip(IpAddr::V4(src), meta.endpoint.port);
                 let _ = down.try_send((from, self.pump_buf[..n].to_vec()));
             }
         }
@@ -1901,6 +1944,11 @@ fn cache_key(cfg: &WgOut) -> String {
         &cfg.peer_public_key,
         cfg.pre_shared_key.as_deref().unwrap_or(""),
         &cfg.local_ip.to_string(),
+        cfg.local_ipv6
+            .as_ref()
+            .map(std::net::Ipv6Addr::to_string)
+            .as_deref()
+            .unwrap_or(""),
         &cfg.effective_mtu().to_string(),
         &format!("{:?}", cfg.reserved),
         &cfg.udp.to_string(),
@@ -1946,12 +1994,24 @@ async fn resolve_endpoint(server: &str, port: u16) -> Result<SocketAddr> {
         .ok_or_else(|| Error::dns(format!("wg: no address for {server}")))
 }
 
-fn target_v4(target: &NetAddr, what: &str) -> Result<SocketAddrV4> {
+/// Resolve a proxy target to the socket address the netstack dials.
+///
+/// * IPv4: always dialable.
+/// * IPv6: dialable exactly when the tunnel has an inner v6 address
+///   configured (`local_ipv6`); sing-wireguard derives no addresses, so an
+///   unconfigured family is refused, not guessed.
+/// * Domain: refused — upstream resolves destinations outside the tunnel and
+///   hands the stack an IP (the netstack routes IPs only).
+fn target_addr(target: &NetAddr, what: &str, local_ipv6: Option<Ipv6Addr>) -> Result<SocketAddr> {
     match &target.host {
-        crate::addr::Host::Ip(IpAddr::V4(ip)) => Ok(SocketAddrV4::new(*ip, target.port)),
-        crate::addr::Host::Ip(IpAddr::V6(_)) => Err(Error::network(format!(
-            "wg: {what} to an IPv6 target: the userspace netstack is built IPv4-only"
-        ))),
+        crate::addr::Host::Ip(IpAddr::V4(ip)) => Ok(SocketAddr::V4(SocketAddrV4::new(*ip, target.port))),
+        crate::addr::Host::Ip(IpAddr::V6(ip)) => match local_ipv6 {
+            Some(_) => Ok(SocketAddr::V6(SocketAddrV6::new(*ip, target.port, 0, 0))),
+            None => Err(Error::network(format!(
+                "wg: {what} to an IPv6 target: no inner IPv6 address configured \
+                 (set the peer's ipv6 / local_address v6 entry)"
+            ))),
+        },
         crate::addr::Host::Domain(d) => Err(Error::network(format!(
             "wg: {what} to domain {d}: resolve before dialing (the netstack routes IPs only)"
         ))),
@@ -1963,7 +2023,7 @@ fn target_v4(target: &NetAddr, what: &str) -> Result<SocketAddrV4> {
 /// every later dial with the same configuration; the returned stream is a
 /// plain `AsyncRead + AsyncWrite` the relay can splice.
 pub async fn connect(cfg: &WgOut, target: &NetAddr) -> Result<BoxProxyStream> {
-    let remote = target_v4(target, "connect")?;
+    let remote = target_addr(target, "connect", cfg.local_ipv6)?;
     let tunnel = tunnel_for(cfg).await?;
     let (tx, rx) = oneshot::channel();
     tunnel
@@ -1982,6 +2042,9 @@ pub async fn connect(cfg: &WgOut, target: &NetAddr) -> Result<BoxProxyStream> {
 pub struct WgUdp {
     cmd: mpsc::Sender<Cmd>,
     id: u32,
+    /// The tunnel's inner v6 address, for target validation on send (the
+    /// stack performs the actual per-family source selection).
+    local_ipv6: Option<Ipv6Addr>,
     down: tokio::sync::Mutex<UdpDownlink>,
 }
 
@@ -2002,13 +2065,15 @@ impl WgUdp {
         Ok(WgUdp {
             cmd: tunnel,
             id,
+            local_ipv6: cfg.local_ipv6,
             down: tokio::sync::Mutex::new(down),
         })
     }
 
-    /// Send one datagram to `target` (must be a resolved IPv4 address).
+    /// Send one datagram to `target` (a resolved IP address; IPv6 needs the
+    /// tunnel's inner v6 address to be configured).
     pub async fn send(&self, target: &NetAddr, data: &[u8]) -> Result<()> {
-        let dst = target_v4(target, "send")?;
+        let dst = target_addr(target, "send", self.local_ipv6)?;
         self.cmd
             .send(Cmd::UdpSend {
                 id: self.id,
@@ -2450,23 +2515,36 @@ mod tests {
     // -- config / address guards ----------------------------------------------
 
     #[tokio::test]
-    async fn connect_rejects_domain_and_ipv6_targets() {
+    async fn connect_rejects_domain_and_unconfigured_ipv6_targets() {
         let cfg = dummy_cfg("127.0.0.1", 1);
+        // Domains are always refused: upstream resolves outside the tunnel
+        // and hands the stack an IP.
         let err = match connect(&cfg, &NetAddr::domain("example.com", 443).unwrap()).await {
             Ok(_) => panic!("domain targets must be refused"),
             Err(e) => e,
         };
         assert!(err.to_string().contains("resolve before dialing"));
+        // IPv6 without a configured inner v6 address is refused too —
+        // sing-wireguard derives no addresses, so the family is not guessed.
         let err = match connect(
             &cfg,
             &NetAddr::ip(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 443),
         )
         .await
         {
-            Ok(_) => panic!("ipv6 targets must be refused"),
+            Ok(_) => panic!("ipv6 targets must be refused without an inner v6 address"),
             Err(e) => e,
         };
-        assert!(err.to_string().contains("IPv4-only"));
+        assert!(err.to_string().contains("no inner IPv6 address"));
+        // With a configured v6 address the same target passes the guard.
+        let mut cfg6 = cfg;
+        cfg6.local_ipv6 = Some(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2));
+        assert!(target_addr(
+            &NetAddr::ip(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 443),
+            "connect",
+            cfg6.local_ipv6
+        )
+        .is_ok());
     }
 
     fn dummy_cfg(server: &str, port: u16) -> WgOut {
@@ -2488,7 +2566,10 @@ mod tests {
     // ========================================================================
     // The in-test WireGuard server: noise responder + transport decryption +
     // a smoltcp stack terminating TCP/UDP inside the tunnel. Everything is
-    // generated at runtime; nothing leaves loopback.
+    // generated at runtime; nothing leaves loopback. The noise responder is
+    // address-agnostic (WireGuard messages carry no IP addresses), so it
+    // answers v4 and v6 handshakes identically — the IPv6 tunnel tests below
+    // drive the very same handshake; only the inner IP layer differs.
     // ========================================================================
 
     mod server {
@@ -2676,6 +2757,8 @@ mod tests {
     }
 
     const SERVER_TUNNEL_IP: Ipv4Addr = Ipv4Addr::new(172, 16, 200, 1);
+    const SERVER_TUNNEL_IP_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x1720, 0x16, 0x200, 0, 0, 0, 1);
+    const CLIENT_TUNNEL_IP_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x1720, 0x16, 0x200, 0, 0, 0, 2);
     const ECHO_TCP_PORT: u16 = 9021;
     const ECHO_UDP_PORT: u16 = 9022;
 
@@ -2703,6 +2786,16 @@ mod tests {
 
     impl LoopbackServer {
         fn cfg_for(&self, client: &StaticKeys) -> WgOut {
+            self.cfg_with(client, false)
+        }
+
+        /// The same peer, dual-stack: v4 and v6 inner addresses (mihomo
+        /// `ip` + `ipv6`, sing-box `local_address` with a v6 entry).
+        fn cfg_for_dual(&self, client: &StaticKeys) -> WgOut {
+            self.cfg_with(client, true)
+        }
+
+        fn cfg_with(&self, client: &StaticKeys, ipv6: bool) -> WgOut {
             WgOut {
                 server: self.endpoint.ip().to_string(),
                 port: self.endpoint.port(),
@@ -2710,7 +2803,7 @@ mod tests {
                 peer_public_key: b64(&self.statics.pk),
                 pre_shared_key: Some(b64(&self.psk)),
                 local_ip: Ipv4Addr::new(172, 16, 200, 2),
-                local_ipv6: None,
+                local_ipv6: ipv6.then_some(CLIENT_TUNNEL_IP_V6),
                 mtu: 0,
                 reserved: self.expected_reserved.unwrap_or([0; 3]),
                 udp: true,
@@ -2718,14 +2811,17 @@ mod tests {
         }
     }
 
-    /// The server's own smoltcp stack: address 172.16.200.1/24 with a TCP
-    /// echo listener and a UDP echo socket.
+    /// The server's own smoltcp stack: address 172.16.200.1/24 plus
+    /// fd00:172:16:200::1/64, with TCP echo listeners (re-armed on every
+    /// accept, since a smoltcp listener becomes the accepted connection)
+    /// and a UDP echo socket on both families.
     struct ServerStack {
         iface: Interface,
         sockets: SocketSet<'static>,
         shim: Shim,
         listener: SocketHandle,
-        conn: Option<SocketHandle>,
+        /// Accepted TCP connections being echoed.
+        conns: Vec<SocketHandle>,
         udp_sock: SocketHandle,
         start: Instant,
         pump: Vec<u8>,
@@ -2742,25 +2838,25 @@ mod tests {
                     IpAddress::Ipv4(SERVER_TUNNEL_IP),
                     24,
                 ));
+                // Dual-stack listener side: the v6 prefix mirrors the /24 so
+                // same-subnet replies need no route, plus a default v6 route.
+                let _ = addrs.push(IpCidr::new(
+                    IpAddress::Ipv6(SERVER_TUNNEL_IP_V6),
+                    64,
+                ));
             });
             iface
                 .routes_mut()
                 .add_default_ipv4_route(SERVER_TUNNEL_IP)
                 .unwrap();
+            iface
+                .routes_mut()
+                .add_default_ipv6_route(SERVER_TUNNEL_IP_V6)
+                .unwrap();
             iface.set_any_ip(true);
 
             let mut sockets = SocketSet::new(Vec::new());
-            let mut tcp_sock = tcp::Socket::new(
-                tcp::SocketBuffer::new(vec![0; 64 * 1024]),
-                tcp::SocketBuffer::new(vec![0; 64 * 1024]),
-            );
-            tcp_sock
-                .listen(IpListenEndpoint {
-                    addr: None,
-                    port: ECHO_TCP_PORT,
-                })
-                .unwrap();
-            let listener = sockets.add(tcp_sock);
+            let listener = Self::add_listener(&mut sockets);
 
             let mut udp_sock = udp::Socket::new(
                 udp::PacketBuffer::new(
@@ -2785,11 +2881,27 @@ mod tests {
                 sockets,
                 shim,
                 listener,
-                conn: None,
+                conns: Vec::new(),
                 udp_sock,
                 start: Instant::now(),
                 pump: vec![0u8; 32 * 1024],
             }
+        }
+
+        /// One more listening socket on the echo port (both families: the
+        /// listen endpoint is address-agnostic).
+        fn add_listener(sockets: &mut SocketSet<'static>) -> SocketHandle {
+            let mut tcp_sock = tcp::Socket::new(
+                tcp::SocketBuffer::new(vec![0; 64 * 1024]),
+                tcp::SocketBuffer::new(vec![0; 64 * 1024]),
+            );
+            tcp_sock
+                .listen(IpListenEndpoint {
+                    addr: None,
+                    port: ECHO_TCP_PORT,
+                })
+                .unwrap();
+            sockets.add(tcp_sock)
         }
 
         fn now(&self) -> SmolInstant {
@@ -2801,18 +2913,18 @@ mod tests {
             let now = self.now();
             self.iface.poll(now, &mut self.shim, &mut self.sockets);
 
-            // Promote an accepted connection to the echo socket.
-            if self.conn.is_none() {
-                let l = self.sockets.get::<tcp::Socket>(self.listener);
-                if l.state() == tcp::State::Established {
-                    // smoltcp listeners do not fork: the listener socket
-                    // itself becomes the connection.
-                    self.conn = Some(self.listener);
-                }
+            // Promote accepted connections (a smoltcp listener socket becomes
+            // the connection) and re-arm a fresh listener each time.
+            if self.sockets.get::<tcp::Socket>(self.listener).state()
+                == tcp::State::Established
+            {
+                self.conns.push(self.listener);
+                self.listener = Self::add_listener(&mut self.sockets);
             }
 
-            // TCP echo: whatever arrived goes straight back.
-            if let Some(handle) = self.conn {
+            // TCP echo: whatever arrived on any connection goes straight back.
+            let mut closed = Vec::new();
+            for &handle in &self.conns {
                 let sock = self.sockets.get_mut::<tcp::Socket>(handle);
                 while sock.can_recv() {
                     let n = match sock.recv_slice(&mut self.pump) {
@@ -2827,9 +2939,20 @@ mod tests {
                         }
                     }
                 }
+                if sock.state() == tcp::State::Closed {
+                    closed.push(handle);
+                }
+            }
+            if !closed.is_empty() {
+                self.conns.retain(|h| !closed.contains(h));
+                for handle in closed {
+                    self.sockets.remove(handle);
+                }
             }
 
-            // UDP echo: reply from the same endpoint.
+            // UDP echo: reply from the same endpoint, source address picked
+            // by the requester's family (the client stack selects its source
+            // the same way).
             {
                 let sock = self.sockets.get_mut::<udp::Socket>(self.udp_sock);
                 while sock.can_recv() {
@@ -2838,7 +2961,10 @@ mod tests {
                         Err(_) => break,
                     };
                     let mut reply_meta = meta;
-                    reply_meta.local_address = Some(IpAddress::Ipv4(SERVER_TUNNEL_IP));
+                    reply_meta.local_address = match meta.endpoint.addr {
+                        IpAddress::Ipv4(_) => Some(IpAddress::Ipv4(SERVER_TUNNEL_IP)),
+                        IpAddress::Ipv6(_) => Some(IpAddress::Ipv6(SERVER_TUNNEL_IP_V6)),
+                    };
                     if sock.send_slice(&self.pump[..n], reply_meta).is_err() {
                         break;
                     }
@@ -2965,6 +3091,137 @@ mod tests {
         udp.send(&target, b"again").await.unwrap();
         let (_, data2) = udp.recv().await.unwrap();
         assert_eq!(data2, b"again");
+    }
+
+    // -- IPv6 inner stack ------------------------------------------------------
+    //
+    // The noise responder is address-agnostic (WireGuard handshakes carry no
+    // IP addresses), so these v6 tunnels run the very same
+    // `consume_initiation_and_respond` handshake as the v4 tests; what
+    // changes is the inner IP layer: the client stack carries
+    // CLIENT_TUNNEL_IP_V6/128 with a default v6 route and dials with it as
+    // the source, and the server stack answers from its v6 prefix.
+
+    /// A TCP echo over the tunnel's IPv6 side, with the relay both ways.
+    #[tokio::test]
+    async fn tcp_echo_through_loopback_wireguard_ipv6() {
+        let server = spawn_wg_echo_server(None).await;
+        let client_keys = x25519_keypair();
+        let cfg = server.cfg_for_dual(&client_keys);
+        let target = NetAddr::ip(IpAddr::V6(SERVER_TUNNEL_IP_V6), ECHO_TCP_PORT);
+
+        let mut stream = connect(&cfg, &target).await.expect("v6 dial through the tunnel");
+        let payload = b"hello over wireguard v6!".repeat(64);
+        stream.write_all(&payload).await.unwrap();
+        let mut echoed = vec![0u8; payload.len()];
+        stream.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(echoed, payload, "v6 TCP echo, both directions");
+        stream.write_all(b"second v6 chunk").await.unwrap();
+        let mut more = vec![0u8; 15];
+        stream.read_exact(&mut more).await.unwrap();
+        assert_eq!(more, b"second v6 chunk");
+        stream.shutdown().await.unwrap();
+    }
+
+    /// A UDP echo over the tunnel's IPv6 side, including the NetAddr
+    /// reporting a v6 source.
+    #[tokio::test]
+    async fn udp_echo_through_loopback_wireguard_ipv6() {
+        let server = spawn_wg_echo_server(None).await;
+        let client_keys = x25519_keypair();
+        let cfg = server.cfg_for_dual(&client_keys);
+        let udp = WgUdp::bind(&cfg).await.expect("udp through the v6 tunnel");
+        let target = NetAddr::ip(IpAddr::V6(SERVER_TUNNEL_IP_V6), ECHO_UDP_PORT);
+        udp.send(&target, b"udp v6 round trip").await.unwrap();
+        let (from, data) = udp.recv().await.expect("v6 echo datagram");
+        assert_eq!(data, b"udp v6 round trip");
+        assert_eq!(
+            from.to_string(),
+            format!("[{SERVER_TUNNEL_IP_V6}]:{ECHO_UDP_PORT}"),
+            "the v6 source address survives the stack"
+        );
+        udp.send(&target, b"again v6").await.unwrap();
+        let (_, data2) = udp.recv().await.unwrap();
+        assert_eq!(data2, b"again v6");
+    }
+
+    /// One peer, both families at once: the same tunnel (same handshake,
+    /// same transport keys) carries a v4 TCP relay, a v6 TCP relay, v4 UDP
+    /// and v6 UDP — source selection per destination family.
+    #[tokio::test]
+    async fn mixed_v4_and_v6_targets_share_one_tunnel() {
+        let server = spawn_wg_echo_server(None).await;
+        let client_keys = x25519_keypair();
+        let cfg = server.cfg_for_dual(&client_keys);
+
+        // v4 TCP.
+        let mut v4 = connect(
+            &cfg,
+            &NetAddr::ip(IpAddr::V4(SERVER_TUNNEL_IP), ECHO_TCP_PORT),
+        )
+        .await
+        .expect("v4 dial");
+        v4.write_all(b"v4 tcp").await.unwrap();
+        let mut back = vec![0u8; 6];
+        v4.read_exact(&mut back).await.unwrap();
+        assert_eq!(back, b"v4 tcp".to_vec());
+
+        // v6 TCP on the same tunnel.
+        let mut v6 = connect(
+            &cfg,
+            &NetAddr::ip(IpAddr::V6(SERVER_TUNNEL_IP_V6), ECHO_TCP_PORT),
+        )
+        .await
+        .expect("v6 dial on the same tunnel");
+        v6.write_all(b"v6 tcp").await.unwrap();
+        let mut back = vec![0u8; 6];
+        v6.read_exact(&mut back).await.unwrap();
+        assert_eq!(back, b"v6 tcp".to_vec());
+
+        // Both UDP families through one WgUdp socket.
+        let udp = WgUdp::bind(&cfg).await.expect("udp");
+        udp.send(
+            &NetAddr::ip(IpAddr::V4(SERVER_TUNNEL_IP), ECHO_UDP_PORT),
+            b"u4",
+        )
+        .await
+        .unwrap();
+        udp.send(
+            &NetAddr::ip(IpAddr::V6(SERVER_TUNNEL_IP_V6), ECHO_UDP_PORT),
+            b"u6",
+        )
+        .await
+        .unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..2 {
+            let (from, data) = tokio::time::timeout(Duration::from_secs(30), udp.recv())
+                .await
+                .expect("both udp echoes arrive")
+                .expect("udp echo");
+            seen.insert((from.to_string(), data));
+        }
+        assert_eq!(
+            seen,
+            {
+                let mut s = std::collections::HashSet::new();
+                s.insert((
+                    format!("{SERVER_TUNNEL_IP}:{ECHO_UDP_PORT}"),
+                    b"u4".to_vec(),
+                ));
+                s.insert((
+                    format!("[{SERVER_TUNNEL_IP_V6}]:{ECHO_UDP_PORT}"),
+                    b"u6".to_vec(),
+                ));
+                s
+            },
+            "both families echo back with their own source address"
+        );
+
+        // The v4 connection still relays after all of the above.
+        v4.write_all(b"v4 still up").await.unwrap();
+        let mut back = vec![0u8; 11];
+        v4.read_exact(&mut back).await.unwrap();
+        assert_eq!(back, b"v4 still up");
     }
 
     #[tokio::test]

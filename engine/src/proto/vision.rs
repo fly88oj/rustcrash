@@ -114,51 +114,56 @@
 //! sing-vmess (`vless/vision.go:88-89`, `:152-167`, `:236-255`) do the same
 //! with the same reflection.
 //!
-//! # What this port implements: the framing half of `02`, exactly
+//! # What this port implements: framing half + full splice on OUR tls13 outer
 //!
-//! * downlink: the `02` frame's content is delivered, its padding skipped,
-//!   everything after the frame passes through verbatim (the same visible
-//!   bytes as `01`); mirroring upstream's early return (`:228-233`),
-//!   passthrough bytes are no longer fed to the TLS filter once direct was
-//!   announced. [`VisionConn::direct_mode`] reports the announcement.
-//! * uplink: unchanged by the received `02` (upstream's writer flag is
-//!   independent). Our own app-data transition still sends command `01`, and
-//!   writes after it go out unframed through the outer stream.
+//! Two outer-transport shapes are supported, chosen by constructor:
 //!
-//! # Why full splice equivalence is out of reach from this layer
+//! * [`VisionConn::connect`] (any [`BoxProxyStream`]): the framing half of
+//!   `02`, exactly — the `02` frame's content is delivered, its padding
+//!   skipped, everything after the frame passes through verbatim inside the
+//!   outer stream's own encryption. Fine for framing-level-direct peers.
+//! * [`VisionConn::connect_tls13`] (this crate's
+//!   [`Tls13Stream`](crate::proto::reality::tls13::Tls13Stream)): the *full*
+//!   Xray-equivalent splice. A `BoxProxyStream` cannot reach under an outer
+//!   TLS session (no downcast exists on the type-erased box), so the splice
+//!   path takes the concrete stream the REALITY/TLS wiring already built.
 //!
-//! The *transport* half of `02` — abandoning the outer TLS records — cannot
-//! be expressed here. [`VisionConn`] is handed a [`BoxProxyStream`] (the
-//! outbound wiring stacks `VlessStream` over `reality::tls13::Tls13Stream`
-//! or utls). A splice would need (a) the raw transport under that outer TLS
-//! session, (b) its decrypted-unread plaintext (upstream `input`; our
-//! `Tls13Stream` keeps it in a private `plain` buffer) and its read-ahead
-//! (upstream `rawInput`; `Tls13Stream::rec`), and (c) the right to stop
-//! outer-TLS-encrypting writes. The type-erased box exposes none of that,
-//! and no API on the outer layers hands those parts back through the box
-//! chain. So, stated rather than faked:
+//! The full splice mirrors upstream's two independent transitions:
 //!
-//! * a peer that sends `02` but keeps carrying the post-frame bytes inside
-//!   the outer TLS records (framing-level direct, like the loopback server
-//!   in the tests) is followed correctly, byte for byte, both directions;
-//! * a peer that sends `02` and then writes the inner records raw on the
-//!   transport (a current Xray server, whenever the inner session negotiates
-//!   TLS 1.3) cannot be followed by this layer: the raw inner records reach
-//!   our outer TLS reader, which fails on its own — the failure surfaces
-//!   from the transport, not from misparsed framing. A `warn!` log and
-//!   [`VisionConn::direct_mode`] make the announced switch observable;
-//! * this port never *sends* `02`: it would promise a raw uplink we cannot
-//!   provide, and a splicing peer would then read our outer-TLS records as
-//!   raw inner bytes.
+//! * *downlink* (server sent `02`): after the frame's content and padding are
+//!   consumed, the outer TLS read side is abandoned — its decrypted-unread
+//!   plaintext (`input`) and read-ahead (`rawInput`) are drained after the
+//!   frame's content, then reads come from the raw transport
+//!   (Xray `proxy/proxy.go:246-250`, `:259-283`, main 2026-09; mihomo
+//!   `transport/vless/vision/conn.go:142-175`). Here
+//!   [`Tls13Stream::splice_reads`] is exactly that rebind.
+//! * *uplink* (our own transition, inner TLS 1.3 detected): the transition
+//!   frame is sent with command `02` instead of `01` — still sealed inside
+//!   the outer TLS records — and once it is out, the write side is
+//!   re-bound to the raw transport (mihomo `conn.go:212-214` sends
+//!   `commandPaddingDirect` + `writeDirect`, `:230-232` swaps the writer;
+//!   Xray `proxy/proxy.go:371-373` command choice, `:334-347` writer
+//!   rebind). Upstream main additionally requires the application-data
+//!   piece to be a *complete* record before the transition
+//!   (`proxy/proxy.go:360-364`, `IsCompleteRecord` :407-458); the splice
+//!   path enforces that too, falling back to staying padded (command `00`)
+//!   for a partial record.
+//! * each direction re-binds on its own transition, so a half-spliced
+//!   period (raw downlink, sealed uplink, or the reverse) is handled the
+//!   same way upstream's independent `DownlinkReaderDirectCopy` /
+//!   `UplinkWriterDirectCopy` flags handle it (`proxy/proxy.go:129-140`).
 //!
-//! Uplink interop unchanged: vision over this port works with peers that stay
-//! in padding-end mode end to end — inner TLS 1.2 sessions, non-splicing
-//! `xtls-rprx-vision` peers, framing-level-direct peers, and the loopback
-//! servers in this module's tests.
+//! Uplink interop for the boxed path is unchanged: vision over this port
+//! works with peers that stay in padding-end mode end to end — inner TLS 1.2
+//! sessions, non-splicing `xtls-rprx-vision` peers, framing-level-direct
+//! peers, and the loopback servers in this module's tests. The tls13 path
+//! additionally follows a peer that abandons the outer records in both
+//! directions (a current Xray server, whenever the inner session negotiates
+//! TLS 1.3).
 //!
 //! # Integration sequence
 //!
-//! See [`VisionConn::connect`].
+//! See [`VisionConn::connect`] and [`VisionConn::connect_tls13`].
 
 use std::io;
 use std::pin::Pin;
@@ -169,6 +174,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::addr::NetAddr;
 use crate::error::{Error, Result};
+use crate::proto::reality::tls13::Tls13Stream;
 use crate::stream::BoxProxyStream;
 
 // ------------------------------------------------------------- wire constants
@@ -608,6 +614,65 @@ impl VisionConfig {
 
 // ------------------------------------------------------------- VisionConn
 
+/// The outer transport the framing rides on.
+///
+/// The boxed variant is any [`BoxProxyStream`] (framing-level direct only);
+/// the tls13 variant holds this crate's own
+/// [`Tls13Stream`](crate::proto::reality::tls13::Tls13Stream) unwrapped so
+/// the Vision direct-copy splice can rebind each direction to the raw
+/// transport under it (a type-erased box cannot be downcast, so the splice
+/// path is chosen by constructor, not by runtime type check).
+enum Outer {
+    /// Any stream: `02` is followed at the framing level only.
+    Boxed(BoxProxyStream),
+    /// Our TLS 1.3 outer: full splice (both directions re-bind to the raw
+    /// transport on their own transitions). Boxed so the enum stays
+    /// pointer-sized like the boxed variant.
+    Tls13(Box<Tls13Stream>),
+}
+
+impl Outer {
+    fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        match self {
+            Outer::Boxed(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+            Outer::Tls13(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
+    }
+
+    fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        match self {
+            Outer::Boxed(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+            Outer::Tls13(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self {
+            Outer::Boxed(s) => Pin::new(s.as_mut()).poll_flush(cx),
+            Outer::Tls13(s) => Pin::new(s.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self {
+            Outer::Boxed(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+            Outer::Tls13(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
+    }
+
+    /// Whether this outer supports the full splice.
+    fn is_tls13(&self) -> bool {
+        matches!(self, Outer::Tls13(_))
+    }
+
+    fn tls13(&mut self) -> Option<&mut Tls13Stream> {
+        match self {
+            Outer::Boxed(_) => None,
+            Outer::Tls13(s) => Some(s),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReadPhase {
     /// Fewer than 21 downlink bytes seen: framed or unframed is still unknown.
@@ -637,10 +702,10 @@ impl ReadPhase {
             // (Xray `proxy/proxy.go:246-247`, main 2026-09).
             COMMAND_END => ReadPhase::Raw,
             // `*currentCommand == 2` -> padding over AND the direct switch
-            // fired (`proxy/proxy.go:248-250`). The visible passthrough is
-            // identical to `01`; upstream then also re-binds its reader to
-            // the raw transport (`:280-282`), which this layer cannot do —
-            // see the module docs' direct section.
+            // fired (`proxy/proxy.go:248-250`): `withinPaddingBuffers=false`
+            // plus `switchToDirectCopy=true`. On a tls13 outer the transport
+            // rebind happens here too (see `VisionConn::enter_after_block`);
+            // on a boxed outer only the framing half applies.
             COMMAND_DIRECT => ReadPhase::RawDirect,
             _ => unreachable!("vision: after_block on a non-terminal command"),
         }
@@ -654,7 +719,7 @@ impl ReadPhase {
 /// of the outer VLESS/TLS stream are in exactly one state machine (like
 /// upstream's `TrafficState`); reads and writes may be driven concurrently.
 pub struct VisionConn {
-    outer: BoxProxyStream,
+    outer: Outer,
     target: Option<NetAddr>,
     uuid: [u8; 16],
     cfg: VisionConfig,
@@ -668,6 +733,11 @@ pub struct VisionConn {
     once_uuid: Option<[u8; 16]>,
     /// Framed/queued bytes on their way to `outer`.
     pending: Vec<u8>,
+    /// A direct (`02`) transition frame was queued; once `pending` drains
+    /// into the transport, re-bind the write side to the raw transport
+    /// (mihomo `conn.go:230-232` swaps its writer right after the direct
+    /// frame's write completes).
+    splice_write_after_drain: bool,
 
     // downlink
     in_buf: Vec<u8>,
@@ -679,6 +749,14 @@ pub struct VisionConn {
     /// parsed and the downlink switched to unframed passthrough (upstream's
     /// `Outbound.DownlinkReaderDirectCopy`).
     direct_received: bool,
+    /// The downlink was actually re-bound to the raw transport (tls13 outer
+    /// only; the framing-level half of every `02` is tracked by
+    /// [`VisionConn::direct_mode`] instead).
+    downlink_spliced: bool,
+    /// Our own `02` went out and the uplink was re-bound to the raw
+    /// transport (upstream `Outbound.UplinkWriterDirectCopy`, set by the
+    /// writer's own decision; mihomo `writeDirect`).
+    uplink_spliced: bool,
     eof: bool,
 }
 
@@ -689,6 +767,8 @@ impl std::fmt::Debug for VisionConn {
             .field("padding", &self.padding)
             .field("phase", &self.phase)
             .field("direct", &self.direct_received)
+            .field("downlink_spliced", &self.downlink_spliced)
+            .field("uplink_spliced", &self.uplink_spliced)
             .field("inner_tls13", &self.filter.inner_tls13())
             .finish_non_exhaustive()
     }
@@ -708,6 +788,10 @@ impl VisionConn {
     ///      in-tree VlessStream::handshake writes today (that file is the
     ///      integrator's to change).
     /// 4. let conn = VisionConn::connect(outer, &target, uuid, cfg).await?;
+    ///    — or, when the outer handshake was this crate's own
+    ///    reality::tls13::connect, `VisionConn::connect_tls13(outer, ..)`
+    ///    instead, which additionally performs the full direct-copy splice
+    ///    (see the module docs);
     /// 5. run the inner session over `conn`, e.g.
     ///        let inner = tokio_rustls::TlsConnector::from(cfg).connect(name, conn).await?;
     ///    or `crate::proto::reality::tls13::connect(Box::new(conn), ..)`;
@@ -732,11 +816,42 @@ impl VisionConn {
         uuid: uuid::Uuid,
         cfg: VisionConfig,
     ) -> Result<Self> {
+        Self::with_outer(Outer::Boxed(outer), target, uuid, cfg).await
+    }
+
+    /// The full-splice variant: wrap *our own* TLS 1.3 outer stream (the
+    /// REALITY/plain-TLS wiring of [`crate::proto::reality::tls13`]).
+    ///
+    /// Identical framing to [`VisionConn::connect`], but a server `02`
+    /// re-binds the downlink to the raw transport (draining the TLS layer's
+    /// read-ahead first) and this port's own transition — when the inner
+    /// session is detected TLS 1.3 — sends `02` and re-binds the uplink,
+    /// the exact Xray/mihomo direct-copy behavior (see the module docs).
+    /// The outbound wiring should prefer this constructor whenever the outer
+    /// session was established with [`crate::proto::reality::tls13::connect`]
+    /// (a `BoxProxyStream` outer cannot splice; there is no downcast).
+    pub async fn connect_tls13(
+        outer: Tls13Stream,
+        target: &NetAddr,
+        uuid: uuid::Uuid,
+        cfg: VisionConfig,
+    ) -> Result<Self> {
+        Self::with_outer(Outer::Tls13(Box::new(outer)), target, uuid, cfg).await
+    }
+
+    async fn with_outer(
+        outer: Outer,
+        target: &NetAddr,
+        uuid: uuid::Uuid,
+        cfg: VisionConfig,
+    ) -> Result<Self> {
+        let splice_capable = outer.is_tls13();
         tracing::debug!(
             dst = %target,
-            "engine: vision: framing {} (uplink padding-end; a server direct \
-             command is followed as unframed passthrough)",
-            FLOW_XTLS_RPRX_VISION
+            splice = splice_capable,
+            "engine: vision: framing {} (a direct command {} the transport)",
+            FLOW_XTLS_RPRX_VISION,
+            if splice_capable { "rebinds" } else { "only ends framing on" },
         );
         let mut conn = VisionConn {
             outer,
@@ -747,12 +862,15 @@ impl VisionConn {
             padding: true,
             once_uuid: Some(*uuid.as_bytes()),
             pending: Vec::new(),
+            splice_write_after_drain: false,
             in_buf: Vec::new(),
             phase: ReadPhase::Init,
             remaining_content: 0,
             remaining_padding: 0,
             current_command: COMMAND_CONTINUE,
             direct_received: false,
+            downlink_spliced: false,
+            uplink_spliced: false,
             eof: false,
         };
         if conn.cfg.initial_padding {
@@ -779,29 +897,50 @@ impl VisionConn {
     /// Whether the server announced XTLS direct copy: a downlink frame with
     /// command `02` (`Direct`) was parsed.
     ///
-    /// What "direct" means in *this* layering — upstream's client, on
-    /// receiving `02`, stops unpadding **and** abandons the outer TLS
-    /// records, draining the outer session's decrypted-unread and read-ahead
-    /// buffers and re-binding its reader to the raw transport (Xray
-    /// `proxy/proxy.go:248-250`, `:259-283`, main 2026-09). A
-    /// [`BoxProxyStream`] cannot reach under the outer TLS session, so this
-    /// port implements the framing half only: the `02` frame's content is
-    /// delivered, its padding skipped, every later byte passes through
-    /// verbatim, and the uplink is untouched (its own transition still sends
-    /// `01`). The byte stream is therefore exactly correct with peers that
-    /// keep the outer TLS records after announcing direct; with peers that
-    /// splice the transport (a real Xray server on inner TLS 1.3), the raw
-    /// inner records that follow hit our outer TLS reader and the failure
-    /// surfaces there — observable here via this flag and a `warn!` log, not
-    /// silently faked. See the module docs' direct section for the full
-    /// analysis.
+    /// What "direct" means depends on the outer transport this connection
+    /// was built on. Upstream's client, on receiving `02`, stops unpadding
+    /// **and** abandons the outer TLS records, draining the outer session's
+    /// decrypted-unread and read-ahead buffers and re-binding its reader to
+    /// the raw transport (Xray `proxy/proxy.go:248-250`, `:259-283`, main
+    /// 2026-09). A connection from [`VisionConn::connect_tls13`] does
+    /// exactly that ([`VisionConn::downlink_spliced`] reports the rebind); a
+    /// connection from [`VisionConn::connect`] (an opaque
+    /// [`BoxProxyStream`]) implements the framing half only — the `02`
+    /// frame's content is delivered, its padding skipped, every later byte
+    /// passes through verbatim inside the outer stream, and the uplink is
+    /// untouched. See the module docs' splice section for the full analysis.
     pub fn direct_mode(&self) -> bool {
         self.direct_received
     }
 
+    /// Whether this connection was built on our own TLS 1.3 outer and can
+    /// therefore perform the full direct-copy splice (both-direction
+    /// transport rebind). `false` for [`VisionConn::connect`] connections.
+    pub fn splice_capable(&self) -> bool {
+        self.outer.is_tls13()
+    }
+
+    /// Whether the downlink was re-bound to the raw transport after the
+    /// server's `02` (upstream `Outbound.DownlinkReaderDirectCopy`). Only
+    /// ever `true` on a [`VisionConn::connect_tls13`] connection;
+    /// [`VisionConn::direct_mode`] tracks the framing-level announcement for
+    /// every outer.
+    pub fn downlink_spliced(&self) -> bool {
+        self.downlink_spliced
+    }
+
+    /// Whether our own `02` was sent and the uplink was re-bound to the raw
+    /// transport (upstream `Outbound.UplinkWriterDirectCopy`, the writer's
+    /// own decision when the inner session is TLS 1.3). Only ever `true` on
+    /// a [`VisionConn::connect_tls13`] connection.
+    pub fn uplink_spliced(&self) -> bool {
+        self.uplink_spliced
+    }
+
     /// Whether the inner session was detected as TLS 1.3 (upstream's
-    /// `EnableXtls`). When this is `true`, upstream clients would switch to
-    /// XTLS direct copy; this port keeps padding-end mode and logs a warning.
+    /// `EnableXtls`). When this is `true`, a tls13-outer connection sends
+    /// command `02` at its transition and splices; a boxed-outer connection
+    /// keeps padding-end mode and logs a warning.
     pub fn inner_tls13_detected(&self) -> bool {
         self.filter.inner_tls13()
     }
@@ -841,7 +980,25 @@ impl VisionConn {
             Some(command) => {
                 // Upstream passes a literal `true` for long padding here
                 // (proxy/proxy.go:370 v25.9.11 / :373 main).
-                (command, true)
+                if command == FrameCommand::End
+                    && self.outer.is_tls13()
+                    && self.filter.inner_tls13()
+                {
+                    // Upstream sends Direct instead of End when EnableXtls
+                    // (mihomo conn.go:211-214; Xray proxy/proxy.go:371-373),
+                    // and upstream main additionally requires a *complete*
+                    // application-data record for the transition
+                    // (proxy/proxy.go:360-364 — the splice must not cut a
+                    // record in half at the framed/raw boundary); a partial
+                    // record keeps padding (command 00).
+                    if is_complete_record(content) {
+                        (FrameCommand::Direct, true)
+                    } else {
+                        (FrameCommand::Continue, self.filter.is_tls())
+                    }
+                } else {
+                    (command, true)
+                }
             }
             None => (FrameCommand::Continue, self.filter.is_tls()),
         }
@@ -864,10 +1021,21 @@ impl VisionConn {
                 .extend_from_slice(&frame(command, piece, pad, uuid.as_ref()));
             if command != FrameCommand::Continue {
                 self.padding = false;
-                if self.filter.inner_tls13() {
+                if command == FrameCommand::Direct {
+                    // Our own direct-copy announcement: once this frame has
+                    // been written through the (still sealed) outer, the
+                    // write side re-binds to the raw transport — mihomo
+                    // conn.go:212-214 sets writeDirect here and :230-232
+                    // swaps the writer after the frame's write completes.
+                    self.splice_write_after_drain = true;
+                    tracing::info!(
+                        "engine: vision: inner TLS 1.3 — announcing direct copy \
+                         (command 02) and splicing the uplink"
+                    );
+                } else if self.filter.inner_tls13() && !self.outer.is_tls13() {
                     tracing::warn!(
                         "engine: vision: inner TLS 1.3 detected; upstream would splice \
-                         (command 02) but this port stays double-TLS (command 01)"
+                         (command 02) but this outer stays double-TLS (command 01)"
                     );
                 }
             }
@@ -877,7 +1045,7 @@ impl VisionConn {
     /// Push queued bytes into `outer` until it blocks.
     fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while !self.pending.is_empty() {
-            let n = ready!(Pin::new(&mut self.outer).poll_write(cx, &self.pending))?;
+            let n = ready!(self.outer.poll_write(cx, &self.pending))?;
             if n == 0 {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::WriteZero,
@@ -886,7 +1054,41 @@ impl VisionConn {
             }
             self.pending.drain(..n);
         }
+        if self.splice_write_after_drain {
+            // The direct frame reached the transport sealed (the outer's
+            // poll_write only reports success once the record is out);
+            // everything after it goes raw (mihomo conn.go:230-232).
+            self.splice_write_after_drain = false;
+            if let Some(tls) = self.outer.tls13() {
+                tls.splice_writes();
+                self.uplink_spliced = true;
+            }
+        }
         Poll::Ready(Ok(()))
+    }
+
+    /// Finish the current frame's block: enter the follow-up phase, and for
+    /// a direct (`02`) frame on a tls13 outer perform the transport rebind
+    /// at exactly the upstream point — after the frame's content and padding
+    /// were consumed, the outer TLS session's decrypted-unread plaintext and
+    /// read-ahead are drained and reads come from the raw transport from now
+    /// on (Xray `proxy/proxy.go:259-283`, main 2026-09; mihomo
+    /// `conn.go:142-175`). Bytes already buffered here (`in_buf`) were read
+    /// before the switch and are delivered first, preserving upstream's
+    /// merge order (unpad output, then `input`, then `rawInput`).
+    fn enter_after_block(&mut self) {
+        let phase = ReadPhase::after_block(self.current_command);
+        if phase == ReadPhase::RawDirect && self.outer.is_tls13() && !self.downlink_spliced {
+            if let Some(tls) = self.outer.tls13() {
+                tls.splice_reads();
+                self.downlink_spliced = true;
+                tracing::info!(
+                    "engine: vision: downlink spliced — drained the outer TLS \
+                     read-ahead, reading the raw transport"
+                );
+            }
+        }
+        self.phase = phase;
     }
 
     fn poll_read_inner(&mut self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
@@ -936,32 +1138,36 @@ impl VisionConn {
                             // Server command `02`. Upstream's downlink reader
                             // (VisionReader.ReadMultiBuffer, Xray proxy/proxy.go
                             // :248-250, main 2026-09) sets `withinPaddingBuffers
-                            // = false` plus the direct flag, then (in the same
-                            // read) drains the outer TLS session's
-                            // decrypted-unread `input` and read-ahead
-                            // `rawInput` and re-binds its reader to the raw
-                            // transport (:259-283). The re-bind is unreachable
-                            // through the BoxProxyStream (see the module docs);
-                            // the framing half is exact: this frame's content
-                            // is delivered, its padding skipped, and everything
-                            // after the frame passes through verbatim.
+                            // = false` plus the direct flag; the transport
+                            // rebind (draining `input`/`rawInput`, :259-283)
+                            // happens once the frame's content and padding are
+                            // consumed — `enter_after_block` below.
                             self.direct_received = true;
-                            tracing::warn!(
-                                "engine: vision: server announced XTLS direct copy (command 02); \
-                                 framing stopped, passthrough rides the outer stream — this port \
-                                 cannot splice the transport (see the module docs)"
-                            );
+                            if self.outer.is_tls13() {
+                                tracing::info!(
+                                    "engine: vision: server announced XTLS direct copy \
+                                     (command 02); the downlink will splice to the raw \
+                                     transport after this frame"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    "engine: vision: server announced XTLS direct copy \
+                                     (command 02); framing stopped, passthrough rides the \
+                                     outer stream — this outer cannot splice the transport \
+                                     (see the module docs)"
+                                );
+                            }
                         }
                         self.current_command = command.byte();
                         self.remaining_content = content_len;
                         self.remaining_padding = padding_len;
-                        self.phase = if content_len > 0 {
-                            ReadPhase::Content
+                        if content_len > 0 {
+                            self.phase = ReadPhase::Content;
                         } else if padding_len > 0 {
-                            ReadPhase::Padding
+                            self.phase = ReadPhase::Padding;
                         } else {
-                            ReadPhase::after_block(self.current_command)
-                        };
+                            self.enter_after_block();
+                        }
                         tracing::debug!(
                             "engine: vision: downlink frame command={} content={} padding={}",
                             self.current_command,
@@ -986,11 +1192,11 @@ impl VisionConn {
                         buf.put_slice(&chunk);
                         self.remaining_content -= n;
                         if self.remaining_content == 0 {
-                            self.phase = if self.remaining_padding > 0 {
-                                ReadPhase::Padding
+                            if self.remaining_padding > 0 {
+                                self.phase = ReadPhase::Padding;
                             } else {
-                                ReadPhase::after_block(self.current_command)
-                            };
+                                self.enter_after_block();
+                            }
                         }
                         return Poll::Ready(Ok(()));
                     }
@@ -1001,7 +1207,7 @@ impl VisionConn {
                         self.in_buf.drain(..n);
                         self.remaining_padding -= n;
                         if self.remaining_padding == 0 {
-                            self.phase = ReadPhase::after_block(self.current_command);
+                            self.enter_after_block();
                         }
                         continue;
                     }
@@ -1022,7 +1228,9 @@ impl VisionConn {
                         buf.put_slice(&chunk);
                         return Poll::Ready(Ok(()));
                     }
-                    return Pin::new(&mut self.outer).poll_read(cx, buf);
+                    // Raw passthrough: on a spliced tls13 outer this serves
+                    // the drained read-ahead first, then the raw transport.
+                    return self.outer.poll_read(cx, buf);
                 }
             }
             // The current phase needs more bytes from the transport.
@@ -1052,7 +1260,7 @@ impl VisionConn {
         let mut tmp = [0u8; XRAY_CHUNK_SIZE];
         let n = {
             let mut rb = ReadBuf::new(&mut tmp);
-            ready!(Pin::new(&mut self.outer).poll_read(cx, &mut rb))?;
+            ready!(self.outer.poll_read(cx, &mut rb))?;
             rb.filled().len()
         };
         if n == 0 {
@@ -1087,7 +1295,7 @@ impl AsyncWrite for VisionConn {
         if !this.padding && this.pending.is_empty() {
             // Padding phase over: upstream writes the buffer through untouched
             // (only the direct/splice mode introduces another layer here).
-            return Pin::new(&mut this.outer).poll_write(cx, data);
+            return this.outer.poll_write(cx, data);
         }
         if data.is_empty() {
             return Poll::Ready(Ok(0));
@@ -1104,13 +1312,13 @@ impl AsyncWrite for VisionConn {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         ready!(this.poll_drain(cx))?;
-        Pin::new(&mut this.outer).poll_flush(cx)
+        this.outer.poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         ready!(this.poll_drain(cx))?;
-        Pin::new(&mut this.outer).poll_shutdown(cx)
+        this.outer.poll_shutdown(cx)
     }
 }
 
@@ -2087,5 +2295,213 @@ mod tests {
         let debug = format!("{conn:?}");
         assert!(debug.contains("VisionConn"), "{debug}");
         assert!(debug.contains("direct"), "{debug}");
+    }
+
+    // ------------------------------------------------ full splice (tls13 outer)
+
+    /// Read one whole vision frame off a still-sealed peer stream: optional
+    /// UUID prefix, 5-byte header, content, padding (test-server side of the
+    /// framing, mirroring `XtlsUnpadding`).
+    async fn read_vision_frame(
+        tls: &mut Tls13Stream,
+        uuid: &[u8; 16],
+        expect_uuid: bool,
+    ) -> io::Result<(u8, Vec<u8>)> {
+        use tokio::io::AsyncReadExt;
+        if expect_uuid {
+            let mut u = [0u8; 16];
+            tls.read_exact(&mut u).await?;
+            assert_eq!(&u, uuid, "first frame must be UUID-prefixed");
+        }
+        let mut head = [0u8; 5];
+        tls.read_exact(&mut head).await?;
+        let content_len = usize::from(u16::from_be_bytes([head[1], head[2]]));
+        let padding_len = usize::from(u16::from_be_bytes([head[3], head[4]]));
+        let mut content = vec![0u8; content_len];
+        tls.read_exact(&mut content).await?;
+        let mut pad = vec![0u8; padding_len];
+        tls.read_exact(&mut pad).await?;
+        assert!(pad.iter().all(|b| *b == 0), "padding is zero bytes");
+        Ok((head[0], content))
+    }
+
+    /// The full Xray-equivalent direct copy, end to end, on our own TLS 1.3
+    /// outer. The loopback peer is the crate's in-tree TLS 1.3 server
+    /// carrying the vision frames; both sides perform the splice:
+    ///
+    /// * the server announces `02`, splices its writer, and writes the rest
+    ///   raw on the transport;
+    /// * the client parses the `02`, delivers the frame's content, then the
+    ///   outer TLS read-ahead drained at the switch (upstream `input`), then
+    ///   reads the raw transport (no double-decrypt);
+    /// * the client's own transition (inner TLS 1.3 app-data) sends `02` —
+    ///   still sealed — splices its writer, and everything after goes raw;
+    /// * the server parses the client's `02`, splices its reader, and reads
+    ///   the client's raw bytes.
+    ///
+    /// Pre-direct buffered vision frames and the drained read-ahead must be
+    /// delivered in order before any raw byte, in both directions.
+    #[tokio::test]
+    async fn tls13_outer_direct_splice_end_to_end() {
+        use crate::proto::reality::tls13 as outer_tls;
+        use crate::proto::reality::tls13::test_server;
+        use crate::proto::reality::profiles::{build_client_hello, UtslProfile};
+        use rand::RngCore;
+        use tokio::io::AsyncReadExt;
+
+        let uuid = uuid_bytes();
+
+        // Synthetic inner-session bytes, shaped exactly like the record
+        // prefixes the filter rules key on: a ClientHello record, a complete
+        // TLS 1.3 ServerHello record (drives `EnableXtls`), and a complete
+        // application-data record (drives the transition).
+        let mut inner_ch = vec![0x16, 0x03, 0x01, 0x00, 0x10, 0x01];
+        inner_ch.resize(6 + 0x10, 0x41);
+        let inner_sh = server_hello(0x1301, true);
+        let inner_app: Vec<u8> = [TLS_APPLICATION_DATA.as_slice(), &[0x00, 0x05, 1, 2, 3, 4, 5]].concat();
+        assert!(is_complete_record(&inner_app), "the transition piece is complete");
+        let d_tail = b"D-rides-the-input-drain".to_vec();
+        let uplink_raw = b"raw-uplink-after-direct".to_vec();
+        let downlink_raw = b"raw-downlink-after-direct".to_vec();
+
+        // The outer TLS peers: our own tls13 client against the in-tree test
+        // server, over a loopback duplex.
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        let der = cert.der().to_vec();
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(key_pair.serialize_der().into());
+        let signing_key = rustls::crypto::ring::sign::any_supported_type(&key).unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+
+        // Copies the server task compares/asserts against.
+        let srv_inner_ch = inner_ch.clone();
+        let srv_inner_sh = inner_sh.clone();
+        let srv_inner_app = inner_app.clone();
+        let srv_uplink_raw = uplink_raw.clone();
+        let srv_d_tail = d_tail.clone();
+        let srv_downlink_raw = downlink_raw.clone();
+
+        let srv_uuid = uuid;
+        let server_task = tokio::spawn(async move {
+            let (mut tls, hello) = test_server::accept(
+                Box::new(server_io),
+                outer_tls::CipherSuite::Aes128GcmSha256,
+                move |_| Ok((der.clone(), signing_key.clone())),
+            )
+            .await
+            .expect("outer TLS handshake");
+            assert_eq!(hello.sni.as_deref(), Some("localhost"));
+
+            // 1. The client's first vision frame: UUID + ClientHello content.
+            let (cmd, content) = read_vision_frame(&mut tls, &srv_uuid, true)
+                .await
+                .expect("first uplink frame");
+            assert_eq!(cmd, COMMAND_CONTINUE);
+            assert_eq!(content, srv_inner_ch);
+
+            // 2. Downlink: a continue frame with the ServerHello —
+            //    UUID-prefixed, it is the first downlink frame — then, in
+            //    ONE sealed write (so the trailing bytes land inside the
+            //    same outer record), the direct frame plus the bytes that
+            //    must be recovered from the client's decrypted-unread
+            //    buffer (upstream `input`). Then the writer splices and
+            //    everything after is raw on the transport.
+            tls.write_all(&frame(
+                FrameCommand::Continue,
+                &srv_inner_sh,
+                0,
+                Some(&srv_uuid),
+            ))
+            .await
+            .unwrap();
+            let mut direct = frame(FrameCommand::Direct, &srv_inner_app, 32, None);
+            direct.extend_from_slice(&srv_d_tail);
+            tls.write_all(&direct).await.unwrap();
+            tls.flush().await.unwrap();
+            tls.splice_writes();
+            assert!(tls.writes_spliced());
+            tls.write_all(&srv_downlink_raw).await.unwrap();
+            tls.flush().await.unwrap();
+
+            // 3. The client's own transition: its direct frame arrives still
+            //    sealed. Once parsed, this side splices its reads (the
+            //    server half of the protocol, mirror of the client's).
+            let (cmd, content) = read_vision_frame(&mut tls, &srv_uuid, false)
+                .await
+                .expect("client transition frame");
+            assert_eq!(cmd, COMMAND_DIRECT, "the client announces direct too");
+            assert_eq!(content, srv_inner_app);
+            tls.splice_reads();
+            assert!(tls.reads_spliced());
+
+            // 4. Everything after is raw on the wire.
+            let mut raw = vec![0u8; srv_uplink_raw.len()];
+            tls.read_exact(&mut raw).await.expect("raw uplink");
+            assert_eq!(raw, srv_uplink_raw);
+        });
+
+        let mut random = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut random);
+        let session_id = [5u8; 32];
+        let (secret, public) = outer_tls::x25519_keygen();
+        let ch = build_client_hello(UtslProfile::Chrome, "localhost", &random, &session_id, &public);
+        let outer = outer_tls::connect(
+            Box::new(client_io),
+            &ch,
+            &secret,
+            outer_tls::ServerAuth::AcceptAny,
+        )
+        .await
+        .expect("client outer TLS handshake");
+
+        let mut conn = VisionConn::connect_tls13(
+            outer,
+            &NetAddr::domain("target.test", 443).unwrap(),
+            uuid::Uuid::from_bytes(uuid),
+            VisionConfig::new(),
+        )
+        .await
+        .unwrap();
+        assert!(conn.splice_capable());
+        assert!(!conn.uplink_spliced() && !conn.downlink_spliced());
+
+        // Uplink: the ClientHello goes out framed (command 00, sealed in the
+        // outer records — the server read it as such above).
+        conn.write_all(&inner_ch).await.unwrap();
+        conn.flush().await.unwrap();
+
+        // Downlink: the ServerHello frame's content, in order.
+        let mut sh = vec![0u8; inner_sh.len()];
+        conn.read_exact(&mut sh).await.unwrap();
+        assert_eq!(sh, inner_sh);
+        assert!(conn.inner_tls13_detected(), "EnableXtls from the downlink");
+
+        // Uplink transition: the first inner app-data record is sent with
+        // command 02 (upstream sends Direct when EnableXtls) — sealed — and
+        // once it is out the uplink is raw.
+        conn.write_all(&inner_app).await.unwrap();
+        conn.flush().await.unwrap();
+        assert!(conn.uplink_spliced(), "the writer re-bound to the raw transport");
+        conn.write_all(&uplink_raw).await.unwrap();
+
+        // Downlink through the switch: the `02` frame's content, then the
+        // bytes recovered from the outer TLS read-ahead (`input`), then the
+        // raw transport bytes — one ordered byte string, no double-decrypt.
+        let expect: Vec<u8> =
+            [inner_app.as_slice(), d_tail.as_slice(), downlink_raw.as_slice()].concat();
+        let mut got = vec![0u8; expect.len()];
+        conn.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, expect, "content, drained read-ahead, then raw");
+        assert!(conn.direct_mode());
+        assert!(conn.downlink_spliced(), "the reader re-bound to the raw transport");
+
+        // Clean EOF after the splice (the raw socket's EOF, not a TLS error).
+        let mut tail = [0u8; 8];
+        let n = conn.read(&mut tail).await.unwrap();
+        assert_eq!(n, 0, "EOF, not an error");
+        drop(conn);
+        server_task.await.unwrap();
     }
 }
