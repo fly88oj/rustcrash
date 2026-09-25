@@ -21,16 +21,19 @@
 //!   scheme is *not* checked against our advertised list — Xray's REALITY
 //!   server always signs with Ed25519 even though real Chrome never offers
 //!   it, so the reference client cannot be stricter than this either.
-//! * No PSK/resumption/0-RTT/client auth/ECH/certificate compression.
-//!   `NewSessionTicket` is ignored, `KeyUpdate` is honoured.
+//! * No PSK/resumption/0-RTT/client auth/certificate compression.
+//!   `NewSessionTicket` is ignored, `KeyUpdate` is honoured. ECH (RFC 9460)
+//!   lives in a separate entry point, [`connect_ech`], and never touches the
+//!   non-ECH path.
 //!
 //! The key schedule and record layer are pinned against the RFC 8448
 //! handshake trace and against a real rustls server (see the tests).
 
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use hkdf::Hkdf;
 use rand::RngCore;
@@ -40,6 +43,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::error::{Error, Result};
 use crate::proto::aead::{Aead, AeadKind};
+use crate::proto::ech;
 use crate::stream::BoxProxyStream;
 
 /// `supported_versions` codepoint for TLS 1.3.
@@ -65,6 +69,21 @@ const EXT_ALPN: u16 = 0x0010;
 const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 const EXT_KEY_SHARE: u16 = 0x0033;
 const EXT_PRE_SHARED_KEY: u16 = 0x0029;
+// ECH hello-construction codepoints (metacubex/tls handshake_messages.go
+// marshal order; see the ECH client section below).
+const EXT_SERVER_NAME: u16 = 0x0000;
+const EXT_STATUS_REQUEST: u16 = 0x0005;
+const EXT_SUPPORTED_GROUPS: u16 = 0x000a;
+const EXT_EC_POINT_FORMATS: u16 = 0x000b;
+const EXT_SIGNATURE_ALGORITHMS: u16 = 0x000d;
+const EXT_SCTS: u16 = 0x0012;
+const EXT_EXTENDED_MASTER_SECRET_ECH: u16 = 0x0017;
+const EXT_SESSION_TICKET: u16 = 0x0023;
+const EXT_COOKIE: u16 = 0x002c;
+const EXT_PSK_KEY_EXCHANGE_MODES_ECH: u16 = 0x002d;
+const EXT_RENEGOTIATION_INFO: u16 = 0xff01;
+/// `alert_ech_required` (RFC 9460 §7; metacubex/tls `alertECHRequired`).
+const ALERT_ECH_REQUIRED: u8 = 121;
 const GROUP_X25519: u16 = 0x001d;
 
 /// Maximum TLSInnerPlaintext length (RFC 8446 §5.2).
@@ -242,7 +261,9 @@ pub(crate) mod der {
         const OID_EC_PUBLIC_KEY: &[u8] = &[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
         const OID_P256: &[u8] = &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
         const OID_P384: &[u8] = &[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22];
-        const OID_RSA: &[u8] = &[0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
+        const OID_RSA: &[u8] = &[
+            0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01,
+        ];
 
         if alg.starts_with(OID_ED25519) {
             let k: [u8; 32] = key
@@ -398,12 +419,14 @@ enum TranscriptHash {
 
 #[derive(Clone)]
 struct Transcript {
+    kind: HashKind,
     inner: TranscriptHash,
 }
 
 impl Transcript {
     fn new(hash: HashKind) -> Self {
         Transcript {
+            kind: hash,
             inner: match hash {
                 HashKind::Sha256 => TranscriptHash::Sha256(Sha256::new()),
                 HashKind::Sha384 => TranscriptHash::Sha384(Sha384::new()),
@@ -423,6 +446,23 @@ impl Transcript {
             TranscriptHash::Sha256(h) => h.clone().finalize().to_vec(),
             TranscriptHash::Sha384(h) => h.clone().finalize().to_vec(),
         }
+    }
+
+    /// RFC 8446 §4.4.1 message_hash fold for the HelloRetryRequest path: a
+    /// fresh transcript holding only `[254, 0, 0, len] ‖ hash(self)`. The
+    /// ECH client folds both its inner and outer transcripts this way
+    /// (metacubex/tls handshake_client_tls13.go:238-244 and :249-253).
+    fn fold_message_hash(&self) -> Transcript {
+        let digest = self.hash();
+        let mut folded = Transcript::new(self.kind);
+        let mut wrap = Vec::with_capacity(4 + digest.len());
+        wrap.push(254); // message_hash
+        wrap.push(0);
+        wrap.push(0);
+        wrap.push(digest.len() as u8);
+        wrap.extend_from_slice(&digest);
+        folded.update(&wrap);
+        folded
     }
 }
 
@@ -617,7 +657,7 @@ impl RecordProtector {
 
 /// Certificate authentication callback: receives the leaf certificate DER and
 /// returns `Ok(true)` when the custom scheme verified it (REALITY's temp-auth).
-pub type CertCallback = Box<dyn Fn(&[u8]) -> Result<bool> + Send>;
+pub type CertCallback = Box<dyn Fn(&[u8]) -> Result<bool> + Send + Sync>;
 
 /// How the client authenticates the server's certificate chain.
 pub enum ServerAuth {
@@ -726,7 +766,7 @@ fn parse_server_hello(msg: &[u8]) -> Result<ServerHello> {
         Some(other) => {
             return Err(Error::protocol(format!(
                 "tls13: server selected compression {other:#x}"
-            )))
+            )));
         }
         None => return Err(Error::protocol("tls13: short ServerHello")),
     }
@@ -757,7 +797,7 @@ fn parse_server_hello(msg: &[u8]) -> Result<ServerHello> {
             EXT_PRE_SHARED_KEY => {
                 return Err(Error::protocol(
                     "tls13: server selected a PSK we never offered",
-                ))
+                ));
             }
             _ => {}
         }
@@ -767,12 +807,12 @@ fn parse_server_hello(msg: &[u8]) -> Result<ServerHello> {
         Some(v) => {
             return Err(Error::protocol(format!(
                 "tls13: server negotiated version {v:#06x}, this client is TLS 1.3 only"
-            )))
+            )));
         }
         None => {
             return Err(Error::protocol(
                 "tls13: ServerHello has no supported_versions extension",
-            ))
+            ));
         }
     }
     let share = share.ok_or_else(|| Error::protocol("tls13: ServerHello has no key_share"))?;
@@ -843,7 +883,9 @@ fn parse_certificate(msg: &[u8]) -> Result<Vec<Vec<u8>>> {
         off += 2 + ext_len;
     }
     if chain.is_empty() {
-        return Err(Error::protocol("tls13: server sent an empty certificate chain"));
+        return Err(Error::protocol(
+            "tls13: server sent an empty certificate chain",
+        ));
     }
     Ok(chain)
 }
@@ -906,7 +948,7 @@ fn verify_certificate_verify(body: &[u8], leaf: &[u8], transcript_hash: &[u8]) -
             return Err(Error::protocol(format!(
                 "tls13: server CertificateVerify scheme {s:#06x} does not match its {} key",
                 key_name(k)
-            )))
+            )));
         }
     }
     Ok(())
@@ -1053,7 +1095,7 @@ async fn next_plaintext_handshake(
             other => {
                 return Err(Error::protocol(format!(
                     "tls13: unexpected record type {other} before the ServerHello"
-                )))
+                )));
             }
         }
     }
@@ -1095,7 +1137,7 @@ async fn next_encrypted_handshake(
             other => {
                 return Err(Error::protocol(format!(
                     "tls13: unexpected inner content type {other} during the handshake"
-                )))
+                )));
             }
         }
     }
@@ -1116,13 +1158,13 @@ pub async fn connect(
     x25519_secret: &[u8; 32],
     auth: ServerAuth,
 ) -> Result<Tls13Stream> {
-    if client_hello.len() < super::profiles::SESSION_ID_OFFSET + 32 || client_hello[0] != HS_CLIENT_HELLO
+    if client_hello.len() < super::profiles::SESSION_ID_OFFSET + 32
+        || client_hello[0] != HS_CLIENT_HELLO
     {
         return Err(Error::protocol("tls13: malformed ClientHello"));
     }
     let mut expected_session_id = [0u8; 32];
-    expected_session_id
-        .copy_from_slice(&client_hello[super::profiles::SESSION_ID_OFFSET..][..32]);
+    expected_session_id.copy_from_slice(&client_hello[super::profiles::SESSION_ID_OFFSET..][..32]);
 
     let mut t = transport;
     t.write_all(&super::profiles::client_hello_record(client_hello))
@@ -1160,7 +1202,8 @@ pub async fn connect(
 
     // Middlebox compatibility (RFC 8446 §D.4): Go's TLS 1.3 client — which is
     // what the REALITY reference client is — sends a dummy CCS here.
-    t.write_all(&[RECORD_CCS, 0x03, 0x03, 0x00, 0x01, 0x01]).await?;
+    t.write_all(&[RECORD_CCS, 0x03, 0x03, 0x00, 0x01, 0x01])
+        .await?;
 
     let (typ, ee_raw) =
         next_encrypted_handshake(&mut t, &mut read_key, &mut pending, &mut ccs).await?;
@@ -1291,15 +1334,1133 @@ fn verify_chain_webpki(
         .map(|c| CertificateDer::from(c.clone()))
         .collect();
     verifier
-        .verify_server_cert(
-            &end_entity,
-            &intermediates,
-            &name,
-            &[],
-            UnixTime::now(),
-        )
+        .verify_server_cert(&end_entity, &intermediates, &name, &[], UnixTime::now())
         .map_err(|e| Error::protocol(format!("tls13: certificate verification failed: {e}")))?;
     Ok(())
+}
+
+// --- ECH client (RFC 9460, ported from metacubex/tls) --------------------
+//
+// `connect_ech` drives a TLS 1.3 handshake whose ClientHello is split into
+// an inner hello (the real SNI/ALPN, HPKE-sealed) and an outer hello (the
+// ECHConfig's public_name in the clear). The pieces and their sources:
+//
+// * inner/outer shaping — `makeClientHello` + the ECH split in
+//   `clientHandshake` (handshake_client.go:167-199, :250-275) over the
+//   `marshalMsg(echInner)` rules (handshake_messages.go:103-345): the inner
+//   drops the four legacy-compat extensions (`ec_point_formats` 0x000b,
+//   `session_ticket` 0x0023, `renegotiation_info` 0xff01,
+//   `extended_master_secret` 0x0017), carries
+//   `encrypted_client_hello = [0x01]`, and is wire-serialized with an EMPTY
+//   legacy_session_id; the transcript form restores the OUTER session id.
+//   The outer replaces the SNI with the public name, draws a fresh random,
+//   and carries the sealed payload. The wire inner is padded per
+//   `encodeInnerClientHello` (ech.go:197-216) and sealed with the whole
+//   serialized outer body as AAD (`computeAndUpdateOuterECHExtension`,
+//   ech.go:418-449 — here `ech::compute_outer_ech_ext`).
+//   DELTA vs upstream: the inner does not compress outer-mirrored
+//   extensions through `ech_outer_extensions` (0xfd00) — RFC 9460 §6.1
+//   makes the compression optional, the ciphertext is only marginally
+//   larger, and `ech::decode_inner_client_hello` accepts both forms.
+// * accept confirmation — `handshake_client_tls13.go:86-116` (normal
+//   ServerHello: the last 8 bytes of the random) and `:255-281` (HRR: the
+//   8-byte ECH extension value), both over the inner transcript with the
+//   confirmation slot zeroed, PRK = HKDF-Extract(inner random), label
+//   `"ech accept confirmation"` / `"hrr ech accept confirmation"`. On
+//   acceptance the ACTIVE transcript rebinds to the inner one
+//   (`hs.transcript = innerTranscript`, handshake_client_tls13.go:101).
+// * rejection — the handshake completes against the OUTER hello, the
+//   chain is verified against the PUBLIC name while the peer-certificate
+//   callback is skipped (`verifyServerCertificate`'s `echRejected` branch,
+//   handshake_client.go:1081-1145), retry configs are captured from the
+//   EncryptedExtensions `encrypted_client_hello` extension
+//   (handshake_client_tls13.go:577-585), and the connection ends with
+//   alert `ech_required` and the `ECHRejectionError` text
+//   `"tls: server rejected ECH"` (ech.go:486-492). `connect_ech` retries
+//   exactly once when the retry list parses and picks (the dial-closure
+//   equivalent of the caller-side retry the upstream error invites).
+
+/// Determinism hooks for [`connect_ech`] tests; every field is `None` in
+/// production and the value comes from `OsRng` instead.
+#[derive(Debug, Clone)]
+pub struct EchHandshakeParams {
+    /// The picked ECHConfig + HPKE AEAD (`ech::select_ech_config` on the
+    /// configured ECHConfigList wire bytes).
+    pub selection: ech::EchConfigSelection,
+    /// Fixed inner-hello random.
+    pub inner_random: Option<[u8; 32]>,
+    /// Fixed outer-hello random.
+    pub outer_random: Option<[u8; 32]>,
+    /// Fixed legacy session id.
+    pub session_id: Option<[u8; 32]>,
+    /// Fixed X25519 ECDHE secret (inner and outer share one key share).
+    pub x25519_secret: Option<[u8; 32]>,
+    /// Fixed HPKE ephemeral secret.
+    pub hpke_secret: Option<[u8; 32]>,
+}
+
+/// Fingerprint-TLS-with-ECH configuration for [`connect_ech`].
+#[derive(Debug, Clone)]
+pub struct EchCfg {
+    /// The real (inner) server name: the SNI inside the sealed hello and
+    /// the name the certificate must verify against once ECH is accepted.
+    pub server_name: String,
+    /// ClientHello template the inner/outer hellos are shaped from.
+    pub profile: super::profiles::UtslProfile,
+    /// ALPN list; empty means the profile's own list (h2, http/1.1).
+    pub alpn: Vec<String>,
+    pub ech: EchHandshakeParams,
+}
+
+impl EchCfg {
+    /// Config with the profile's default ALPN list.
+    pub fn new(
+        server_name: impl Into<String>,
+        profile: super::profiles::UtslProfile,
+        selection: ech::EchConfigSelection,
+    ) -> Self {
+        EchCfg {
+            server_name: server_name.into(),
+            profile,
+            alpn: Vec::new(),
+            ech: EchHandshakeParams {
+                selection,
+                inner_random: None,
+                outer_random: None,
+                session_id: None,
+                x25519_secret: None,
+                hpke_secret: None,
+            },
+        }
+    }
+}
+
+/// The outcome of one ECH handshake attempt; `Rejected` carries the
+/// server's retry ECHConfigList when it sent one (`ECHRejectionError`,
+/// ech.go:486-492).
+enum EchAttemptError {
+    Fatal(Error),
+    Rejected { retry_configs: Vec<u8> },
+}
+
+impl From<Error> for EchAttemptError {
+    fn from(e: Error) -> Self {
+        EchAttemptError::Fatal(e)
+    }
+}
+
+/// Connect with ECH (RFC 9460) over transports produced by `dial`.
+///
+/// `dial` is called once per attempt (twice at most: one retry with the
+/// server's retry configs, mirroring the caller-side retry upstream's
+/// `ECHRejectionError.RetryConfigList` invites). `auth` names the INNER
+/// server — on ECH acceptance the certificate is verified against
+/// [`EchCfg::server_name`], exactly like upstream's rebind of
+/// `c.serverName` to `config.ServerName` (handshake_client_tls13.go:99-100).
+/// On rejection the rejected handshake verifies against the ECHConfig's
+/// public name instead (handshake_client.go:1081-1104) and the caller sees
+/// the upstream error `"tls: server rejected ECH"`; there is no silent
+/// outer-mode fallback.
+pub async fn connect_ech<D, F>(cfg: &EchCfg, auth: &ServerAuth, mut dial: D) -> Result<Tls13Stream>
+where
+    D: FnMut() -> F,
+    F: Future<Output = Result<BoxProxyStream>> + Send,
+{
+    let mut selection = cfg.ech.selection.clone();
+    for attempt in 0..2 {
+        let transport = dial().await?;
+        match ech_attempt(cfg, &selection, auth, transport).await {
+            Ok(stream) => return Ok(stream),
+            Err(EchAttemptError::Fatal(e)) => return Err(e),
+            Err(EchAttemptError::Rejected { retry_configs }) => {
+                if attempt == 1 {
+                    return Err(Error::protocol("tls: server rejected ECH"));
+                }
+                // Retry once, only when the server's configs are usable.
+                match ech::select_ech_config(&retry_configs) {
+                    Ok(next) => selection = next,
+                    Err(_) => return Err(Error::protocol("tls: server rejected ECH")),
+                }
+            }
+        }
+    }
+    unreachable!("the retry loop returns on its second rejection")
+}
+
+/// `hkdf.Extract(h, innerHello.random, nil)` + `tls13ExpandLabel` for the
+/// ECH accept confirmation, generic over the suite hash — the port of
+/// handshake_client_tls13.go:86-98. SHA-256 agrees byte for byte with
+/// [`ech::server_hello_accept_confirmation`] (pinned by a unit test).
+fn ech_accept_confirmation(
+    hash: HashKind,
+    inner_transcript: &Transcript,
+    server_hello_msg: &[u8],
+    inner_client_random: &[u8; 32],
+) -> Result<[u8; 8]> {
+    if server_hello_msg.len() < 38 {
+        return Err(Error::protocol(
+            "tls: malformed encrypted_client_hello extension",
+        ));
+    }
+    let mut conf = inner_transcript.clone();
+    conf.update(&server_hello_msg[..30]);
+    conf.update(&[0u8; 8]);
+    conf.update(&server_hello_msg[38..]);
+    let digest = conf.hash();
+    let prk = hkdf_extract(hash, &[], inner_client_random);
+    let mut out = [0u8; 8];
+    hash.hkdf_expand_label(&prk, "ech accept confirmation", &digest, &mut out)?;
+    Ok(out)
+}
+
+/// The HRR variant (`handshake_client_tls13.go:261-272`): the whole HRR
+/// message with its 8-byte ECH extension value replaced by zeros is hashed
+/// onto the (already folded) inner transcript; the label is
+/// `"hrr ech accept confirmation"`.
+fn ech_hrr_confirmation(
+    hash: HashKind,
+    inner_transcript: &Transcript,
+    hrr_msg: &[u8],
+    ech_ext_value: &[u8],
+    inner_client_random: &[u8; 32],
+) -> Result<[u8; 8]> {
+    if ech_ext_value.len() != 8 {
+        return Err(Error::protocol(
+            "tls: malformed encrypted_client_hello extension",
+        ));
+    }
+    let mut hrr = hrr_msg.to_vec();
+    let pos = hrr
+        .windows(8)
+        .position(|w| w == ech_ext_value)
+        .ok_or_else(|| Error::protocol("tls: hrr without the ECH extension value"))?;
+    hrr[pos..pos + 8].fill(0);
+    let mut conf = inner_transcript.clone();
+    conf.update(&hrr);
+    let digest = conf.hash();
+    let prk = hkdf_extract(hash, &[], inner_client_random);
+    let mut out = [0u8; 8];
+    hash.hkdf_expand_label(&prk, "hrr ech accept confirmation", &digest, &mut out)?;
+    Ok(out)
+}
+
+/// A ServerHello-or-HRR as the ECH client needs it. Unlike
+/// [`parse_server_hello`] this accepts the HelloRetryRequest random and
+/// surfaces the ECH/cookie extensions an HRR may carry.
+struct EchServerHello {
+    is_hrr: bool,
+    cipher_suite: u16,
+    session_id: Vec<u8>,
+    /// The 8-byte ECH extension value of an HRR (absent in a normal SH).
+    ech_ext: Option<Vec<u8>>,
+    cookie: Option<Vec<u8>>,
+    selected_group: Option<u16>,
+    /// Server X25519 share (normal ServerHello only).
+    share: Vec<u8>,
+}
+
+fn parse_server_hello_ech(msg: &[u8]) -> Result<EchServerHello> {
+    let b = msg
+        .get(4..)
+        .ok_or_else(|| Error::protocol("tls13: short ServerHello"))?;
+    let random = b
+        .get(2..34)
+        .ok_or_else(|| Error::protocol("tls13: short ServerHello random"))?;
+    let is_hrr = random == HRR_RANDOM.as_slice();
+    let sid_len = *b
+        .get(34)
+        .ok_or_else(|| Error::protocol("tls13: short ServerHello"))? as usize;
+    let session_id = b
+        .get(35..35 + sid_len)
+        .ok_or_else(|| Error::protocol("tls13: short ServerHello session id"))?
+        .to_vec();
+    let mut off = 35 + sid_len;
+    let cipher_suite = u16_at(b, off)?;
+    off += 2;
+    match b.get(off) {
+        Some(0x00) => {}
+        Some(other) => {
+            return Err(Error::protocol(format!(
+                "tls13: server selected compression {other:#x}"
+            )));
+        }
+        None => return Err(Error::protocol("tls13: short ServerHello")),
+    }
+    off += 1;
+    let mut selected_version = None;
+    let mut share = None;
+    let mut ech_ext = None;
+    let mut cookie = None;
+    let mut selected_group = None;
+    for (typ, body) in extensions(b.get(off..).unwrap_or_default())? {
+        match typ {
+            EXT_SUPPORTED_VERSIONS => selected_version = Some(u16_at(body, 0)?),
+            EXT_KEY_SHARE => {
+                if !is_hrr {
+                    let group = u16_at(body, 0)?;
+                    let len = u16_at(body, 2)? as usize;
+                    if group != GROUP_X25519 {
+                        return Err(Error::protocol(format!(
+                            "tls13: server selected key exchange group {group:#06x}; only X25519 is implemented"
+                        )));
+                    }
+                    share = Some(
+                        body.get(4..4 + len)
+                            .ok_or_else(|| Error::protocol("tls13: short key share"))?
+                            .to_vec(),
+                    );
+                } else {
+                    selected_group = Some(u16_at(body, 0)?);
+                }
+            }
+            ech::EXTENSION_ENCRYPTED_CLIENT_HELLO => {
+                // Only meaningful in an HRR; a normal ServerHello carrying
+                // ECH is handled by the caller (the accepted case must not
+                // see one at all).
+                ech_ext = Some(body.to_vec());
+            }
+            EXT_COOKIE => cookie = Some(body.to_vec()),
+            EXT_PRE_SHARED_KEY => {
+                return Err(Error::protocol(
+                    "tls13: server selected a PSK we never offered",
+                ));
+            }
+            _ => {}
+        }
+    }
+    match selected_version {
+        Some(v) if v == VERSION_TLS13 => {}
+        Some(v) => {
+            return Err(Error::protocol(format!(
+                "tls13: server negotiated version {v:#06x}, this client is TLS 1.3 only"
+            )));
+        }
+        None => {
+            return Err(Error::protocol(
+                "tls13: ServerHello has no supported_versions extension",
+            ));
+        }
+    }
+    if !is_hrr {
+        let share = share.ok_or_else(|| Error::protocol("tls13: ServerHello has no key_share"))?;
+        if share.len() != 32 {
+            return Err(Error::protocol("tls13: X25519 key share is not 32 bytes"));
+        }
+        Ok(EchServerHello {
+            is_hrr: false,
+            cipher_suite,
+            session_id,
+            ech_ext,
+            cookie,
+            selected_group,
+            share,
+        })
+    } else {
+        Ok(EchServerHello {
+            is_hrr: true,
+            cipher_suite,
+            session_id,
+            ech_ext,
+            cookie,
+            selected_group,
+            share: Vec::new(),
+        })
+    }
+}
+
+/// The extension block (u16 total included) of a hello handshake message,
+/// via the canonical field walk (session id, cipher suites, compression).
+fn hello_ext_block(msg: &[u8]) -> Result<&[u8]> {
+    let b = msg
+        .get(4..)
+        .ok_or_else(|| Error::protocol("tls13: short hello"))?;
+    let sid_len = *b
+        .get(34)
+        .ok_or_else(|| Error::protocol("tls13: short hello"))? as usize;
+    let mut off = 35 + sid_len;
+    let cs_len = u16_at(b, off)? as usize;
+    off += 2 + cs_len;
+    let comp_len = *b
+        .get(off)
+        .ok_or_else(|| Error::protocol("tls13: short hello"))? as usize;
+    off += 1 + comp_len;
+    b.get(off..)
+        .ok_or_else(|| Error::protocol("tls13: short hello"))
+}
+
+/// Find one extension body in a hello's extension block.
+fn find_hello_ext(msg: &[u8], want: u16) -> Result<Option<Vec<u8>>> {
+    for (typ, body) in extensions(hello_ext_block(msg)?)? {
+        if typ == want {
+            return Ok(Some(body.to_vec()));
+        }
+    }
+    Ok(None)
+}
+
+/// The retry ECHConfigList out of an EncryptedExtensions message (the
+/// `encrypted_client_hello` extension of the EE,
+/// handshake_client_tls13.go:577-585 / handshake_messages.go:1039-1042).
+fn ee_retry_configs(ee_msg: &[u8]) -> Result<Option<Vec<u8>>> {
+    let body = ee_msg
+        .get(4..)
+        .ok_or_else(|| Error::protocol("tls13: short EncryptedExtensions"))?;
+    for (typ, data) in extensions(body)? {
+        if typ == ech::EXTENSION_ENCRYPTED_CLIENT_HELLO {
+            return Ok(Some(data.to_vec()));
+        }
+    }
+    Ok(None)
+}
+
+/// One `(type, body)` extension list serialized into a ClientHello
+/// extension block body (everything after the u16 total, which
+/// [`serialize_ech_hello`] writes).
+fn ech_ext_block(exts: &[(u16, Vec<u8>)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (typ, body) in exts {
+        out.extend_from_slice(&typ.to_be_bytes());
+        out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        out.extend_from_slice(body);
+    }
+    out
+}
+
+/// Serialize an ECH hello: `legacy_version 0x0303 ‖ random ‖
+/// legacy_session_id (empty when None) ‖ cipher_suites ‖ compression ‖
+/// extensions` behind the 4-byte handshake header. `None` produces the
+/// WIRE (encoded) inner form; `Some` the transcript form — the two differ
+/// only in the session id (handshake_messages.go:353-357).
+fn serialize_ech_hello(
+    random: &[u8; 32],
+    session_id: Option<&[u8; 32]>,
+    suites_comp: &[u8],
+    exts: &[(u16, Vec<u8>)],
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(2 + 32 + 1 + suites_comp.len() + 2 + 64);
+    body.extend_from_slice(&VERSION_TLS12.to_be_bytes());
+    body.extend_from_slice(random);
+    match session_id {
+        Some(sid) => {
+            body.push(sid.len() as u8);
+            body.extend_from_slice(sid);
+        }
+        None => body.push(0),
+    }
+    body.extend_from_slice(suites_comp);
+    let block = ech_ext_block(exts);
+    body.extend_from_slice(&(block.len() as u16).to_be_bytes());
+    body.extend_from_slice(&block);
+    let mut msg = Vec::with_capacity(4 + body.len());
+    msg.push(HS_CLIENT_HELLO);
+    let len = body.len();
+    msg.push((len >> 16) as u8);
+    msg.push((len >> 8) as u8);
+    msg.push(len as u8);
+    msg.extend_from_slice(&body);
+    msg
+}
+
+/// The `server_name` extension body (RFC 6066 §3, one host_name entry).
+fn ech_sni_body(name: &[u8]) -> Vec<u8> {
+    let mut entry = Vec::with_capacity(3 + name.len());
+    entry.push(0); // name_type = host_name
+    entry.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    entry.extend_from_slice(name);
+    let mut body = Vec::with_capacity(2 + entry.len());
+    body.extend_from_slice(&(entry.len() as u16).to_be_bytes());
+    body.extend_from_slice(&entry);
+    body
+}
+
+/// Insert the HRR `cookie` extension at its canonical slot (between
+/// `supported_versions` and `key_share`, handshake_messages.go:256-265).
+fn ech_insert_cookie(exts: &mut Vec<(u16, Vec<u8>)>, cookie: &[u8]) {
+    let pos = exts
+        .iter()
+        .position(|(t, _)| *t == EXT_KEY_SHARE)
+        .unwrap_or(exts.len());
+    exts.insert(pos, (EXT_COOKIE, cookie.to_vec()));
+}
+
+/// The inner/outer hello pair of one ECH attempt, plus everything the HRR
+/// second flight needs to rebuild them.
+struct EchHelloSet {
+    // fresh material of this attempt
+    inner_random: [u8; 32],
+    outer_random: [u8; 32],
+    session_id: [u8; 32],
+    x25519_secret: [u8; 32],
+    // template pieces (canonical fork order; ECH ext appended at seal time)
+    suites_comp: Vec<u8>,
+    inner_exts: Vec<(u16, Vec<u8>)>,
+    outer_exts: Vec<(u16, Vec<u8>)>,
+    public_name: String,
+    /// The real (inner) SNI bytes — the ECH padding input.
+    inner_sni_bytes: Vec<u8>,
+    max_name_length: usize,
+    config_id: u8,
+    kdf_id: u16,
+    aead_id: u16,
+    // built forms
+    /// Transcript-form inner (32-byte session id): what the transcript runs
+    /// over once ECH is accepted.
+    inner_msg: Vec<u8>,
+    /// The outer hello as sent (public SNI, sealed payload).
+    outer_msg: Vec<u8>,
+}
+
+impl EchHelloSet {
+    /// Build the pair: the inner from the profile template with the real
+    /// SNI minus the four legacy-compat extensions plus the `[0x01]` marker,
+    /// the outer with the public SNI, a fresh random and the HPKE-sealed
+    /// encoded inner (metacubex/tls handshake_client.go:250-275 over the
+    /// `marshalMsg(echInner)` rules).
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        cfg: &EchCfg,
+        selection: &ech::EchConfigSelection,
+        inner_random: [u8; 32],
+        outer_random: [u8; 32],
+        session_id: [u8; 32],
+        x25519_secret: [u8; 32],
+        hpke_secret: &[u8; 32],
+    ) -> Result<(EchHelloSet, ech::HpkeSender)> {
+        let config = &selection.config;
+        let public: [u8; 32] = config
+            .public_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::config("tls13: ECH public key is not 32 bytes"))?;
+        let public_share =
+            curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(x25519_secret).0;
+
+        // Base template: the profile machinery with the REAL server name.
+        let alpn = if cfg.alpn.is_empty() {
+            None
+        } else {
+            Some(cfg.alpn.as_slice())
+        };
+        let base = super::profiles::build_client_hello_alpn(
+            cfg.profile,
+            &cfg.server_name,
+            &inner_random,
+            &session_id,
+            &public_share,
+            alpn,
+        );
+        let body = &base[4..];
+        // vers(2) random(32) sid_len(1)=32 sid(32) suites(u16-pref) comp(u8-pref)
+        let suites_len = u16::from_be_bytes([body[67], body[68]]) as usize;
+        // cipher_suites (u16-prefixed) plus compression methods
+        // (u8-length 1 + the null method) — copied verbatim.
+        let suites_comp = body[67..67 + 2 + suites_len + 2].to_vec();
+        let base_exts = extensions(&body[67 + 2 + suites_len + 2..])?;
+        let find = |want: u16| {
+            base_exts
+                .iter()
+                .find(|(t, _)| *t == want)
+                .map(|(_, b)| b.to_vec())
+        };
+
+        // supported_versions without anything below TLS 1.3 (the inner must
+        // offer 1.3 only — metacubex/tls decodeInnerClientHello rejects a
+        // non-GREASE version < 0x0304, ech.go:374-394; GREASE stays).
+        let mut versions = Vec::new();
+        if let Some(v) = find(EXT_SUPPORTED_VERSIONS) {
+            let list = &v[1..];
+            let mut i = 0;
+            while i + 2 <= list.len() {
+                let ver = u16::from_be_bytes([list[i], list[i + 1]]);
+                let grease = ver & 0x0f0f == 0x0a0a && ver & 0xff == ver >> 8;
+                if grease || ver == VERSION_TLS13 {
+                    versions.extend_from_slice(&ver.to_be_bytes());
+                }
+                i += 2;
+            }
+        } else {
+            versions.extend_from_slice(&VERSION_TLS13.to_be_bytes());
+        }
+        let versions_body = {
+            let mut b = Vec::with_capacity(1 + versions.len());
+            b.push(versions.len() as u8);
+            b.extend_from_slice(&versions);
+            b
+        };
+
+        // Inner: real SNI, scts, the [0x01] marker, then the negotiation
+        // extensions (canonical fork marshal order).
+        let inner_exts: Vec<(u16, Vec<u8>)> = vec![
+            (EXT_SERVER_NAME, ech_sni_body(cfg.server_name.as_bytes())),
+            (EXT_SCTS, Vec::new()),
+            (
+                ech::EXTENSION_ENCRYPTED_CLIENT_HELLO,
+                vec![1], // inner marker (ech.go:186)
+            ),
+            (
+                EXT_STATUS_REQUEST,
+                find(EXT_STATUS_REQUEST).unwrap_or_else(|| vec![0x01, 0x00, 0x00, 0x00, 0x00]),
+            ),
+            (
+                EXT_SUPPORTED_GROUPS,
+                find(EXT_SUPPORTED_GROUPS).unwrap_or_else(|| {
+                    let mut b = Vec::new();
+                    b.extend_from_slice(&2u16.to_be_bytes());
+                    b.extend_from_slice(&GROUP_X25519.to_be_bytes());
+                    b
+                }),
+            ),
+            (
+                EXT_SIGNATURE_ALGORITHMS,
+                find(EXT_SIGNATURE_ALGORITHMS)
+                    .unwrap_or_else(|| vec![0x00, 0x04, 0x04, 0x03, 0x08, 0x04]),
+            ),
+            (EXT_ALPN, find(EXT_ALPN).unwrap_or_default()),
+            (EXT_SUPPORTED_VERSIONS, versions_body.clone()),
+            (EXT_KEY_SHARE, find(EXT_KEY_SHARE).unwrap_or_default()),
+            (
+                EXT_PSK_KEY_EXCHANGE_MODES_ECH,
+                find(EXT_PSK_KEY_EXCHANGE_MODES_ECH).unwrap_or_else(|| vec![0x01, 0x01]),
+            ),
+        ];
+        // Outer: public SNI + the legacy-compat extensions the inner drops,
+        // then the same negotiation set (the ECH ext slots in after scts).
+        let outer_exts: Vec<(u16, Vec<u8>)> = vec![
+            (EXT_SERVER_NAME, ech_sni_body(&config.public_name)),
+            (
+                EXT_EC_POINT_FORMATS,
+                find(EXT_EC_POINT_FORMATS).unwrap_or_else(|| vec![0x01, 0x00]),
+            ),
+            (EXT_SESSION_TICKET, Vec::new()),
+            (EXT_RENEGOTIATION_INFO, vec![0x00]),
+            (EXT_EXTENDED_MASTER_SECRET_ECH, Vec::new()),
+            (EXT_SCTS, Vec::new()),
+            (
+                EXT_STATUS_REQUEST,
+                find(EXT_STATUS_REQUEST).unwrap_or_else(|| vec![0x01, 0x00, 0x00, 0x00, 0x00]),
+            ),
+            (
+                EXT_SUPPORTED_GROUPS,
+                find(EXT_SUPPORTED_GROUPS).unwrap_or_else(|| {
+                    let mut b = Vec::new();
+                    b.extend_from_slice(&2u16.to_be_bytes());
+                    b.extend_from_slice(&GROUP_X25519.to_be_bytes());
+                    b
+                }),
+            ),
+            (
+                EXT_SIGNATURE_ALGORITHMS,
+                find(EXT_SIGNATURE_ALGORITHMS)
+                    .unwrap_or_else(|| vec![0x00, 0x04, 0x04, 0x03, 0x08, 0x04]),
+            ),
+            (EXT_ALPN, find(EXT_ALPN).unwrap_or_default()),
+            (EXT_SUPPORTED_VERSIONS, versions_body),
+            (EXT_KEY_SHARE, find(EXT_KEY_SHARE).unwrap_or_default()),
+            (
+                EXT_PSK_KEY_EXCHANGE_MODES_ECH,
+                find(EXT_PSK_KEY_EXCHANGE_MODES_ECH).unwrap_or_else(|| vec![0x01, 0x01]),
+            ),
+        ];
+
+        let public_name = String::from_utf8_lossy(&config.public_name).into_owned();
+        let mut set = EchHelloSet {
+            inner_random,
+            outer_random,
+            session_id,
+            x25519_secret,
+            suites_comp,
+            inner_exts,
+            outer_exts,
+            public_name,
+            inner_sni_bytes: cfg.server_name.as_bytes().to_vec(),
+            max_name_length: config.max_name_length as usize,
+            config_id: config.config_id,
+            kdf_id: ech::KDF_HKDF_SHA256,
+            aead_id: selection.aead.id(),
+            inner_msg: Vec::new(),
+            outer_msg: Vec::new(),
+        };
+
+        // Wire (encoded) inner: EMPTY session id, then ECH padding.
+        let wire = serialize_ech_hello(&inner_random, None, &set.suites_comp, &set.inner_exts);
+        let encoded_inner = ech::encode_inner_client_hello(
+            &wire[4..],
+            Some(cfg.server_name.as_bytes()),
+            set.max_name_length,
+        );
+
+        // HPKE sender: info = "tls ech\0" ‖ config.raw
+        // (handshake_client.go:193-194).
+        let (enc, mut sender) = ech::HpkeSender::setup_with(
+            &public,
+            selection.aead,
+            &ech::ech_hpke_info(config),
+            hpke_secret,
+        )?;
+
+        let ech_ext = set.seal_outer(&mut sender, &enc, &encoded_inner, true, None)?;
+        set.inner_msg = serialize_ech_hello(
+            &set.inner_random,
+            Some(&set.session_id),
+            &set.suites_comp,
+            &set.inner_exts,
+        );
+        set.outer_msg = set.serialize_outer_with(&ech_ext, None);
+        Ok((set, sender))
+    }
+
+    /// `computeAndUpdateOuterECHExtension` (ech.go:418-449): seal the encoded
+    /// inner against the placeholder outer serialization. `include_enc`
+    /// mirrors upstream's `useKey` — the HRR second flight omits the
+    /// encapsulated key.
+    fn seal_outer(
+        &self,
+        sender: &mut ech::HpkeSender,
+        enc: &[u8],
+        encoded_inner: &[u8],
+        include_enc: bool,
+        cookie: Option<&[u8]>,
+    ) -> Result<Vec<u8>> {
+        ech::compute_outer_ech_ext(
+            sender,
+            self.config_id,
+            self.kdf_id,
+            self.aead_id,
+            enc,
+            encoded_inner,
+            include_enc,
+            |placeholder| self.serialize_outer_with(placeholder, cookie)[4..].to_vec(),
+        )
+    }
+
+    /// The full outer hello with the given `encrypted_client_hello`
+    /// extension body (placeholder or final) at the canonical slot after
+    /// `scts`, optionally carrying an HRR cookie.
+    fn serialize_outer_with(&self, ech_ext: &[u8], cookie: Option<&[u8]>) -> Vec<u8> {
+        let mut exts = self.outer_exts.clone();
+        if let Some(cookie) = cookie {
+            ech_insert_cookie(&mut exts, cookie);
+        }
+        // The ECH extension sits right after scts (0x0012), the fork's
+        // marshal position (handshake_messages.go:163-170).
+        let pos = exts
+            .iter()
+            .position(|(t, _)| *t == EXT_SCTS)
+            .map(|i| i + 1)
+            .unwrap_or(exts.len());
+        exts.insert(
+            pos,
+            (ech::EXTENSION_ENCRYPTED_CLIENT_HELLO, ech_ext.to_vec()),
+        );
+        serialize_ech_hello(
+            &self.outer_random,
+            Some(&self.session_id),
+            &self.suites_comp,
+            &exts,
+        )
+    }
+
+    /// The HRR second flight (`processHelloRetryRequest`,
+    /// handshake_client_tls13.go:231-405): on acceptance the inner gains the
+    /// cookie, is re-encoded and re-sealed WITHOUT the encapsulated key, and
+    /// the transcript gains the second inner; on rejection the second hello
+    /// is the outer one with the cookie and the FIRST flight's ciphertext
+    /// (upstream re-seals only the accepted path). Returns
+    /// `(inner2_transcript_msg, outer2_wire_msg)`.
+    fn rebuild_after_hrr(
+        &self,
+        sender: &mut ech::HpkeSender,
+        cookie: &[u8],
+        accepted: bool,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        if accepted {
+            let mut inner_exts = self.inner_exts.clone();
+            ech_insert_cookie(&mut inner_exts, cookie);
+            let inner2 = serialize_ech_hello(
+                &self.inner_random,
+                Some(&self.session_id),
+                &self.suites_comp,
+                &inner_exts,
+            );
+            let wire2 =
+                serialize_ech_hello(&self.inner_random, None, &self.suites_comp, &inner_exts);
+            let encoded2 = ech::encode_inner_client_hello(
+                &wire2[4..],
+                Some(&self.inner_sni_bytes),
+                self.max_name_length,
+            );
+            let ech_ext = self.seal_outer(sender, &[], &encoded2, false, None)?;
+            let outer2 = self.serialize_outer_with(&ech_ext, None);
+            Ok((inner2, outer2))
+        } else {
+            // The second outer keeps the first flight's sealed payload;
+            // upstream only adds the cookie (handshake_client_tls13.go:388).
+            let outer2 = self.serialize_outer_with(&self.first_flight_ech_ext(), Some(cookie));
+            Ok((Vec::new(), outer2))
+        }
+    }
+
+    /// The `encrypted_client_hello` body of the first-flight outer hello
+    /// (for the rejection second flight).
+    fn first_flight_ech_ext(&self) -> Vec<u8> {
+        find_hello_ext(&self.outer_msg, ech::EXTENSION_ENCRYPTED_CLIENT_HELLO)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    }
+}
+
+/// Fixed-or-random 32 bytes for the ECH determinism hooks.
+fn ech_fixed_or_rng(fixed: Option<[u8; 32]>) -> [u8; 32] {
+    fixed.unwrap_or_else(|| {
+        let mut v = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut v);
+        v
+    })
+}
+
+/// One full ECH handshake attempt — the TLS 1.3 client handshake of
+/// metacubex/tls `handshake_client_tls13.go` with the `echContext`
+/// branches: outer hello out, ServerHello/HRR in, accept-confirmation
+/// check, transcript rebind on acceptance, outer-mode completion +
+/// `ech_required` alert on rejection.
+async fn ech_attempt(
+    cfg: &EchCfg,
+    selection: &ech::EchConfigSelection,
+    auth: &ServerAuth,
+    transport: BoxProxyStream,
+) -> std::result::Result<Tls13Stream, EchAttemptError> {
+    let fatal = EchAttemptError::Fatal;
+    let mut t = transport;
+
+    let (set, mut hpke) = {
+        let inner_random = ech_fixed_or_rng(cfg.ech.inner_random);
+        let outer_random = ech_fixed_or_rng(cfg.ech.outer_random);
+        let session_id = ech_fixed_or_rng(cfg.ech.session_id);
+        let x25519_secret = ech_fixed_or_rng(cfg.ech.x25519_secret);
+        let hpke_secret = ech_fixed_or_rng(cfg.ech.hpke_secret);
+        match EchHelloSet::build(
+            cfg,
+            selection,
+            inner_random,
+            outer_random,
+            session_id,
+            x25519_secret,
+            &hpke_secret,
+        ) {
+            Ok(v) => v,
+            Err(e) => return Err(fatal(e)),
+        }
+    };
+
+    t.write_all(&super::profiles::client_hello_record(&set.outer_msg))
+        .await
+        .map_err(|e| fatal(e.into()))?;
+
+    let mut pending = Vec::new();
+    let mut ccs = 0u8;
+    let mut ccs_sent = false;
+
+    let (typ, sh_raw) = next_plaintext_handshake(&mut t, &mut pending, &mut ccs)
+        .await
+        .map_err(fatal)?;
+    if typ != HS_SERVER_HELLO {
+        return Err(fatal(Error::protocol(format!(
+            "tls13: expected a ServerHello, got handshake type {typ}"
+        ))));
+    }
+    let mut sh = parse_server_hello_ech(&sh_raw).map_err(fatal)?;
+    // `checkServerHelloOrHRR`: the server must echo the outer session id
+    // (handshake_client_tls13.go:192-195).
+    let suite = match CipherSuite::from_id(sh.cipher_suite) {
+        Some(s) => s,
+        None => {
+            return Err(fatal(Error::protocol(format!(
+                "tls: server chose an unconfigured cipher suite {:#06x}",
+                sh.cipher_suite
+            ))));
+        }
+    };
+
+    let mut outer_transcript = Transcript::new(suite.hash());
+    outer_transcript.update(&set.outer_msg);
+    let mut inner_transcript = Transcript::new(suite.hash());
+    inner_transcript.update(&set.inner_msg);
+
+    // HelloRetryRequest flight (handshake_client_tls13.go:244-405).
+    let mut sh_raw = sh_raw;
+    if sh.is_hrr {
+        // sendDummyChangeCipherSpec happens right after the HRR.
+        t.write_all(&[RECORD_CCS, 0x03, 0x03, 0x00, 0x01, 0x01])
+            .await
+            .map_err(|e| fatal(e.into()))?;
+        ccs_sent = true;
+
+        // Both transcripts fold to a message_hash FIRST
+        // (handshake_client_tls13.go:238-253); the HRR confirmation is then
+        // computed over the folded inner transcript (cloneHash there, the
+        // clone inside `ech_hrr_confirmation` here).
+        outer_transcript = outer_transcript.fold_message_hash();
+        inner_transcript = inner_transcript.fold_message_hash();
+
+        let mut hrr_accepted = false;
+        if let Some(value) = sh.ech_ext.clone() {
+            if value.len() != 8 {
+                return Err(fatal(Error::protocol(
+                    "tls: malformed encrypted client hello extension",
+                )));
+            }
+            let conf = ech_hrr_confirmation(
+                suite.hash(),
+                &inner_transcript,
+                &sh_raw,
+                &value,
+                &set.inner_random,
+            )
+            .map_err(fatal)?;
+            hrr_accepted =
+                ech::confirmation_matches(&conf, value.as_slice().try_into().expect("8 bytes"));
+        }
+
+        inner_transcript.update(&sh_raw);
+        outer_transcript.update(&sh_raw);
+
+        // The only HRR requests we can honour are cookies: our key share is
+        // always X25519 (handshake_client_tls13.go:287-318).
+        if sh.selected_group.is_none() && sh.cookie.is_none() {
+            return Err(fatal(Error::protocol(
+                "tls: server sent an unnecessary HelloRetryRequest message",
+            )));
+        }
+        if let Some(group) = sh.selected_group {
+            if group == GROUP_X25519 {
+                return Err(fatal(Error::protocol(
+                    "tls: server sent an unnecessary HelloRetryRequest key_share",
+                )));
+            }
+            // Only X25519 shares can be generated by this stack.
+            return Err(fatal(Error::protocol(
+                "tls: server selected unsupported group",
+            )));
+        }
+        let cookie = sh.cookie.clone().unwrap_or_default();
+        let (inner2, outer2) = set
+            .rebuild_after_hrr(&mut hpke, &cookie, hrr_accepted)
+            .map_err(fatal)?;
+        if hrr_accepted {
+            inner_transcript.update(&inner2);
+        }
+        t.write_all(&super::profiles::client_hello_record(&outer2))
+            .await
+            .map_err(|e| fatal(e.into()))?;
+        outer_transcript.update(&outer2);
+
+        // The second ServerHello.
+        let (typ, second_raw) = next_plaintext_handshake(&mut t, &mut pending, &mut ccs)
+            .await
+            .map_err(fatal)?;
+        if typ != HS_SERVER_HELLO {
+            return Err(fatal(Error::protocol(format!(
+                "tls13: expected a ServerHello, got handshake type {typ}"
+            ))));
+        }
+        sh = parse_server_hello_ech(&second_raw).map_err(fatal)?;
+        if sh.is_hrr {
+            return Err(fatal(Error::protocol(
+                "tls: server sent two HelloRetryRequest messages",
+            )));
+        }
+        if sh.cipher_suite != suite.id() {
+            return Err(fatal(Error::protocol(
+                "tls: server changed cipher suite after a HelloRetryRequest",
+            )));
+        }
+        sh_raw = second_raw;
+    }
+    if sh.session_id != set.session_id {
+        return Err(fatal(Error::protocol(
+            "tls: server did not echo the legacy session ID",
+        )));
+    }
+
+    // Accept confirmation: the last 8 bytes of the ServerHello random
+    // (handshake_client_tls13.go:86-116). On a match the ACTIVE transcript
+    // rebinds to the inner one; otherwise the handshake runs to completion
+    // in outer mode and fails as a rejection.
+    let random_last8: [u8; 8] = sh_raw[30..38]
+        .try_into()
+        .map_err(|_| fatal(Error::protocol("tls13: short ServerHello random")))?;
+    let conf = ech_accept_confirmation(suite.hash(), &inner_transcript, &sh_raw, &set.inner_random)
+        .map_err(fatal)?;
+    let accepted = ech::confirmation_matches(&conf, &random_last8);
+    let mut transcript = outer_transcript;
+    if accepted {
+        if sh.ech_ext.is_some() {
+            return Err(fatal(Error::protocol(
+                "tls: unexpected encrypted client hello extension in server hello despite ECH being accepted",
+            )));
+        }
+        transcript = inner_transcript;
+    }
+    transcript.update(&sh_raw);
+
+    let shared = x25519(&set.x25519_secret, &sh.share).map_err(fatal)?;
+    let secrets = handshake_secrets(suite, &shared, &transcript.hash()).map_err(fatal)?;
+    let mut read_key = RecordProtector::new(&traffic_keys(suite, &secrets.s_hs)?).map_err(fatal)?;
+    let mut write_key =
+        RecordProtector::new(&traffic_keys(suite, &secrets.c_hs)?).map_err(fatal)?;
+
+    if !ccs_sent {
+        t.write_all(&[RECORD_CCS, 0x03, 0x03, 0x00, 0x01, 0x01])
+            .await
+            .map_err(|e| fatal(e.into()))?;
+    }
+
+    let (typ, ee_raw) = next_encrypted_handshake(&mut t, &mut read_key, &mut pending, &mut ccs)
+        .await
+        .map_err(fatal)?;
+    if typ != HS_ENCRYPTED_EXTENSIONS {
+        return Err(fatal(Error::protocol(format!(
+            "tls13: expected EncryptedExtensions, got handshake type {typ}"
+        ))));
+    }
+    let retry_configs = ee_retry_configs(&ee_raw).map_err(fatal)?;
+    if retry_configs.is_some() && accepted {
+        return Err(fatal(Error::protocol(
+            "tls: server sent encrypted client hello retry configs after accepting encrypted client hello",
+        )));
+    }
+    transcript.update(&ee_raw);
+    let alpn = parse_encrypted_extensions(&ee_raw).map_err(fatal)?;
+
+    let (typ, cert_raw) = next_encrypted_handshake(&mut t, &mut read_key, &mut pending, &mut ccs)
+        .await
+        .map_err(fatal)?;
+    if typ != HS_CERTIFICATE {
+        return Err(fatal(Error::protocol(format!(
+            "tls13: expected Certificate, got handshake type {typ}"
+        ))));
+    }
+    transcript.update(&cert_raw);
+    let chain = parse_certificate(&cert_raw).map_err(fatal)?;
+    let leaf = chain.first().cloned().unwrap_or_default();
+
+    let (typ, cv_raw) = next_encrypted_handshake(&mut t, &mut read_key, &mut pending, &mut ccs)
+        .await
+        .map_err(fatal)?;
+    if typ != HS_CERTIFICATE_VERIFY {
+        return Err(fatal(Error::protocol(format!(
+            "tls13: expected CertificateVerify, got handshake type {typ}"
+        ))));
+    }
+    let hash_at_cert = transcript.hash();
+    transcript.update(&cv_raw);
+    verify_certificate_verify(cv_raw.get(4..).unwrap_or_default(), &leaf, &hash_at_cert)
+        .map_err(fatal)?;
+
+    // Server authentication: on acceptance the INNER name (the rebind of
+    // `c.serverName` to `config.ServerName`,
+    // handshake_client_tls13.go:99-100); on rejection the PUBLIC name with
+    // the caller's callback skipped — the `echRejected` branch of
+    // `verifyServerCertificate` (handshake_client.go:1081-1145).
+    let cert_verified = if accepted {
+        match auth {
+            ServerAuth::AcceptAny => true,
+            ServerAuth::WebPki { roots, .. } => {
+                verify_chain_webpki(roots, &cfg.server_name, &chain).map_err(fatal)?;
+                true
+            }
+            ServerAuth::Callback(check) => check(&leaf).map_err(fatal)?,
+        }
+    } else {
+        match auth {
+            ServerAuth::AcceptAny => true,
+            ServerAuth::WebPki { roots, .. } => {
+                verify_chain_webpki(roots, &set.public_name, &chain).map_err(fatal)?;
+                true
+            }
+            ServerAuth::Callback(_) => false,
+        }
+    };
+
+    let (typ, fin_raw) = next_encrypted_handshake(&mut t, &mut read_key, &mut pending, &mut ccs)
+        .await
+        .map_err(fatal)?;
+    if typ != HS_FINISHED {
+        return Err(fatal(Error::protocol(format!(
+            "tls13: expected Finished, got handshake type {typ}"
+        ))));
+    }
+    let hash_at_cv = transcript.hash();
+    verify_finished(
+        suite.hash(),
+        &finished_key(suite.hash(), &secrets.s_hs).map_err(fatal)?,
+        &hash_at_cv,
+        fin_raw.get(4..).unwrap_or_default(),
+    )
+    .map_err(fatal)?;
+    transcript.update(&fin_raw);
+
+    // Client Finished over the active (inner-on-accept) transcript.
+    let verify_data = finished_verify_data(
+        suite.hash(),
+        &finished_key(suite.hash(), &secrets.c_hs).map_err(fatal)?,
+        &transcript.hash(),
+    )
+    .map_err(fatal)?;
+    let record = write_key
+        .seal(RECORD_HANDSHAKE, &hs_message(HS_FINISHED, &verify_data))
+        .map_err(fatal)?;
+    t.write_all(&record).await.map_err(|e| fatal(e.into()))?;
+
+    let hash_at_sfin = transcript.hash();
+    let (c_ap, s_ap) =
+        application_secrets(suite.hash(), &secrets.master, &hash_at_sfin).map_err(fatal)?;
+    let read_key = RecordProtector::new(&traffic_keys(suite, &s_ap)?).map_err(fatal)?;
+    let write_key = RecordProtector::new(&traffic_keys(suite, &c_ap)?).map_err(fatal)?;
+
+    if !accepted {
+        // The handshake completed in outer mode; end it the upstream way —
+        // alert `ech_required`, then `ECHRejectionError` with the retry
+        // configs (handshake_client_tls13.go:151-153, ech.go:486-492).
+        let _ = t
+            .write_all(&[
+                RECORD_ALERT,
+                0x03,
+                0x03,
+                0x00,
+                0x02,
+                0x02,
+                ALERT_ECH_REQUIRED,
+            ])
+            .await;
+        return Err(EchAttemptError::Rejected {
+            retry_configs: retry_configs.unwrap_or_default(),
+        });
+    }
+
+    Ok(Tls13Stream {
+        inner: t,
+        read_secret: s_ap,
+        write_secret: c_ap,
+        read_key,
+        write_key,
+        suite,
+        alpn,
+        cert_verified,
+        plain: Vec::new(),
+        rec: Vec::new(),
+        out: Vec::new(),
+        out_plain: 0,
+        ctl: Vec::new(),
+        peer_ccs: ccs,
+        key_updates: 0,
+        eof: false,
+        close_notify_sent: false,
+        read_spliced: false,
+        write_spliced: false,
+        splice_prefix: Vec::new(),
+    })
 }
 
 impl std::fmt::Debug for Tls13Stream {
@@ -1593,7 +2754,9 @@ impl Tls13Stream {
     /// Queue a `KeyUpdate(update_not_requested)` reply and rotate the write
     /// key after sealing it (RFC 8446 §4.6.3).
     fn queue_key_update_reply(&mut self) -> Result<()> {
-        let record = self.write_key.seal(RECORD_HANDSHAKE, &hs_message(HS_KEY_UPDATE, &[0x00]))?;
+        let record = self
+            .write_key
+            .seal(RECORD_HANDSHAKE, &hs_message(HS_KEY_UPDATE, &[0x00]))?;
         self.ctl.extend_from_slice(&record);
         self.write_secret = next_traffic_secret(self.suite.hash(), &self.write_secret)?;
         self.write_key = RecordProtector::new(&traffic_keys(self.suite, &self.write_secret)?)?;
@@ -1654,7 +2817,7 @@ impl Tls13Stream {
                                 other => {
                                     return Err(Error::protocol(format!(
                                         "tls13: unexpected post-handshake message {other}"
-                                    )))
+                                    )));
                                 }
                             }
                         }
@@ -1672,14 +2835,14 @@ impl Tls13Stream {
                     other => {
                         return Err(Error::protocol(format!(
                             "tls13: unexpected inner content type {other}"
-                        )))
+                        )));
                     }
                 }
             }
             other => {
                 return Err(Error::protocol(format!(
                     "tls13: unexpected record type {other}"
-                )))
+                )));
             }
         }
         Ok(())
@@ -1844,8 +3007,10 @@ pub(crate) mod test_server {
         pub(crate) cipher_suites: Vec<u16>,
     }
 
-    fn parse_client_hello(raw: &[u8]) -> Result<ClientHelloInfo> {
-        let b = raw.get(4..).ok_or_else(|| Error::protocol("test server: short hello"))?;
+    pub(crate) fn parse_client_hello(raw: &[u8]) -> Result<ClientHelloInfo> {
+        let b = raw
+            .get(4..)
+            .ok_or_else(|| Error::protocol("test server: short hello"))?;
         let random: [u8; 32] = b[2..34].try_into().unwrap();
         let sid_len = b[34] as usize;
         let session_id = b[35..35 + sid_len].to_vec();
@@ -2090,12 +3255,514 @@ pub(crate) mod test_server {
         out.extend_from_slice(body);
         out
     }
+
+    // ------------------------------------------------ ECH termination ----
+    //
+    // A test peer that terminates ECH the way metacubex/tls's server does
+    // (handshake_server.go + ech.go:550-655): HPKE-open the outer payload
+    // with the server's private key, reconstruct the transcript-form inner
+    // hello, answer with a confirmation-carrying ServerHello, and complete
+    // the handshake against the INNER transcript. The reject/HRR modes
+    // cover the other upstream shapes.
+
+    /// A server-side ECH key: the X25519 private half plus the
+    /// ECHConfigList wire bytes advertising its public half (mihomo
+    /// `component/ech/key.go`).
+    pub(crate) struct EchServerKey {
+        pub(crate) sk_r: [u8; 32],
+        pub(crate) config_list: Vec<u8>,
+    }
+
+    /// Deterministic server key: `derive_key_pair_x25519(seed)` for the
+    /// private half, one X25519/HKDF-SHA256 config with both AES AEADs.
+    pub(crate) fn ech_server_key(seed: &[u8], config_id: u8, public_name: &[u8]) -> EchServerKey {
+        let sk = ech::derive_key_pair_x25519(seed);
+        let pk = curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(sk).0;
+        let mut body = Vec::new();
+        body.push(config_id);
+        body.extend_from_slice(&ech::KEM_DH_X25519_HKDF_SHA256.to_be_bytes());
+        body.extend_from_slice(&32u16.to_be_bytes());
+        body.extend_from_slice(&pk);
+        let suites = [
+            (ech::KDF_HKDF_SHA256, ech::AEAD_AES_128_GCM),
+            (ech::KDF_HKDF_SHA256, ech::AEAD_AES_256_GCM),
+        ];
+        body.extend_from_slice(&((suites.len() * 4) as u16).to_be_bytes());
+        for (kdf, aead) in suites {
+            body.extend_from_slice(&kdf.to_be_bytes());
+            body.extend_from_slice(&aead.to_be_bytes());
+        }
+        body.push(0x20); // max_name_length
+        body.push(public_name.len() as u8);
+        body.extend_from_slice(public_name);
+        body.extend_from_slice(&0u16.to_be_bytes()); // no config extensions
+        let mut list = Vec::with_capacity(6 + body.len());
+        list.extend_from_slice(&((4 + body.len()) as u16).to_be_bytes());
+        list.extend_from_slice(&ech::EXTENSION_ENCRYPTED_CLIENT_HELLO.to_be_bytes());
+        list.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        list.extend_from_slice(&body);
+        EchServerKey {
+            sk_r: sk,
+            config_list: list,
+        }
+    }
+
+    /// How the ECH test server answers.
+    pub(crate) enum EchServerMode {
+        /// Terminate ECH: confirmation in the ServerHello random.
+        Accept,
+        /// Complete the handshake against the OUTER hello; put the retry
+        /// ECHConfigList (when given) into EncryptedExtensions.
+        Reject { retry_configs: Option<Vec<u8>> },
+        /// HelloRetryRequest first (with a cookie): the 8-byte ECH extension
+        /// carries a valid hrr confirmation (`accept == true`) or zeros.
+        Hrr {
+            accept: bool,
+            retry_configs: Option<Vec<u8>>,
+        },
+    }
+
+    /// What the ECH test server saw.
+    pub(crate) struct EchServerObserved {
+        /// The outer ClientHello (public SNI, ECH payload).
+        pub(crate) outer: ClientHelloInfo,
+        /// The reconstructed transcript-form inner hello (accept modes).
+        pub(crate) inner: Option<ClientHelloInfo>,
+    }
+
+    /// Find one extension body in a handshake message's extension block.
+    pub(crate) fn find_ext_body(msg: &[u8], want: u16) -> Result<Option<Vec<u8>>> {
+        find_hello_ext(msg, want)
+    }
+
+    /// The HPKE-open of one outer hello's ECH payload (the trial-decryption
+    /// loop of `processECHClientHello`, ech.go:550-620, for one key).
+    /// Returns the reconstructed transcript-form inner hello.
+    pub(crate) fn open_ech_hello(
+        ch_raw: &[u8],
+        recipient: &mut ech::HpkeSender,
+    ) -> Result<Vec<u8>> {
+        let ext_body = find_ext_body(ch_raw, ech::EXTENSION_ENCRYPTED_CLIENT_HELLO)?
+            .ok_or_else(|| Error::protocol("test ech server: no ECH extension"))?;
+        let payload = match ech::parse_ech_ext(&ext_body)? {
+            ech::EchExt::Inner => {
+                return Err(Error::protocol("test ech server: inner marker on the wire"));
+            }
+            ech::EchExt::Outer { payload, .. } => payload,
+        };
+        // decryptECHPayload (ech.go:401-405): AAD = hello[4..] with the
+        // payload's first occurrence zeroed.
+        let body = &ch_raw[4..];
+        let pos = body
+            .windows(payload.len())
+            .position(|w| w == payload.as_slice())
+            .ok_or_else(|| Error::protocol("test ech server: payload not in hello"))?;
+        let mut aad = body.to_vec();
+        aad[pos..pos + payload.len()].fill(0);
+        let encoded = recipient.open(&aad, &payload)?;
+        ech::decode_inner_client_hello(ch_raw, &encoded)
+    }
+
+    /// Build the recipient for an outer hello's `enc` (NewRecipient +
+    /// decap, ech.go:607-613): decap with the server key and the key
+    /// schedule over the config's `info`.
+    fn ech_recipient(key: &EchServerKey, enc: &[u8], aead_id: u16) -> Result<ech::HpkeSender> {
+        let enc: [u8; 32] = enc
+            .try_into()
+            .map_err(|_| Error::protocol("test ech server: enc is not 32 bytes"))?;
+        let configs = ech::parse_ech_config_list(&key.config_list)?;
+        let config = &configs[0];
+        let aead = ech::HpkeAead::from_id(aead_id)
+            .ok_or_else(|| Error::protocol("test ech server: unsupported aead"))?;
+        let shared = ech::hpke_decap(&key.sk_r, &enc)?;
+        ech::HpkeSender::from_shared_secret(&shared, aead, &ech::ech_hpke_info(config))
+    }
+
+    /// The server flight from the (already CH-seeded) transcript on:
+    /// ServerHello (with the accept confirmation patched into random[24..32]
+    /// when `inner_random` is given), EncryptedExtensions (echoing ALPN,
+    /// plus the retry list when given), Certificate/CertificateVerify/
+    /// Finished, then the client Finished — the tail of
+    /// `test_server::accept` parameterized on the ECH pieces.
+    #[allow(clippy::too_many_arguments)]
+    async fn ech_server_flight(
+        transport: BoxProxyStream,
+        mut pending: Vec<u8>,
+        mut ccs: u8,
+        suite: CipherSuite,
+        transcript: &mut Transcript,
+        hello: &ClientHelloInfo,
+        inner_random: Option<&[u8; 32]>,
+        choose_cert: impl FnOnce(
+            &ClientHelloInfo,
+        ) -> Result<(Vec<u8>, Arc<dyn rustls::sign::SigningKey>)>,
+        retry_configs: Option<Vec<u8>>,
+    ) -> Result<Tls13Stream> {
+        let mut t = transport;
+        let mut server_random = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut server_random);
+        let (server_secret, server_public) = x25519_keygen();
+        let shared = x25519(&server_secret, &hello.x25519_share)?;
+
+        let mut sh_body = Vec::with_capacity(96);
+        sh_body.extend_from_slice(&VERSION_TLS12.to_be_bytes());
+        sh_body.extend_from_slice(&server_random);
+        sh_body.push(hello.session_id.len() as u8);
+        sh_body.extend_from_slice(&hello.session_id);
+        sh_body.extend_from_slice(&suite.id().to_be_bytes());
+        sh_body.push(0x00);
+        let mut sh_exts = Vec::new();
+        sh_exts.extend_from_slice(&ext(EXT_SUPPORTED_VERSIONS, &VERSION_TLS13.to_be_bytes()));
+        let mut ks = Vec::new();
+        ks.extend_from_slice(&GROUP_X25519.to_be_bytes());
+        ks.extend_from_slice(&32u16.to_be_bytes());
+        ks.extend_from_slice(&server_public);
+        sh_exts.extend_from_slice(&ext(EXT_KEY_SHARE, &ks));
+        if let Some(first) = hello.alpn.first() {
+            let mut list = vec![first.len() as u8];
+            list.extend_from_slice(first.as_bytes());
+            let mut body = Vec::new();
+            body.extend_from_slice(&(list.len() as u16).to_be_bytes());
+            body.extend_from_slice(&list);
+            sh_exts.extend_from_slice(&ext(EXT_ALPN, &body));
+        }
+        sh_body.extend_from_slice(&(sh_exts.len() as u16).to_be_bytes());
+        sh_body.extend_from_slice(&sh_exts);
+        let mut sh_raw = hs_message(HS_SERVER_HELLO, &sh_body);
+
+        if let Some(inner_random) = inner_random {
+            // Patch the accept confirmation into random[24..32] — the client
+            // computes it over this very SH with the slot zeroed
+            // (handshake_client_tls13.go:86-98, mirrored on the server side).
+            let conf = ech_accept_confirmation(suite.hash(), transcript, &sh_raw, inner_random)?;
+            sh_raw[30..38].copy_from_slice(&conf);
+        }
+
+        transcript.update(&sh_raw);
+        t.write_all(&super::super::profiles::client_hello_record(&sh_raw))
+            .await?;
+
+        let secrets = handshake_secrets(suite, &shared, &transcript.hash())?;
+        let mut read_key = RecordProtector::new(&traffic_keys(suite, &secrets.c_hs)?)?;
+        let mut write_key = RecordProtector::new(&traffic_keys(suite, &secrets.s_hs)?)?;
+
+        // EncryptedExtensions: ALPN echo + the ECH retry list.
+        let mut ee_exts = Vec::new();
+        if let Some(first) = hello.alpn.first() {
+            let mut list = vec![first.len() as u8];
+            list.extend_from_slice(first.as_bytes());
+            let mut body = Vec::new();
+            body.extend_from_slice(&(list.len() as u16).to_be_bytes());
+            body.extend_from_slice(&list);
+            ee_exts.extend_from_slice(&ext(EXT_ALPN, &body));
+        }
+        if let Some(retry) = &retry_configs {
+            ee_exts.extend_from_slice(&ext(ech::EXTENSION_ENCRYPTED_CLIENT_HELLO, retry));
+        }
+        let mut ee_body = Vec::new();
+        ee_body.extend_from_slice(&(ee_exts.len() as u16).to_be_bytes());
+        ee_body.extend_from_slice(&ee_exts);
+        let ee_raw = hs_message(HS_ENCRYPTED_EXTENSIONS, &ee_body);
+        transcript.update(&ee_raw);
+
+        let (cert_der, signing_key) = choose_cert(hello)?;
+        let mut cert_body = vec![0x00];
+        let mut list = Vec::new();
+        list.push((cert_der.len() >> 16) as u8);
+        list.push((cert_der.len() >> 8) as u8);
+        list.push(cert_der.len() as u8);
+        list.extend_from_slice(&cert_der);
+        list.extend_from_slice(&0u16.to_be_bytes());
+        cert_body.extend_from_slice(&(list.len() as u32).to_be_bytes()[1..]);
+        cert_body.extend_from_slice(&list);
+        let cert_raw = hs_message(HS_CERTIFICATE, &cert_body);
+        transcript.update(&cert_raw);
+
+        let signer = signing_key
+            .choose_scheme(&[
+                rustls::SignatureScheme::ED25519,
+                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            ])
+            .ok_or_else(|| Error::protocol("test server: no usable signing scheme"))?;
+        let mut message = Vec::new();
+        message.extend_from_slice(&[0x20u8; 64]);
+        message.extend_from_slice(SERVER_SIGNATURE_CONTEXT);
+        message.push(0x00);
+        message.extend_from_slice(&transcript.hash());
+        let sig = signer
+            .sign(&message)
+            .map_err(|e| Error::crypto(format!("test server: sign failed: {e}")))?;
+        let mut cv_body = Vec::new();
+        cv_body.extend_from_slice(&u16::from(signer.scheme()).to_be_bytes());
+        cv_body.extend_from_slice(&(sig.len() as u16).to_be_bytes());
+        cv_body.extend_from_slice(&sig);
+        let cv_raw = hs_message(HS_CERTIFICATE_VERIFY, &cv_body);
+        transcript.update(&cv_raw);
+
+        let server_fin = finished_verify_data(
+            suite.hash(),
+            &finished_key(suite.hash(), &secrets.s_hs)?,
+            &transcript.hash(),
+        )?;
+        let fin_raw = hs_message(HS_FINISHED, &server_fin);
+        transcript.update(&fin_raw);
+
+        let mut flight = Vec::new();
+        flight.extend_from_slice(&write_key.seal(RECORD_HANDSHAKE, &ee_raw)?);
+        flight.extend_from_slice(&write_key.seal(RECORD_HANDSHAKE, &cert_raw)?);
+        flight.extend_from_slice(&write_key.seal(RECORD_HANDSHAKE, &cv_raw)?);
+        flight.extend_from_slice(&write_key.seal(RECORD_HANDSHAKE, &fin_raw)?);
+        t.write_all(&flight).await?;
+
+        let (typ, cfin_raw) =
+            next_encrypted_handshake(&mut t, &mut read_key, &mut pending, &mut ccs).await?;
+        if typ != HS_FINISHED {
+            return Err(Error::protocol("test server: expected the client Finished"));
+        }
+        verify_finished(
+            suite.hash(),
+            &finished_key(suite.hash(), &secrets.c_hs)?,
+            &transcript.hash(),
+            cfin_raw.get(4..).unwrap_or_default(),
+        )?;
+
+        let (c_ap, s_ap) = application_secrets(suite.hash(), &secrets.master, &transcript.hash())?;
+        let read_key = RecordProtector::new(&traffic_keys(suite, &c_ap)?)?;
+        let write_key = RecordProtector::new(&traffic_keys(suite, &s_ap)?)?;
+        drop(pending);
+        Ok(Tls13Stream {
+            inner: t,
+            suite,
+            read_secret: c_ap,
+            write_secret: s_ap,
+            read_key,
+            write_key,
+            alpn: hello.alpn.first().map(|p| p.as_bytes().to_vec()),
+            cert_verified: true,
+            plain: Vec::new(),
+            rec: Vec::new(),
+            out: Vec::new(),
+            out_plain: 0,
+            ctl: Vec::new(),
+            peer_ccs: ccs,
+            key_updates: 0,
+            eof: false,
+            close_notify_sent: false,
+            read_spliced: false,
+            write_spliced: false,
+            splice_prefix: Vec::new(),
+        })
+    }
+
+    /// Terminate (or reject) an ECH handshake as the test peer.
+    pub(crate) async fn accept_ech(
+        transport: BoxProxyStream,
+        suite: CipherSuite,
+        key: &EchServerKey,
+        mode: EchServerMode,
+        choose_cert: impl FnOnce(
+            &ClientHelloInfo,
+        ) -> Result<(Vec<u8>, Arc<dyn rustls::sign::SigningKey>)>,
+    ) -> Result<(Tls13Stream, EchServerObserved)> {
+        let mut t = transport;
+        let mut pending = Vec::new();
+        let mut ccs = 0u8;
+        let (typ, ch1_raw) = next_plaintext_handshake(&mut t, &mut pending, &mut ccs).await?;
+        if typ != HS_CLIENT_HELLO {
+            return Err(Error::protocol("test ech server: expected a ClientHello"));
+        }
+        let outer = parse_client_hello(&ch1_raw)?;
+        if !outer.cipher_suites.contains(&suite.id()) {
+            return Err(Error::protocol("test ech server: suite not offered"));
+        }
+
+        // Trial-open the ECH payload (ech.go:550-620): a failed open with
+        // this key means the reject modes fall back to the outer hello.
+        let mut recipient = None;
+        if let Some(ext_body) = find_ext_body(&ch1_raw, ech::EXTENSION_ENCRYPTED_CLIENT_HELLO)? {
+            if let ech::EchExt::Outer {
+                kdf_id: _,
+                aead_id,
+                config_id: _,
+                enc,
+                payload: _,
+            } = ech::parse_ech_ext(&ext_body)?
+            {
+                if let Ok(mut r) = ech_recipient(key, &enc, aead_id) {
+                    if let Ok(inner_msg) = open_ech_hello(&ch1_raw, &mut r) {
+                        recipient = Some((r, inner_msg));
+                    }
+                }
+            }
+        }
+
+        match mode {
+            EchServerMode::Accept => {
+                let (_recipient, inner_msg) = recipient.ok_or_else(|| {
+                    Error::protocol("test ech server: could not open the ECH payload")
+                })?;
+                let inner = parse_client_hello(&inner_msg)?;
+                let inner_random = inner.random;
+                let mut transcript = Transcript::new(suite.hash());
+                transcript.update(&inner_msg);
+                let stream = ech_server_flight(
+                    t,
+                    pending,
+                    ccs,
+                    suite,
+                    &mut transcript,
+                    &inner,
+                    Some(&inner_random),
+                    choose_cert,
+                    None,
+                )
+                .await?;
+                Ok((
+                    stream,
+                    EchServerObserved {
+                        outer,
+                        inner: Some(inner),
+                    },
+                ))
+            }
+            EchServerMode::Reject { retry_configs } => {
+                let mut transcript = Transcript::new(suite.hash());
+                transcript.update(&ch1_raw);
+                let stream = ech_server_flight(
+                    t,
+                    pending,
+                    ccs,
+                    suite,
+                    &mut transcript,
+                    &outer,
+                    None,
+                    choose_cert,
+                    retry_configs,
+                )
+                .await?;
+                Ok((stream, EchServerObserved { outer, inner: None }))
+            }
+            EchServerMode::Hrr {
+                accept,
+                retry_configs,
+            } => {
+                // The HRR needs the inner random for its confirmation, and
+                // the accept path needs the recipient context (whose HPKE
+                // sequence advanced past the first open) for the second one.
+                let (mut recipient, inner1_msg) = recipient.ok_or_else(|| {
+                    Error::protocol("test ech server: could not open the ECH payload")
+                })?;
+                let inner1 = parse_client_hello(&inner1_msg)?;
+                let cookie: Vec<u8> = (0..16u8).collect();
+                // HRR with the ECH extension value zeroed first, then the
+                // confirmation patched in (the mirror of the client's
+                // zeroing, handshake_client_tls13.go:262-269).
+                let mut hrr_exts = Vec::new();
+                hrr_exts
+                    .extend_from_slice(&ext(EXT_SUPPORTED_VERSIONS, &VERSION_TLS13.to_be_bytes()));
+                hrr_exts.extend_from_slice(&ext(EXT_COOKIE, &cookie));
+                hrr_exts.extend_from_slice(&ext(ech::EXTENSION_ENCRYPTED_CLIENT_HELLO, &[0u8; 8]));
+                let mut hrr_body = Vec::new();
+                hrr_body.extend_from_slice(&VERSION_TLS12.to_be_bytes());
+                hrr_body.extend_from_slice(&HRR_RANDOM);
+                hrr_body.push(outer.session_id.len() as u8);
+                hrr_body.extend_from_slice(&outer.session_id);
+                hrr_body.extend_from_slice(&suite.id().to_be_bytes());
+                hrr_body.push(0x00);
+                hrr_body.extend_from_slice(&(hrr_exts.len() as u16).to_be_bytes());
+                hrr_body.extend_from_slice(&hrr_exts);
+                let mut hrr_raw = hs_message(HS_SERVER_HELLO, &hrr_body);
+                if accept {
+                    let mut folded = Transcript::new(suite.hash());
+                    folded.update(&inner1_msg);
+                    folded = folded.fold_message_hash();
+                    folded.update(&hrr_raw);
+                    let prk = hkdf_extract(suite.hash(), &[], &inner1.random);
+                    let mut conf = [0u8; 8];
+                    suite.hash().hkdf_expand_label(
+                        &prk,
+                        "hrr ech accept confirmation",
+                        &folded.hash(),
+                        &mut conf,
+                    )?;
+                    // Patch into the (single) ECH extension slot: the
+                    // 8-byte body right after the u16 ext length.
+                    let pos = hrr_raw
+                        .windows(2)
+                        .position(|w| w == ech::EXTENSION_ENCRYPTED_CLIENT_HELLO.to_be_bytes())
+                        .expect("the ext was just written");
+                    hrr_raw[pos + 4..pos + 4 + 8].copy_from_slice(&conf);
+                }
+                t.write_all(&super::super::profiles::client_hello_record(&hrr_raw))
+                    .await?;
+
+                // The second ClientHello.
+                let (typ, ch2_raw) =
+                    next_plaintext_handshake(&mut t, &mut pending, &mut ccs).await?;
+                if typ != HS_CLIENT_HELLO {
+                    return Err(Error::protocol(
+                        "test ech server: expected the second ClientHello",
+                    ));
+                }
+                if accept {
+                    // Same HPKE context, sequence 1 (the first open consumed 0).
+                    let inner2_msg = open_ech_hello(&ch2_raw, &mut recipient)?;
+                    let inner2 = parse_client_hello(&inner2_msg)?;
+                    let inner_random = inner2.random;
+                    let mut transcript = Transcript::new(suite.hash());
+                    transcript.update(&inner1_msg);
+                    transcript = transcript.fold_message_hash();
+                    transcript.update(&hrr_raw);
+                    transcript.update(&inner2_msg);
+                    let stream = ech_server_flight(
+                        t,
+                        pending,
+                        ccs,
+                        suite,
+                        &mut transcript,
+                        &inner2,
+                        Some(&inner_random),
+                        choose_cert,
+                        None,
+                    )
+                    .await?;
+                    Ok((
+                        stream,
+                        EchServerObserved {
+                            outer,
+                            inner: Some(inner2),
+                        },
+                    ))
+                } else {
+                    let mut transcript = Transcript::new(suite.hash());
+                    transcript.update(&ch1_raw);
+                    transcript = transcript.fold_message_hash();
+                    transcript.update(&hrr_raw);
+                    transcript.update(&ch2_raw);
+                    let outer2 = parse_client_hello(&ch2_raw)?;
+                    let stream = ech_server_flight(
+                        t,
+                        pending,
+                        ccs,
+                        suite,
+                        &mut transcript,
+                        &outer2,
+                        None,
+                        choose_cert,
+                        retry_configs,
+                    )
+                    .await?;
+                    Ok((stream, EchServerObserved { outer, inner: None }))
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::reality::profiles::{build_client_hello, UtslProfile};
+    use crate::proto::reality::profiles::{UtslProfile, build_client_hello};
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::AsyncWriteExt;
 
@@ -2156,8 +3823,8 @@ mod tests {
 
         // The master secret, then the client application traffic secret.
         let empty_hash: [u8; 32] = Sha256::digest([]).into();
-        let derived2 = derive_secret(HashKind::Sha256, &handshake_secret, "derived", &empty_hash)
-            .unwrap();
+        let derived2 =
+            derive_secret(HashKind::Sha256, &handshake_secret, "derived", &empty_hash).unwrap();
         let master = hkdf_extract(HashKind::Sha256, &derived2, &[0u8; 32]);
         assert_eq!(
             master.to_vec(),
@@ -2186,7 +3853,12 @@ mod tests {
             iv: [0xa5; 12],
         };
         let mut p = RecordProtector::new(&keys).unwrap();
-        assert_eq!(p.nonce(), [0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5]);
+        assert_eq!(
+            p.nonce(),
+            [
+                0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5
+            ]
+        );
         p.seq = 1;
         assert_eq!(p.nonce()[11], 0xa4);
         p.seq = 0x0102_0304_0506_0708;
@@ -2196,7 +3868,9 @@ mod tests {
 
     // --- rustls as the counterparty ------------------------------------
 
-    fn provider_with(suites: Vec<rustls::SupportedCipherSuite>) -> Arc<rustls::crypto::CryptoProvider> {
+    fn provider_with(
+        suites: Vec<rustls::SupportedCipherSuite>,
+    ) -> Arc<rustls::crypto::CryptoProvider> {
         let mut provider = rustls::crypto::ring::default_provider();
         provider.cipher_suites = suites;
         Arc::new(provider)
@@ -2229,7 +3903,9 @@ mod tests {
             let mut tls = acceptor.accept(sock).await.unwrap();
             let mut buf = [0u8; 1024];
             loop {
-                let n = tokio::io::AsyncReadExt::read(&mut tls, &mut buf).await.unwrap();
+                let n = tokio::io::AsyncReadExt::read(&mut tls, &mut buf)
+                    .await
+                    .unwrap();
                 if n == 0 {
                     break;
                 }
@@ -2405,7 +4081,10 @@ mod tests {
         )
         .await
         .expect_err("a name mismatch must fail");
-        assert!(err.to_string().contains("certificate verification failed"), "{err}");
+        assert!(
+            err.to_string().contains("certificate verification failed"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -2461,8 +4140,14 @@ mod tests {
     /// suite's hash is what decides the schedule.
     #[test]
     fn cipher_suite_ids_and_hashes() {
-        assert_eq!(CipherSuite::from_id(0x1301), Some(CipherSuite::Aes128GcmSha256));
-        assert_eq!(CipherSuite::from_id(0x1302), Some(CipherSuite::Aes256GcmSha384));
+        assert_eq!(
+            CipherSuite::from_id(0x1301),
+            Some(CipherSuite::Aes128GcmSha256)
+        );
+        assert_eq!(
+            CipherSuite::from_id(0x1302),
+            Some(CipherSuite::Aes256GcmSha384)
+        );
         assert_eq!(
             CipherSuite::from_id(0x1303),
             Some(CipherSuite::Chacha20Poly1305Sha256)
@@ -2491,17 +4176,18 @@ mod tests {
         let (client, server) = tokio::io::duplex(64 * 1024);
 
         let server_task = tokio::spawn(async move {
-            let (mut tls, hello) = test_server::accept(
-                Box::new(server),
-                CipherSuite::Aes128GcmSha256,
-                move |_| Ok((der.clone(), signing_key.clone())),
-            )
-            .await
-            .unwrap();
+            let (mut tls, hello) =
+                test_server::accept(Box::new(server), CipherSuite::Aes128GcmSha256, move |_| {
+                    Ok((der.clone(), signing_key.clone()))
+                })
+                .await
+                .unwrap();
             assert_eq!(hello.sni.as_deref(), Some("localhost"));
             assert_eq!(hello.session_id.len(), 32);
             let mut buf = [0u8; 64];
-            let n = tokio::io::AsyncReadExt::read(&mut tls, &mut buf).await.unwrap();
+            let n = tokio::io::AsyncReadExt::read(&mut tls, &mut buf)
+                .await
+                .unwrap();
             tls.write_all(&buf[..n]).await.unwrap();
             tls.flush().await.unwrap();
             tls
@@ -2511,15 +4197,16 @@ mod tests {
         rand::rngs::OsRng.fill_bytes(&mut random);
         let session_id = [7u8; 32];
         let (secret, public) = x25519_keygen();
-        let hello = build_client_hello(UtslProfile::Chrome, "localhost", &random, &session_id, &public);
-        let mut stream = connect(
-            Box::new(client),
-            &hello,
-            &secret,
-            ServerAuth::AcceptAny,
-        )
-        .await
-        .unwrap();
+        let hello = build_client_hello(
+            UtslProfile::Chrome,
+            "localhost",
+            &random,
+            &session_id,
+            &public,
+        );
+        let mut stream = connect(Box::new(client), &hello, &secret, ServerAuth::AcceptAny)
+            .await
+            .unwrap();
         assert!(stream.cert_verified());
         stream.write_all(b"ping").await.unwrap();
         let mut buf = [0u8; 4];
@@ -2566,15 +4253,16 @@ mod tests {
         rand::rngs::OsRng.fill_bytes(&mut random);
         let session_id = [9u8; 32];
         let (secret, public) = x25519_keygen();
-        let hello = build_client_hello(UtslProfile::Chrome, "localhost", &random, &session_id, &public);
-        let client = connect(
-            Box::new(client_io),
-            &hello,
-            &secret,
-            ServerAuth::AcceptAny,
-        )
-        .await
-        .unwrap();
+        let hello = build_client_hello(
+            UtslProfile::Chrome,
+            "localhost",
+            &random,
+            &session_id,
+            &public,
+        );
+        let client = connect(Box::new(client_io), &hello, &secret, ServerAuth::AcceptAny)
+            .await
+            .unwrap();
         let server = server_task.await.unwrap();
         (client, server)
     }
@@ -2596,7 +4284,10 @@ mod tests {
         assert!(client.has_read_ahead(), "unread plaintext is buffered");
         assert_eq!(client.take_read_ahead(), b"llo");
         assert!(!client.has_read_ahead());
-        assert!(client.take_read_ahead().is_empty(), "draining is idempotent");
+        assert!(
+            client.take_read_ahead().is_empty(),
+            "draining is idempotent"
+        );
 
         // The stream keeps working in TLS mode: the next records still
         // decrypt with unbroken sequence numbers.
@@ -2750,5 +4441,613 @@ mod tests {
             b"irst-recordsecond-recordRAW".to_vec(),
             "the buffered second record decrypts in order, then the raw tail"
         );
+    }
+
+    // --- ECH (RFC 9460 / metacubex/tls) ------------------------------------
+    //
+    // All against the in-tree ECH-terminating test peer: hermetic, fake
+    // certs via rcgen, no network.
+
+    use crate::proto::ech as ech_mod;
+    use crate::proto::reality::tls13::test_server::{
+        EchServerMode, accept_ech, ech_server_key, find_ext_body,
+    };
+
+    fn ech_webpki_auth(cert_der: &[u8], name: &str) -> ServerAuth {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der.to_vec().into()).unwrap();
+        ServerAuth::WebPki {
+            roots: Arc::new(roots),
+            server_name: name.to_string(),
+        }
+    }
+
+    /// A single-attempt dial closure over one duplex end.
+    fn once_dial(
+        io: tokio::io::DuplexStream,
+    ) -> impl FnMut() -> std::future::Ready<Result<BoxProxyStream>> {
+        let mut first = Some(Box::new(io) as BoxProxyStream);
+        move || {
+            std::future::ready(Ok(first
+                .take()
+                .expect("the test dials at most twice; got a third")))
+        }
+    }
+
+    /// The happy path: the server terminates ECH (HPKE-open, confirmation
+    /// ServerHello, inner-transcript handshake), the client verifies the
+    /// certificate against the INNER name, and the relayed session echoes.
+    #[tokio::test]
+    async fn ech_accept_terminates_inner_and_relays() {
+        let cert = self_signed("secret.example", &rcgen::PKCS_ED25519);
+        let key = ech_server_key(b"ech-key-a", 0x11, b"public.example");
+        let client_list = key.config_list.clone();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let signer = any_ed25519_signer(&cert);
+        let der = cert.der.clone();
+
+        let server_task = tokio::spawn(async move {
+            let (mut tls, seen) = accept_ech(
+                Box::new(server_io),
+                CipherSuite::Aes128GcmSha256,
+                &key,
+                EchServerMode::Accept,
+                move |_| Ok((der.clone(), signer.clone())),
+            )
+            .await
+            .unwrap();
+            // What the server saw must be the split-hello shapes.
+            assert_eq!(seen.outer.sni.as_deref(), Some("public.example"));
+            let inner = seen.inner.unwrap();
+            assert_eq!(inner.sni.as_deref(), Some("secret.example"));
+            assert_eq!(inner.alpn.first().map(String::as_str), Some("h2"));
+            // Relay.
+            let mut buf = [0u8; 5];
+            tokio::io::AsyncReadExt::read_exact(&mut tls, &mut buf)
+                .await
+                .unwrap();
+            tls.write_all(b"pong!").await.unwrap();
+            tls.flush().await.unwrap();
+            tls
+        });
+
+        let selection = ech_mod::select_ech_config(&client_list).unwrap();
+        let cfg = EchCfg::new("secret.example", UtslProfile::Chrome, selection);
+        let auth = ech_webpki_auth(&cert.der, "secret.example");
+        let mut stream = connect_ech(&cfg, &auth, once_dial(client_io))
+            .await
+            .expect("the ECH handshake must succeed");
+        assert_eq!(stream.suite(), CipherSuite::Aes128GcmSha256);
+        assert_eq!(stream.alpn(), Some(&b"h2"[..]));
+        assert!(stream.cert_verified());
+        stream.write_all(b"ping!").await.unwrap();
+        let mut buf = [0u8; 5];
+        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(&buf, b"pong!");
+        drop(stream);
+        let _ = server_task.await.unwrap();
+    }
+
+    fn any_ed25519_signer(cert: &TestCert) -> Arc<dyn rustls::sign::SigningKey> {
+        rustls::crypto::ring::sign::any_supported_type(&cert.key).unwrap()
+    }
+
+    /// Acceptance verifies against the INNER name: a certificate issued for
+    /// the OUTER public name must fail webpki (it would pass if the client
+    /// verified the outer name).
+    #[tokio::test]
+    async fn ech_accept_verifies_against_the_inner_name() {
+        // The server presents a cert for the PUBLIC name.
+        let cert = self_signed("public.example", &rcgen::PKCS_ECDSA_P256_SHA256);
+        let key = ech_server_key(b"ech-key-a", 0x11, b"public.example");
+        let client_list = key.config_list.clone();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let signer = any_ecdsa_signer(&cert);
+        let der = cert.der.clone();
+        let server_task = tokio::spawn(async move {
+            // The client aborts at verification; the server's read of the
+            // client Finished may or may not complete first.
+            let _ = accept_ech(
+                Box::new(server_io),
+                CipherSuite::Aes128GcmSha256,
+                &key,
+                EchServerMode::Accept,
+                move |_| Ok((der.clone(), signer.clone())),
+            )
+            .await;
+        });
+
+        let selection = ech_mod::select_ech_config(&client_list).unwrap();
+        let cfg = EchCfg::new("secret.example", UtslProfile::Chrome, selection);
+        // The client trusts the cert but requires the INNER name.
+        let auth = ech_webpki_auth(&cert.der, "secret.example");
+        let err = connect_ech(&cfg, &auth, once_dial(client_io))
+            .await
+            .expect_err("a public-name certificate must not pass inner verification");
+        assert!(
+            err.to_string().contains("certificate verification failed"),
+            "{err}"
+        );
+        let _ = server_task.await;
+    }
+
+    fn any_ecdsa_signer(cert: &TestCert) -> Arc<dyn rustls::sign::SigningKey> {
+        rustls::crypto::ring::sign::any_supported_type(&cert.key).unwrap()
+    }
+
+    /// A server that cannot open the payload (different key: the wrong
+    /// config id / key pair) rejects, and the client fails with the exact
+    /// upstream `ECHRejectionError` text — no fallback, no retry material.
+    #[tokio::test]
+    async fn ech_rejection_wrong_key_is_the_upstream_error() {
+        let cert = self_signed("public.example", &rcgen::PKCS_ECDSA_P256_SHA256);
+        let server_key = ech_server_key(b"server-real-key", 0x22, b"public.example");
+        let client_list = ech_server_key(b"client-stale-key", 0x22, b"public.example").config_list;
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let signer = any_ecdsa_signer(&cert);
+        let der = cert.der.clone();
+        let server_task = tokio::spawn(async move {
+            let r = accept_ech(
+                Box::new(server_io),
+                CipherSuite::Aes128GcmSha256,
+                &server_key,
+                EchServerMode::Reject {
+                    retry_configs: None,
+                },
+                move |_| Ok((der.clone(), signer.clone())),
+            )
+            .await;
+            // The handshake completes in outer mode; the client then sends
+            // the ech_required alert and drops.
+            assert!(r.is_ok(), "{:?}", r.err().map(|e| e.to_string()));
+        });
+
+        let selection = ech_mod::select_ech_config(&client_list).unwrap();
+        let cfg = EchCfg::new("secret.example", UtslProfile::Chrome, selection);
+        let auth = ech_webpki_auth(&cert.der, "secret.example");
+        let err = connect_ech(&cfg, &auth, once_dial(client_io))
+            .await
+            .expect_err("the stale key must be rejected");
+        // ECHRejectionError.Error() (ech.go:491).
+        assert!(
+            err.to_string().contains("tls: server rejected ECH"),
+            "{err}"
+        );
+        let _ = server_task.await;
+    }
+
+    /// One retry with the server-provided retry configs: the first attempt
+    /// is rejected with a usable list, the second (fresh transport, fresh
+    /// keys, the retry config) succeeds.
+    #[tokio::test]
+    async fn ech_retries_once_with_the_retry_configs() {
+        // The rejecting server presents the PUBLIC-name certificate (the
+        // rejected handshake verifies against it); the accepting retry
+        // presents the inner-name one.
+        let public_cert = self_signed("public.example", &rcgen::PKCS_ED25519);
+        let cert = self_signed("secret.example", &rcgen::PKCS_ED25519);
+        let stale = ech_server_key(b"client-stale-key", 0x33, b"public.example");
+        let real = ech_server_key(b"server-real-key", 0x44, b"public.example");
+        let (io1, srv1) = tokio::io::duplex(64 * 1024);
+        let (io2, srv2) = tokio::io::duplex(64 * 1024);
+        let signer = any_ed25519_signer(&public_cert);
+        let der = public_cert.der.clone();
+        let retry_list = real.config_list.clone();
+
+        let server1 = tokio::spawn(async move {
+            accept_ech(
+                Box::new(srv1),
+                CipherSuite::Aes128GcmSha256,
+                &real,
+                EchServerMode::Reject {
+                    retry_configs: Some(retry_list),
+                },
+                move |_| Ok((der.clone(), signer.clone())),
+            )
+            .await
+            .unwrap();
+        });
+        let der2 = cert.der.clone();
+        let signer2 = any_ed25519_signer(&cert);
+        let real2 = ech_server_key(b"server-real-key", 0x44, b"public.example");
+        let server2 = tokio::spawn(async move {
+            let (mut tls, seen) = accept_ech(
+                Box::new(srv2),
+                CipherSuite::Aes128GcmSha256,
+                &real2,
+                EchServerMode::Accept,
+                move |_| Ok((der2.clone(), signer2.clone())),
+            )
+            .await
+            .unwrap();
+            assert_eq!(seen.inner.unwrap().sni.as_deref(), Some("secret.example"));
+            let mut buf = [0u8; 4];
+            tokio::io::AsyncReadExt::read_exact(&mut tls, &mut buf)
+                .await
+                .unwrap();
+            assert_eq!(&buf, b"echo");
+            tls.write_all(b"back").await.unwrap();
+            tls.flush().await.unwrap();
+        });
+
+        let selection = ech_mod::select_ech_config(&stale.config_list).unwrap();
+        let cfg = EchCfg::new("secret.example", UtslProfile::Firefox, selection);
+        // Trust BOTH certificates: the rejected first attempt verifies the
+        // public-name one, the accepted retry the inner-name one.
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(public_cert.der.clone().into()).unwrap();
+        roots.add(cert.der.clone().into()).unwrap();
+        let auth = ServerAuth::WebPki {
+            roots: Arc::new(roots),
+            server_name: "secret.example".to_string(),
+        };
+        let mut dials = 0usize;
+        let mut first = Some(Box::new(io1) as BoxProxyStream);
+        let mut second = Some(Box::new(io2) as BoxProxyStream);
+        let mut stream = connect_ech(&cfg, &auth, || {
+            dials += 1;
+            let io = match dials {
+                1 => first.take().unwrap(),
+                2 => second.take().unwrap(),
+                _ => panic!("a third dial must never happen"),
+            };
+            std::future::ready(Ok(io))
+        })
+        .await
+        .expect("the retry attempt must succeed");
+        assert_eq!(dials, 2, "exactly one retry");
+        assert!(stream.cert_verified());
+        stream.write_all(b"echo").await.unwrap();
+        let mut buf = [0u8; 4];
+        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(&buf, b"back");
+        drop(stream);
+        server1.await.unwrap();
+        server2.await.unwrap();
+    }
+
+    /// A second rejection after the retry still ends with the upstream
+    /// error (and no third dial).
+    #[tokio::test]
+    async fn ech_second_rejection_fails_without_more_dials() {
+        let cert = self_signed("public.example", &rcgen::PKCS_ECDSA_P256_SHA256);
+        let stale = ech_server_key(b"client-stale-key", 0x55, b"public.example");
+        let real = ech_server_key(b"server-real-key", 0x66, b"public.example");
+        let (io1, srv1) = tokio::io::duplex(64 * 1024);
+        let (io2, srv2) = tokio::io::duplex(64 * 1024);
+        let signer = any_ecdsa_signer(&cert);
+        let der = cert.der.clone();
+        let retry_list = real.config_list.clone();
+        let server1 = tokio::spawn(async move {
+            accept_ech(
+                Box::new(srv1),
+                CipherSuite::Aes128GcmSha256,
+                &real,
+                EchServerMode::Reject {
+                    retry_configs: Some(retry_list),
+                },
+                move |_| Ok((der.clone(), signer.clone())),
+            )
+            .await
+            .unwrap();
+        });
+        let der2 = cert.der.clone();
+        let signer2 = any_ecdsa_signer(&cert);
+        // The second server also rejects (with nothing usable).
+        let server2 = tokio::spawn(async move {
+            accept_ech(
+                Box::new(srv2),
+                CipherSuite::Aes128GcmSha256,
+                &ech_server_key(b"server-real-key", 0x66, b"public.example"),
+                EchServerMode::Reject {
+                    retry_configs: None,
+                },
+                move |_| Ok((der2.clone(), signer2.clone())),
+            )
+            .await
+            .unwrap();
+        });
+
+        let selection = ech_mod::select_ech_config(&stale.config_list).unwrap();
+        let cfg = EchCfg::new("secret.example", UtslProfile::Chrome, selection);
+        let auth = ech_webpki_auth(&cert.der, "secret.example");
+        let mut dials = 0usize;
+        let mut first = Some(Box::new(io1) as BoxProxyStream);
+        let mut second = Some(Box::new(io2) as BoxProxyStream);
+        let err = connect_ech(&cfg, &auth, || {
+            dials += 1;
+            let io = match dials {
+                1 => first.take().unwrap(),
+                2 => second.take().unwrap(),
+                _ => panic!("a third dial must never happen"),
+            };
+            std::future::ready(Ok(io))
+        })
+        .await
+        .expect_err("the second rejection must fail");
+        assert_eq!(dials, 2);
+        assert!(
+            err.to_string().contains("tls: server rejected ECH"),
+            "{err}"
+        );
+        server1.await.unwrap();
+        server2.await.unwrap();
+    }
+
+    /// The HRR accept path: the server HelloRetryRequests with a cookie and
+    /// a valid hrr confirmation; the client re-seals the second hello
+    /// WITHOUT the encapsulated key (HPKE sequence 1) and completes.
+    #[tokio::test]
+    async fn ech_hrr_accept_with_cookie_and_reseal() {
+        let cert = self_signed("secret.example", &rcgen::PKCS_ED25519);
+        let key = ech_server_key(b"ech-hrr-key", 0x77, b"public.example");
+        let client_list = key.config_list.clone();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let signer = any_ed25519_signer(&cert);
+        let der = cert.der.clone();
+        let server_task = tokio::spawn(async move {
+            let (mut tls, seen) = accept_ech(
+                Box::new(server_io),
+                CipherSuite::Aes128GcmSha256,
+                &key,
+                EchServerMode::Hrr {
+                    accept: true,
+                    retry_configs: None,
+                },
+                move |_| Ok((der.clone(), signer.clone())),
+            )
+            .await
+            .expect("the HRR accept handshake must complete");
+            // The second inner carried the cookie extension.
+            let inner = seen.inner.unwrap();
+            let has_cookie = find_ext_body(&inner.raw, 0x002c)
+                .expect("cookie ext lookup")
+                .is_some();
+            assert!(has_cookie, "the second inner hello carries the cookie");
+            let mut buf = [0u8; 3];
+            tokio::io::AsyncReadExt::read_exact(&mut tls, &mut buf)
+                .await
+                .unwrap();
+            tls.write_all(b"ok!").await.unwrap();
+            tls.flush().await.unwrap();
+        });
+
+        let selection = ech_mod::select_ech_config(&client_list).unwrap();
+        let cfg = EchCfg::new("secret.example", UtslProfile::Chrome, selection);
+        let auth = ech_webpki_auth(&cert.der, "secret.example");
+        let mut stream = connect_ech(&cfg, &auth, once_dial(client_io))
+            .await
+            .expect("the HRR accept handshake must succeed");
+        stream.write_all(b"hi!").await.unwrap();
+        let mut buf = [0u8; 3];
+        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(&buf, b"ok!");
+        drop(stream);
+        let _ = server_task.await;
+    }
+
+    /// An HRR whose 8-byte ECH extension does NOT confirm (zeros) rejects:
+    /// the client completes the second flight in outer mode and fails with
+    /// the upstream rejection error.
+    #[tokio::test]
+    async fn ech_hrr_zero_confirmation_rejects() {
+        let cert = self_signed("public.example", &rcgen::PKCS_ECDSA_P256_SHA256);
+        let key = ech_server_key(b"ech-hrr-key", 0x88, b"public.example");
+        let client_list = key.config_list.clone();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let signer = any_ecdsa_signer(&cert);
+        let der = cert.der.clone();
+        let server_task = tokio::spawn(async move {
+            accept_ech(
+                Box::new(server_io),
+                CipherSuite::Aes128GcmSha256,
+                &key,
+                EchServerMode::Hrr {
+                    accept: false,
+                    retry_configs: None,
+                },
+                move |_| Ok((der.clone(), signer.clone())),
+            )
+            .await
+            .unwrap();
+        });
+
+        let selection = ech_mod::select_ech_config(&client_list).unwrap();
+        let cfg = EchCfg::new("secret.example", UtslProfile::Chrome, selection);
+        let auth = ech_webpki_auth(&cert.der, "secret.example");
+        let err = connect_ech(&cfg, &auth, once_dial(client_io))
+            .await
+            .expect_err("the zero confirmation must reject");
+        assert!(
+            err.to_string().contains("tls: server rejected ECH"),
+            "{err}"
+        );
+        let _ = server_task.await;
+    }
+
+    /// The SHA-384 suite drives the ECH confirmation and schedule too.
+    #[tokio::test]
+    async fn ech_accept_sha384_suite() {
+        let cert = self_signed("secret.example", &rcgen::PKCS_ECDSA_P256_SHA256);
+        let key = ech_server_key(b"ech-key-sha384", 0x99, b"public.example");
+        let client_list = key.config_list.clone();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let signer = any_ecdsa_signer(&cert);
+        let der = cert.der.clone();
+        let server_task = tokio::spawn(async move {
+            let (mut tls, _seen) = accept_ech(
+                Box::new(server_io),
+                CipherSuite::Aes256GcmSha384,
+                &key,
+                EchServerMode::Accept,
+                move |_| Ok((der.clone(), signer.clone())),
+            )
+            .await
+            .unwrap();
+            let mut buf = [0u8; 6];
+            tokio::io::AsyncReadExt::read_exact(&mut tls, &mut buf)
+                .await
+                .unwrap();
+            tls.write_all(b"sha384").await.unwrap();
+            tls.flush().await.unwrap();
+        });
+
+        let selection = ech_mod::select_ech_config(&client_list).unwrap();
+        let cfg = EchCfg::new("secret.example", UtslProfile::Chrome, selection);
+        let auth = ech_webpki_auth(&cert.der, "secret.example");
+        let mut stream = connect_ech(&cfg, &auth, once_dial(client_io))
+            .await
+            .expect("the SHA-384 ECH handshake");
+        assert_eq!(stream.suite(), CipherSuite::Aes256GcmSha384);
+        stream.write_all(b"cipher").await.unwrap();
+        let mut buf = [0u8; 6];
+        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(&buf, b"sha384");
+        drop(stream);
+        let _ = server_task.await;
+    }
+
+    /// Byte-level shape pins on the built hello pair, including the
+    /// round-trip invariant the whole transcript correctness rests on: the
+    /// server-side reconstruction of the sealed inner equals the client's
+    /// transcript-form inner.
+    #[test]
+    fn ech_hello_shapes_and_roundtrip_reconstruction() {
+        let key = ech_server_key(b"ech-shape-key", 0xab, b"public.example");
+        let selection = ech_mod::select_ech_config(&key.config_list).unwrap();
+        let cfg = EchCfg {
+            server_name: "secret.example".into(),
+            profile: UtslProfile::Chrome,
+            alpn: vec!["h2".into()],
+            ech: EchHandshakeParams {
+                selection,
+                inner_random: Some([0x11; 32]),
+                outer_random: Some([0x22; 32]),
+                session_id: Some([0x33; 32]),
+                x25519_secret: Some([0x44; 32]),
+                hpke_secret: Some([0x55; 32]),
+            },
+        };
+        // Rebuild the pair the same way ech_attempt does.
+        let (set, _client_sender) = EchHelloSet::build(
+            &cfg,
+            &cfg.ech.selection,
+            [0x11; 32],
+            [0x22; 32],
+            [0x33; 32],
+            [0x44; 32],
+            &[0x55; 32],
+        )
+        .unwrap();
+        // Server-side recipient over the same config: decap the `enc` out of
+        // the outer's ECH extension and run the key schedule.
+        let configs = ech_mod::parse_ech_config_list(&key.config_list).unwrap();
+        let ext_body =
+            test_server::find_ext_body(&set.outer_msg, ech_mod::EXTENSION_ENCRYPTED_CLIENT_HELLO)
+                .unwrap()
+                .unwrap();
+        let (aead_id, enc) = match ech_mod::parse_ech_ext(&ext_body).unwrap() {
+            ech_mod::EchExt::Outer { aead_id, enc, .. } => (aead_id, enc),
+            other => panic!("outer ext expected, got {other:?}"),
+        };
+        assert_eq!(enc.len(), 32);
+        let enc: [u8; 32] = enc.try_into().unwrap();
+        let shared = ech_mod::hpke_decap(&key.sk_r, &enc).unwrap();
+        let mut server_recipient = ech_mod::HpkeSender::from_shared_secret(
+            &shared,
+            ech_mod::HpkeAead::from_id(aead_id).unwrap(),
+            &ech_mod::ech_hpke_info(&configs[0]),
+        )
+        .unwrap();
+
+        // Outer: public SNI, the sealed ECH ext, and the compat extensions
+        // the inner drops; no 1.2-only version in supported_versions.
+        let outer_info = test_server::parse_client_hello(&set.outer_msg).unwrap();
+        assert_eq!(outer_info.sni.as_deref(), Some("public.example"));
+        assert!(find_ext_body(&set.outer_msg, 0x000b).unwrap().is_some());
+        assert!(find_ext_body(&set.outer_msg, 0x0023).unwrap().is_some());
+        assert!(find_ext_body(&set.outer_msg, 0xff01).unwrap().is_some());
+        assert!(find_ext_body(&set.outer_msg, 0x0017).unwrap().is_some());
+        let sv = find_ext_body(&set.outer_msg, EXT_SUPPORTED_VERSIONS)
+            .unwrap()
+            .unwrap();
+        assert!(!sv[1..].chunks(2).any(|c| c == [0x03, 0x03]));
+        assert!(sv[1..].chunks(2).any(|c| c == [0x03, 0x04]));
+
+        // Inner (transcript form): real SNI, 32-byte session id, marker,
+        // and none of the four compat extensions.
+        let inner_info = test_server::parse_client_hello(&set.inner_msg).unwrap();
+        assert_eq!(inner_info.sni.as_deref(), Some("secret.example"));
+        assert_eq!(inner_info.session_id.len(), 32);
+        assert!(
+            find_ext_body(&set.inner_msg, ech_mod::EXTENSION_ENCRYPTED_CLIENT_HELLO)
+                .unwrap()
+                .is_some()
+        );
+        for dropped in [0x000bu16, 0x0023, 0xff01, 0x0017] {
+            assert!(
+                find_ext_body(&set.inner_msg, dropped).unwrap().is_none(),
+                "the inner must not carry {dropped:#06x}"
+            );
+        }
+        // The outer hello in the clear must not leak the inner name.
+        assert!(
+            !set.outer_msg
+                .windows(b"secret.example".len())
+                .any(|w| w == b"secret.example")
+        );
+
+        // Round-trip: HPKE-open the outer payload and reconstruct — the
+        // result must equal the client's transcript-form inner byte for
+        // byte (this is the invariant that makes the Finished keys match).
+        let opened = test_server::open_ech_hello(&set.outer_msg, &mut server_recipient).unwrap();
+        assert_eq!(
+            opened, set.inner_msg,
+            "server transcript form == client transcript form"
+        );
+    }
+
+    /// The generic (SHA-256) confirmation must agree byte for byte with the
+    /// standalone wave-7 helper in proto::ech.
+    #[test]
+    fn ech_confirmation_matches_the_ech_module() {
+        let inner_random = [0x42u8; 32];
+        let sh: Vec<u8> = (0..96u16).map(|i| (i % 251) as u8).collect();
+        let mut t = Transcript::new(HashKind::Sha256);
+        t.update(&[0x55; 64]);
+        let mine = ech_accept_confirmation(HashKind::Sha256, &t, &sh, &inner_random).unwrap();
+        let reference = ech_mod::server_hello_accept_confirmation(
+            &ech_mod::transcript_context(&[&[0x55; 64]]),
+            &sh,
+            &inner_random,
+        )
+        .unwrap();
+        assert_eq!(mine, reference);
+        // And the HRR variant likewise.
+        let mut hrr = vec![2u8, 0, 0, 60];
+        hrr.extend_from_slice(&[0u8; 40]);
+        let value = [0x99u8; 8];
+        hrr.extend_from_slice(&value);
+        hrr.extend_from_slice(&[1u8; 12]);
+        let mut folded = Transcript::new(HashKind::Sha256);
+        folded.update(&[0x55; 64]);
+        let mine_hrr =
+            ech_hrr_confirmation(HashKind::Sha256, &folded, &hrr, &value, &inner_random).unwrap();
+        let reference_hrr = ech_mod::hrr_accept_confirmation(
+            &ech_mod::transcript_context(&[&[0x55; 64]]),
+            &hrr,
+            &value,
+            &inner_random,
+        )
+        .unwrap();
+        assert_eq!(mine_hrr, reference_hrr);
     }
 }

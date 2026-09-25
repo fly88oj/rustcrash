@@ -1,7 +1,12 @@
-//! RestLS client (v1.2 of the RestLS protocol, the `restls-client-go`
-//! branch mihomo vendors): a genuine TLS handshake to the camouflage SNI
-//! whose ClientHello session id carries a password-derived MAC, followed by
-//! script-driven `0x17`-record framing for the tunnelled bytes.
+//! RestLS v1.2 (the `restls-client-go` branch mihomo vendors) — both
+//! halves: the [`connect`] CLIENT (a genuine TLS handshake to the
+//! camouflage SNI whose ClientHello session id carries a
+//! password-derived MAC, followed by script-driven `0x17`-record
+//! framing for the tunnelled bytes) and the [`server`] SERVER
+//! (`tls.RestlsServer`, mihomo's `listeners` restls type): the
+//! camouflage TLS relayed to the real `dest`, the first encrypted
+//! server flight XOR-masked, and the hidden stream riding the same
+//! script framing in reverse.
 //!
 //! Upstream: mihomo `adapter/outbound/restls.go` delegates to
 //! `github.com/metacubex/restls-client-go` (branch `restls-utls`;
@@ -94,6 +99,7 @@ use rustls::crypto::ring as ring_provider;
 use rustls::crypto::{CryptoProvider, GetRandomFailed, SecureRandom};
 use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::error::{Error, Result};
@@ -124,8 +130,7 @@ const SESSION_ID_INDEX: usize = SESSION_ID_LENGTH_INDEX + 1;
 /// ServerHello.random offset.
 const SERVER_RANDOM_INDEX: usize = RECORD_HEADER_LEN + 1 + 3 + 2;
 /// key_share extension (RFC 8446) and the X25519 group id. The share
-/// extraction is the server-side auth check the test mimic re-implements.
-#[cfg(test)]
+/// extraction is the session-id auth input (client and server).
 const EXT_KEY_SHARE: u16 = 51;
 const GROUP_X25519: u16 = 0x001d;
 
@@ -682,6 +687,9 @@ struct RestlsStream {
     to_server: u64,
     /// `restlsToClientCounter`.
     to_client: u64,
+    /// The raw TLS Finished record; the FIRST framed record's authMac
+    /// covers it (`write0x17AuthHeader`'s `takeClientFinished`).
+    client_fin: Option<Vec<u8>>,
     /// `restlsWritePending`: the script interrupted the writer.
     write_pending: bool,
     /// `restlsSendBuf`: plaintext parked behind an interrupt.
@@ -724,7 +732,7 @@ impl RestlsStream {
     /// response, `fake_response`). Returns the wire record, how many bytes
     /// of `data` it consumed, and whether the writer must now wait for a
     /// peer record (`needInterrupt && !fakeResponse`).
-    fn build_record(&self, data: &[u8], fake_response: bool) -> Result<(Vec<u8>, usize, bool)> {
+    fn build_record(&mut self, data: &[u8], fake_response: bool) -> Result<(Vec<u8>, usize, bool)> {
         let (payload_len, data_len, padding_len, command) = self.act_according_to_script(data.len())?;
         if payload_len == 0 {
             return Ok((Vec::new(), 0, false));
@@ -755,14 +763,20 @@ impl RestlsStream {
             .copy_from_slice(&(data_len as u16).to_be_bytes());
         region[AUTH_MAC_LEN + CMD_LEN..AUTH_HEADER_LEN].copy_from_slice(&command.to_bytes());
         xor_with_mac(&mut region[AUTH_MAC_LEN..AUTH_HEADER_LEN], &mask_digest[..MASK_LEN]);
-        // authMac = MAC(base ‖ record header ‖ region[8:]) — the masked
-        // length and command, data and padding, in that order.
+        // authMac = MAC(base ‖ [clientFinished] ‖ record header ‖
+        // region[8:]) — the masked length and command, data and padding,
+        // in that order; the Finished record prefixes the FIRST framed
+        // record only (conn.go write0x17AuthHeader takeClientFinished).
         let auth_digest = {
             let mut h = auth_header_hasher(&self.secret, &self.server_random, DIR_TO_SERVER, self.to_server);
+            if let Some(fin) = &self.client_fin {
+                h.update(fin);
+            }
             h.update(&header);
             h.update(&region[AUTH_MAC_LEN..]);
             *h.finalize().as_bytes()
         };
+        self.client_fin = None;
         region[..AUTH_MAC_LEN].copy_from_slice(&auth_digest[..AUTH_MAC_LEN]);
         let interrupt = command.need_interrupt() && !fake_response;
         Ok((rec, data_len, interrupt))
@@ -1076,6 +1090,7 @@ pub async fn connect(cfg: &RestlsOut, transport: BoxProxyStream) -> Result<BoxPr
     let (mut tls, flight) = restls_client_hello(&config, &cfg.sni, &secret)?;
     let mut transport = transport;
     let mut rbuf = BytesMut::with_capacity(16 * 1024);
+    let mut written = flight.clone();
     transport.write_all(&flight).await?;
     transport.flush().await?;
 
@@ -1091,6 +1106,7 @@ pub async fn connect(cfg: &RestlsOut, transport: BoxProxyStream) -> Result<BoxPr
             if out.is_empty() {
                 break;
             }
+            written.extend_from_slice(&out);
             transport.write_all(&out).await?;
         }
         transport.flush().await?;
@@ -1132,6 +1148,7 @@ pub async fn connect(cfg: &RestlsOut, transport: BoxProxyStream) -> Result<BoxPr
         if out.is_empty() {
             break;
         }
+        written.extend_from_slice(&out);
         transport.write_all(&out).await?;
     }
     transport.flush().await?;
@@ -1142,6 +1159,13 @@ pub async fn connect(cfg: &RestlsOut, transport: BoxProxyStream) -> Result<BoxPr
     }
     let server_random =
         srv_random.ok_or_else(|| Error::protocol("restls: no ServerHello seen"))?;
+    // The raw Finished record: the last 0x17 record the client wrote
+    // during the handshake. Its bytes prefix the first framed record's
+    // authMac (conn.go:1205 captureClientFinished / 1411 takeClientFinished).
+    let client_fin = split_tls_records(&written)
+        .into_iter()
+        .rev()
+        .find(|r| r[0] == REC_APP_DATA);
     debug!(target: "engine", sni = %cfg.sni, "restls: tunnel established");
 
     Ok(Box::new(RestlsStream {
@@ -1151,6 +1175,7 @@ pub async fn connect(cfg: &RestlsOut, transport: BoxProxyStream) -> Result<BoxPr
         script,
         to_server: 0,
         to_client: 0,
+        client_fin,
         write_pending: false,
         send_buf: Vec::new(),
         rbuf,
@@ -1158,6 +1183,1082 @@ pub async fn connect(cfg: &RestlsOut, transport: BoxProxyStream) -> Result<BoxPr
         wbuf: BytesMut::new(),
         closed: false,
     }))
+}
+
+/// Split a raw TLS byte stream into its records.
+fn split_tls_records(mut data: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    while data.len() >= RECORD_HEADER_LEN {
+        let len = usize::from(u16::from_be_bytes([data[3], data[4]]));
+        if data.len() < RECORD_HEADER_LEN + len {
+            break;
+        }
+        out.push(data[..RECORD_HEADER_LEN + len].to_vec());
+        data = &data[RECORD_HEADER_LEN + len..];
+    }
+    out
+}
+
+
+// ---------------------------------------------------------------------------
+// Server half (restls-client-go restls_server.go, the `tls.RestlsServer`
+// mihomo's listener/restls builder calls). The camouflage TLS is carried
+// out against the REAL `dest` server: the client conn and the dialed
+// target conn are bridged record by record, the first encrypted server
+// flight is XOR-masked, and the hidden stream rides the script-framed
+// 0x17 records afterwards.
+// ---------------------------------------------------------------------------
+
+/// `RestlsServerConfig` (restls_server.go:20-45). `DialContext` is not
+/// a callback here: the camouflage conn is dialed directly by
+/// [`server`]; upstream routes it through mihomo's tunnel, which the
+/// engine's listener model has no dial-back for (the hidden stream is
+/// what rides the router, via the relay).
+#[derive(Debug, Clone)]
+pub struct RestlsServerConfig {
+    /// The camouflage destination (`host` or `host:port`; 443 default).
+    pub server_hostname: String,
+    pub password: String,
+    /// mihomo `restls-script`; empty selects the upstream default.
+    pub restls_script: Option<String>,
+    /// Minimum server-to-client record target length after the script is
+    /// exhausted (upstream default 15).
+    pub min_record_len: u32,
+    /// Fallback raw-relay rate limit, bits per second (0 = unlimited).
+    pub rate_limit: u64,
+}
+
+/// Validate a restls script without keeping the parsed lines (for
+/// listeners that want the config error before binding).
+pub fn validate_script(script: &str) -> Result<()> {
+    parse_record_script(script).map(|_| ())
+}
+
+/// `restlsHostPort` (restls_server.go:183-188).
+fn restls_host_port(host: &str) -> String {
+    if let Some((_, p)) = host.rsplit_once(':') {
+        if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) {
+            return host.to_string();
+        }
+    }
+    format!("{host}:443")
+}
+
+/// RFC 8446 HelloRetryRequest random (a fixed constant).
+const HELLO_RETRY_REQUEST_RANDOM: [u8; 32] = [
+    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8,
+    0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8,
+    0x33, 0x9c,
+];
+
+const EXT_PRE_SHARED_KEY: u16 = 41;
+const EXT_SUPPORTED_VERSIONS: u16 = 43;
+
+/// The pieces of a ClientHello the session-id auth covers
+/// (`checkTLS13ClientAuth`).
+struct ClientHelloInfo {
+    session_id: Vec<u8>,
+    key_shares: Vec<(u16, Vec<u8>)>,
+    psk_labels: Vec<Vec<u8>>,
+}
+
+/// `parseClientHelloRecord` (restls_server.go:301-314): the record must
+/// be a handshake record whose first message parses as a ClientHello.
+fn parse_client_hello_record(record: &[u8]) -> Option<ClientHelloInfo> {
+    if record.len() <= RECORD_HEADER_LEN || record[0] != REC_HANDSHAKE {
+        return None;
+    }
+    let payload = &record[RECORD_HEADER_LEN..];
+    // firstHandshakeMessage: 4-byte header, unfragmented.
+    if payload.len() < 4 {
+        return None;
+    }
+    if payload[0] != 0x01 {
+        return None;
+    }
+    let n = (usize::from(payload[1]) << 16) | (usize::from(payload[2]) << 8) | usize::from(payload[3]);
+    if payload.len() < 4 + n {
+        return None;
+    }
+    let msg = &payload[4..4 + n];
+    // The handshake header is consumed above: the body starts with the
+    // 2-byte legacy version, then the 32-byte random.
+    let mut off = 2usize;
+    if msg.len() < off + 32 + 1 {
+        return None;
+    }
+    off += 32; // random
+    let sid_len = msg[off] as usize;
+    off += 1;
+    if msg.len() < off + sid_len + 2 {
+        return None;
+    }
+    let session_id = msg[off..off + sid_len].to_vec();
+    off += sid_len;
+    let cs_len = usize::from(u16::from_be_bytes([msg[off], msg[off + 1]]));
+    off += 2 + cs_len;
+    if msg.len() < off + 1 {
+        return None;
+    }
+    let comp_len = msg[off] as usize;
+    off += 1 + comp_len;
+    if msg.len() < off + 2 {
+        return None;
+    }
+    let ext_len = usize::from(u16::from_be_bytes([msg[off], msg[off + 1]]));
+    off += 2;
+    if msg.len() < off + ext_len {
+        return None;
+    }
+    let mut rest = &msg[off..off + ext_len];
+    let mut info = ClientHelloInfo {
+        session_id,
+        key_shares: Vec::new(),
+        psk_labels: Vec::new(),
+    };
+    while rest.len() >= 4 {
+        let ext_type = u16::from_be_bytes([rest[0], rest[1]]);
+        let len = usize::from(u16::from_be_bytes([rest[2], rest[3]]));
+        rest = &rest[4..];
+        if len > rest.len() {
+            return None;
+        }
+        let body = &rest[..len];
+        if ext_type == EXT_KEY_SHARE {
+            let mut entry = body.get(2..).unwrap_or(&[]);
+            while entry.len() >= 4 {
+                let group = u16::from_be_bytes([entry[0], entry[1]]);
+                let klen = usize::from(u16::from_be_bytes([entry[2], entry[3]]));
+                if entry.len() < 4 + klen {
+                    break;
+                }
+                info.key_shares.push((group, entry[4..4 + klen].to_vec()));
+                entry = &entry[4 + klen..];
+            }
+        } else if ext_type == EXT_PRE_SHARED_KEY {
+            let mut ids = body;
+            if ids.len() >= 2 {
+                let total = usize::from(u16::from_be_bytes([ids[0], ids[1]]));
+                ids = &ids[2..];
+                let end = total.min(ids.len());
+                let mut walk = &ids[..end];
+                while walk.len() >= 2 {
+                    let ilen = usize::from(u16::from_be_bytes([walk[0], walk[1]]));
+                    if walk.len() < 2 + ilen {
+                        break;
+                    }
+                    info.psk_labels.push(walk[2..2 + ilen].to_vec());
+                    walk = &walk[2 + ilen..];
+                }
+            }
+        }
+        rest = &rest[len..];
+    }
+    Some(info)
+}
+
+/// The pieces of a ServerHello the server side keys off.
+struct ServerHelloInfo {
+    random: [u8; 32],
+    /// The negotiated version (supported_versions ext, else legacy).
+    supported_version: u16,
+    #[allow(dead_code)]
+    cipher_suite: u16,
+}
+
+fn parse_server_hello_record(record: &[u8]) -> Option<ServerHelloInfo> {
+    if record.len() <= RECORD_HEADER_LEN || record[0] != REC_HANDSHAKE {
+        return None;
+    }
+    let payload = &record[RECORD_HEADER_LEN..];
+    if payload.len() < 4 || payload[0] != HS_SERVER_HELLO {
+        return None;
+    }
+    let n = (usize::from(payload[1]) << 16) | (usize::from(payload[2]) << 8) | usize::from(payload[3]);
+    let msg = payload.get(4..4 + n)?;
+    if msg.len() < 2 + 32 + 1 {
+        return None;
+    }
+    let mut random = [0u8; 32];
+    random.copy_from_slice(&msg[2..34]);
+    let legacy_version = u16::from_be_bytes([msg[0], msg[1]]);
+    let mut off = 34usize;
+    let sid_len = msg[off] as usize;
+    off += 1 + sid_len;
+    if msg.len() < off + 2 {
+        return None;
+    }
+    let cipher_suite = u16::from_be_bytes([msg[off], msg[off + 1]]);
+    off += 2 + 1; // + compression
+    let mut supported_version = legacy_version;
+    if msg.len() >= off + 2 {
+        let ext_len = usize::from(u16::from_be_bytes([msg[off], msg[off + 1]]));
+        off += 2;
+        let mut rest = msg.get(off..off + ext_len)?;
+        while rest.len() >= 4 {
+            let ext_type = u16::from_be_bytes([rest[0], rest[1]]);
+            let len = usize::from(u16::from_be_bytes([rest[2], rest[3]]));
+            rest = &rest[4..];
+            if len > rest.len() {
+                return None;
+            }
+            if ext_type == EXT_SUPPORTED_VERSIONS && len >= 2 {
+                supported_version = u16::from_be_bytes([rest[0], rest[1]]);
+            }
+            rest = &rest[len..];
+        }
+    }
+    Some(ServerHelloInfo {
+        random,
+        supported_version,
+        cipher_suite,
+    })
+}
+
+/// `checkTLS13ClientAuth` (restls_server.go:352-369): the session id's
+/// first 16 bytes must be the MAC over the key shares and PSK labels.
+fn check_tls13_client_auth(secret: &[u8; 32], hello: &ClientHelloInfo) -> bool {
+    if hello.session_id.len() != 32 {
+        return false;
+    }
+    let mut mac_input = Vec::new();
+    for (group, key) in &hello.key_shares {
+        mac_input.extend_from_slice(&group.to_be_bytes());
+        mac_input.extend_from_slice(key);
+    }
+    for label in &hello.psk_labels {
+        mac_input.extend_from_slice(label);
+    }
+    let digest = restls_hmac(secret, &[&mac_input]);
+    hello.session_id[..HANDSHAKE_MAC_LEN] == digest[..HANDSHAKE_MAC_LEN]
+}
+
+/// `isRestlsCCSRecord` (restls_server.go:841-843).
+fn is_restls_ccs_record(record: &[u8]) -> bool {
+    record == [20u8, 0x03, 0x03, 0x00, 0x01, 0x01]
+}
+
+/// `maskServerAuth` (restls_server.go:829-839): XOR the record body
+/// with MAC(serverRandom)[:16].
+fn mask_server_auth(secret: &[u8; 32], server_random: &[u8; 32], record: &mut [u8]) {
+    let mac = server_random_mac(secret, server_random);
+    xor_with_mac(&mut record[RECORD_HEADER_LEN..], &mac);
+}
+
+/// `isValidTargetTLSRecord` (restls_server.go:286-299).
+fn is_valid_target_tls_record(record: &[u8]) -> bool {
+    if record.len() < RECORD_HEADER_LEN {
+        return false;
+    }
+    if !matches!(record[0], 20 | REC_ALERT | REC_HANDSHAKE | REC_APP_DATA) {
+        return false;
+    }
+    let vers = u16::from_be_bytes([record[1], record[2]]);
+    if !(0x0301..=0x0304).contains(&vers) {
+        return false;
+    }
+    let n = usize::from(u16::from_be_bytes([record[3], record[4]]));
+    record.len() == RECORD_HEADER_LEN + n
+}
+
+/// `isFirstRestlsClientRecord` (restls_server.go:544-584), non-GCM shape:
+/// the authMac must verify with the client's Finished record prefixed
+/// (to-server counter 0), and the length/command must decode.
+fn is_first_restls_client_record(
+    secret: &[u8; 32],
+    server_random: &[u8; 32],
+    record: &[u8],
+    client_finished: &[u8],
+) -> bool {
+    if record.len() < RECORD_HEADER_LEN + AUTH_HEADER_LEN || record[0] != REC_APP_DATA {
+        return false;
+    }
+    let header = &record[..RECORD_HEADER_LEN];
+    let payload = &record[RECORD_HEADER_LEN..];
+    let mut auth = blake3::Hasher::new_keyed(secret);
+    auth.update(server_random);
+    auth.update(DIR_TO_SERVER);
+    auth.update(&0u64.to_be_bytes());
+    auth.update(client_finished);
+    auth.update(header);
+    auth.update(&payload[AUTH_MAC_LEN..]);
+    if payload[..AUTH_MAC_LEN] != auth.finalize().as_bytes()[..AUTH_MAC_LEN] {
+        return false;
+    }
+    let body = &payload[AUTH_HEADER_LEN..];
+    let sample = &body[..body.len().min(32)];
+    let mut mask = blake3::Hasher::new_keyed(secret);
+    mask.update(server_random);
+    mask.update(DIR_TO_SERVER);
+    mask.update(&0u64.to_be_bytes());
+    mask.update(sample);
+    let mask = mask.finalize();
+    let mut lencmd = [0u8; MASK_LEN];
+    lencmd.copy_from_slice(&payload[AUTH_MAC_LEN..AUTH_HEADER_LEN]);
+    for (b, m) in lencmd.iter_mut().zip(mask.as_bytes()[..MASK_LEN].iter()) {
+        *b ^= m;
+    }
+    let data_len = usize::from(u16::from_be_bytes([lencmd[0], lencmd[1]]));
+    if Cmd::parse([lencmd[2], lencmd[3]]).is_err() {
+        return false;
+    }
+    data_len <= payload.len() - AUTH_HEADER_LEN
+}
+
+/// A trivial bit-rate pacer for the raw fallback relay
+/// (`bitRateLimiter`, restls_server.go:972-1004).
+struct BitPacer {
+    rate_bps: u64,
+    next: tokio::time::Instant,
+}
+
+impl BitPacer {
+    fn new(rate_bps: u64) -> Self {
+        BitPacer {
+            rate_bps,
+            next: tokio::time::Instant::now(),
+        }
+    }
+
+    async fn wait(&mut self, bytes: usize) {
+        if self.rate_bps == 0 {
+            return;
+        }
+        let interval = (bytes as u64 * 8).saturating_mul(1_000_000) / self.rate_bps.max(1);
+        let now = tokio::time::Instant::now();
+        let ready = self.next.max(now);
+        self.next = ready + std::time::Duration::from_micros(interval);
+        let delay = ready.saturating_duration_since(now);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+    }
+}
+
+/// `relayRaw` (restls_server.go:874-892): both directions until EOF,
+/// rate limited per direction. A completed raw relay surfaces the
+/// upstream sentinel error.
+async fn relay_raw(
+    inbound: BoxProxyStream,
+    target: tokio::net::TcpStream,
+    rate_limit: u64,
+    client_leftover: Vec<u8>,
+    target_leftover: Vec<u8>,
+) -> Error {
+    let (mut ri, mut wi) = tokio::io::split(inbound);
+    let (mut rt, mut wt) = tokio::io::split(target);
+    // Read-ahead bytes captured before the fallback must still flow.
+    if !target_leftover.is_empty() {
+        let _ = wi.write_all(&target_leftover).await;
+    }
+    if !client_leftover.is_empty() {
+        let _ = wt.write_all(&client_leftover).await;
+    }
+    let mut down_pacer = BitPacer::new(rate_limit);
+    let mut up_pacer = BitPacer::new(rate_limit);
+    let mut down_buf = vec![0u8; 16 * 1024];
+    let mut up_buf = vec![0u8; 16 * 1024];
+    let down = async {
+        loop {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let n = match rt.read(&mut down_buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            down_pacer.wait(n).await;
+            if wi.write_all(&down_buf[..n]).await.is_err() {
+                break;
+            }
+        }
+    };
+    let up = async {
+        loop {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let n = match ri.read(&mut up_buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            up_pacer.wait(n).await;
+            if wt.write_all(&up_buf[..n]).await.is_err() {
+                break;
+            }
+        }
+    };
+    tokio::select! {
+        _ = down => {}
+        _ = up => {}
+    }
+    Error::network("restls: raw relay closed without restls connection")
+}
+
+/// State shared between the stream and the target pump task.
+struct ServerShared {
+    /// `toClientCounter` as the pump sees it (raw relayed records).
+    to_client: std::sync::Mutex<u64>,
+    /// `closeNotifyCache` — short (<50B) target records, written at close.
+    close_notify: std::sync::Mutex<Vec<u8>>,
+    /// `awaitClientRecord` — the script paused the writer.
+    awaiting: std::sync::Mutex<bool>,
+    wake: Arc<tokio::sync::Notify>,
+}
+
+/// The authenticated plaintext connection [`server`] returns:
+/// `restlsServerConn` (restls_server.go:1006-1199).
+struct RestlsServerStream {
+    inner: BoxProxyStream,
+    /// Raw target records forwarded as camouflage
+    /// (`relayTargetPostHandshake`).
+    target_rx: mpsc::Receiver<Vec<u8>>,
+    shared: Arc<ServerShared>,
+    secret: [u8; 32],
+    server_random: [u8; 32],
+    script: Vec<(Line, Cmd)>,
+    min_record_len: usize,
+    to_client: u64,
+    to_server: u64,
+    /// The client's raw Finished record; prefixes the first framed
+    /// record's auth verification (`clientFinRaw`).
+    client_fin: Option<Vec<u8>>,
+    send_buf: Vec<u8>,
+    rbuf: BytesMut,
+    out: BytesMut,
+    wbuf: BytesMut,
+    closed: bool,
+}
+
+impl RestlsServerStream {
+    /// `nextToClientTarget` (restls_server.go:1373-1385).
+    fn next_to_client_target(&self, data_len: usize) -> (usize, Cmd) {
+        if (self.to_client as usize) < self.script.len() {
+            let (line, cmd) = self.script[self.to_client as usize];
+            return (line.len(), cmd);
+        }
+        let min = self.min_record_len + (rand::random::<u32>() % 100) as usize;
+        if data_len < min {
+            (min, Cmd::Noop)
+        } else {
+            (data_len, Cmd::Noop)
+        }
+    }
+
+    /// `writeOneRestlsRecord` + `writeAuthHeader`
+    /// (restls_server.go:1321-1406). Returns the wire record, how many
+    /// payload bytes it carried and whether the writer must pause for a
+    /// client record (`maybeAwaitClientRecord`).
+    fn build_record(&mut self, data: &[u8], fake: bool) -> (Vec<u8>, usize, bool) {
+        let (mut target_len, command) = self.next_to_client_target(data.len());
+        let overhead = AUTH_HEADER_LEN;
+        let max_target = MAX_PLAINTEXT.saturating_sub(overhead);
+        target_len = target_len.min(max_target);
+        let mut data_len = data.len().min(target_len);
+        let mut padding_len = target_len - data_len;
+        if fake && target_len < AUTH_HEADER_LEN + self.min_record_len {
+            padding_len = self.min_record_len.min(max_target);
+        }
+        let payload_len = overhead + data_len + padding_len;
+        let mut rec = Vec::with_capacity(RECORD_HEADER_LEN + payload_len);
+        rec.extend_from_slice(&[REC_APP_DATA, 0x03, 0x03]);
+        rec.extend_from_slice(&(payload_len as u16).to_be_bytes());
+        let auth_off = rec.len();
+        rec.extend_from_slice(&[0u8; AUTH_HEADER_LEN]);
+        rec.extend_from_slice(&data[..data_len]);
+        let mut padding = vec![0u8; padding_len];
+        rand::rngs::OsRng.fill_bytes(&mut padding);
+        rec.extend_from_slice(&padding);
+
+        let body = &rec[auth_off + AUTH_HEADER_LEN..];
+        let sample = &body[..body.len().min(32)];
+        let mask_digest = {
+            let mut h = auth_header_hasher(
+                &self.secret,
+                &self.server_random,
+                DIR_TO_CLIENT,
+                self.to_client,
+            );
+            h.update(sample);
+            *h.finalize().as_bytes()
+        };
+        let header = rec[..RECORD_HEADER_LEN].to_vec();
+        let region = &mut rec[auth_off..];
+        region[AUTH_MAC_LEN..AUTH_MAC_LEN + CMD_LEN]
+            .copy_from_slice(&(data_len as u16).to_be_bytes());
+        region[AUTH_MAC_LEN + CMD_LEN..AUTH_HEADER_LEN].copy_from_slice(&command.to_bytes());
+        xor_with_mac(&mut region[AUTH_MAC_LEN..AUTH_HEADER_LEN], &mask_digest[..MASK_LEN]);
+        let auth_digest = {
+            let mut h = auth_header_hasher(
+                &self.secret,
+                &self.server_random,
+                DIR_TO_CLIENT,
+                self.to_client,
+            );
+            h.update(&header);
+            h.update(&region[AUTH_MAC_LEN..]);
+            *h.finalize().as_bytes()
+        };
+        region[..AUTH_MAC_LEN].copy_from_slice(&auth_digest[..AUTH_MAC_LEN]);
+        data_len = payload_len - overhead - padding_len;
+        self.to_client += 1;
+        (rec, data_len, command.need_interrupt() && !fake)
+    }
+
+    /// `readRestlsAppData` (restls_server.go:1216-1264): verify the
+    /// authMac (clientFinRaw prefixes the first record), unmask the
+    /// length/command, return the data.
+    fn extract_record(&mut self, record: &[u8]) -> Result<(Vec<u8>, Cmd)> {
+        if record.len() < RECORD_HEADER_LEN + AUTH_HEADER_LEN || record[0] != REC_APP_DATA {
+            return Err(Error::protocol("restls: bad record MAC"));
+        }
+        if record[1] != 0x03 || record[2] != 0x03 {
+            return Err(Error::protocol("restls: bad record MAC"));
+        }
+        let header = &record[..RECORD_HEADER_LEN];
+        let payload = &record[RECORD_HEADER_LEN..];
+        let mut auth = blake3::Hasher::new_keyed(&self.secret);
+        auth.update(&self.server_random);
+        auth.update(DIR_TO_SERVER);
+        auth.update(&self.to_server.to_be_bytes());
+        if let Some(fin) = self.client_fin.take() {
+            auth.update(&fin);
+        }
+        auth.update(header);
+        auth.update(&payload[AUTH_MAC_LEN..]);
+        if payload[..AUTH_MAC_LEN] != auth.finalize().as_bytes()[..AUTH_MAC_LEN] {
+            return Err(Error::protocol("restls: bad record MAC"));
+        }
+        let body = &payload[AUTH_HEADER_LEN..];
+        let sample = &body[..body.len().min(32)];
+        let mut mask = blake3::Hasher::new_keyed(&self.secret);
+        mask.update(&self.server_random);
+        mask.update(DIR_TO_SERVER);
+        mask.update(&self.to_server.to_be_bytes());
+        mask.update(sample);
+        let mask = mask.finalize();
+        let mut lencmd = [0u8; MASK_LEN];
+        lencmd.copy_from_slice(&payload[AUTH_MAC_LEN..AUTH_HEADER_LEN]);
+        for (b, m) in lencmd.iter_mut().zip(mask.as_bytes()[..MASK_LEN].iter()) {
+            *b ^= m;
+        }
+        let data_len = usize::from(u16::from_be_bytes([lencmd[0], lencmd[1]]));
+        let cmd = Cmd::parse([lencmd[2], lencmd[3]])?;
+        if data_len > payload.len() - AUTH_HEADER_LEN {
+            return Err(Error::protocol("restls: bad record MAC"));
+        }
+        self.to_server += 1;
+        Ok((body[..data_len].to_vec(), cmd))
+    }
+
+    /// `noteClientRecord` (restls_server.go:1312-1319): a client record
+    /// arrived; unblock a writer paused by an `ActResponse` script line.
+    fn note_client_record(&self) {
+        let mut awaiting = self.shared.awaiting.lock().unwrap_or_else(|e| e.into_inner());
+        if *awaiting {
+            *awaiting = false;
+            self.shared.wake.notify_one();
+        }
+    }
+
+    fn awaiting_client_record(&self) -> bool {
+        *self.shared.awaiting.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set_awaiting(&self) {
+        *self.shared.awaiting.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    }
+
+    /// Try to consume one complete framed record from `rbuf`;
+    /// `Ok(false)` = more bytes needed.
+    fn parse_record(&mut self) -> Result<bool> {
+        if self.rbuf.len() < RECORD_HEADER_LEN {
+            return Ok(false);
+        }
+        let len = usize::from(u16::from_be_bytes([self.rbuf[3], self.rbuf[4]]));
+        if RECORD_HEADER_LEN + len > MAX_RECORD_LEN {
+            return Err(Error::protocol("restls: oversized record"));
+        }
+        if self.rbuf.len() < RECORD_HEADER_LEN + len {
+            return Ok(false);
+        }
+        let record = self.rbuf.split_to(RECORD_HEADER_LEN + len).to_vec();
+        if record[0] == REC_ALERT {
+            self.closed = true;
+            return Ok(true);
+        }
+        if record[0] != REC_APP_DATA {
+            // A plain-TLS record from the client: dropped (the server
+            // side never relayed such a record to itself, so the counter
+            // does not advance).
+            return Ok(true);
+        }
+        let (data, cmd) = self.extract_record(&record)?;
+        self.out.extend_from_slice(&data);
+        self.note_client_record();
+        if let Cmd::Response(n) = cmd {
+            for _ in 0..n {
+                let (rec, _, _) = self.build_record(&[], true);
+                self.wbuf.extend_from_slice(&rec);
+            }
+        }
+        Ok(true)
+    }
+
+    fn flush_wbuf(this: &mut Self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while !this.wbuf.is_empty() {
+            match Pin::new(&mut this.inner).poll_write(cx, &this.wbuf) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "restls: transport accepted zero bytes",
+                    )))
+                }
+                Poll::Ready(Ok(n)) => this.wbuf.advance(n),
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    /// Forward raw target records queued by the pump (camouflage).
+    fn drain_target_rx(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            match self.target_rx.poll_recv(cx) {
+                Poll::Ready(Some(record)) => {
+                    if !is_valid_target_tls_record(&record) {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "restls: invalid target TLS record",
+                        )));
+                    }
+                    self.wbuf.extend_from_slice(&record);
+                    self.to_client += 1;
+                    *self.shared.to_client.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+                    ready!(Self::flush_wbuf(self, cx))?;
+                }
+                Poll::Ready(None) | Poll::Pending => return Poll::Ready(Ok(())),
+            }
+        }
+    }
+}
+
+impl AsyncRead for RestlsServerStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        loop {
+            ready!(Self::drain_target_rx(this, cx))?;
+            if !this.out.is_empty() {
+                let n = this.out.len().min(buf.remaining());
+                buf.put_slice(&this.out[..n]);
+                this.out.advance(n);
+                return Poll::Ready(Ok(()));
+            }
+            if this.closed {
+                return Poll::Ready(Ok(()));
+            }
+            match this.parse_record() {
+                Ok(true) => {
+                    ready!(Self::flush_wbuf(this, cx))?;
+                    continue;
+                }
+                Ok(false) => {
+                    let mut tmp = [0u8; 16 * 1024];
+                    let mut rb = ReadBuf::new(&mut tmp);
+                    ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
+                    if rb.filled().is_empty() {
+                        this.closed = true;
+                        return Poll::Ready(Ok(()));
+                    }
+                    this.rbuf.extend_from_slice(rb.filled());
+                }
+                Err(e) => return Poll::Ready(Err(io_err(e))),
+            }
+        }
+    }
+}
+
+impl AsyncWrite for RestlsServerStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        if this.closed {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "restls: connection closed",
+            )));
+        }
+        ready!(Self::drain_target_rx(this, cx))?;
+        if this.awaiting_client_record() {
+            // `waitToClientWritable`: park the plaintext until a client
+            // record unblocks the writer.
+            this.send_buf.extend_from_slice(buf);
+            return Poll::Ready(Ok(buf.len()));
+        }
+        let mut data = std::mem::take(&mut this.send_buf);
+        data.extend_from_slice(buf);
+        while !data.is_empty() {
+            let (rec, consumed, interrupt) = this.build_record(&data, false);
+            if !rec.is_empty() {
+                this.wbuf.extend_from_slice(&rec);
+            }
+            let consumed = consumed.clamp(1, data.len());
+            data.drain(..consumed);
+            if interrupt {
+                this.set_awaiting();
+                break;
+            }
+        }
+        this.send_buf = data;
+        ready!(Self::flush_wbuf(this, cx))?;
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        ready!(Self::drain_target_rx(this, cx))?;
+        Self::flush_wbuf(this, cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        // `Close` → `writeCachedCloseNotify`: the short target records
+        // cached by the pump go out before the half-close.
+        {
+            let mut cache = this.shared.close_notify.lock().unwrap_or_else(|e| e.into_inner());
+            if !cache.is_empty() {
+                this.wbuf.extend_from_slice(&cache);
+                cache.clear();
+            }
+        }
+        while !this.wbuf.is_empty() {
+            let n = ready!(Pin::new(&mut this.inner).poll_write(cx, &this.wbuf))?;
+            if n == 0 {
+                break;
+            }
+            this.wbuf.advance(n);
+        }
+        Pin::new(&mut this.inner).poll_shutdown(cx)
+    }
+}
+
+impl Drop for RestlsServerStream {
+    fn drop(&mut self) {
+        self.closed = true;
+    }
+}
+
+/// `RestlsServer` (restls_server.go:61-181): complete the restls
+/// handshake over `inbound`, relaying the camouflage TLS to the real
+/// `dest`, and return the authenticated plaintext stream.
+///
+/// Non-restls clients (an unparseable hello, a HelloRetryRequest, a TLS
+/// 1.2 negotiation, a failed session-id auth) fall back to the rate
+/// limited raw relay, which surfaces the upstream sentinel error once it
+/// ends — exactly upstream's `relayRaw` behavior.
+pub async fn server(cfg: &RestlsServerConfig, inbound: BoxProxyStream) -> Result<BoxProxyStream> {
+    if cfg.password.is_empty() {
+        return Err(Error::config("restls: password is required"));
+    }
+    let min_record_len = if cfg.min_record_len == 0 {
+        15
+    } else {
+        cfg.min_record_len as usize
+    };
+    let script_src = cfg
+        .restls_script
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_SCRIPT);
+    let script = parse_record_script(script_src)?;
+    let secret = restls_secret(&cfg.password);
+
+    let target_addr = restls_host_port(&cfg.server_hostname);
+    let target = match tokio::net::TcpStream::connect(&target_addr).await {
+        Ok(t) => t,
+        Err(e) => {
+            return Err(Error::network(format!(
+                "restls: dial camouflage target {target_addr}: {e}"
+            )))
+        }
+    };
+    let mut inbound = inbound;
+    let mut target = target;
+    let mut rbuf = BytesMut::with_capacity(16 * 1024);
+    let mut trbuf = BytesMut::with_capacity(16 * 1024);
+
+    // 1. The client's first record must parse as a ClientHello
+    //    (restls_server.go:103-119).
+    let first = match read_one_record(&mut inbound, &mut rbuf).await {
+        Ok(r) => r,
+        Err(_) => {
+            if !rbuf.is_empty() {
+                let _ = target.write_all(&rbuf).await;
+            }
+            let leftover = rbuf.to_vec();
+            return Err(relay_raw(inbound, target, cfg.rate_limit, leftover, trbuf.to_vec()).await);
+        }
+    };
+    let hello = match parse_client_hello_record(&first) {
+        Some(h) => h,
+        None => {
+            let _ = target.write_all(&first).await;
+            let leftover = [first, rbuf.to_vec()].concat();
+            return Err(relay_raw(inbound, target, cfg.rate_limit, leftover, trbuf.to_vec()).await);
+        }
+    };
+    if target.write_all(&first).await.is_err() {
+        return Err(Error::network("restls: camouflage target closed"));
+    }
+
+    // 2. The target's first record must parse as a ServerHello
+    //    (restls_server.go:125-147); HRR falls back to the raw relay.
+    let first_server = match read_one_record(&mut target, &mut trbuf).await {
+        Ok(r) => r,
+        Err(_) => {
+            let _ = inbound.write_all(&trbuf).await;
+            let leftover = [first, rbuf.to_vec()].concat();
+            return Err(relay_raw(inbound, target, cfg.rate_limit, leftover, trbuf.to_vec()).await);
+        }
+    };
+    let server_hello = match parse_server_hello_record(&first_server) {
+        Some(sh) => sh,
+        None => {
+            let _ = inbound.write_all(&first_server).await;
+            let leftover = [first, rbuf.to_vec()].concat();
+            let tleftover = [first_server, trbuf.to_vec()].concat();
+            return Err(
+                relay_raw(inbound, target, cfg.rate_limit, leftover, tleftover).await,
+            );
+        }
+    };
+    if server_hello.random == HELLO_RETRY_REQUEST_RANDOM {
+        let _ = inbound.write_all(&first_server).await;
+        let leftover = [first, rbuf.to_vec()].concat();
+        let tleftover = [first_server, trbuf.to_vec()].concat();
+        return Err(relay_raw(inbound, target, cfg.rate_limit, leftover, tleftover).await);
+    }
+    let server_random = server_hello.random;
+    if inbound.write_all(&first_server).await.is_err() {
+        return Err(Error::network("restls: client closed"));
+    }
+    if server_hello.supported_version != 0x0304 {
+        // The TLS 1.2 server half is deferred with the client's tls12
+        // deferral (handshakeTLS12 + the eager-key session-id layouts).
+        tracing::debug!(
+            target: "engine",
+            "restls: server negotiated TLS {:#06x}, falling back to the raw relay",
+            server_hello.supported_version
+        );
+        let leftover = [first, rbuf.to_vec()].concat();
+        let tleftover = [first_server, trbuf.to_vec()].concat();
+        return Err(relay_raw(inbound, target, cfg.rate_limit, leftover, tleftover).await);
+    }
+
+    // 3. Client authentication: the session-id MAC (restls_server.go:156-159).
+    if !check_tls13_client_auth(&secret, &hello) {
+        // Upstream raw-relays an unauthenticated client (RestlsServer's
+        // relayRaw fallback on checkTLS13ClientAuth failure).
+        let leftover = [first, rbuf.to_vec()].concat();
+        let tleftover = trbuf.to_vec();
+        return Err(relay_raw(inbound, target, cfg.rate_limit, leftover, tleftover).await);
+    }
+
+    // 4. handshakeTLS13 (restls_server.go:371-401): the target's CCS is
+    //    forwarded, its first 0x17 record is masked, then the two
+    //    connections are bridged until the client's first framed record.
+    let mut seen_server_ccs = false;
+    loop {
+        let record = read_one_record(&mut target, &mut trbuf).await?;
+        match record[0] {
+            20 => {
+                if seen_server_ccs {
+                    return Err(Error::protocol("restls: duplicate TLS 1.3 server CCS"));
+                }
+                seen_server_ccs = true;
+                if inbound.write_all(&record).await.is_err() {
+                    return Err(Error::network("restls: client closed"));
+                }
+            }
+            REC_APP_DATA => {
+                if !seen_server_ccs {
+                    return Err(Error::protocol(
+                        "restls: TLS 1.3 encrypted server flight before CCS",
+                    ));
+                }
+                let mut masked_record = record;
+                mask_server_auth(&secret, &server_random, &mut masked_record);
+                if inbound.write_all(&masked_record).await.is_err() {
+                    return Err(Error::network("restls: client closed"));
+                }
+                break;
+            }
+            other => {
+                return Err(Error::protocol(format!(
+                    "restls: unexpected TLS 1.3 server record type {other}"
+                )))
+            }
+        }
+    }
+
+    // 5. finishTLS13Handshake + readTLS13ClientHandshake
+    //    (restls_server.go:454-530): relay further target records raw
+    //    while the client's CCS and encrypted flight arrive; the record
+    //    whose auth verifies with the previous one as the Finished is the
+    //    first framed client record.
+    //
+    //    Counter note (deviation): upstream guesses the extra raw target
+    //    records with an expected-flight heuristic of 3; this port counts
+    //    the records it actually relayed — which is exactly the set the
+    //    client counts as unframable, so the counters agree for any
+    //    target flight shape.
+    let mut seen_client_ccs = false;
+    let mut previous_client: Option<Vec<u8>> = None;
+    let mut client_fin: Option<Vec<u8>> = None;
+    let mut pending_client: Option<Vec<u8>> = None;
+    let mut raw_relayed: u64 = 0;
+    let result: Result<()> = loop {
+        tokio::select! {
+            r = read_one_record(&mut target, &mut trbuf) => {
+                let record = match r {
+                    Ok(rec) => rec,
+                    Err(e) => break Err(e),
+                };
+                if record[0] != REC_APP_DATA {
+                    break Err(Error::protocol(format!(
+                        "restls: unexpected TLS 1.3 server flight record type {}",
+                        record[0]
+                    )));
+                }
+                if let Err(e) = inbound.write_all(&record).await {
+                    break Err(Error::network(e.to_string()));
+                }
+                raw_relayed += 1;
+            }
+            r = read_one_record(&mut inbound, &mut rbuf) => {
+                let record = match r {
+                    Ok(rec) => rec,
+                    Err(e) => break Err(e),
+                };
+                match record[0] {
+                    20 => {
+                        if seen_client_ccs {
+                            break Err(Error::protocol("restls: duplicate TLS 1.3 client CCS"));
+                        }
+                        if !is_restls_ccs_record(&record) {
+                            break Err(Error::protocol("restls: incorrect TLS 1.3 client CCS"));
+                        }
+                        seen_client_ccs = true;
+                        if let Err(e) = target.write_all(&record).await {
+                            break Err(Error::network(e.to_string()));
+                        }
+                    }
+                    REC_APP_DATA => {
+                        if let Some(prev) = previous_client.take() {
+                            if is_first_restls_client_record(&secret, &server_random, &record, &prev)
+                            {
+                                client_fin = Some(prev);
+                                pending_client = Some(record);
+                                break Ok(());
+                            }
+                        }
+                        if let Err(e) = target.write_all(&record).await {
+                            break Err(Error::network(e.to_string()));
+                        }
+                        previous_client = Some(record);
+                    }
+                    other => {
+                        break Err(Error::protocol(format!(
+                            "restls: unexpected TLS 1.3 client record type {other}"
+                        )));
+                    }
+                }
+            }
+        }
+    };
+    result?;
+    let pending_client = pending_client
+        .ok_or_else(|| Error::protocol("restls: handshake ended without a client record"))?;
+
+    // 6. The pump: raw target records continue to the client as
+    //    camouflage (relayTargetPostHandshake); records < 50 bytes are
+    //    cached as the close notification.
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
+    let shared = Arc::new(ServerShared {
+        to_client: std::sync::Mutex::new(raw_relayed),
+        close_notify: std::sync::Mutex::new(Vec::new()),
+        awaiting: std::sync::Mutex::new(false),
+        wake: Arc::new(tokio::sync::Notify::new()),
+    });
+    let pump_shared = shared.clone();
+    tokio::spawn(async move {
+        let mut target = target;
+        let mut buf = BytesMut::with_capacity(16 * 1024);
+        loop {
+            match read_one_record(&mut target, &mut buf).await {
+                Ok(record) => {
+                    if record.len() < 50 {
+                        pump_shared
+                            .close_notify
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .extend_from_slice(&record);
+                        continue;
+                    }
+                    if tx.send(record).await.is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    let mut stream = RestlsServerStream {
+        inner: inbound,
+        target_rx: rx,
+        shared,
+        secret,
+        server_random,
+        script,
+        min_record_len,
+        to_client: raw_relayed,
+        to_server: 0,
+        client_fin,
+        send_buf: Vec::new(),
+        rbuf,
+        out: BytesMut::with_capacity(16 * 1024),
+        wbuf: BytesMut::new(),
+        closed: false,
+    };
+    // The captured first framed record is processed before anything else.
+    if pending_client[0] == REC_APP_DATA {
+        match stream.extract_record(&pending_client) {
+            Ok((data, cmd)) => {
+                stream.out.extend_from_slice(&data);
+                stream.note_client_record();
+                if let Cmd::Response(n) = cmd {
+                    for _ in 0..n {
+                        let (rec, _, _) = stream.build_record(&[], true);
+                        stream.wbuf.extend_from_slice(&rec);
+                    }
+                }
+            }
+            Err(_) => {
+                return Err(Error::protocol(
+                    "restls: first client record failed authentication",
+                ))
+            }
+        }
+    }
+    Ok(Box::new(stream))
 }
 
 #[cfg(test)]
@@ -1231,6 +2332,7 @@ mod tests {
         server_random: &[u8; 32],
         dir: &[u8],
         counter: u64,
+        client_fin: Option<&[u8]>,
         record: &[u8],
     ) -> Result<(Vec<u8>, Cmd)> {
         let region = &record[RECORD_HEADER_LEN..];
@@ -1238,6 +2340,9 @@ mod tests {
         auth.update(server_random);
         auth.update(dir);
         auth.update(&counter.to_be_bytes());
+        if let Some(fin) = client_fin {
+            auth.update(fin);
+        }
         auth.update(&record[..RECORD_HEADER_LEN]);
         auth.update(&region[AUTH_MAC_LEN..]);
         if region[..AUTH_MAC_LEN] != auth.finalize().as_bytes()[..AUTH_MAC_LEN] {
@@ -1265,13 +2370,14 @@ mod tests {
     fn framed_record_passes_independent_extraction() {
         let secret = restls_secret("shared-test-secret");
         let server_random = [7u8; 32];
-        let stream = RestlsStream {
+        let mut stream = RestlsStream {
             inner: Box::new(tokio::io::duplex(16).0),
             secret,
             server_random,
             script: parse_record_script("50<1,40,0").unwrap(),
             to_server: 0,
             to_client: 0,
+            client_fin: None,
             write_pending: false,
             send_buf: Vec::new(),
             rbuf: BytesMut::new(),
@@ -1289,31 +2395,32 @@ mod tests {
         assert_eq!(rec.len(), RECORD_HEADER_LEN + payload_len);
 
         // The server-side transcription accepts it.
-        let (data, cmd) = upstream_extract(&secret, &server_random, DIR_TO_SERVER, 0, &rec).unwrap();
+        let (data, cmd) = upstream_extract(&secret, &server_random, DIR_TO_SERVER, 0, None, &rec).unwrap();
         assert_eq!(data, b"hello world".to_vec());
         assert_eq!(cmd, Cmd::Response(1));
 
         // A wrong counter fails the authMac.
-        assert!(upstream_extract(&secret, &server_random, DIR_TO_SERVER, 1, &rec).is_err());
+        assert!(upstream_extract(&secret, &server_random, DIR_TO_SERVER, 1, None, &rec).is_err());
         // A wrong secret fails.
-        assert!(upstream_extract(&restls_secret("other"), &server_random, DIR_TO_SERVER, 0, &rec).is_err());
+        assert!(upstream_extract(&restls_secret("other"), &server_random, DIR_TO_SERVER, 0, None, &rec).is_err());
         // Flipping one payload bit breaks the authMac (padding is covered).
         let mut tampered = rec.clone();
         let last = tampered.len() - 1;
         tampered[last] ^= 1;
-        assert!(upstream_extract(&secret, &server_random, DIR_TO_SERVER, 0, &tampered).is_err());
+        assert!(upstream_extract(&secret, &server_random, DIR_TO_SERVER, 0, None, &tampered).is_err());
     }
 
     #[test]
     fn zero_length_script_line_pads() {
         let secret = restls_secret("pw");
-        let stream = RestlsStream {
+        let mut stream = RestlsStream {
             inner: Box::new(tokio::io::duplex(16).0),
             secret,
             server_random: [1u8; 32],
             script: parse_record_script("0,5").unwrap(),
             to_server: 0,
             to_client: 0,
+            client_fin: None,
             write_pending: false,
             send_buf: Vec::new(),
             rbuf: BytesMut::new(),
@@ -1327,7 +2434,7 @@ mod tests {
         assert!(!interrupt);
         let payload_len = u16::from_be_bytes([rec[3], rec[4]]) as usize;
         assert!(((19 + AUTH_HEADER_LEN)..=(118 + AUTH_HEADER_LEN)).contains(&payload_len));
-        let (data, cmd) = upstream_extract(&secret, &[1u8; 32], DIR_TO_SERVER, 0, &rec).unwrap();
+        let (data, cmd) = upstream_extract(&secret, &[1u8; 32], DIR_TO_SERVER, 0, None, &rec).unwrap();
         assert!(data.is_empty());
         assert_eq!(cmd, Cmd::Noop);
     }
@@ -1455,6 +2562,10 @@ mod tests {
         tls.process_new_packets().map_err(|e| e.to_string())?;
         let mut xor_done = false;
         let mut srv_random: Option<[u8; 32]> = None;
+        // The client's Finished: the last 0x17 record it sends during the
+        // handshake (restls_server.go readTLS13ClientHandshake keeps it as
+        // clientFinRaw for the first framed record's authMac).
+        let mut client_fin: Option<Vec<u8>> = None;
         // Raw 0x17 records written after the handshake (the rustls
         // NewSessionTicket) — the client's framed reader will drop them and
         // still advance its counter, so the server must count them into its
@@ -1524,6 +2635,9 @@ mod tests {
             rd.read_exact(&mut record[RECORD_HEADER_LEN..])
                 .await
                 .map_err(|e| e.to_string())?;
+            if record[0] == REC_APP_DATA {
+                client_fin = Some(record.clone());
+            }
             let mut input = record.as_slice();
             tls.read_tls(&mut input).map_err(|e| e.to_string())?;
             tls.process_new_packets().map_err(|e| e.to_string())?;
@@ -1555,6 +2669,11 @@ mod tests {
             auth.update(&server_random);
             auth.update(b"client-to-server");
             auth.update(&from_client.to_be_bytes());
+            if from_client == 0 {
+                // readRestlsAppData: clientFinRaw prefixes the first
+                // framed record's auth hash, then is consumed.
+                auth.update(client_fin.as_deref().unwrap_or(&[]));
+            }
             auth.update(&record[..RECORD_HEADER_LEN]);
             auth.update(&region[AUTH_MAC_LEN..]);
             if region[..AUTH_MAC_LEN] != auth.finalize().as_bytes()[..AUTH_MAC_LEN] {

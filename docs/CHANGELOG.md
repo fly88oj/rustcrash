@@ -27,6 +27,45 @@ All notable changes to RustCrash. Format based on
   passthrough (the framing half of the splice; the raw-transport
   rebind is tracked).
 
+### Engine — wave 8: ECH runtime, OpenVPN, snell/mieru UDP, sudoku tunnel modes, tlsmirror enrolment, restls/tlsmirror listeners
+
+- **ECH is live** on the TCP-TLS outbounds (vless/trojan/vmess/anytls,
+  `ech-opts`): the engine's own TLS 1.3 stack now performs the full
+  encrypted-client-hello handshake — inner/outer ClientHello shaping,
+  HPKE-sealed extension, accept/HRR confirmations, transcript rebind to
+  the inner hello, certificate verification against the inner name, and
+  the upstream rejection path (`ech_required` alert, one retry with the
+  server's retry configs, exact Go error strings). QUIC/h2 carriers
+  (hysteria2/tuic/trusttunnel) still fail with the precise quinn/rustls
+  blocker; HTTPS-RR discovery needs DNS type-64 (precise error).
+- **OpenVPN outbound**: the complete 2.x client — control channel with
+  reliable transport and replay windows, tls-auth/tls-crypt/tls-crypt-v2
+  auth layers, rustls TLS-1.3 control epoch, key-method-2 derivation,
+  AES-GCM/CHACHA20/AES-CBC data channel, push parsing (ifconfig/route/
+  dns/cipher negotiation), soft-reset rekey, and the smoltcp userspace
+  stack for L3 dialing (the wireguard pattern). TCP and UDP transports.
+- **snell UDP**: a frame-boundary reader on the AEAD session
+  (one decrypted frame per read, v4 whole-datagram single-frame writes)
+  — `UdpChannel::Snell` wired, the refusal deleted.
+- **mieru UDP packet transport**: stateless datagram cipher with the
+  retransmit/window/ACK engine (RTT stats + CUBIC, heartbeats, reorder
+  delivery), plus the SOCKS5 UDP-ASSOCIATE relay that works over either
+  underlay; `transport: UDP` no longer rejected.
+- **sudoku http-mask tunnel modes**: stream (chunked pull + sequenced
+  uploads), poll (base64 lines), auto (probe + fallback) and ws
+  (WebSocket upgrade + HMAC token), each with optional TLS carriers and
+  the early-handshake KIP exchange riding the tunnel bootstrap; TCP,
+  UoT and session-mux entry points over any mode.
+- **tlsmirror connection-enrolment**: server-identifier host derivation,
+  the protobuf confirmation over a minimal h2c client/server, and the
+  server half (`ServeConnReady`) with the matching camouflage listener;
+  a `tlsmirror` listener now also serves enrolment control connections.
+- **restls listener**: the server half of the restls handshake
+  (session-id MAC over key shares, XOR-masked first flight, script-framed
+  records with min-record-len/rate-limit, camouflage raw-relay fallback)
+  behind a fixed-dest listener; the wave-6 client was fixed to capture
+  its Finished record for real-server compatibility.
+
 ### Engine — wave 7: jls, shadowquic, sudoku, gost-relay, tlsmirror, trusttunnel, masque, ECH core; Vision full splice; WireGuard IPv6
 
 - Five new mihomo outbound types, all with TCP+UDP wiring and their

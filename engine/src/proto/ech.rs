@@ -162,9 +162,7 @@ impl Cursor<'_> {
 fn parse_ech_config(enc: &[u8]) -> Result<Option<EchConfig>> {
     let ec_raw_all = enc;
     let mut s = Cursor { data: enc };
-    let version = s
-        .u16()
-        .ok_or_else(|| err_config_field("version"))?;
+    let version = s.u16().ok_or_else(|| err_config_field("version"))?;
     let length = s.u16().ok_or_else(|| err_config_field("length"))?;
     if ec_raw_all.len() < length as usize + 4 {
         return Err(err_config_field("length"));
@@ -298,11 +296,7 @@ pub fn pick_ech_config(configs: &[EchConfig]) -> Result<(&EchConfig, HpkeAead)> 
             continue;
         }
         // A mandatory extension (high bit) means "skip this config".
-        if ec
-            .extensions
-            .iter()
-            .any(|e| e.typ & (1 << 15) != 0)
-        {
+        if ec.extensions.iter().any(|e| e.typ & (1 << 15) != 0) {
             continue;
         }
         // hpke.NewKEM(ec.KemID): only X25519 is implemented here.
@@ -325,6 +319,29 @@ pub fn pick_ech_config(configs: &[EchConfig]) -> Result<(&EchConfig, HpkeAead)> 
     Err(Error::crypto(
         "tls: EncryptedClientHelloConfigList contains no valid configs",
     ))
+}
+
+/// The ECHConfig + HPKE suite a client seals its inner hello with — the
+/// `echClientContext{config, kdfID, aeadID}` triple built by `makeClientHello`
+/// (metacubex/tls handshake_client.go:175-183). Owned so a caller can hold it
+/// across an ECH retry that swaps in the server's retry configs.
+#[derive(Debug, Clone)]
+pub struct EchConfigSelection {
+    pub config: EchConfig,
+    pub aead: HpkeAead,
+}
+
+/// `parseECHConfigList` + `pickECHConfig` in one step (the ECH block of
+/// `makeClientHello`, handshake_client.go:175-183): parse the raw
+/// ECHConfigList wire bytes and pick the first usable config. The exact
+/// upstream error strings surface on failure.
+pub fn select_ech_config(list: &[u8]) -> Result<EchConfigSelection> {
+    let configs = parse_ech_config_list(list)?;
+    let (config, aead) = pick_ech_config(&configs)?;
+    Ok(EchConfigSelection {
+        config: config.clone(),
+        aead,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -425,7 +442,12 @@ fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; KDF_HKDF_SHA256_SIZE] {
 
 /// `labeledExtract` (kdf.go:86-93):
 /// `Extract(salt, "HPKE-v1" ‖ suite_id ‖ label ‖ ikm)`.
-fn labeled_extract(suite_id: &[u8], salt: &[u8], label: &[u8], ikm: &[u8]) -> [u8; KDF_HKDF_SHA256_SIZE] {
+fn labeled_extract(
+    suite_id: &[u8],
+    salt: &[u8],
+    label: &[u8],
+    ikm: &[u8],
+) -> [u8; KDF_HKDF_SHA256_SIZE] {
     let mut labeled = Vec::with_capacity(7 + suite_id.len() + label.len() + ikm.len());
     labeled.extend_from_slice(b"HPKE-v1");
     labeled.extend_from_slice(suite_id);
@@ -474,17 +496,25 @@ fn kem_suite_id(kem_id: u16) -> [u8; 5] {
 fn kem_extract_and_expand(kem_id: u16, dh: &[u8], kem_context: &[u8]) -> [u8; KEM_SECRET_LEN] {
     let sid = kem_suite_id(kem_id);
     let eae_prk = labeled_extract(&sid, b"", b"eae_prk", dh);
-    labeled_expand(&sid, &eae_prk, b"shared_secret", kem_context, KEM_SECRET_LEN as u16)
-        .expect("32 bytes is a valid HKDF-SHA256 output")
-        .try_into()
-        .expect("labeled_expand honors the requested length")
+    labeled_expand(
+        &sid,
+        &eae_prk,
+        b"shared_secret",
+        kem_context,
+        KEM_SECRET_LEN as u16,
+    )
+    .expect("32 bytes is a valid HKDF-SHA256 output")
+    .try_into()
+    .expect("labeled_expand honors the requested length")
 }
 
 /// X25519 (clamped on use, as `crypto/ecdh` does; RFC 7748).
 fn x25519(scalar: &[u8; 32], peer: &[u8; 32]) -> Result<[u8; 32]> {
     let shared = MontgomeryPoint(*peer).mul_clamped(*scalar).0;
     if shared.iter().all(|&b| b == 0) {
-        return Err(Error::crypto("ech: X25519 produced an all-zero shared secret"));
+        return Err(Error::crypto(
+            "ech: X25519 produced an all-zero shared secret",
+        ));
     }
     Ok(shared)
 }
@@ -499,7 +529,10 @@ pub fn hpke_encap(sk_e: &[u8; 32], pk_r: &[u8; 32]) -> Result<([u8; 32], [u8; 32
     let mut kem_context = Vec::with_capacity(64);
     kem_context.extend_from_slice(&enc);
     kem_context.extend_from_slice(pk_r);
-    Ok((kem_extract_and_expand(KEM_DH_X25519_HKDF_SHA256, &dh, &kem_context), enc))
+    Ok((
+        kem_extract_and_expand(KEM_DH_X25519_HKDF_SHA256, &dh, &kem_context),
+        enc,
+    ))
 }
 
 /// `dhKEMPrivateKey.decap` (kem.go:371-382) — the recipient mirror, used
@@ -509,7 +542,11 @@ pub fn hpke_decap(sk_r: &[u8; 32], enc: &[u8; 32]) -> Result<[u8; 32]> {
     let mut kem_context = Vec::with_capacity(64);
     kem_context.extend_from_slice(enc);
     kem_context.extend_from_slice(&MontgomeryPoint::mul_base_clamped(*sk_r).0);
-    Ok(kem_extract_and_expand(KEM_DH_X25519_HKDF_SHA256, &dh, &kem_context))
+    Ok(kem_extract_and_expand(
+        KEM_DH_X25519_HKDF_SHA256,
+        &dh,
+        &kem_context,
+    ))
 }
 
 /// `DeriveKeyPair` for X25519 (RFC 9180 §7.1.3; kem.go:303-316):
@@ -536,11 +573,7 @@ pub struct HpkeKeys {
 /// `newContext`'s two-stage KDF path (hpke.go:83-123, `oneStage() ==
 /// false` for HKDF): `psk_id_hash`/`info_hash` both empty-psk, then
 /// `secret`, `key`, `base_nonce` and `exp` labeled derives.
-pub fn hpke_key_schedule(
-    shared_secret: &[u8],
-    aead: HpkeAead,
-    info: &[u8],
-) -> Result<HpkeKeys> {
+pub fn hpke_key_schedule(shared_secret: &[u8], aead: HpkeAead, info: &[u8]) -> Result<HpkeKeys> {
     let sid = hpke_suite_id(KEM_DH_X25519_HKDF_SHA256, aead.id());
     let psk_id_hash = labeled_extract(&sid, b"", b"psk_id_hash", b"");
     let info_hash = labeled_extract(&sid, b"", b"info_hash", info);
@@ -561,8 +594,13 @@ pub fn hpke_key_schedule(
         &ks_context,
         HPKE_NONCE_LEN as u16,
     )?;
-    let exporter_secret =
-        labeled_expand(&sid, &secret, b"exp", &ks_context, KDF_HKDF_SHA256_SIZE as u16)?;
+    let exporter_secret = labeled_expand(
+        &sid,
+        &secret,
+        b"exp",
+        &ks_context,
+        KDF_HKDF_SHA256_SIZE as u16,
+    )?;
     Ok(HpkeKeys {
         key,
         base_nonce: base_nonce.try_into().expect("12 bytes requested"),
@@ -747,7 +785,9 @@ pub fn parse_ech_ext(ext: &[u8]) -> Result<EchExt> {
         .ok_or_else(|| Error::protocol("tls: malformed encrypted_client_hello extension"))?;
     if ech_type == INNER_ECH_EXT {
         if !s.data.is_empty() {
-            return Err(Error::protocol("tls: malformed encrypted_client_hello extension"));
+            return Err(Error::protocol(
+                "tls: malformed encrypted_client_hello extension",
+            ));
         }
         return Ok(EchExt::Inner);
     }
@@ -838,6 +878,171 @@ pub fn compute_outer_ech_ext(
     let aad = serialize_outer(&placeholder_ext);
     let ciphertext = sender.seal(&aad, encoded_inner)?;
     generate_outer_ech_ext(config_id, kdf_id, aead_id, enc_bytes, &ciphertext)
+}
+
+/// `extractRawExtensions` (ech.go:235-263): the `(type, body)` entries of a
+/// ClientHello's extension block, parsed off the raw hello message.
+fn extract_raw_extensions(hello: &[u8]) -> Result<Vec<(u16, Vec<u8>)>> {
+    let bad = || Error::protocol("tls: malformed outer client hello");
+    let mut s = Cursor { data: hello };
+    if s.data.len() < 4 + 2 + 32 {
+        return Err(bad());
+    }
+    s.data = s.data.get(4 + 2 + 32..).ok_or_else(bad)?;
+    let _session_id = s.u8_bytes().ok_or_else(bad)?;
+    let _cipher_suites = s.u16_bytes().ok_or_else(bad)?;
+    let _compression = s.u8_bytes().ok_or_else(bad)?;
+    let block = s.u16_bytes().ok_or_else(bad)?;
+    let mut out = Vec::new();
+    let mut c = Cursor { data: block };
+    while !c.data.is_empty() {
+        let typ = c.u16().ok_or_else(bad)?;
+        let body = c.u16_bytes().ok_or_else(bad)?.to_vec();
+        out.push((typ, body));
+    }
+    Ok(out)
+}
+
+/// `decodeInnerClientHello` (ech.go:264-345) — the server-side reconstruction
+/// of the *transcript form* of the inner ClientHello from its decrypted
+/// encoded form. The encoded form is missing its 4-byte handshake header and
+/// legacy_session_id (always empty on the wire, handshake_messages.go:353-357)
+/// and may compress outer-mirrored extensions into `ech_outer_extensions`;
+/// the reconstruction restores the OUTER hello's session id and expands the
+/// compressed references from the outer's extension block, in the exact
+/// upstream wire order. Returns the complete handshake message the server
+/// must hash into its transcript.
+///
+/// Also ports the upstream validity checks: trailing padding must be zero,
+/// the `0xfe0d` marker must be the inner form, and the inner
+/// supported_versions must offer TLS 1.3 with nothing (non-GREASE) below it.
+pub fn decode_inner_client_hello(outer_msg: &[u8], encoded: &[u8]) -> Result<Vec<u8>> {
+    let invalid = || Error::protocol("tls: invalid inner client hello");
+    let mut s = Cursor { data: encoded };
+    let version_and_random = s.data.get(..2 + 32).ok_or_else(invalid)?.to_vec();
+    s.data = &s.data[2 + 32..];
+    let sid = s.u8_bytes().ok_or_else(invalid)?;
+    if !sid.is_empty() {
+        return Err(invalid());
+    }
+    let cipher_suites = s.u16_bytes().ok_or_else(invalid)?.to_vec();
+    let compression = s.u8_bytes().ok_or_else(invalid)?.to_vec();
+    let exts = s.u16_bytes().ok_or_else(invalid)?.to_vec();
+    // The padding after the encoded hello must be all zeros (ech.go:284-289).
+    if !s.data.iter().all(|&b| b == 0) {
+        return Err(invalid());
+    }
+
+    let raw_outer_exts = extract_raw_extensions(outer_msg)?;
+    // The outer hello's legacy_session_id (restored into the inner form).
+    let outer_sid = outer_msg
+        .get(4 + 2 + 32 + 1..4 + 2 + 32 + 1 + 32)
+        .ok_or_else(|| Error::protocol("tls: malformed outer client hello"))?;
+
+    // Expand `ech_outer_extensions` references in place (ech.go:324-358):
+    // each referenced type is looked up in the outer's list with a
+    // forward-moving cursor, exactly like the upstream loop.
+    let mut expanded: Vec<(u16, Vec<u8>)> = Vec::new();
+    let mut c = Cursor { data: &exts };
+    while !c.data.is_empty() {
+        let typ = c.u16().ok_or_else(invalid)?;
+        let body = c.u16_bytes().ok_or_else(invalid)?.to_vec();
+        if typ != EXTENSION_ECH_OUTER_EXTENSIONS {
+            expanded.push((typ, body));
+            continue;
+        }
+        let mut refs = Cursor { data: &body };
+        let refs = refs.u8_bytes().ok_or_else(invalid)?;
+        let mut search_from = 0usize;
+        let mut r = Cursor { data: refs };
+        while !r.data.is_empty() {
+            let want = r.u16().ok_or_else(invalid)?;
+            if want == EXTENSION_ENCRYPTED_CLIENT_HELLO {
+                return Err(Error::protocol("tls: invalid outer extensions"));
+            }
+            let found = raw_outer_exts[search_from..]
+                .iter()
+                .position(|(t, _)| *t == want)
+                .map(|i| i + search_from)
+                .ok_or_else(|| Error::protocol("tls: invalid outer extensions"))?;
+            search_from = found + 1;
+            expanded.push((want, raw_outer_exts[found].1.clone()));
+        }
+    }
+    // The reconstructed inner must carry the `0x01` inner marker
+    // (ech.go:370-372).
+    let marker_ok = expanded
+        .iter()
+        .any(|(t, b)| *t == EXTENSION_ENCRYPTED_CLIENT_HELLO && b.as_slice() == [INNER_ECH_EXT]);
+    if !marker_ok {
+        return Err(Error::protocol(
+            "tls: client sent invalid encrypted_client_hello extension",
+        ));
+    }
+
+    // supported_versions: skip GREASE (0x?A0A with equal octets), require
+    // 0x0304, and refuse anything non-GREASE below it (ech.go:374-394).
+    const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
+    let mut has_tls13 = false;
+    if let Some((_, body)) = expanded.iter().find(|(t, _)| *t == EXT_SUPPORTED_VERSIONS) {
+        let mut v = Cursor { data: body };
+        let list = v.u8_bytes().ok_or_else(invalid)?;
+        let mut l = Cursor { data: list };
+        while !l.data.is_empty() {
+            let ver = l.u16().ok_or_else(invalid)?;
+            if ver & 0x0f0f == 0x0a0a && ver & 0xff == ver >> 8 {
+                continue;
+            }
+            if ver == 0x0304 {
+                has_tls13 = true;
+            } else if ver < 0x0304 {
+                return Err(Error::protocol(
+                    "tls: client sent encrypted_client_hello extension with unsupported versions",
+                ));
+            }
+        }
+    }
+    if !has_tls13 {
+        return Err(Error::protocol(
+            "tls: client sent encrypted_client_hello extension but did not offer TLS 1.3",
+        ));
+    }
+
+    // Rebuild the message (ech.go:296-345 recon builder).
+    let mut ext_bytes = Vec::new();
+    for (typ, body) in &expanded {
+        ext_bytes.extend_from_slice(&typ.to_be_bytes());
+        ext_bytes.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        ext_bytes.extend_from_slice(body);
+    }
+    let mut body = Vec::with_capacity(
+        version_and_random.len()
+            + 1
+            + outer_sid.len()
+            + 2
+            + cipher_suites.len()
+            + 1
+            + compression.len()
+            + 2
+            + ext_bytes.len(),
+    );
+    body.extend_from_slice(&version_and_random);
+    body.push(outer_sid.len() as u8);
+    body.extend_from_slice(outer_sid);
+    body.extend_from_slice(&(cipher_suites.len() as u16).to_be_bytes());
+    body.extend_from_slice(&cipher_suites);
+    body.push(compression.len() as u8);
+    body.extend_from_slice(&compression);
+    body.extend_from_slice(&(ext_bytes.len() as u16).to_be_bytes());
+    body.extend_from_slice(&ext_bytes);
+    let mut msg = Vec::with_capacity(4 + body.len());
+    msg.push(1); // handshake type: client_hello
+    let len = body.len();
+    msg.push((len >> 16) as u8);
+    msg.push((len >> 8) as u8);
+    msg.push(len as u8);
+    msg.extend_from_slice(&body);
+    Ok(msg)
 }
 
 // ---------------------------------------------------------------------------
@@ -980,9 +1185,7 @@ pub enum EchConfigSource {
     /// variant with `dns::upstream::Upstream::exchange` on a hand-built
     /// HTTPS query and extract SvcParamKey 5 (`ech`), then hand the
     /// bytes to [`parse_ech_config_list`].
-    DnsHttpsQuery {
-        server_name: Option<String>,
-    },
+    DnsHttpsQuery { server_name: Option<String> },
 }
 
 impl EchOptions {
@@ -998,9 +1201,7 @@ impl EchOptions {
             let list = base64::engine::general_purpose::STANDARD
                 .decode(self.config.as_bytes())
                 .map_err(|e| {
-                    Error::config(format!(
-                        "base64 decode ech config string failed: {e}"
-                    ))
+                    Error::config(format!("base64 decode ech config string failed: {e}"))
                 })?;
             return Ok(Some(EchConfigSource::Static(list)));
         }
@@ -1060,7 +1261,9 @@ mod tests {
     /// (`TestDecodeECHConfigLists`).
     #[test]
     fn config_lists_parse_upstream_vectors() {
-        let list = unhex("0045fe0d0041590020002092a01233db2218518ccbbbbc24df20686af417b37388de6460e94011974777090004000100010012636c6f7564666c6172652d6563682e636f6d0000");
+        let list = unhex(
+            "0045fe0d0041590020002092a01233db2218518ccbbbbc24df20686af417b37388de6460e94011974777090004000100010012636c6f7564666c6172652d6563682e636f6d0000",
+        );
         let configs = parse_ech_config_list(&list).unwrap();
         assert_eq!(configs.len(), 1);
         let c = &configs[0];
@@ -1073,13 +1276,21 @@ mod tests {
         // COUNT, so these field values are read straight off the wire.
         assert_eq!(c.max_name_length, 0x00);
         assert_eq!(c.public_name, b"cloudflare-ech.com".to_vec());
-        assert_eq!(c.cipher_suites, vec![EchCipher { kdf_id: 1, aead_id: 1 }]);
+        assert_eq!(
+            c.cipher_suites,
+            vec![EchCipher {
+                kdf_id: 1,
+                aead_id: 1
+            }]
+        );
         assert_eq!(c.raw.len(), 4 + 0x41);
         // raw covers exactly version+length+body.
         assert_eq!(hex(&c.raw), hex(&list[2..]));
 
         // Three configs, one of them an unknown version (skipped).
-        let list = unhex("0105badd00050504030201fe0d0066000010004104e62b69e2bf659f97be2f1e0d948a4cd5976bb7a91e0d46fbdda9a91e9ddcba5a01e7d697a80a18f9c3c4a31e56e27c8348db161a1cf51d7ef1942d4bcf7222c1000c000100010001000200010003400e7075626c69632e6578616d706c650000fe0d003d00002000207d661615730214aeee70533366f36a609ead65c0c208e62322346ab5bcd8de1c000411112222400e7075626c69632e6578616d706c650000fe0d004d000020002085bd6a03277c25427b52e269e0c77a8eb524ba1eb3d2f132662d4b0ac6cb7357000c000100010001000200010003400e7075626c69632e6578616d706c650008aaaa000474657374");
+        let list = unhex(
+            "0105badd00050504030201fe0d0066000010004104e62b69e2bf659f97be2f1e0d948a4cd5976bb7a91e0d46fbdda9a91e9ddcba5a01e7d697a80a18f9c3c4a31e56e27c8348db161a1cf51d7ef1942d4bcf7222c1000c000100010001000200010003400e7075626c69632e6578616d706c650000fe0d003d00002000207d661615730214aeee70533366f36a609ead65c0c208e62322346ab5bcd8de1c000411112222400e7075626c69632e6578616d706c650000fe0d004d000020002085bd6a03277c25427b52e269e0c77a8eb524ba1eb3d2f132662d4b0ac6cb7357000c000100010001000200010003400e7075626c69632e6578616d706c650008aaaa000474657374",
+        );
         let configs = parse_ech_config_list(&list).unwrap();
         assert_eq!(configs.len(), 3);
         // First: P-256 KEM (0x0010) — parses fine, unsupported by pick.
@@ -1096,7 +1307,9 @@ mod tests {
     /// must find nothing usable.
     #[test]
     fn skip_bad_configs_pick_finds_nothing() {
-        let list = unhex("00c8badd00050504030201fe0d0029006666000401020304000c000100010001000200010003400e7075626c69632e6578616d706c650000fe0d003d000020002072e8a23b7aef67832bcc89d652e3870a60f88ca684ec65d6eace6b61f136064c000411112222400e7075626c69632e6578616d706c650000fe0d004d00002000200ce95810a81d8023f41e83679bc92701b2acd46c75869f95c72bc61c6b12297c000c000100010001000200010003400e7075626c69632e6578616d706c650008aaaa000474657374");
+        let list = unhex(
+            "00c8badd00050504030201fe0d0029006666000401020304000c000100010001000200010003400e7075626c69632e6578616d706c650000fe0d003d000020002072e8a23b7aef67832bcc89d652e3870a60f88ca684ec65d6eace6b61f136064c000411112222400e7075626c69632e6578616d706c650000fe0d004d00002000200ce95810a81d8023f41e83679bc92701b2acd46c75869f95c72bc61c6b12297c000c000100010001000200010003400e7075626c69632e6578616d706c650008aaaa000474657374",
+        );
         let configs = parse_ech_config_list(&list).unwrap();
         // 0x6666 KEM, a 4-byte public key with KEM 0x0020, and a
         // mandatory 0xaaaa extension: nothing is pickable.
@@ -1109,15 +1322,23 @@ mod tests {
         // by pick — only X25519 is implemented), an X25519 whose single
         // suite is the bogus (0x1111, 0x2222) pair, and an X25519 with
         // all three supported suites.
-        let p256 = unhex("fe0d0066000010004104e62b69e2bf659f97be2f1e0d948a4cd5976bb7a91e0d46fbdda9a91e9ddcba5a01e7d697a80a18f9c3c4a31e56e27c8348db161a1cf51d7ef1942d4bcf7222c1000c000100010001000200010003400e7075626c69632e6578616d706c650000");
-        let x25519_one = unhex("fe0d003d00002000207d661615730214aeee70533366f36a609ead65c0c208e62322346ab5bcd8de1c000411112222400e7075626c69632e6578616d706c650000");
+        let p256 = unhex(
+            "fe0d0066000010004104e62b69e2bf659f97be2f1e0d948a4cd5976bb7a91e0d46fbdda9a91e9ddcba5a01e7d697a80a18f9c3c4a31e56e27c8348db161a1cf51d7ef1942d4bcf7222c1000c000100010001000200010003400e7075626c69632e6578616d706c650000",
+        );
+        let x25519_one = unhex(
+            "fe0d003d00002000207d661615730214aeee70533366f36a609ead65c0c208e62322346ab5bcd8de1c000411112222400e7075626c69632e6578616d706c650000",
+        );
         // As transcribed, the third config carries extension type 0xaaaa —
         // the high bit marks it MANDATORY and upstream pickECHConfig skips
         // the whole config (ech.go:162-169), exactly like TestSkipBadConfigs
         // expects. Clearing the high bit (0x2aaa) makes the same config
         // pickable, isolating the "first valid suite" behavior.
-        let x25519_all_mandatory = unhex("fe0d004d000020002085bd6a03277c25427b52e269e0c77a8eb524ba1eb3d2f132662d4b0ac6cb7357000c000100010001000200010003400e7075626c69632e6578616d706c650008aaaa000474657374");
-        let x25519_all = unhex("fe0d004d000020002085bd6a03277c25427b52e269e0c77a8eb524ba1eb3d2f132662d4b0ac6cb7357000c000100010001000200010003400e7075626c69632e6578616d706c6500082aaa000474657374");
+        let x25519_all_mandatory = unhex(
+            "fe0d004d000020002085bd6a03277c25427b52e269e0c77a8eb524ba1eb3d2f132662d4b0ac6cb7357000c000100010001000200010003400e7075626c69632e6578616d706c650008aaaa000474657374",
+        );
+        let x25519_all = unhex(
+            "fe0d004d000020002085bd6a03277c25427b52e269e0c77a8eb524ba1eb3d2f132662d4b0ac6cb7357000c000100010001000200010003400e7075626c69632e6578616d706c6500082aaa000474657374",
+        );
         let build = |parts: &[Vec<u8>]| -> Vec<u8> {
             let total: usize = parts.iter().map(|p| p.len()).sum();
             let mut list = (total as u16).to_be_bytes().to_vec();
@@ -1141,8 +1362,7 @@ mod tests {
         // The x25519_one config carries a single (0x1111, 0x2222) suite —
         // parseable but unsupported, so nothing is pickable behind a
         // mandatory-ext config either.
-        let configs =
-            parse_ech_config_list(&build(&[x25519_all_mandatory, x25519_one])).unwrap();
+        let configs = parse_ech_config_list(&build(&[x25519_all_mandatory, x25519_one])).unwrap();
         assert!(pick_ech_config(&configs).is_err());
     }
 
@@ -1150,7 +1370,9 @@ mod tests {
     fn malformed_lists_rejected() {
         // Bad outer length.
         assert!(parse_ech_config_list(&[0x00, 0x45, 0x00]).is_err());
-        let good = unhex("0045fe0d0041590020002092a01233db2218518ccbbbbc24df20686af417b37388de6460e94011974777090004000100010012636c6f7564666c6172652d6563682e636f6d0000");
+        let good = unhex(
+            "0045fe0d0041590020002092a01233db2218518ccbbbbc24df20686af417b37388de6460e94011974777090004000100010012636c6f7564666c6172652d6563682e636f6d0000",
+        );
         // Length not matching the payload.
         let mut bad = good.clone();
         bad[0] = 0x00;
@@ -1179,13 +1401,13 @@ mod tests {
     fn rfc9180_a1_x25519_aes128_base() {
         let info = unhex("4f6465206f6e2061204772656369616e2055726e");
         let ikm_e = unhex("7268600d403fce431561aef583ee1613527cff655c1343f29812e66706df3234");
-        let pk_rm: [u8; 32] = unhex("3948cfe0ad1ddb695d780e59077195da6c56506b027329794ab02bca80815c4d")
-            .try_into()
-            .unwrap();
+        let pk_rm: [u8; 32] =
+            unhex("3948cfe0ad1ddb695d780e59077195da6c56506b027329794ab02bca80815c4d")
+                .try_into()
+                .unwrap();
         let sk_em_want = "52c4a758a802cd8b936eceea314432798d5baf2d7e9235dc084ab1b9cfa2f736";
         let enc_want = "37fda3567bdbd628e88668c3c8d7e97d1d1253b6d4ea6d44c150f741f1bf4431";
-        let shared_want =
-            "fe0e18c9f024ce43799ae393c7e8fe8fce9d218875e8227b0187c04e7d2ea1fc";
+        let shared_want = "fe0e18c9f024ce43799ae393c7e8fe8fce9d218875e8227b0187c04e7d2ea1fc";
         let key_want = "4531685d41d65f03dc48f6b8302c05b0";
         let nonce_want = "56d890e5accaaf011cff4b7d";
         let exp_want = "45ff1c2e220db587171952c0592d5f5ebe103f1561a2614e38f2ffd47e99e3f8";
@@ -1203,17 +1425,41 @@ mod tests {
         assert_eq!(hex(&keys.base_nonce), nonce_want);
         assert_eq!(hex(&keys.exporter_secret), exp_want);
 
-        let (_, mut sender) = HpkeSender::setup_with(&pk_rm, HpkeAead::Aes128Gcm, &info, &sk_e)
-            .unwrap();
+        let (_, mut sender) =
+            HpkeSender::setup_with(&pk_rm, HpkeAead::Aes128Gcm, &info, &sk_e).unwrap();
         let pt = unhex("4265617574792069732074727574682c20747275746820626561757479");
         // Sequence 0/1/2 with matching AADs.
         for (seq, aad, ct) in [
-            (0u64, "436f756e742d30", "f938558b5d72f1a23810b4be2ab4f84331acc02fc97babc53a52ae8218a355a96d8770ac83d07bea87e13c512a"),
-            (1, "436f756e742d31", "af2d7e9ac9ae7e270f46ba1f975be53c09f8d875bdc8535458c2494e8a6eab251c03d0c22a56b8ca42c2063b84"),
-            (2, "436f756e742d32", "498dfcabd92e8acedc281e85af1cb4e3e31c7dc394a1ca20e173cb72516491588d96a19ad4a683518973dcc180"),
-            (4, "436f756e742d34", "583bd32bc67a5994bb8ceaca813d369bca7b2a42408cddef5e22f880b631215a09fc0012bc69fccaa251c0246d"),
-            (255, "436f756e742d323535", "7175db9717964058640a3a11fb9007941a5d1757fda1a6935c805c21af32505bf106deefec4a49ac38d71c9e0a"),
-            (256, "436f756e742d323536", "957f9800542b0b8891badb026d79cc54597cb2d225b54c00c5238c25d05c30e3fbeda97d2e0e1aba483a2df9f2"),
+            (
+                0u64,
+                "436f756e742d30",
+                "f938558b5d72f1a23810b4be2ab4f84331acc02fc97babc53a52ae8218a355a96d8770ac83d07bea87e13c512a",
+            ),
+            (
+                1,
+                "436f756e742d31",
+                "af2d7e9ac9ae7e270f46ba1f975be53c09f8d875bdc8535458c2494e8a6eab251c03d0c22a56b8ca42c2063b84",
+            ),
+            (
+                2,
+                "436f756e742d32",
+                "498dfcabd92e8acedc281e85af1cb4e3e31c7dc394a1ca20e173cb72516491588d96a19ad4a683518973dcc180",
+            ),
+            (
+                4,
+                "436f756e742d34",
+                "583bd32bc67a5994bb8ceaca813d369bca7b2a42408cddef5e22f880b631215a09fc0012bc69fccaa251c0246d",
+            ),
+            (
+                255,
+                "436f756e742d323535",
+                "7175db9717964058640a3a11fb9007941a5d1757fda1a6935c805c21af32505bf106deefec4a49ac38d71c9e0a",
+            ),
+            (
+                256,
+                "436f756e742d323536",
+                "957f9800542b0b8891badb026d79cc54597cb2d225b54c00c5238c25d05c30e3fbeda97d2e0e1aba483a2df9f2",
+            ),
         ] {
             sender.set_sequence(seq);
             let ct_got = sender.seal(&unhex(aad), &pt).unwrap();
@@ -1243,12 +1489,14 @@ mod tests {
     fn rfc9180_x25519_aes256_enc_and_recipient_roundtrip() {
         let info = unhex("4f6465206f6e2061204772656369616e2055726e");
         let ikm_e = unhex("2cd7c601cefb3d42a62b04b7a9041494c06c7843818e0ce28a8f704ae7ab20f9");
-        let sk_rm: [u8; 32] = unhex("497b4502664cfea5d5af0b39934dac72242a74f8480451e1aee7d6a53320333d")
-            .try_into()
-            .unwrap();
-        let pk_rm: [u8; 32] = unhex("430f4b9859665145a6b1ba274024487bd66f03a2dd577d7753c68d7d7d00c00c")
-            .try_into()
-            .unwrap();
+        let sk_rm: [u8; 32] =
+            unhex("497b4502664cfea5d5af0b39934dac72242a74f8480451e1aee7d6a53320333d")
+                .try_into()
+                .unwrap();
+        let pk_rm: [u8; 32] =
+            unhex("430f4b9859665145a6b1ba274024487bd66f03a2dd577d7753c68d7d7d00c00c")
+                .try_into()
+                .unwrap();
         let enc_want = "6c93e09869df3402d7bf231bf540fadd35cd56be14f97178f0954db94b7fc256";
 
         let sk_e = derive_key_pair_x25519(&ikm_e);
@@ -1258,8 +1506,8 @@ mod tests {
 
         // Recipient side (hpke_decap + the shared key schedule).
         let shared_r = hpke_decap(&sk_rm, &enc).unwrap();
-        let mut recipient = HpkeSender::from_shared_secret(&shared_r, HpkeAead::Aes256Gcm, &info)
-            .unwrap();
+        let mut recipient =
+            HpkeSender::from_shared_secret(&shared_r, HpkeAead::Aes256Gcm, &info).unwrap();
         let aad = b"ech-aad";
         let ct = sender.seal(aad, b"inner hello bytes").unwrap();
         let pt = recipient
@@ -1355,8 +1603,15 @@ mod tests {
         let config_id = 0x33;
         let encoded_inner = encode_inner_client_hello(&[0x11; 77], Some(b"sni.test"), 32);
 
-        let final_ext =
-            compute_outer_ech_ext(&mut sender, config_id, KDF_HKDF_SHA256, AEAD_AES_128_GCM, &enc, &encoded_inner, true, |placeholder| {
+        let final_ext = compute_outer_ech_ext(
+            &mut sender,
+            config_id,
+            KDF_HKDF_SHA256,
+            AEAD_AES_128_GCM,
+            &enc,
+            &encoded_inner,
+            true,
+            |placeholder| {
                 // The caller's serialization of the outer hello BODY —
                 // upstream seals against outer.marshal()[4:]
                 // (ech.go:436-439), so the 4-byte handshake header is
@@ -1369,11 +1624,14 @@ mod tests {
                 // len(encoded_inner) + 16 (the AEAD tag).
                 assert_eq!(placeholder.len(), 10 + enc.len() + encoded_inner.len() + 16);
                 body
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         // Placeholder payload replaced by real ciphertext of len+16.
         match parse_ech_ext(&final_ext).unwrap() {
-            EchExt::Outer { payload, enc: e, .. } => {
+            EchExt::Outer {
+                payload, enc: e, ..
+            } => {
                 assert_eq!(e, enc);
                 assert_eq!(payload.len(), encoded_inner.len() + 16);
                 // The recipient reconstructs the AAD from the FULL hello:
@@ -1536,8 +1794,13 @@ mod tests {
         );
         o.config = "!!!not base64!!!".into();
         let err = o.parse().unwrap_err().to_string();
-        assert!(err.contains("base64 decode ech config string failed"), "{err}");
-        let list = unhex("0045fe0d0041590020002092a01233db2218518ccbbbbc24df20686af417b37388de6460e94011974777090004000100010012636c6f7564666c6172652d6563682e636f6d0000");
+        assert!(
+            err.contains("base64 decode ech config string failed"),
+            "{err}"
+        );
+        let list = unhex(
+            "0045fe0d0041590020002092a01233db2218518ccbbbbc24df20686af417b37388de6460e94011974777090004000100010012636c6f7564666c6172652d6563682e636f6d0000",
+        );
         use base64::Engine as _;
         o.config = base64::engine::general_purpose::STANDARD.encode(&list);
         assert_eq!(o.parse().unwrap(), Some(EchConfigSource::Static(list)));
@@ -1550,5 +1813,206 @@ mod tests {
         let b = vec![3u8];
         let out = build_retry_config_list(&[&a, &b]).unwrap();
         assert_eq!(out, vec![0, 3, 1, 2, 3]);
+    }
+
+    // ---------------------------------------------- selection + inner decode
+
+    /// An ECHConfigList with one X25519/HKDF-SHA256/AES-128-GCM config, built
+    /// by hand (the same shape the test server in reality::tls13 dials with).
+    fn test_config_list(config_id: u8, public_name: &[u8], pk: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.push(config_id);
+        body.extend_from_slice(&KEM_DH_X25519_HKDF_SHA256.to_be_bytes());
+        body.extend_from_slice(&(pk.len() as u16).to_be_bytes());
+        body.extend_from_slice(pk);
+        let mut suites = Vec::new();
+        for (kdf, aead) in [
+            (KDF_HKDF_SHA256, AEAD_AES_128_GCM),
+            (KDF_HKDF_SHA256, AEAD_AES_256_GCM),
+        ] {
+            suites.extend_from_slice(&kdf.to_be_bytes());
+            suites.extend_from_slice(&aead.to_be_bytes());
+        }
+        // The cipher_suites length prefix is a BYTE count (4 per suite).
+        body.extend_from_slice(&((suites.len() / 4 * 4) as u16).to_be_bytes());
+        body.extend_from_slice(&suites);
+        body.push(0x20); // max_name_length
+        body.push(public_name.len() as u8);
+        body.extend_from_slice(public_name);
+        body.extend_from_slice(&0u16.to_be_bytes()); // no extensions
+        let mut list = Vec::with_capacity(4 + body.len());
+        list.extend_from_slice(&((4 + body.len() - 2) as u16).to_be_bytes());
+        list.extend_from_slice(&EXTENSION_ENCRYPTED_CLIENT_HELLO.to_be_bytes());
+        list.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        list.extend_from_slice(&body);
+        // The list length prefix covers everything after the first two bytes.
+        let total = (list.len() - 2) as u16;
+        list[0..2].copy_from_slice(&total.to_be_bytes());
+        list
+    }
+
+    #[test]
+    fn select_ech_config_parses_and_picks() {
+        let pk = [7u8; 32];
+        let list = test_config_list(0xab, b"public.example", &pk);
+        let sel = select_ech_config(&list).unwrap();
+        assert_eq!(sel.config.config_id, 0xab);
+        assert_eq!(sel.config.public_name, b"public.example".to_vec());
+        assert_eq!(sel.aead, HpkeAead::Aes128Gcm);
+        // A list whose only config has an unsupported KEM picks nothing —
+        // the makeClientHello error text surfaces verbatim.
+        let mut bad = test_config_list(1, b"public.example", &[7u8; 32]);
+        // KEM id is at: 2 (list len) + 4 (config hdr) + 1 (config id).
+        bad[2 + 4 + 1..2 + 4 + 3].copy_from_slice(&0x0010u16.to_be_bytes());
+        let err = select_ech_config(&bad).unwrap_err().to_string();
+        assert!(err.contains("no valid configs"), "{err}");
+        // Truncated list: the malformed-list error.
+        assert!(select_ech_config(&list[..5]).is_err());
+    }
+
+    /// `decodeInnerClientHello` (ech.go:264-345): round-trip with an
+    /// `ech_outer_extensions` reference list, plus every upstream rejection.
+    #[test]
+    fn decode_inner_client_hello_roundtrip_and_rejections() {
+        // An outer hello carrying the referenced extensions.
+        let outer_sid = [0x5eu8; 32];
+        let mut outer = vec![0x01, 0, 0, 0, 0x03, 0x03];
+        outer.extend_from_slice(&[0x11u8; 32]); // random
+        outer.push(32);
+        outer.extend_from_slice(&outer_sid);
+        outer.extend_from_slice(&[0x00, 0x04, 0x13, 0x01, 0x13, 0x03]); // suites
+        outer.push(0x01);
+        outer.push(0x00); // compression
+        let groups = vec![0x00, 0x02, 0x00, 0x1d];
+        let alpn = vec![0x00, 0x03, 0x02, 0x68, 0x32];
+        let versions = vec![0x02, 0x03, 0x04];
+        let mut exts = Vec::new();
+        for (typ, body) in [
+            (0x000au16, groups.clone()),
+            (0x0010, alpn.clone()),
+            (0x002b, versions.clone()),
+        ] {
+            exts.extend_from_slice(&typ.to_be_bytes());
+            exts.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            exts.extend_from_slice(&body);
+        }
+        outer.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        outer.extend_from_slice(&exts);
+        let body_len = (outer.len() - 4) as u32;
+        outer[1..4].copy_from_slice(&body_len.to_be_bytes()[1..]);
+
+        // The encoded inner: vers+random, empty session id, suites+comp, the
+        // SNI and the ECH marker in the clear, and groups/alpn/versions
+        // referenced through ech_outer_extensions (0xfd00).
+        let sni_body = {
+            let mut b = vec![0x00, 0x00, 0x00, 0x0b];
+            b.extend_from_slice(b"inner.test");
+            b
+        };
+        let mut refs = Vec::new();
+        for t in [0x000au16, 0x0010, 0x002b] {
+            refs.extend_from_slice(&t.to_be_bytes());
+        }
+        let mut compressed = vec![refs.len() as u8];
+        compressed.extend_from_slice(&refs);
+        let mut inner_exts = Vec::new();
+        inner_exts.extend_from_slice(&0x0000u16.to_be_bytes());
+        inner_exts.extend_from_slice(&(sni_body.len() as u16).to_be_bytes());
+        inner_exts.extend_from_slice(&sni_body);
+        inner_exts.extend_from_slice(&EXTENSION_ENCRYPTED_CLIENT_HELLO.to_be_bytes());
+        inner_exts.extend_from_slice(&1u16.to_be_bytes());
+        inner_exts.push(1);
+        inner_exts.extend_from_slice(&EXTENSION_ECH_OUTER_EXTENSIONS.to_be_bytes());
+        inner_exts.extend_from_slice(&(compressed.len() as u16).to_be_bytes());
+        inner_exts.extend_from_slice(&compressed);
+
+        let mut encoded = vec![0x03, 0x03];
+        encoded.extend_from_slice(&[0x22u8; 32]);
+        encoded.push(0); // empty session id
+        encoded.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]);
+        encoded.push(1);
+        encoded.push(0);
+        encoded.extend_from_slice(&(inner_exts.len() as u16).to_be_bytes());
+        encoded.extend_from_slice(&inner_exts);
+        encoded.extend_from_slice(&[0u8; 7]); // padding
+
+        let recon = decode_inner_client_hello(&outer, &encoded).unwrap();
+        assert_eq!(recon[0], 1);
+        // The OUTER session id is restored into the transcript form.
+        assert_eq!(recon[4 + 2 + 32], 32);
+        assert_eq!(&recon[4 + 2 + 32 + 1..4 + 2 + 32 + 1 + 32], &outer_sid[..]);
+        // The referenced extensions expanded to the outer's bodies, in the
+        // referenced order, at the position of the 0xfd00 extension.
+        let off = 4 + 2 + 32 + 1 + 32 + 2 + 2 + 1 + 1 + 2;
+        let expanded_block = &recon[off..];
+        let mut expect = Vec::new();
+        for (typ, body) in [
+            (0x0000u16, sni_body.clone()),
+            (EXTENSION_ENCRYPTED_CLIENT_HELLO, vec![1]),
+            (0x000a, groups),
+            (0x0010, alpn),
+            (0x002b, versions),
+        ] {
+            expect.extend_from_slice(&typ.to_be_bytes());
+            expect.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            expect.extend_from_slice(&body);
+        }
+        assert_eq!(expanded_block, expect);
+
+        // Rejections.
+        let mut bad = encoded.clone();
+        *bad.last_mut().unwrap() = 1; // non-zero padding
+        assert!(decode_inner_client_hello(&outer, &bad).is_err());
+        let mut with_sid = encoded.clone();
+        with_sid[34] = 2; // a non-empty encoded session id
+        with_sid.splice(35..35, [1, 2]);
+        assert!(decode_inner_client_hello(&outer, &with_sid).is_err());
+        // A reference list naming an extension the outer does not carry.
+        let mut bad_ref = encoded.clone();
+        let fd_pos = bad_ref
+            .windows(2)
+            .position(|w| w == EXTENSION_ECH_OUTER_EXTENSIONS.to_be_bytes())
+            .unwrap();
+        bad_ref[fd_pos + 4] = 8; // u8 count past the real payload
+        assert!(decode_inner_client_hello(&outer, &bad_ref).is_err());
+        // A missing inner marker: an extension block with only the SNI.
+        let block_off = 2 + 32 + 1 + 2 + 2 + 1 + 1;
+        let mut no_marker = encoded[..block_off].to_vec();
+        let mut tail = Vec::new();
+        tail.extend_from_slice(&0x0000u16.to_be_bytes());
+        tail.extend_from_slice(&(sni_body.len() as u16).to_be_bytes());
+        tail.extend_from_slice(&sni_body);
+        no_marker.extend_from_slice(&(tail.len() as u16).to_be_bytes());
+        no_marker.extend_from_slice(&tail);
+        assert!(decode_inner_client_hello(&outer, &no_marker).is_err());
+        // supported_versions below TLS 1.3 (uncompressed, in the clear).
+        let mut old = encoded.clone();
+        let mut own = Vec::new();
+        own.extend_from_slice(&0x002bu16.to_be_bytes());
+        own.extend_from_slice(&3u16.to_be_bytes());
+        own.extend_from_slice(&[2, 0x03, 0x03]);
+        // Replace the whole extension block: SNI + the marker + 0x002b
+        // (TLS 1.2 only — the marker must still be present so the failure
+        // isolates the version check).
+        let block_off = 2 + 32 + 1 + 2 + 2 + 1 + 1;
+        let mut tail = Vec::new();
+        tail.extend_from_slice(&0x0000u16.to_be_bytes());
+        tail.extend_from_slice(&(sni_body.len() as u16).to_be_bytes());
+        tail.extend_from_slice(&sni_body);
+        tail.extend_from_slice(&EXTENSION_ENCRYPTED_CLIENT_HELLO.to_be_bytes());
+        tail.extend_from_slice(&1u16.to_be_bytes());
+        tail.push(1);
+        tail.extend_from_slice(&own);
+        let mut head = old[..block_off].to_vec();
+        head.extend_from_slice(&(tail.len() as u16).to_be_bytes());
+        head.extend_from_slice(&tail);
+        old = head;
+        let err = decode_inner_client_hello(&outer, &old)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("encrypted_client_hello extension with unsupported versions"),
+            "{err}"
+        );
     }
 }
