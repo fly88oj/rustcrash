@@ -60,20 +60,23 @@
 //! ## Scope (what mihomo's adapter exercises, and what is deferred)
 //!
 //! mihomo delegates the whole client to the mieru library; this port covers
-//! the **TCP and UDP transports with multiplexing off** — the default
-//! profile mihomo builds (a fresh underlay plus one session per dial,
-//! `Mux.DialContext` with `multiplexFactor = 0`). Deferred, with the
+//! the **TCP and UDP transports, port ranges, and client-side
+//! multiplexing** — see [`MieruMux`] for the multiplexor (`pkg/protocol/
+//! mux.go`) and [`parse_port_range`] for `port-range` ("begin-end", mihomo
+//! `adapter/outbound/mieru.go`). The single-session [`connect`] keeps the
+//! wave-8 shape: a fresh underlay plus one session per dial
+//! (`Mux.DialContext` with `multiplexFactor = 0`). Deferred, with the
 //! upstream file that owns them:
 //!
-//! * **Multiplexing** (`mux.go maybePickExistingUnderlay`): reusing one
-//!   underlay for several sessions.
-//! * **Port ranges** (`PortBindings`; mihomo's `port-range` option), which
-//!   belong to the dialer: upstream picks a random endpoint port per
-//!   underlay from the configured range (`mux.go newUnderlay` →
-//!   `mrand.Intn(len(m.endpoints))`). The config carries a single port.
 //! * Handshake-mode `no-wait` (`apis/internal/early_conn.go`) and
 //!   **traffic patterns** — nonce rewriting, TCP fragmentation,
 //!   low-entropy payload encoding (`trafficpattern`, `low_entropy.go`).
+//! * The underlay **scheduler**'s pending-session gate and idle timer
+//!   (`IncPending`/`TryDisableIdle`, mux.go:425-436, 784-806): an
+//!   underlay's reusability here is `reader alive && !disabled`, with
+//!   zero-session underlays closed at dial time (cleanUnderlay's effect)
+//!   and the 512 MiB << factor traffic-volume disable kept.
+//! * Server-side JLS-style user quotas, `ExportSessionInfoList`, metrics.
 //!
 //! ## UDP (packet) transport
 //!
@@ -250,14 +253,111 @@ impl MieruTransport {
 }
 
 /// Outbound mieru endpoint — the subset of mihomo's `MieruOption` the TCP
-/// client exercises: server, port, username, password, transport.
+/// client exercises: server, port (or `port-range`), username, password,
+/// transport.
 #[derive(Debug, Clone)]
 pub struct MieruOut {
     pub server: String,
     pub port: u16,
+    /// mihomo `port-range` ("begin-end", `MieruOption.PortRange`,
+    /// adapter/outbound/mieru.go:35): when set, every underlay dial picks a
+    /// random port from the range (`mux.go newUnderlay` →
+    /// `mrand.Intn(len(m.endpoints))` over `FlatPortBindings`' expansion,
+    /// appctlcommon/port_binding.go:37-119). Mutually exclusive with a
+    /// nonzero `port` ([`validate_ports`]).
+    pub port_range: Option<(u16, u16)>,
     pub username: String,
     pub password: String,
     pub transport: MieruTransport,
+    /// mihomo `multiplexing` (adapter/outbound/mieru.go:40): off | low
+    /// (mieru's default) | middle | high — the level the outbound's mux
+    /// pool runs at.
+    pub multiplexing: Multiplexing,
+}
+
+impl MieruOut {
+    /// The endpoint port list a dialer may use — `FlatPortBindings`
+    /// (pkg/appctl/appctlcommon/port_binding.go:37-119): a range expands
+    /// to one binding per port, a single port to itself.
+    pub fn endpoint_ports(&self) -> Vec<u16> {
+        endpoint_ports(self.port, self.port_range)
+    }
+}
+
+/// `beginAndEndPortFromPortRange` + `validateMieruOption`
+/// (adapter/outbound/mieru.go:294-361, 357-361) over the strict
+/// `^(\d+)-(\d+)$` shape mieru's `validPortRange` regex enforces
+/// (appctlcommon/port_binding.go:33, 61-63 — mihomo's looser
+/// `fmt.Sscanf("%d-%d")` leaves tails like "1-2-3" unparsed, which the
+/// mieru library then rejects at startup, so the strict form is the
+/// union of both). Error texts are mihomo's, verbatim.
+pub fn parse_port_range(spec: &str) -> Result<(u16, u16)> {
+    let invalid = || Error::config(format!("mieru: invalid port-range format: {spec:?}"));
+    let Some((begin, end)) = spec.split_once('-') else {
+        return Err(invalid());
+    };
+    // Digits only, both sides, nothing else (the regex anchors).
+    if begin.is_empty()
+        || end.is_empty()
+        || !begin.bytes().all(|b| b.is_ascii_digit())
+        || !end.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(invalid());
+    }
+    let begin: u32 = begin.parse().map_err(|_| invalid())?;
+    let end: u32 = end.parse().map_err(|_| invalid())?;
+    if !(1..=65535).contains(&begin) {
+        return Err(Error::config(
+            "mieru: begin port must be between 1 and 65535",
+        ));
+    }
+    if !(1..=65535).contains(&end) {
+        return Err(Error::config("mieru: end port must be between 1 and 65535"));
+    }
+    if begin > end {
+        return Err(Error::config(
+            "mieru: begin port must be less than or equal to end port",
+        ));
+    }
+    Ok((begin as u16, end as u16))
+}
+
+/// The port/port-range cross-checks of `validateMieruOption`
+/// (adapter/outbound/mieru.go:301-309): exactly one of `port` or
+/// `port_range` must be set, and a bare port must be in 1..=65535.
+/// (`port == 0` means "unset" — mihomo's protobuf `Port` default.)
+pub fn validate_ports(port: u16, port_range: Option<(u16, u16)>) -> Result<()> {
+    if port == 0 && port_range.is_none() {
+        return Err(Error::config("mieru: either port or port-range must be set"));
+    }
+    if port != 0 && port_range.is_some() {
+        return Err(Error::config(
+            "mieru: port and port-range cannot be set at the same time",
+        ));
+    }
+    if port != 0 && !(1..=65535).contains(&port) {
+        // Unreachable for u16; kept for parity with upstream's int check.
+        return Err(Error::config("mieru: port must be between 1 and 65535"));
+    }
+    Ok(())
+}
+
+/// The dial-time endpoint list (range expanded, else the single port).
+fn endpoint_ports(port: u16, port_range: Option<(u16, u16)>) -> Vec<u16> {
+    match port_range {
+        Some((begin, end)) => (begin..=end).collect(),
+        None => vec![port],
+    }
+}
+
+/// `mux.go newUnderlay` (663-675): `i := mrand.Intn(len(m.endpoints))` —
+/// a uniformly random endpoint port per underlay dial.
+fn pick_port(ports: &[u16]) -> Result<u16> {
+    if ports.is_empty() {
+        return Err(Error::config("mieru: either port or port-range must be set"));
+    }
+    // rand::random usize; modulo bias is negligible for ≤ 65535 ports.
+    Ok(ports[rand::random::<usize>() % ports.len()])
 }
 
 /// `cipher.HashPassword` (pkg/cipher/api.go):
@@ -796,56 +896,20 @@ impl MieruStream {
 
     /// Try to consume one complete inbound segment from `rbuf`
     /// (`readOneSegment` + `readSessionSegment` / `readDataAckSegment`).
-    /// `Ok(false)` = more bytes needed. The metadata is decrypted exactly
+    /// `Ok(None)` = more bytes needed. The metadata is decrypted exactly
     /// once (each decrypt advances the nonce counter).
     fn parse_segment(&mut self) -> Result<bool> {
-        if self.pending_meta.is_none() {
-            let overhead = TAG_SIZE + usize::from(self.first_read) * NONCE_SIZE;
-            if self.rbuf.len() < METADATA_LENGTH + overhead {
-                return Ok(false);
-            }
-            let enc = self.rbuf.split_to(METADATA_LENGTH + overhead).to_vec();
-            let plain = self.recv.decrypt(&enc)?;
-            self.first_read = false;
-            let meta = parse_metadata(&plain)?;
-            match meta.protocol {
-                OPEN_SESSION_REQUEST | OPEN_SESSION_RESPONSE | CLOSE_SESSION_REQUEST
-                | CLOSE_SESSION_RESPONSE | DATA_SERVER_TO_CLIENT | ACK_SERVER_TO_CLIENT => {}
-                other => {
-                    return Err(Error::protocol(format!(
-                        "mieru: unknown inbound protocol {other}"
-                    )))
-                }
-            }
-            self.pending_meta = Some(meta);
-            self.prefix_done = false;
-        }
-        let meta = self.pending_meta.unwrap();
-        let is_session = is_session_protocol(meta.protocol);
-        if !is_session && !self.prefix_done {
-            if self.rbuf.len() < meta.prefix_len as usize {
-                return Ok(false);
-            }
-            self.rbuf.advance(meta.prefix_len as usize);
-            self.prefix_done = true;
-        }
-        if meta.payload_len > 0 {
-            let want = meta.payload_len as usize + TAG_SIZE;
-            if self.rbuf.len() < want {
-                return Ok(false);
-            }
-            let enc = self.rbuf.split_to(want).to_vec();
-            let payload = self.recv.decrypt(&enc)?;
-            self.out.extend_from_slice(&payload);
-        }
-        if meta.suffix_len > 0 {
-            if self.rbuf.len() < meta.suffix_len as usize {
-                return Ok(false);
-            }
-            self.rbuf.advance(meta.suffix_len as usize);
-        }
-        self.pending_meta = None;
-
+        let Some((meta, payload)) = parse_stream_segment(
+            &mut self.recv,
+            &mut self.rbuf,
+            &mut self.pending_meta,
+            &mut self.prefix_done,
+            &mut self.first_read,
+        )?
+        else {
+            return Ok(false);
+        };
+        self.out.extend_from_slice(&payload);
         match meta.protocol {
             OPEN_SESSION_RESPONSE => {
                 if meta.session_id != self.session_id {
@@ -880,16 +944,72 @@ impl MieruStream {
                 self.closed = true;
             }
             CLOSE_SESSION_RESPONSE => self.closed = true,
-            OPEN_SESSION_REQUEST | DATA_CLIENT_TO_SERVER => {
-                return Err(Error::protocol(format!(
-                    "mieru: unexpected inbound protocol {}",
-                    meta.protocol
-                )))
-            }
-            _ => unreachable!("protocols validated above"),
+            // The parser rejects client-only protocols already.
+            _ => unreachable!("protocols validated by parse_stream_segment"),
         }
         Ok(true)
     }
+}
+
+/// The wire half of `StreamUnderlay.readOneSegment`
+/// (underlay_stream.go): peel one segment off `rbuf` using the shared
+/// (per-direction) implicit-nonce cipher. Used by [`MieruStream`] (single
+/// session) and by the multiplexor's reader (any session, demux by
+/// metadata session id). `Ok(None)` = more bytes needed.
+fn parse_stream_segment(
+    recv: &mut StatefulCipher,
+    rbuf: &mut BytesMut,
+    pending_meta: &mut Option<InboundMeta>,
+    prefix_done: &mut bool,
+    first_read: &mut bool,
+) -> Result<Option<(InboundMeta, Vec<u8>)>> {
+    if pending_meta.is_none() {
+        let overhead = TAG_SIZE + usize::from(*first_read) * NONCE_SIZE;
+        if rbuf.len() < METADATA_LENGTH + overhead {
+            return Ok(None);
+        }
+        let enc = rbuf.split_to(METADATA_LENGTH + overhead).to_vec();
+        let plain = recv.decrypt(&enc)?;
+        *first_read = false;
+        let meta = parse_metadata(&plain)?;
+        match meta.protocol {
+            OPEN_SESSION_REQUEST | OPEN_SESSION_RESPONSE | CLOSE_SESSION_REQUEST
+            | CLOSE_SESSION_RESPONSE | DATA_SERVER_TO_CLIENT | ACK_SERVER_TO_CLIENT => {}
+            other => {
+                return Err(Error::protocol(format!(
+                    "mieru: unknown inbound protocol {other}"
+                )))
+            }
+        }
+        *pending_meta = Some(meta);
+        *prefix_done = false;
+    }
+    let meta = (*pending_meta).expect("just set");
+    let is_session = is_session_protocol(meta.protocol);
+    if !is_session && !*prefix_done {
+        if rbuf.len() < meta.prefix_len as usize {
+            return Ok(None);
+        }
+        rbuf.advance(meta.prefix_len as usize);
+        *prefix_done = true;
+    }
+    let mut payload = Vec::new();
+    if meta.payload_len > 0 {
+        let want = meta.payload_len as usize + TAG_SIZE;
+        if rbuf.len() < want {
+            return Ok(None);
+        }
+        let enc = rbuf.split_to(want).to_vec();
+        payload = recv.decrypt(&enc)?;
+    }
+    if meta.suffix_len > 0 {
+        if rbuf.len() < meta.suffix_len as usize {
+            return Ok(None);
+        }
+        rbuf.advance(meta.suffix_len as usize);
+    }
+    *pending_meta = None;
+    Ok(Some((meta, payload)))
 }
 
 fn io_err(e: Error) -> io::Error {
@@ -1229,12 +1349,91 @@ struct OutSeg {
     tx_timeout: Duration,
 }
 
+/// One datagram already decrypted and routed by a multiplexor's demux
+/// loop (`PacketUnderlay.readOneSegment` + `deliverToSession`): the
+/// metadata block, its wire nonce, and the un-decrypted remainder
+/// (padding + sealed payload + padding).
+struct DemuxedDgram {
+    meta: InboundMeta,
+    nonce: [u8; NONCE_SIZE],
+    rest: Vec<u8>,
+}
+
+/// Where a [`PacketEngine`] gets bytes and puts wire datagrams. The
+/// single-session path owns the socket directly; a multiplexed session
+/// (`MieruMux`) receives pre-demultiplexed datagrams over a channel and
+/// sends through the shared, connected socket.
+enum PacketIo {
+    /// `Mux.DialContext` without multiplexing: one session, one socket.
+    Socket(UdpSocket),
+    /// One session of many on a `PacketUnderlay`: the demux loop feeds
+    /// datagrams for our session id; sends ride the underlay socket.
+    Shared {
+        rx: tokio::sync::mpsc::Receiver<DemuxedDgram>,
+        sock: std::sync::Arc<UdpSocket>,
+    },
+}
+
+/// What [`PacketIo::recv`] produced: raw wire bytes (socket path, the
+/// engine decrypts with its own cipher) or an already-routed datagram
+/// (multiplexed path).
+enum PacketRx {
+    Raw(usize),
+    Demuxed(DemuxedDgram),
+    Closed,
+}
+
+impl PacketIo {
+    async fn recv(&mut self, buf: &mut [u8]) -> Result<PacketRx> {
+        match self {
+            PacketIo::Socket(s) => match s.recv(buf).await {
+                Ok(n) => Ok(PacketRx::Raw(n)),
+                Err(e) => Err(Error::network(format!("mieru: udp recv failed: {e}"))),
+            },
+            PacketIo::Shared { rx, .. } => {
+                Ok(rx.recv().await.map_or(PacketRx::Closed, PacketRx::Demuxed))
+            }
+        }
+    }
+
+    async fn send(&mut self, wire: &[u8]) -> Result<()> {
+        match self {
+            PacketIo::Socket(s) => s
+                .send(wire)
+                .await
+                .map(|_| ())
+                .map_err(|e| Error::network(format!("mieru: udp underlay send failed: {e}"))),
+            PacketIo::Shared { sock, .. } => sock
+                .send(wire)
+                .await
+                .map(|_| ())
+                .map_err(|e| Error::network(format!("mieru: udp underlay send failed: {e}"))),
+        }
+    }
+}
+
+/// Decrypt-and-parse one raw datagram against `cipher`
+/// (`PacketUnderlay.readOneSegment`'s metadata half). `None` = not ours
+/// (length gate or decrypt failure — silently dropped upstream too).
+fn parse_datagram_with(
+    cipher: &StatelessCipher,
+    dgram: &[u8],
+) -> Option<(InboundMeta, [u8; NONCE_SIZE])> {
+    if dgram.len() < PACKET_NON_HEADER_POSITION {
+        return None;
+    }
+    let meta_plain = cipher.decrypt(&dgram[..PACKET_NON_HEADER_POSITION]).ok()?;
+    let meta = parse_metadata(&meta_plain).ok()?;
+    let nonce: [u8; NONCE_SIZE] = dgram[..NONCE_SIZE].try_into().expect("nonce prefix");
+    Some((meta, nonce))
+}
+
 /// The packet-transport session engine — a faithful single-session port of
 /// `PacketUnderlay` (client half) + `Session`'s packet loops, exposed to
 /// the application as a byte-stream pipe (`tokio::io::duplex`), so the
 /// SOCKS5 handshake and `MieruUdp` framing above are transport-agnostic.
 struct PacketEngine {
-    sock: UdpSocket,
+    io: PacketIo,
     cipher: StatelessCipher,
     /// Application side of the session (the post-handshake byte stream).
     app: DuplexStream,
@@ -1263,26 +1462,32 @@ struct PacketEngine {
     last_rx: Instant,
     heartbeat_jitter: Duration,
     next_retx_check: Instant,
+    /// Fired once the open session response lands, so a multiplexing
+    /// caller can await session establishment (`MieruMux::connect`).
+    established_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 enum EngineEvent {
     App(Option<usize>),
     Dgram(usize),
+    Demuxed(DemuxedDgram),
     SockErr,
     Timer,
 }
 
 impl PacketEngine {
+    #[allow(clippy::too_many_arguments)]
     fn new(
-        sock: UdpSocket,
+        io: PacketIo,
         key: &[u8; KEY_LEN],
         username: &str,
         session_id: u32,
         app: DuplexStream,
+        established_tx: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Self {
         let now = Instant::now();
         PacketEngine {
-            sock,
+            io,
             cipher: StatelessCipher::new(key, username),
             app,
             session_id,
@@ -1305,6 +1510,7 @@ impl PacketEngine {
             last_rx: now,
             heartbeat_jitter: random_heartbeat_jitter(),
             next_retx_check: now,
+            established_tx,
         }
     }
 
@@ -1364,7 +1570,7 @@ impl PacketEngine {
             let deadline = self.next_deadline();
             let poll_app = !self.app_eof;
             let ev = {
-                let PacketEngine { app, sock, .. } = &mut self;
+                let PacketEngine { app, io, .. } = &mut self;
                 tokio::select! {
                     n = app.read(&mut rbuf), if poll_app => {
                         EngineEvent::App(match n {
@@ -1373,8 +1579,10 @@ impl PacketEngine {
                             Err(_) => None,
                         })
                     }
-                    n = sock.recv(&mut dgram) => match n {
-                        Ok(n) => EngineEvent::Dgram(n),
+                    rx = io.recv(&mut dgram) => match rx {
+                        Ok(PacketRx::Raw(n)) => EngineEvent::Dgram(n),
+                        Ok(PacketRx::Demuxed(d)) => EngineEvent::Demuxed(d),
+                        Ok(PacketRx::Closed) => EngineEvent::SockErr,
                         Err(_) => EngineEvent::SockErr,
                     },
                     _ = sleep_until(deadline) => EngineEvent::Timer,
@@ -1396,6 +1604,11 @@ impl PacketEngine {
                 },
                 EngineEvent::Dgram(n) => {
                     self.on_datagram(&dgram[..n]).await;
+                    self.run_output_once_packet().await;
+                }
+                EngineEvent::Demuxed(d) => {
+                    self.last_rx = Instant::now();
+                    self.ingest(d.meta, &d.nonce, &d.rest).await;
                     self.run_output_once_packet().await;
                 }
                 EngineEvent::SockErr => break,
@@ -1609,7 +1822,7 @@ impl PacketEngine {
                 &[],
             );
             if let Ok(wire) = ack {
-                if self.sock.send(&wire).await.is_ok() {
+                if self.io.send(&wire).await.is_ok() {
                     self.last_tx = Instant::now();
                     self.heartbeat_jitter = random_heartbeat_jitter();
                 }
@@ -1641,7 +1854,7 @@ impl PacketEngine {
                 &seg.payload,
             )?
         };
-        self.sock.send(&wire).await.map_err(|e| {
+        self.io.send(&wire).await.map_err(|e| {
             Error::network(format!("mieru: udp underlay send failed: {e}"))
         })?;
         self.last_tx = Instant::now();
@@ -1715,26 +1928,22 @@ impl PacketEngine {
 
     /// The client half of `readOneSegment` (underlay_packet.go:341-513) +
     /// `Session.input` (session.go:1045-1338). A datagram for a foreign
-    /// session is dropped (single-session scope).
+    /// session is dropped (single-session scope); on a multiplexed
+    /// underlay the demux loop routes by session id before this runs.
     async fn on_datagram(&mut self, dgram: &[u8]) {
         self.last_rx = Instant::now();
-        if dgram.len() < PACKET_NON_HEADER_POSITION {
-            return;
-        }
-        let meta_ct = &dgram[..PACKET_NON_HEADER_POSITION];
-        let meta_plain = match self.cipher.decrypt(meta_ct) {
-            Ok(p) => p,
-            Err(_) => return, // not ours (or corrupted): silently drop
-        };
-        let meta = match parse_metadata(&meta_plain) {
-            Ok(m) => m,
-            Err(_) => return,
+        let Some((meta, nonce)) = parse_datagram_with(&self.cipher, dgram) else {
+            return; // not ours (or corrupted): silently drop
         };
         if meta.session_id != self.session_id {
             return;
         }
-        let nonce: [u8; NONCE_SIZE] = dgram[..NONCE_SIZE].try_into().expect("nonce prefix");
-        let rest = &dgram[PACKET_NON_HEADER_POSITION..];
+        self.ingest(meta, &nonce, &dgram[PACKET_NON_HEADER_POSITION..]).await;
+    }
+
+    /// Post-metadata session dispatch — shared by the socket path above
+    /// and the multiplexor's pre-decrypted datagrams.
+    async fn ingest(&mut self, meta: InboundMeta, nonce: &[u8; NONCE_SIZE], rest: &[u8]) {
         match meta.protocol {
             OPEN_SESSION_RESPONSE | DATA_SERVER_TO_CLIENT => {
                 let mut rest = rest;
@@ -1753,7 +1962,7 @@ impl PacketEngine {
                     return; // padding: size not match
                 }
                 let payload = if want > 0 {
-                    match self.cipher.decrypt_with_nonce(&nonce, &rest[..want]) {
+                    match self.cipher.decrypt_with_nonce(nonce, &rest[..want]) {
                         Ok(p) => p,
                         Err(_) => return,
                     }
@@ -1768,6 +1977,9 @@ impl PacketEngine {
                 self.request_ack();
                 if meta.protocol == OPEN_SESSION_RESPONSE {
                     self.established = true;
+                    if let Some(tx) = self.established_tx.take() {
+                        let _ = tx.send(());
+                    }
                 }
             }
             ACK_SERVER_TO_CLIENT => {
@@ -1793,7 +2005,7 @@ impl PacketEngine {
                 let response =
                     self.build_session_wire(CLOSE_SESSION_RESPONSE, seq, 0, &[]);
                 if let Ok(wire) = response {
-                    let _ = self.sock.send(&wire).await;
+                    let _ = self.io.send(&wire).await;
                 }
                 self.closed = true;
                 self.send_queue.clear();
@@ -1846,20 +2058,21 @@ impl PacketEngine {
 /// `NewPacketUnderlay` + `NewSession` + `AddSession`, mux.go:393-433,
 /// 665-700: one underlay and one session per dial).
 async fn dial_packet(cfg: &MieruOut) -> Result<DuplexStream> {
+    let port = pick_port(&cfg.endpoint_ports())?;
     let sock = UdpSocket::bind(("0.0.0.0", 0))
         .await
         .map_err(|e| Error::network(format!("mieru: bind udp underlay: {e}")))?;
-    sock.connect((cfg.server.as_str(), cfg.port))
+    sock.connect((cfg.server.as_str(), port))
         .await
         .map_err(|e| {
             Error::network(format!(
-                "mieru: udp underlay connect {}:{}: {e}",
-                cfg.server, cfg.port
+                "mieru: udp underlay connect {}:{port}: {e}",
+                cfg.server
             ))
         })?;
     debug!(
         target: "engine",
-        server = %cfg.server, port = cfg.port,
+        server = %cfg.server, port,
         "mieru: packet underlay connected"
     );
 
@@ -1878,11 +2091,802 @@ async fn dial_packet(cfg: &MieruOut) -> Result<DuplexStream> {
     let (app, engine_side) = tokio::io::duplex(64 * 1024);
     let username = cfg.username.clone();
     tokio::spawn(async move {
-        PacketEngine::new(sock, &key, &username, session_id, engine_side)
-            .run()
-            .await;
+        PacketEngine::new(
+            PacketIo::Socket(sock),
+            &key,
+            &username,
+            session_id,
+            engine_side,
+            None,
+        )
+        .run()
+        .await;
     });
     Ok(app)
+}
+
+// ---------------------------------------------------------------------------
+// Multiplexing — pkg/protocol/mux.go (client) + appctlcommon multiplexing
+// ---------------------------------------------------------------------------
+
+/// mieru's `MultiplexingLevel` (appctlpb) — mihomo's `multiplexing`
+/// option. `NewClientMuxFromProfile` maps the levels to the multiplex
+/// factor (appctlcommon/client.go:159-171): OFF→0 (a fresh underlay per
+/// dial), LOW→1 (upstream's default when the profile leaves the level
+/// unset), MIDDLE→2, HIGH→3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Multiplexing {
+    Off,
+    #[default]
+    Low,
+    Middle,
+    High,
+}
+
+impl Multiplexing {
+    /// The `SetClientMultiplexFactor` value (appctlcommon/client.go:160-171).
+    pub fn factor(self) -> usize {
+        match self {
+            Multiplexing::Off => 0,
+            Multiplexing::Low => 1,
+            Multiplexing::Middle => 2,
+            Multiplexing::High => 3,
+        }
+    }
+
+    /// Parse mihomo's `multiplexing` string — the protobuf enum names
+    /// `mierupb.MultiplexingLevel_value` accepts
+    /// (adapter/outbound/mieru.go:279-283, 335-339). An empty string is
+    /// upstream's unset level (LOW); anything else is mihomo's exact
+    /// error.
+    pub fn parse(level: &str) -> Result<Self> {
+        match level {
+            "" => Ok(Multiplexing::Low),
+            "MULTIPLEXING_OFF" => Ok(Multiplexing::Off),
+            "MULTIPLEXING_LOW" => Ok(Multiplexing::Low),
+            "MULTIPLEXING_MIDDLE" => Ok(Multiplexing::Middle),
+            "MULTIPLEXING_HIGH" => Ok(Multiplexing::High),
+            other => Err(Error::config(format!(
+                "mieru: invalid multiplexing level: {other}"
+            ))),
+        }
+    }
+}
+
+/// Byte counters feeding the traffic-volume disable (mux.go:802-806).
+#[derive(Default)]
+struct UnderlayCounters {
+    in_bytes: std::sync::atomic::AtomicU64,
+    out_bytes: std::sync::atomic::AtomicU64,
+}
+
+/// One live underlay with its session-routing plumbing — the client half
+/// of `Mux`'s underlay bookkeeping (mux.go:46-78, 747-829).
+struct UnderlayHandle {
+    inner: UnderlayKind,
+    /// `underlay.Done()`: the reader loop is still feeding sessions.
+    alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Scheduler disabled (idle or over the traffic volume): never picked
+    /// again (mux.go:756-759, 792-806).
+    disabled: std::sync::atomic::AtomicBool,
+    /// `underlay.SessionCount()`.
+    session_count: std::sync::atomic::AtomicUsize,
+    counters: std::sync::Arc<UnderlayCounters>,
+}
+
+impl UnderlayHandle {
+    fn alive(&self) -> bool {
+        self.alive.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn disabled(&self) -> bool {
+        self.disabled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn disable(&self) {
+        self.disabled.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `underlay.Close()`: stop scheduling on it and tear the transport
+    /// down (the reader loop then ends and clears `alive`). Safe from any
+    /// context — the async shutdown is spawned when a runtime exists.
+    fn close(&self) {
+        self.disable();
+        match &self.inner {
+            UnderlayKind::Tcp(u) => {
+                u.closed.store(true, std::sync::atomic::Ordering::Relaxed);
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let u = u.clone();
+                    handle.spawn(async move {
+                        let mut wire = u.wire.lock().await;
+                        // FIN: the peer closes, our read half sees EOF.
+                        let _ = wire.w.shutdown().await;
+                    });
+                }
+            }
+            UnderlayKind::Udp(u) => u.closing.notify_waiters(),
+        }
+    }
+}
+
+enum UnderlayKind {
+    Tcp(std::sync::Arc<TcpUnderlay>),
+    Udp(std::sync::Arc<UdpUnderlay>),
+}
+
+// ------------------------------------------------------------ TCP underlay
+
+/// The multiplexed TCP underlay — `StreamUnderlay` (underlay_stream.go)
+/// with N sessions: ONE stateful cipher per direction shared by every
+/// session on the connection (segments carry their session id in the
+/// metadata), the write side locked so a segment's two AEAD operations
+/// and its bytes stay adjacent on the wire.
+struct TcpUnderlay {
+    wire: tokio::sync::Mutex<TcpWire>,
+    sessions:
+        std::sync::Mutex<std::collections::HashMap<u32, tokio::sync::mpsc::Sender<ToSession>>>,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+struct TcpWire {
+    cipher: StatefulCipher,
+    w: tokio::net::tcp::OwnedWriteHalf,
+}
+
+/// One routed inbound segment (metadata + decrypted payload).
+struct ToSession {
+    meta: InboundMeta,
+    payload: Vec<u8>,
+}
+
+impl TcpUnderlay {
+    /// `writeOneSegment` — session-struct path with an explicit sequence
+    /// (each session numbers its own segments).
+    #[allow(clippy::too_many_arguments)]
+    async fn write_session_segment(
+        &self,
+        protocol: u8,
+        session_id: u32,
+        seq: u32,
+        status: u8,
+        payload: &[u8],
+        counters: &UnderlayCounters,
+    ) -> Result<()> {
+        if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(Error::network("mieru: underlay closed"));
+        }
+        let mut wire = self.wire.lock().await;
+        let suffix = open_padding_len(&wire.cipher.username);
+        let meta = session_struct(
+            protocol,
+            session_id,
+            seq,
+            status,
+            payload.len() as u16,
+            suffix as u8,
+        );
+        let mut out = wire.cipher.encrypt(&meta)?;
+        if !payload.is_empty() {
+            out.extend_from_slice(&wire.cipher.encrypt(payload)?);
+        }
+        out.extend_from_slice(&random_bytes(suffix));
+        wire.w.write_all(&out).await?;
+        wire.w.flush().await?;
+        counters
+            .out_bytes
+            .fetch_add(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// `writeOneSegment` — dataAck path (prefix + suffix padding).
+    async fn write_data_segment(
+        &self,
+        session_id: u32,
+        seq: u32,
+        payload: &[u8],
+        counters: &UnderlayCounters,
+    ) -> Result<()> {
+        if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(Error::network("mieru: underlay closed"));
+        }
+        let mut wire = self.wire.lock().await;
+        let prefix = data_padding_len();
+        let suffix = data_padding_len();
+        let window = SEGMENT_TREE_CAPACITY.min(u16::MAX as usize) as u16;
+        let meta = data_ack_struct(
+            DATA_CLIENT_TO_SERVER,
+            session_id,
+            seq,
+            0,
+            window,
+            0,
+            prefix as u8,
+            payload.len() as u16,
+            suffix as u8,
+        );
+        let mut out = wire.cipher.encrypt(&meta)?;
+        out.extend_from_slice(&random_bytes(prefix));
+        out.extend_from_slice(&wire.cipher.encrypt(payload)?);
+        out.extend_from_slice(&random_bytes(suffix));
+        wire.w.write_all(&out).await?;
+        wire.w.flush().await?;
+        counters
+            .out_bytes
+            .fetch_add(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// The underlay read loop — `StreamUnderlay.RunEventLoop` /
+/// `readOneSegment` delivering each segment to its session
+/// (`deliverToSession`): segments of *any* session on this connection
+/// share one receive-nonce counter, and route by metadata session id.
+/// A segment for an unknown session is dropped (the single-session port
+/// errors instead — there the only possible foreign id is corruption).
+async fn run_tcp_underlay_reader(
+    mut r: tokio::net::tcp::OwnedReadHalf,
+    mut recv: StatefulCipher,
+    underlay: std::sync::Arc<TcpUnderlay>,
+    counters: std::sync::Arc<UnderlayCounters>,
+    alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let mut rbuf = BytesMut::with_capacity(16 * 1024);
+    let mut pending_meta: Option<InboundMeta> = None;
+    let mut prefix_done = false;
+    let mut first_read = true;
+    loop {
+        match parse_stream_segment(&mut recv, &mut rbuf, &mut pending_meta, &mut prefix_done, &mut first_read)
+        {
+            Ok(Some((meta, payload))) => {
+                counters
+                    .in_bytes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let tx = underlay
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .get(&meta.session_id)
+                    .cloned();
+                match tx {
+                    Some(tx) => {
+                        if tx.send(ToSession { meta, payload }).await.is_err() {
+                            // The session task is gone; late segments for
+                            // it are dropped.
+                        }
+                    }
+                    None => debug!(
+                        target: "engine",
+                        session = meta.session_id,
+                        "mieru: segment for unknown session dropped"
+                    ),
+                }
+            }
+            Ok(None) => {
+                let mut tmp = [0u8; 16 * 1024];
+                match r.read(&mut tmp).await {
+                    Ok(0) | Err(_) => break, // underlay closed
+                    Ok(n) => rbuf.extend_from_slice(&tmp[..n]),
+                }
+            }
+            Err(e) => {
+                debug!(target: "engine", error = %e, "mieru: underlay read loop ending");
+                break;
+            }
+        }
+    }
+    // The underlay is done: disconnect every session so their tasks see
+    // the closed channel (upstream drops the sessions in Close,
+    // underlay_stream.go) instead of waiting forever.
+    underlay.sessions.lock().unwrap().clear();
+    alive.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// One multiplexed stream session — `Session` over a shared `StreamUnderlay`
+/// (`Session.Write` / `input`, session.go): per-session sequence numbers
+/// and open/close state, byte-stream application pipe.
+#[allow(clippy::too_many_arguments)]
+async fn run_tcp_session(
+    underlay: std::sync::Arc<TcpUnderlay>,
+    session_id: u32,
+    mut app: DuplexStream,
+    mut rx: tokio::sync::mpsc::Receiver<ToSession>,
+    established_tx: tokio::sync::oneshot::Sender<()>,
+    counters: std::sync::Arc<UnderlayCounters>,
+    handle: std::sync::Arc<UnderlayHandle>,
+) {
+    let mut established_tx = Some(established_tx);
+    let mut next_send: u32 = 0;
+    let mut open_pending = true;
+    let mut buf = vec![0u8; MAX_PDU];
+    loop {
+        tokio::select! {
+            read = app.read(&mut buf) => {
+                let mut rest: &[u8] = match read {
+                    Ok(0) | Err(_) => {
+                        // Session.closeWithError: closeSessionRequest (seq =
+                        // nextSend, status 0), no response wait.
+                        let seq = next_send;
+                        let _ = underlay
+                            .write_session_segment(
+                                CLOSE_SESSION_REQUEST, session_id, seq, 0, &[], &counters,
+                            )
+                            .await;
+                        break;
+                    }
+                    Ok(n) => &buf[..n],
+                };
+                // Session.Write: a first write of <= 1024 bytes piggybacks
+                // on the open request; a larger one opens empty and the
+                // payload follows as data segments.
+                if open_pending {
+                    open_pending = false;
+                    let seq = next_send;
+                    next_send = next_send.wrapping_add(1);
+                    if rest.len() <= MAX_SESSION_OPEN_PAYLOAD {
+                        if underlay
+                            .write_session_segment(
+                                OPEN_SESSION_REQUEST, session_id, seq, 0, rest, &counters,
+                            )
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        rest = &[];
+                    } else if underlay
+                        .write_session_segment(
+                            OPEN_SESSION_REQUEST, session_id, seq, 0, &[], &counters,
+                        )
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                for chunk in rest.chunks(MAX_PDU) {
+                    let seq = next_send;
+                    next_send = next_send.wrapping_add(1);
+                    if underlay
+                        .write_data_segment(session_id, seq, chunk, &counters)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+            seg = rx.recv() => {
+                let Some(ToSession { meta, payload }) = seg else {
+                    break; // underlay read loop ended
+                };
+                match meta.protocol {
+                    OPEN_SESSION_RESPONSE => {
+                        if meta.session_id != session_id {
+                            break;
+                        }
+                        if let Some(tx) = established_tx.take() {
+                            let _ = tx.send(());
+                        }
+                        if app.write_all(&payload).await.is_err() {
+                            break;
+                        }
+                    }
+                    DATA_SERVER_TO_CLIENT => {
+                        if app.write_all(&payload).await.is_err() {
+                            break;
+                        }
+                    }
+                    CLOSE_SESSION_REQUEST => {
+                        // inputClose: reply, then EOF.
+                        let seq = next_send;
+                        let _ = underlay
+                            .write_session_segment(
+                                CLOSE_SESSION_RESPONSE, session_id, seq, 0, &[], &counters,
+                            )
+                            .await;
+                        break;
+                    }
+                    CLOSE_SESSION_RESPONSE => {
+                        break;
+                    }
+                    ACK_SERVER_TO_CLIENT => {} // no-op on stream
+                    _ => {}
+                }
+            }
+        }
+    }
+    handle
+        .session_count
+        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+// ------------------------------------------------------------- UDP underlay
+
+/// The multiplexed UDP underlay — `PacketUnderlay` with N sessions: one
+/// connected socket, one stateless cipher (the metadata decryptor for the
+/// demux loop; engines clone it for their own outbound seals), datagrams
+/// routed by metadata session id.
+struct UdpUnderlay {
+    sock: std::sync::Arc<UdpSocket>,
+    cipher: StatelessCipher,
+    sessions:
+        std::sync::Mutex<std::collections::HashMap<u32, tokio::sync::mpsc::Sender<DemuxedDgram>>>,
+    /// `underlay.Close()`: unblocks the demux loop's recv.
+    closing: tokio::sync::Notify,
+}
+
+/// `PacketUnderlay.RunEventLoop`'s demux half (underlay_packet.go):
+/// the only socket reader; each datagram's metadata decides the session.
+async fn run_udp_demux(
+    underlay: std::sync::Arc<UdpUnderlay>,
+    counters: std::sync::Arc<UnderlayCounters>,
+    alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let mut buf = vec![0u8; 1500];
+    loop {
+        let n = tokio::select! {
+            n = underlay.sock.recv(&mut buf) => match n {
+                Ok(n) => n,
+                Err(_) => break,
+            },
+            _ = underlay.closing.notified() => break,
+        };
+        counters
+            .in_bytes
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        if let Some((meta, nonce)) = parse_datagram_with(&underlay.cipher, &buf[..n]) {
+            let dgram = DemuxedDgram {
+                meta,
+                nonce,
+                rest: buf[PACKET_NON_HEADER_POSITION..n].to_vec(),
+            };
+            let tx = underlay
+                .sessions
+                .lock()
+                .unwrap()
+                .get(&dgram.meta.session_id)
+                .cloned();
+            if let Some(tx) = tx {
+                // A closed session's late datagrams are dropped.
+                let _ = tx.try_send(dgram);
+            }
+        }
+    }
+    alive.store(false, std::sync::atomic::Ordering::Relaxed);
+    // Disconnect every session so the engines see the closed channel
+    // (their `PacketRx::Closed` unwinds them).
+    underlay.sessions.lock().unwrap().clear();
+}
+
+// ------------------------------------------------------------------- Mux
+
+/// The client multiplexor — the client half of `pkg/protocol/mux.go`
+/// `Mux` (DialContext :391-446, maybePickExistingUnderlay :747-771,
+/// newUnderlay :663-730, cleanUnderlay :774-829). One value per mihomo
+/// mieru outbound (`ensureClientIsRunning` keeps the client — and its
+/// mux — alive across dials); every [`connect`] picks or creates an
+/// underlay and adds a fresh session to it, demultiplexed by session id.
+///
+/// With [`Multiplexing::Off`] the pick always declines, which reproduces
+/// the single-session [`connect`] shape (one underlay per dial) on the
+/// same machinery.
+pub struct MieruMux {
+    cfg: MieruOut,
+    /// The endpoint ports — `FlatPortBindings`' expansion of
+    /// `port-range` (or the single port).
+    ports: Vec<u16>,
+    multiplex_factor: usize,
+    underlays: std::sync::Mutex<Vec<std::sync::Arc<UnderlayHandle>>>,
+    /// Test-only: make `maybe_pick_existing` always return the first
+    /// active underlay, so the demux machinery is exercised
+    /// deterministically (upstream's pick is random).
+    #[cfg(test)]
+    force_reuse: std::sync::atomic::AtomicBool,
+}
+
+impl MieruMux {
+    /// `NewClientMuxFromProfile` (appctlcommon/client.go:104-180): wire
+    /// the credentials, the multiplex factor and the endpoint list.
+    pub fn new(cfg: &MieruOut, multiplexing: Multiplexing) -> Result<Self> {
+        if cfg.username.is_empty() || cfg.password.is_empty() {
+            return Err(Error::config("mieru: username and password are required"));
+        }
+        validate_ports(cfg.port, cfg.port_range)?;
+        let ports = cfg.endpoint_ports();
+        debug!(
+            target: "engine",
+            server = %cfg.server, endpoints = ports.len(),
+            factor = multiplexing.factor(),
+            "mieru: client multiplexer initialized"
+        );
+        Ok(MieruMux {
+            cfg: cfg.clone(),
+            ports,
+            multiplex_factor: multiplexing.factor(),
+            underlays: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            force_reuse: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Live underlay count (test/introspection).
+    pub fn underlay_count(&self) -> usize {
+        self.clean_underlays();
+        self.underlays.lock().unwrap().len()
+    }
+
+    /// Test-only: pin `maybePickExistingUnderlay` to the first active
+    /// underlay (upstream's pick is random; tests need determinism).
+    #[cfg(test)]
+    fn force_reuse(&self) {
+        self.force_reuse.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `cleanUnderlay(true)` (mux.go:412, 775-829): drop finished
+    /// underlays, stop reusing idle (zero-session) ones — closing them —
+    /// and disable any over the traffic volume
+    /// `512 MiB << multiplexFactor` (mux.go:802).
+    fn clean_underlays(&self) {
+        let mut list = self.underlays.lock().unwrap();
+        let mut kept = Vec::with_capacity(list.len());
+        for h in list.drain(..) {
+            if !h.alive() {
+                continue; // reader finished: remove
+            }
+            if h.session_count.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                h.close(); // idle: Close() + never picked again
+                continue;
+            }
+            let limit = 512u64 << self.multiplex_factor;
+            if limit > 0
+                && (h.counters.in_bytes.load(std::sync::atomic::Ordering::Relaxed) > limit
+                    || h.counters.out_bytes.load(std::sync::atomic::Ordering::Relaxed) > limit)
+            {
+                h.disable();
+            }
+            kept.push(h);
+        }
+        *list = kept;
+    }
+
+    /// `maybePickExistingUnderlay` (mux.go:747-771): among active
+    /// underlays, `n := mrand.Intn(len(active)*factor + 1)` — any draw
+    /// below `len(active)*factor` reuses `active[n/factor]`, otherwise a
+    /// new underlay is created (so a bigger factor reuses more eagerly).
+    fn maybe_pick_existing(&self) -> Option<std::sync::Arc<UnderlayHandle>> {
+        let active: Vec<_> = self
+            .underlays
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|h| h.alive() && !h.disabled())
+            .cloned()
+            .collect();
+        if self.multiplex_factor == 0 || active.is_empty() {
+            return None;
+        }
+        #[cfg(test)]
+        if self.force_reuse.load(std::sync::atomic::Ordering::Relaxed) {
+            return Some(active[0].clone());
+        }
+        let reuse_factor = active.len() * self.multiplex_factor;
+        let n = rand::random::<usize>() % (reuse_factor + 1);
+        if n < reuse_factor {
+            return Some(active[n / self.multiplex_factor].clone());
+        }
+        None
+    }
+
+    /// `newUnderlay` (mux.go:663-730): a random endpoint port, then the
+    /// transport's dial. The handle is NOT registered with the underlay
+    /// list here — the caller registers it together with its first
+    /// session (`AddSession`), so an idle underlay can never be swept by
+    /// a concurrent `cleanUnderlay`.
+    async fn new_underlay(&self) -> Result<std::sync::Arc<UnderlayHandle>> {
+        let port = pick_port(&self.ports)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let key = client_key(&self.cfg.password, &self.cfg.username, now);
+        let counters = std::sync::Arc::new(UnderlayCounters::default());
+        match self.cfg.transport {
+            MieruTransport::Tcp => {
+                let tcp = tokio::net::TcpStream::connect((self.cfg.server.as_str(), port))
+                    .await
+                    .map_err(|e| {
+                        Error::network(format!("mieru: dial {}:{port}: {e}", self.cfg.server))
+                    })?;
+                let _ = tcp.set_nodelay(true);
+                debug!(
+                    target: "engine", server = %self.cfg.server, port,
+                    "mieru: new stream underlay"
+                );
+                let (r, w) = tcp.into_split();
+                let underlay = std::sync::Arc::new(TcpUnderlay {
+                    wire: tokio::sync::Mutex::new(TcpWire {
+                        cipher: StatefulCipher::new(&key, &self.cfg.username),
+                        w,
+                    }),
+                    sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+                    closed: std::sync::atomic::AtomicBool::new(false),
+                });
+                let handle = std::sync::Arc::new(UnderlayHandle {
+                    inner: UnderlayKind::Tcp(underlay.clone()),
+                    alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                    disabled: std::sync::atomic::AtomicBool::new(false),
+                    session_count: std::sync::atomic::AtomicUsize::new(0),
+                    counters: counters.clone(),
+                });
+                let alive = handle.alive.clone();
+                tokio::spawn(run_tcp_underlay_reader(
+                    r,
+                    StatefulCipher::new(&key, &self.cfg.username),
+                    underlay,
+                    counters,
+                    alive,
+                ));
+                Ok(handle)
+            }
+            MieruTransport::Udp => {
+                let sock = UdpSocket::bind(("0.0.0.0", 0))
+                    .await
+                    .map_err(|e| Error::network(format!("mieru: bind udp underlay: {e}")))?;
+                sock.connect((self.cfg.server.as_str(), port))
+                    .await
+                    .map_err(|e| {
+                        Error::network(format!(
+                            "mieru: udp underlay connect {}:{port}: {e}",
+                            self.cfg.server
+                        ))
+                    })?;
+                debug!(
+                    target: "engine", server = %self.cfg.server, port,
+                    "mieru: new packet underlay"
+                );
+                let sock = std::sync::Arc::new(sock);
+                let underlay = std::sync::Arc::new(UdpUnderlay {
+                    cipher: StatelessCipher::new(&key, &self.cfg.username),
+                    sock: sock.clone(),
+                    sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+                    closing: tokio::sync::Notify::new(),
+                });
+                let handle = std::sync::Arc::new(UnderlayHandle {
+                    inner: UnderlayKind::Udp(underlay.clone()),
+                    alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                    disabled: std::sync::atomic::AtomicBool::new(false),
+                    session_count: std::sync::atomic::AtomicUsize::new(0),
+                    counters: counters.clone(),
+                });
+                let alive = handle.alive.clone();
+                tokio::spawn(run_udp_demux(underlay, counters, alive));
+                Ok(handle)
+            }
+        }
+    }
+
+    /// `Mux.DialContext` (mux.go:391-446) + `PostDialHandshake`
+    /// (apis/client/client.go:120-142): pick or create an underlay, add a
+    /// fresh session (`NewSession(mrand.Uint32())` — 0 reserved), and run
+    /// the SOCKS5 request/reply over it. `cmd` is CONNECT for stream
+    /// targets and UDP ASSOCIATE for datagram ones.
+    async fn dial(&self, target: &NetAddr, cmd: u8) -> Result<DuplexStream> {
+        self.clean_underlays();
+        // mux.go:412-423: pick an existing underlay or create one; only a
+        // NEW underlay joins the mux list (mux.go:712-714, inside
+        // newUnderlay), after its first session is registered so a
+        // concurrent cleanUnderlay cannot sweep it as idle.
+        let (handle, created) = match self.maybe_pick_existing() {
+            Some(h) => {
+                debug!(target: "engine", "mieru: reusing existing underlay");
+                (h, false)
+            }
+            None => {
+                let h = self.new_underlay().await?;
+                debug!(target: "engine", "mieru: created new underlay");
+                (h, true)
+            }
+        };
+        // Session id: `NewSession(mrand.Uint32(), …)`; 0 is reserved.
+        let session_id = loop {
+            let id = rand::random::<u32>();
+            if id != 0 {
+                break id;
+            }
+        };
+        let (app, engine_side) = tokio::io::duplex(64 * 1024);
+        let (etx, erx) = tokio::sync::oneshot::channel();
+        handle
+            .session_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match &handle.inner {
+            UnderlayKind::Tcp(u) => {
+                let (tx, rx) = tokio::sync::mpsc::channel(64);
+                u.sessions.lock().unwrap().insert(session_id, tx);
+                tokio::spawn(run_tcp_session(
+                    u.clone(),
+                    session_id,
+                    engine_side,
+                    rx,
+                    etx,
+                    handle.counters.clone(),
+                    handle.clone(),
+                ));
+            }
+            UnderlayKind::Udp(u) => {
+                let (tx, rx) = tokio::sync::mpsc::channel(64);
+                u.sessions.lock().unwrap().insert(session_id, tx);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let key = client_key(&self.cfg.password, &self.cfg.username, now);
+                let username = self.cfg.username.clone();
+                let sock = u.sock.clone();
+                let h2 = handle.clone();
+                tokio::spawn(async move {
+                    PacketEngine::new(
+                        PacketIo::Shared { rx, sock },
+                        &key,
+                        &username,
+                        session_id,
+                        engine_side,
+                        Some(etx),
+                    )
+                    .run()
+                    .await;
+                    h2.session_count
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                });
+            }
+        }
+        // AddSession (mux.go:442-445); a newly created underlay joins the
+        // list only now that it owns a session (mux.go:712-714).
+        if created {
+            self.underlays.lock().unwrap().push(handle);
+        }
+
+        let mut app_stream = app;
+        socks5_handshake(&mut app_stream, target, cmd).await?;
+        // The SOCKS5 reply rides the open session response (or follows
+        // it); require the session to have opened (session.go:441-445 —
+        // upstream errors a session that never established).
+        match tokio::time::timeout(Duration::from_secs(10), erx).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                return Err(Error::network(
+                    "mieru: session closed before the open response",
+                ))
+            }
+            Err(_) => {
+                return Err(Error::network(
+                    "mieru: timed out waiting for the open session response",
+                ))
+            }
+        }
+        debug!(target: "engine", session = session_id, "mieru: mux session established");
+        Ok(app_stream)
+    }
+
+    /// mihomo `Mieru.DialContext` (adapter/outbound/mieru.go:74-85) over
+    /// the multiplexor: a SOCKS5 CONNECT session for `target`, possibly
+    /// sharing an underlay with other sessions.
+    pub async fn connect(&self, target: &NetAddr) -> Result<BoxProxyStream> {
+        Ok(Box::new(
+            self.dial(target, SOCKS5_CONNECT_CMD).await?,
+        ))
+    }
+
+    /// mihomo `Mieru.ListenPacketContext` (adapter/outbound/mieru.go:88-104)
+    /// over the multiplexor: a UDP ASSOCIATE session wrapped in the
+    /// packet-over-stream + associate framing ([`MieruUdp`]).
+    pub async fn connect_udp(&self, target: &NetAddr) -> Result<MieruUdp> {
+        let stream = self.dial(target, SOCKS5_UDP_ASSOCIATE_CMD).await?;
+        debug!(target: "engine", target = %target, "mieru: mux udp associate session established");
+        Ok(MieruUdp {
+            stream: Box::new(stream),
+        })
+    }
 }
 
 /// `PostDialHandshake` (apis/internal/handshake.go:26-54): the SOCKS5
@@ -1951,14 +2955,16 @@ async fn dial_session(
 ) -> Result<BoxProxyStream> {
     match cfg.transport {
         MieruTransport::Tcp => {
-            let tcp = tokio::net::TcpStream::connect((cfg.server.as_str(), cfg.port))
+            let port = pick_port(&cfg.endpoint_ports())?;
+            let tcp = tokio::net::TcpStream::connect((cfg.server.as_str(), port))
                 .await
                 .map_err(|e| {
-                    Error::network(format!("mieru: dial {}:{}: {e}", cfg.server, cfg.port))
+                    Error::network(format!("mieru: dial {}:{port}: {e}", cfg.server))
                 })?;
+            let _ = tcp.set_nodelay(true);
             debug!(
                 target: "engine",
-                server = %cfg.server, port = cfg.port, target = %target,
+                server = %cfg.server, port, target = %target,
                 "mieru: stream underlay connected"
             );
 
@@ -2133,6 +3139,7 @@ pub async fn connect_udp(cfg: &MieruOut, target: &NetAddr) -> Result<MieruUdp> {
 mod tests {
     use super::*;
 
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use tokio::net::TcpListener;
@@ -2495,9 +3502,11 @@ mod tests {
         MieruOut {
             server: "127.0.0.1".into(),
             port: 0,
+            port_range: None,
             username: format!("user-{:016x}", rand::random::<u64>()),
             password: format!("pw-{:016x}", rand::random::<u64>()),
             transport: MieruTransport::Tcp,
+            multiplexing: Multiplexing::default(),
         }
     }
 
@@ -2875,9 +3884,11 @@ mod tests {
         MieruOut {
             server: "127.0.0.1".into(),
             port,
+            port_range: None,
             username: format!("user-{:016x}", rand::random::<u64>()),
             password: format!("pw-{:016x}", rand::random::<u64>()),
             transport: MieruTransport::Udp,
+            multiplexing: Multiplexing::default(),
         }
     }
 
@@ -3063,5 +4074,596 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("username"), "{err}");
+    }
+
+    // ------------------------------------------------- port ranges + levels
+
+    #[test]
+    fn port_range_parsing_and_validation() {
+        // mihomo's exact error strings (adapter/outbound/mieru.go:301-323).
+        assert_eq!(parse_port_range("2048-4096").unwrap(), (2048, 4096));
+        assert_eq!(parse_port_range("1-65535").unwrap(), (1, 65535));
+        assert_eq!(parse_port_range("8080-8080").unwrap(), (8080, 8080));
+        for bad in [
+            "",
+            "8080",
+            "-8080",
+            "8080-",
+            "a-8080",
+            "8080-b",
+            "0-8080",
+            "8080-65536",
+            "9080-8080",
+            "8080-9080-7080", // FlatPortBindings' regex is anchored
+            " 8080-9080",
+        ] {
+            let err = parse_port_range(bad).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid port-range format")
+                    || err.to_string().contains("begin port must be")
+                    || err.to_string().contains("end port must be")
+                    || err.to_string().contains("less than or equal"),
+                "{bad:?}: {err}"
+            );
+        }
+        // validateMieruOption's cross-checks (mihomo mieru.go:301-309).
+        assert!(validate_ports(0, None).is_err());
+        let err = validate_ports(0, None).unwrap_err();
+        assert!(err.to_string().contains("either port or port-range must be set"));
+        let err = validate_ports(8080, Some((8080, 9080))).unwrap_err();
+        assert!(err.to_string().contains("cannot be set at the same time"));
+        assert!(validate_ports(8080, None).is_ok());
+        assert!(validate_ports(0, Some((8080, 9080))).is_ok());
+        // FlatPortBindings: a range expands to one binding per port.
+        assert_eq!(endpoint_ports(8080, None), vec![8080]);
+        assert_eq!(endpoint_ports(0, Some((3, 6))), vec![3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn port_picker_stays_inside_the_range_and_spreads() {
+        let ports = endpoint_ports(0, Some((2000, 2009)));
+        // 400 uniform draws: every value inside the range, and with
+        // overwhelming probability every port is hit (P(miss one) < 2e-18).
+        let mut hits = std::collections::HashSet::new();
+        for _ in 0..400 {
+            let p = pick_port(&ports).unwrap();
+            assert!((2000..=2009).contains(&p));
+            hits.insert(p);
+        }
+        assert!(hits.len() >= 9, "picker is not spreading: {hits:?}");
+        assert!(pick_port(&[]).is_err());
+    }
+
+    #[test]
+    fn multiplexing_levels_parse_and_map_to_factors() {
+        // NewClientMuxFromProfile (appctlcommon/client.go:159-171) and
+        // mihomo's invalid-level error (adapter/outbound/mieru.go:335-339).
+        assert_eq!(Multiplexing::default(), Multiplexing::Low);
+        assert_eq!(Multiplexing::parse("").unwrap(), Multiplexing::Low);
+        assert_eq!(Multiplexing::parse("MULTIPLEXING_OFF").unwrap().factor(), 0);
+        assert_eq!(Multiplexing::parse("MULTIPLEXING_LOW").unwrap().factor(), 1);
+        assert_eq!(Multiplexing::parse("MULTIPLEXING_MIDDLE").unwrap().factor(), 2);
+        assert_eq!(Multiplexing::parse("MULTIPLEXING_HIGH").unwrap().factor(), 3);
+        let err = Multiplexing::parse("max").unwrap_err();
+        assert!(err.to_string().contains("invalid multiplexing level: max"));
+        assert!(Multiplexing::parse("low").is_err(), "case-sensitive");
+    }
+
+    // --------------------------------------------- multiplexing: TCP mimic
+
+    /// In-test mieru server for MANY sessions over ONE TCP underlay — the
+    /// demultiplexing half of `StreamUnderlay` the single-session
+    /// [`MimicServer`] does not model: one shared recv cipher and one
+    /// shared send cipher, segments routed by metadata session id, each
+    /// session numbering its own outbound segments.
+    #[derive(Clone)]
+    struct MultiSessionMimicServer {
+        username: String,
+        password: String,
+    }
+
+    struct SessCtx {
+        next_send: u32,
+        socks_done: bool,
+    }
+
+    impl MultiSessionMimicServer {
+        /// The accept loop: one underlay connection at a time, each with
+        /// any number of sessions.
+        async fn serve(self, listener: TcpListener, conns: std::sync::Arc<AtomicUsize>) {
+            loop {
+                let (sock, _) = match listener.accept().await {
+                    Ok(x) => x,
+                    Err(_) => return,
+                };
+                let _ = sock.set_nodelay(true);
+                conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let server = self.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = server.run_connection(sock).await {
+                        if !e.to_string().contains("discovery failed") {
+                            panic!("multi mimic failed: {e}");
+                        }
+                    }
+                });
+            }
+        }
+
+        async fn run_connection(&self, io: tokio::net::TcpStream) -> Result<()> {
+            let (mut rd, mut wr) = tokio::io::split(io);
+            let mut recv: Option<StatefulCipher> = None;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            let mut send = StatefulCipher::new(
+                &client_key(&self.password, &self.username, now),
+                &self.username,
+            );
+            let mut sessions: std::collections::HashMap<u32, SessCtx> =
+                std::collections::HashMap::new();
+
+            loop {
+                let overhead = TAG_SIZE + usize::from(recv.is_none()) * NONCE_SIZE;
+                let mut enc_meta = vec![0u8; METADATA_LENGTH + overhead];
+                if rd.read_exact(&mut enc_meta).await.is_err() {
+                    return Ok(()); // underlay closed
+                }
+                let plain = match &mut recv {
+                    None => {
+                        // serverUsers.Discover over the three window keys.
+                        let mut found = None;
+                        let hashed = hash_password(self.password.as_bytes(), self.username.as_bytes());
+                        for salt in salts_for_time(now) {
+                            let key: [u8; KEY_LEN] =
+                                pbkdf2_hmac_sha256(&hashed, &salt, KEY_ITER, KEY_LEN)
+                                    .try_into()
+                                    .unwrap();
+                            let mut probe = StatefulCipher::new(&key, &self.username);
+                            if let Ok(p) = probe.decrypt(&enc_meta) {
+                                found = Some((probe, p));
+                                break;
+                            }
+                        }
+                        let (cipher, p) =
+                            found.ok_or_else(|| Error::crypto("discovery failed"))?;
+                        recv = Some(cipher);
+                        p
+                    }
+                    Some(c) => c.decrypt(&enc_meta)?,
+                };
+                let meta = parse_metadata(&plain)?;
+                let mut inbound = Vec::new();
+                let is_session = is_session_protocol(meta.protocol);
+                if !is_session && meta.prefix_len > 0 {
+                    skip(&mut rd, meta.prefix_len as usize).await?;
+                }
+                if meta.payload_len > 0 {
+                    let mut enc = vec![0u8; meta.payload_len as usize + TAG_SIZE];
+                    rd.read_exact(&mut enc).await?;
+                    inbound = recv.as_mut().unwrap().decrypt(&enc)?;
+                }
+                if meta.suffix_len > 0 {
+                    skip(&mut rd, meta.suffix_len as usize).await?;
+                }
+
+                let ctx = sessions
+                    .entry(meta.session_id)
+                    .or_insert_with(|| SessCtx { next_send: 0, socks_done: false });
+                let seq = ctx.next_send;
+                ctx.next_send = ctx.next_send.wrapping_add(1);
+                match meta.protocol {
+                    OPEN_SESSION_REQUEST => {
+                        assert!(inbound.starts_with(&[SOCKS5_VERSION]));
+                        assert_ne!(meta.session_id, 0, "reserved session id 0");
+                        ctx.socks_done = true;
+                        let reply = [SOCKS5_VERSION, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+                        let suffix = open_padding_len(&self.username);
+                        let sm = session_struct(
+                            OPEN_SESSION_RESPONSE,
+                            meta.session_id,
+                            seq,
+                            0,
+                            reply.len() as u16,
+                            suffix as u8,
+                        );
+                        let mut wire = send.encrypt(&sm)?;
+                        wire.extend_from_slice(&send.encrypt(&reply)?);
+                        wire.extend_from_slice(&random_bytes(suffix));
+                        wr.write_all(&wire).await?;
+                        wr.flush().await?;
+                    }
+                    DATA_CLIENT_TO_SERVER => {
+                        assert!(ctx.socks_done, "data before the socks handshake");
+                        for chunk in inbound.chunks(MAX_PDU) {
+                            let prefix = data_padding_len();
+                            let suffix = data_padding_len();
+                            let dm = data_ack_struct(
+                                DATA_SERVER_TO_CLIENT,
+                                meta.session_id,
+                                seq,
+                                0,
+                                4096,
+                                0,
+                                prefix as u8,
+                                chunk.len() as u16,
+                                suffix as u8,
+                            );
+                            let mut wire = send.encrypt(&dm)?;
+                            wire.extend_from_slice(&random_bytes(prefix));
+                            wire.extend_from_slice(&send.encrypt(chunk)?);
+                            wire.extend_from_slice(&random_bytes(suffix));
+                            wr.write_all(&wire).await?;
+                        }
+                        wr.flush().await?;
+                    }
+                    CLOSE_SESSION_REQUEST => {
+                        let suffix = open_padding_len(&self.username);
+                        let sm = session_struct(
+                            CLOSE_SESSION_RESPONSE,
+                            meta.session_id,
+                            seq,
+                            0,
+                            0,
+                            suffix as u8,
+                        );
+                        let mut wire = send.encrypt(&sm)?;
+                        wire.extend_from_slice(&random_bytes(suffix));
+                        wr.write_all(&wire).await?;
+                        wr.flush().await?;
+                        sessions.remove(&meta.session_id);
+                    }
+                    CLOSE_SESSION_RESPONSE => {
+                        sessions.remove(&meta.session_id);
+                    }
+                    other => panic!("multi mimic: unexpected protocol {other}"),
+                }
+            }
+        }
+    }
+
+    type AtomicUsize = std::sync::atomic::AtomicUsize;
+
+    /// A listener accepting any number of underlay connections, each
+    /// carrying any number of sessions.
+    async fn spawn_multi_tcp_mimic(
+        cfg: &MieruOut,
+    ) -> (u16, std::sync::Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        spawn_multi_tcp_mimic_on(cfg, 0).await
+    }
+
+    /// [`spawn_multi_tcp_mimic`] with an explicit port (0 = ephemeral).
+    async fn spawn_multi_tcp_mimic_on(
+        cfg: &MieruOut,
+        port: u16,
+    ) -> (u16, std::sync::Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = MultiSessionMimicServer {
+            username: cfg.username.clone(),
+            password: cfg.password.clone(),
+        };
+        let conns = std::sync::Arc::new(AtomicUsize::new(0));
+        let handle = tokio::spawn(server.serve(listener, conns.clone()));
+        (port, conns, handle)
+    }
+
+    fn mux_cfg(port: u16, transport: MieruTransport) -> MieruOut {
+        MieruOut {
+            server: "127.0.0.1".into(),
+            port,
+            port_range: None,
+            username: format!("user-{:016x}", rand::random::<u64>()),
+            password: format!("pw-{:016x}", rand::random::<u64>()),
+            transport,
+            multiplexing: Multiplexing::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn mux_tcp_two_sessions_share_one_underlay() {
+        // Two concurrent SOCKS5 CONNECT targets over ONE TCP underlay,
+        // demultiplexed by session id (mux.go DialContext reusing an
+        // underlay via AddSession).
+        let cfg = mux_cfg(0, MieruTransport::Tcp);
+        let (port, conns, _mimic) = spawn_multi_tcp_mimic(&cfg).await;
+        let cfg = MieruOut {
+            port,
+            ..cfg.clone()
+        };
+        let mux = MieruMux::new(&cfg, Multiplexing::High).unwrap();
+        mux.force_reuse();
+
+        let mut s1 = tokio::time::timeout(
+            Duration::from_secs(20),
+            mux.connect(&NetAddr::domain("alpha.example", 443).unwrap()),
+        )
+        .await
+        .expect("dial 1 timed out")
+        .expect("dial 1 failed");
+        let mut s2 = tokio::time::timeout(
+            Duration::from_secs(20),
+            mux.connect(&NetAddr::domain("beta.example", 80).unwrap()),
+        )
+        .await
+        .expect("dial 2 timed out")
+        .expect("dial 2 failed");
+
+        assert_eq!(mux.underlay_count(), 1, "both sessions share the underlay");
+        assert_eq!(conns.load(Ordering::Relaxed), 1, "exactly one TCP connection");
+
+        // Independent concurrent echoes over the shared underlay.
+        s1.write_all(b"first-session-payload").await.unwrap();
+        s2.write_all(b"second").await.unwrap();
+        let (mut b1, mut b2) = ([0u8; 21], [0u8; 6]);
+        let (r1, r2) = tokio::join!(
+            s1.read_exact(&mut b1),
+            tokio::time::timeout(Duration::from_secs(10), s2.read_exact(&mut b2)),
+        );
+        r1.unwrap();
+        r2.expect("echo 2 timed out").unwrap();
+        assert_eq!(&b1, b"first-session-payload");
+        assert_eq!(&b2, b"second");
+    }
+
+    #[tokio::test]
+    async fn mux_off_creates_one_underlay_per_dial() {
+        // MULTIPLEXING_OFF → factor 0 → maybePickExistingUnderlay always
+        // declines (mux.go:763): one fresh underlay per session.
+        let cfg = mux_cfg(0, MieruTransport::Tcp);
+        let (port, conns, _mimic) = spawn_multi_tcp_mimic(&cfg).await;
+        let cfg = MieruOut {
+            port,
+            ..cfg.clone()
+        };
+        let mux = MieruMux::new(&cfg, Multiplexing::Off).unwrap();
+        let target = NetAddr::domain("off.example", 443).unwrap();
+        let mut s1 = tokio::time::timeout(Duration::from_secs(20), mux.connect(&target))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut s2 = tokio::time::timeout(Duration::from_secs(20), mux.connect(&target))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mux.underlay_count(), 2);
+        assert_eq!(conns.load(Ordering::Relaxed), 2);
+        // Both tunnels still work independently.
+        s1.write_all(b"one").await.unwrap();
+        s2.write_all(b"two!").await.unwrap();
+        let (mut b1, mut b2) = ([0u8; 3], [0u8; 4]);
+        let (r1, r2) = tokio::join!(s1.read_exact(&mut b1), s2.read_exact(&mut b2));
+        r1.unwrap();
+        r2.unwrap();
+        assert_eq!(&b1, b"one");
+        assert_eq!(&b2, b"two!");
+    }
+
+    #[tokio::test]
+    async fn mux_high_reuses_underlays_statistically() {
+        // Without the test pin: every dial creates a new underlay with
+        // probability 1/(len(active)*3 + 1) — over 12 dials the odds of
+        // never reusing are (1/4)(1/7)(1/10)... ≈ 3e-11.
+        let cfg = mux_cfg(0, MieruTransport::Tcp);
+        let (port, _conns, _mimic) = spawn_multi_tcp_mimic(&cfg).await;
+        let cfg = MieruOut {
+            port,
+            ..cfg.clone()
+        };
+        let mux = MieruMux::new(&cfg, Multiplexing::High).unwrap();
+        let target = NetAddr::domain("many.example", 443).unwrap();
+        let mut streams = Vec::new();
+        for _ in 0..12 {
+            streams.push(
+                tokio::time::timeout(Duration::from_secs(20), mux.connect(&target))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert!(
+            mux.underlay_count() < 12,
+            "expected some underlay reuse, got {}",
+            mux.underlay_count()
+        );
+    }
+
+    // --------------------------------------------- multiplexing: UDP mimic
+
+    /// UDP counterpart of [`MultiSessionMimicServer`]: one socket, many
+    /// sessions routed by metadata session id, per-session sequencing.
+    struct MultiPacketMimicServer {
+        username: String,
+        password: String,
+    }
+
+    struct UdpSessCtx {
+        next_recv: u32,
+        next_send: u32,
+    }
+
+    impl MultiPacketMimicServer {
+        async fn run(self, sock: UdpSocket) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            let key = client_key(&self.password, self.username.as_str(), now);
+            let cipher = StatelessCipher::new(&key, &self.username);
+            let decode = PacketMimicServer {
+                username: self.username.clone(),
+                password: self.password.clone(),
+                drop_first: false,
+                associate: false,
+            };
+            let mut sessions: std::collections::HashMap<u32, UdpSessCtx> =
+                std::collections::HashMap::new();
+            let socks_reply = [SOCKS5_VERSION, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+            loop {
+                let mut buf = vec![0u8; 1500];
+                let (n, peer) = match sock.recv_from(&mut buf).await {
+                    Ok(x) => x,
+                    Err(_) => return,
+                };
+                let Some((meta, payload)) = decode.decode(&key, &buf[..n]) else {
+                    continue;
+                };
+                let ctx = sessions
+                    .entry(meta.session_id)
+                    .or_insert_with(|| UdpSessCtx { next_recv: 0, next_send: 0 });
+                match meta.protocol {
+                    OPEN_SESSION_REQUEST => {
+                        assert_ne!(meta.session_id, 0);
+                        assert!(payload.starts_with(&[SOCKS5_VERSION]));
+                        assert_eq!(payload[1], SOCKS5_CONNECT_CMD);
+                        ctx.next_recv = meta.seq + 1;
+                        let wire = PacketMimicServer::session_wire(
+                            &cipher,
+                            meta.session_id,
+                            OPEN_SESSION_RESPONSE,
+                            ctx.next_send,
+                            &socks_reply,
+                        )
+                        .unwrap();
+                        ctx.next_send += 1;
+                        let _ = sock.send_to(&wire, peer).await;
+                    }
+                    DATA_CLIENT_TO_SERVER => {
+                        if meta.seq != ctx.next_recv {
+                            continue; // duplicate or reordered
+                        }
+                        ctx.next_recv += 1;
+                        let wire = PacketMimicServer::data_wire(
+                            &cipher,
+                            meta.session_id,
+                            DATA_SERVER_TO_CLIENT,
+                            ctx.next_send,
+                            ctx.next_recv,
+                            &payload,
+                        )
+                        .unwrap();
+                        ctx.next_send += 1;
+                        let _ = sock.send_to(&wire, peer).await;
+                    }
+                    ACK_CLIENT_TO_SERVER => {}
+                    CLOSE_SESSION_REQUEST => {
+                        let wire = PacketMimicServer::session_wire(
+                            &cipher,
+                            meta.session_id,
+                            CLOSE_SESSION_RESPONSE,
+                            ctx.next_send,
+                            &[],
+                        )
+                        .unwrap();
+                        let _ = sock.send_to(&wire, peer).await;
+                        sessions.remove(&meta.session_id);
+                    }
+                    CLOSE_SESSION_RESPONSE => {
+                        sessions.remove(&meta.session_id);
+                    }
+                    other => panic!("multi udp mimic: unexpected protocol {other}"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mux_udp_two_sessions_share_one_underlay() {
+        // Two sessions over ONE UDP socket (one PacketUnderlay), each with
+        // its own reliability engine, demuxed by session id.
+        let sock = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = sock.local_addr().unwrap().port();
+        let username = format!("user-{:016x}", rand::random::<u64>());
+        let password = format!("pw-{:016x}", rand::random::<u64>());
+        let server = MultiPacketMimicServer {
+            username: username.clone(),
+            password: password.clone(),
+        };
+        tokio::spawn(server.run(sock));
+        let cfg = MieruOut {
+            server: "127.0.0.1".into(),
+            port,
+            port_range: None,
+            username,
+            password,
+            transport: MieruTransport::Udp,
+            multiplexing: Multiplexing::High,
+        };
+        let mux = MieruMux::new(&cfg, Multiplexing::High).unwrap();
+        mux.force_reuse();
+
+        let mut s1 = tokio::time::timeout(
+            Duration::from_secs(20),
+            mux.connect(&NetAddr::domain("u-one.example", 443).unwrap()),
+        )
+        .await
+        .expect("udp dial 1 timed out")
+        .expect("udp dial 1 failed");
+        let mut s2 = tokio::time::timeout(
+            Duration::from_secs(20),
+            mux.connect(&NetAddr::domain("u-two.example", 80).unwrap()),
+        )
+        .await
+        .expect("udp dial 2 timed out")
+        .expect("udp dial 2 failed");
+
+        assert_eq!(mux.underlay_count(), 1, "both sessions share the underlay");
+
+        s1.write_all(b"udp-session-one").await.unwrap();
+        s2.write_all(b"udp-two").await.unwrap();
+        let (mut b1, mut b2) = ([0u8; 15], [0u8; 7]);
+        let (r1, r2) = tokio::join!(
+            s1.read_exact(&mut b1),
+            tokio::time::timeout(Duration::from_secs(10), s2.read_exact(&mut b2)),
+        );
+        r1.unwrap();
+        r2.expect("udp echo 2 timed out").unwrap();
+        assert_eq!(&b1, b"udp-session-one");
+        assert_eq!(&b2, b"udp-two");
+    }
+
+    #[tokio::test]
+    async fn port_range_dials_hit_both_range_ports() {
+        // A "begin-end" range expands to per-port endpoints
+        // (FlatPortBindings); every underlay dial picks one at random
+        // (mux.go:670). Over 40 dials across a two-port range both
+        // listeners must see traffic (P(one side starved) < 2^-39).
+        let mut cfg = mux_cfg(0, MieruTransport::Tcp);
+        // Find two adjacent free ports so the range covers exactly the
+        // two listeners.
+        let (p1, p2) = {
+            let mut found = None;
+            for _ in 0..1000 {
+                let a = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+                let pa = a.local_addr().unwrap().port();
+                if pa != u16::MAX
+                    && TcpListener::bind(("127.0.0.1", pa + 1)).await.is_ok()
+                {
+                    found = Some((pa, pa + 1));
+                    break;
+                }
+            }
+            found.expect("two adjacent free loopback ports")
+        };
+        let (lo, hi) = (p1, p2);
+        let (p1, conns1, _m1) = spawn_multi_tcp_mimic_on(&cfg, lo).await;
+        let (p2, conns2, _m2) = spawn_multi_tcp_mimic_on(&cfg, hi).await;
+        assert_eq!((p1, p2), (lo, hi));
+        cfg.port_range = Some((lo, hi));
+        assert_eq!(cfg.endpoint_ports(), vec![lo, hi]);
+        let mux = MieruMux::new(&cfg, Multiplexing::Off).unwrap();
+        let target = NetAddr::domain("range.example", 443).unwrap();
+        for _ in 0..40 {
+            tokio::time::timeout(Duration::from_secs(20), mux.connect(&target))
+                .await
+                .expect("dial timed out")
+                .expect("dial failed");
+        }
+        assert!(conns1.load(Ordering::Relaxed) >= 1, "port {lo} never dialed");
+        assert!(conns2.load(Ordering::Relaxed) >= 1, "port {hi} never dialed");
+        assert_eq!(
+            conns1.load(Ordering::Relaxed) + conns2.load(Ordering::Relaxed),
+            40
+        );
     }
 }

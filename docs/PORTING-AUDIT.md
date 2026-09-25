@@ -37,14 +37,15 @@ Status legend:
 | hysteria2.go | `proto/hysteria2.rs` over quinn (HTTP/3-style auth, salamander obfs, datagram UDP) | ✅ this pass |
 | tuic.go | `proto/tuic.rs` v5 (TLS-exporter token auth, native/quic UDP relay, heartbeats, dissociate) | ✅ this pass |
 | wireguard.go | `proto/wireguard.rs` — hand-rolled Noise_IKpsk2 handshake (KDF/MAC1/2 step-cited from the whitepaper), transport keys, anti-replay, cookie consumption, keepalive/rekey timers, smoltcp client stack for TCP+UDP, mihomo `reserved` bytes per sing-wireguard `client_bind.go` | ✅ this pass (self-consistent: verified against an in-test noise responder; IPv6 inner stack ✅ wave-7 (dual-stack interface, per-family source selection, v4/v6 share one tunnel) |
-| tailscale.go, easytier.go, zerotier.go | — | ⏳ P3 overlay networks |
+| tailscale.go | `proto/tailscale.rs` — full config surface + the tsnet implementation map (what's portable from wireguard/tls13/http2 vs tailcfg/DERP/ipn gaps); connect fails with the precise cited blocker | 🟡 wave-9 start (control-plane stack = P3 continuation) |
+| easytier.go, zerotier.go | — | ⏳ P3 overlay networks |
 | ssh.go | `proto/ssh.rs` via russh (password/PEM keys, direct-tcpip channels, known host keys) | ✅ this pass |
 | shadowtls.go (v3) | `proto/shadowtls.rs` (Hello-HMAC auth, record XOR chains, inner `proxy:` nesting in the mihomo dialect) | ✅ this pass (v1/v2 rejected with a clear error) |
-| snell.go | `proto/snell.rs` — v3+v4 (Argon2id KDF hand-rolled per RFC 9106 with Go cross-vectors, v4 stride-2 padding/bit-ratio/chunk-ramp) | ✅ TCP+UDP (wave-8 frame-boundary reader: read_packet one AEAD frame per call, v4 whole-datagram single-frame, UdpChannel::Snell wired; v1/v2 + reuse pool ⏳) |
-| anytls.go | `proto/anytls.rs` — auth sha256(pw), padding-scheme session, uot-v2 UDP | ✅ this pass (session multiplexing/idle pool ⏳) |
-| mieru.go | `proto/mieru.rs` — hashed password, PBKDF2 time-key, XChaCha20-Poly1305 implicit-nonce sessions; wave-8: the UDP PACKET transport (stateless cipher, retransmit/window/ACK engine with RTT+CUBIC, heartbeats, reorder delivery) + SOCKS5 UDP-ASSOCIATE relay over either underlay | ✅ TCP + UDP transport (port-ranges/multiplexing remain dialer-level ⏳ documented) |
+| snell.go | `proto/snell.rs` — v3+v4 (Argon2id KDF hand-rolled per RFC 9106 with Go cross-vectors, v4 stride-2 padding/bit-ratio/chunk-ramp) | ✅ v1–v5 + TCP/UDP + SnellPool (wave-9: v1 chacha/v2 reuse-header wire, v5→v4 mapping per adapter, zero-chunk half-close recycling, 15s/10-idle pool; wave-8 UDP reader) |
+| anytls.go | `proto/anytls.rs` — auth sha256(pw), padding-scheme session, uot-v2 UDP; wave-9: session multiplexing (sid registry, writer/recv tasks, FIN on drop) + AnyTlsSessionPool (idle preference, janitor, max-streams) wired per-outbound | ✅ |
+| mieru.go | `proto/mieru.rs` — hashed password, PBKDF2 time-key, XChaCha20-Poly1305 implicit-nonce sessions; wave-8: the UDP PACKET transport (stateless cipher, retransmit/window/ACK engine with RTT+CUBIC, heartbeats, reorder delivery) + SOCKS5 UDP-ASSOCIATE relay over either underlay | ✅ TCP + UDP + port-ranges + multiplexing (wave-9: MieruMux with weighted underlay reuse/clean/traffic-disable, per-session demux both underlays; port-range picker FlatPortBindings) |
 | restls.go | `proto/restls.rs` — TLS1.3 session-id BLAKE3 MAC stamping (rustls SecureRandom trick), XOR auth record, script-driven padding | ✅ this pass (tls12 version-hint rejected: rustls has no KEX hook — error names it) |
-| jls.go | `proto/jls.rs` — JLS cover over TLS 1.3: hello randoms replaced by AES-256-GCM seeds keyed by SHA256(user/pw‖authData) (two-pass rustls hello stamping; Go golden vectors), wired as `jls-opts` on vless/trojan/vmess/anytls | ✅ wave-7 (uTLS-fingerprint hello + server-side fallback relay ⏳) |
+| jls.go | `proto/jls.rs` — JLS cover over TLS 1.3: hello randoms replaced by AES-256-GCM seeds keyed by SHA256(user/pw‖authData) (two-pass rustls hello stamping; Go golden vectors), wired as `jls-opts` on vless/trojan/vmess/anytls | ✅ wave-7 + uTLS-fingerprint hello (wave-9: profile hellos ride the engine's own TLS 1.3 stack — structure_seed two-pass stamping, utls.go parity; server-side fallback relay remains scoped out) |
 | shadowquic.go | `proto/shadowquic.rs` — TCP + UDP (datagram & udp-over-stream) over quinn, control-stream id registration, ≤32 pending demux, Brutal codec; tuned windows/streams | ✅ wave-7 TCP+UDP (jls-in-QUIC-TLS impossible under quinn/rustls — precise error; upstream-always-JLS delta documented; v2/RFC9369 unsupported by quinn) |
 | sudoku.go | `proto/sudoku.rs` — KIP framing, X25519+nonce-echo+rekey handshake, RecordConn epoch AEAD, full table obfs (bit-exact Go math/rand transcription, directional/custom/rotation), HTTP mask, UoT UDP, session mux | ✅ wave-8: http-mask tunnel modes stream/poll/auto/ws landed (early-handshake KIP in `ed` query/base64/body, chunked sequenced uploads, poll lines, WS upgrade + HMAC token, TLS carriers) |
 | gost_relay.go | `proto/gost_relay.rs` — relay v1 features (userauth/addr-port-LAST/network), TCP + UDP associations, TLS, forward mode | ✅ wave-7 (mux:true rejected citing smux; TLS cert extras carried) |
@@ -70,7 +71,7 @@ Status legend:
 | mixed, http, socks | `inbound/{mixed,http,socks}.rs` | ✅ |
 | redir (Linux NAT) | `inbound/redir.rs` (SO_ORIGINAL_DST) | ✅ |
 | tproxy (Linux) | `inbound/tproxy.rs` (TCP+UDP transparent) | ✅ |
-| sing_tun (TUN device) | `inbound/tun/` — /dev/net/tun + smoltcp netstack + DNS hijack + ICMP echo (v4+v6) + inet6-address (in6_ifreq ioctl, kernel-source-verified), both dialects parse into TunConfig | ✅ Linux (e2e attach + hijacked-UDP with NET_ADMIN); Windows/macOS ⏳; v6 ext headers ⏳ |
+| sing_tun (TUN device) | `inbound/tun/` — /dev/net/tun + smoltcp netstack + DNS hijack + ICMP echo (v4+v6) + inet6-address (in6_ifreq ioctl, kernel-source-verified), both dialects parse into TunConfig | ✅ Linux (e2e) + Windows(WinTUN)/macOS(utun) device backends ✅ wave-9 (hand-declared wintun.dll bindings / AF_SYSTEM+CTLIOCGINFO syscalls, cross-checked via cargo-check on both targets; smoltcp netstack stays Linux-only until generalized); v6 ext headers ⏳ |
 | sing_shadowsocks / sing_trojan / sing_vless / sing_vmess / sing_hysteria2 / tuic server listeners | `inbound/proxy_server/` — TCP + UDP for ss (legacy/2022, SIP022 replay window), trojan, vless, vmess, hysteria2 (H3 auth 233 + datagrams) and TUIC v5 (exporter token auth, native UDP, dissociate); both dialects parse them | ✅ + restls & tlsmirror camouflage listeners ✅ wave-8 (server halves in the proto modules; tlsmirror incl. connection-enrolment control connections). Correction: mihomo has NO anytls/snell listeners — this row previously overstated the gap |
 | hysteria2_realm | — | ❌ (server-side hy2, same family) |
 
@@ -113,7 +114,7 @@ Status legend:
 | v2raywebsocket (ws + early-data) | `ws_connect_early` (≤757B rides `Sec-WebSocket-Protocol`) | ✅ this pass |
 | **httpupgrade** (via ws-opts convention) | `httpupgrade_connect` | ✅ |
 | gun / v2raygrpc | `grpc.rs` — hand-rolled HTTP/2 + HPACK (huffman decode, flow control), TLS ALPN h2 | ✅ this pass |
-| simple-obfs | `proto/obfs.rs` (http/tls) | ✅; sip003 external plugins ⏳ P3 |
+| simple-obfs | `proto/obfs.rs` (http/tls) + `proto/sip003.rs` (external SIP003 child processes: obfs-local/v2ray-plugin/raw programs, spec env table, PATH resolution; `plugin: obfs` stays in-process like mihomo) | ✅ wave-9 |
 | vmess AEAD ciphers | `proto/vmess.rs` | ✅ aes-128-gcm / chacha20-poly1305 / none / auto |
 | shadowtls / snell / hysteria core | — | ❌ |
 
@@ -233,13 +234,13 @@ stay available as the escape hatch during migration.
 | **P1** | TUN on Windows (WinTUN) / macOS (utun) | same netstack, different device backends |
 
 | P2 | hy2/tuic server listeners; SS-2022 multi-user server | hy2 server reuses the quinn plumbing; ss UDP server ✅ landed (legacy + 2022) |
-| P1 | WireGuard (outbound + endpoint) | boringtun for the tunnel; consumes the TUN netstack core from the P0 item |
+| P1 | WireGuard (outbound + endpoint) | outbound ✅ (dual-stack, wave-8); ENDPOINT ✅ wave-9: serve_endpoint — handshake responder (MAC1/cookie-under-load/ratelimit), roaming, cryptokey routing, EpStack accept netstack into the relay; sing-box `endpoints` parsed |
 | P2 | DHCP / system / hosts-file DNS upstreams; DoH server | small, one module each |
 | P2 | snell / anytls / mieru / jls / restls / shadowquic transports | ✅ waves 6-8 (client side incl. snell UDP + mieru UDP); anytls/snell listeners do not exist upstream (audit corrected) |
 | P3 | tailscale / tor / series | long tail, driven by user demand (openvpn ✅ wave-8; masque / sudoku / gost-relay / tlsmirror / trusttunnel ✅ wave-7) |
 | P2 | ECH runtime on the engine's own TLS 1.3 stack | core ✅ (`proto/ech`: HPKE + ECHConfig + outer-CH builder); inner-handshake rebind wiring after the vision rebind API stabilizes |
 | P2 | mieru port-ranges/multiplexing; tlsmirror h2 generator; ECH on QUIC carriers | precise-error scopes (see rows above) |
-| P3 | sip003 external plugins; .mrs writing; misc polish | — |
+| P3 | misc polish | .mrs writing ✅ wave-9 (write_mrs: byte-identical upstream payload + hand-rolled pure-Rust zstd store-frame encoder — ruzstd is decode-only; also fixed a reader u128 overflow on ::/0) |
 
 Cluster e2e note (tests/docker-cluster, 10 checks): the dev machine's
 host TUN transparent proxy intercepts SOME forwarded docker UDP flows

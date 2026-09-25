@@ -18,6 +18,8 @@ struct RawConfig {
     #[serde(default)]
     inbounds: Vec<BTreeMap<String, Json>>,
     #[serde(default)]
+    endpoints: Vec<BTreeMap<String, Json>>,
+    #[serde(default)]
     outbounds: Vec<BTreeMap<String, Json>>,
     #[serde(default)]
     route: Option<RawRoute>,
@@ -73,6 +75,26 @@ struct RawClashApi {
     secret: Option<String>,
     #[serde(default, rename = "default_mode")]
     default_mode: Option<String>,
+}
+
+/// sing-box duration strings (`"300s"`, `"5m"`, plain seconds as
+/// numbers are handled by the caller).
+fn parse_duration(s: &str) -> Option<std::time::Duration> {
+    let s = s.trim();
+    if let Some(n) = s.strip_suffix('s') {
+        return n.parse::<u64>().ok().map(std::time::Duration::from_secs);
+    }
+    if let Some(n) = s.strip_suffix('m') {
+        return n.parse::<u64>().ok().map(std::time::Duration::from_secs).map(|d| d * 60);
+    }
+    if let Some(n) = s.strip_suffix('h') {
+        return n
+            .parse::<u64>()
+            .ok()
+            .map(std::time::Duration::from_secs)
+            .map(|d| d * 3600);
+    }
+    s.parse::<u64>().ok().map(std::time::Duration::from_secs)
 }
 
 fn json_str(entry: &BTreeMap<String, Json>, key: &str) -> Option<String> {
@@ -220,6 +242,9 @@ pub fn load(text: &str) -> Result<EngineConfig> {
                     method: SsMethod::parse(&json_str(outbound, "method").unwrap_or_default())?,
                     password: json_str(outbound, "password").unwrap_or_default(),
                     obfs: parse_singbox_obfs(outbound)?,
+                    // sing-box has no SIP003 external-plugin spawn field
+                    // (plugins are not its model).
+                    plugin: None,
                 },
             }),
             "vmess" => outbounds.push(OutboundConfig {
@@ -556,7 +581,94 @@ pub fn load(text: &str) -> Result<EngineConfig> {
         sniff,
         proxy_servers,
         tun,
+        wg_endpoints: parse_wireguard_endpoints(&raw.endpoints)?,
     })
+}
+
+/// sing-box `endpoints: [{type: wireguard, ...}]` → the WG server mode
+/// (sing-box protocol/wireguard/endpoint.go: private_key, listen_port,
+/// address[], mtu, udp_timeout, peers[{public_key, pre_shared_key,
+/// allowed_ips[], persistent_keepalive}]).
+fn parse_wireguard_endpoints(
+    endpoints: &[BTreeMap<String, Json>],
+) -> Result<Vec<crate::proto::wireguard::WgEndpointCfg>> {
+    let mut out = Vec::new();
+    for (i, ep) in endpoints.iter().enumerate() {
+        let etype = json_str(ep, "type").unwrap_or_default();
+        if etype != "wireguard" {
+            return Err(Error::config(format!(
+                "endpoint {i}: type {etype:?} is not supported (wireguard is)"
+            )));
+        }
+        let tag = json_str(ep, "tag").unwrap_or_else(|| format!("wg-endpoint-{i}"));
+        let parse_prefix = |s: &str| -> Option<(std::net::IpAddr, u8)> {
+            let (addr, prefix) = s.split_once('/')?;
+            Some((addr.parse().ok()?, prefix.parse().ok()?))
+        };
+        let mut address = None;
+        let mut inet6_address = None;
+        if let Some(Json::Array(list)) = ep.get("address") {
+            for a in list.iter().filter_map(Json::as_str) {
+                if let Some((ip, p)) = parse_prefix(a) {
+                    match ip {
+                        std::net::IpAddr::V4(v4) if address.is_none() => {
+                            address = Some((v4, p))
+                        }
+                        std::net::IpAddr::V6(v6) if inet6_address.is_none() => {
+                            inet6_address = Some((v6, p))
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let mut peers = Vec::new();
+        if let Some(Json::Array(list)) = ep.get("peers") {
+            for peer in list.iter().filter_map(Json::as_object) {
+                let get = |k: &str| {
+                    peer.get(k)
+                        .and_then(Json::as_str)
+                        .map(str::to_string)
+                };
+                let allowed_ips = peer
+                    .get("allowed_ips")
+                    .and_then(Json::as_array)
+                    .map(|l| {
+                        l.iter()
+                            .filter_map(Json::as_str)
+                            .filter_map(parse_prefix)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                peers.push(crate::proto::wireguard::WgEndpointPeer {
+                    public_key: get("public_key").unwrap_or_default(),
+                    pre_shared_key: get("pre_shared_key").filter(|s| !s.is_empty()),
+                    allowed_ips,
+                    persistent_keepalive: peer
+                        .get("persistent_keepalive")
+                        .and_then(Json::as_u64)
+                        .map(|v| v as u16),
+                });
+            }
+        }
+        out.push(crate::proto::wireguard::WgEndpointCfg {
+            tag: tag.clone(),
+            private_key: json_str(ep, "private_key").unwrap_or_default(),
+            listen_port: ep
+                .get("listen_port")
+                .and_then(Json::as_u64)
+                .unwrap_or(0) as u16,
+            mtu: ep.get("mtu").and_then(Json::as_u64).unwrap_or(0) as u16,
+            address,
+            inet6_address,
+            udp_timeout: ep
+                .get("udp_timeout")
+                .and_then(Json::as_str)
+                .and_then(parse_duration),
+            peers,
+        });
+    }
+    Ok(out)
 }
 
 /// sing-box tun inbound → engine TunConfig. `address` is an array of

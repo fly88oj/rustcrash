@@ -176,6 +176,9 @@ pub struct EngineConfig {
     pub proxy_servers: Vec<crate::inbound::proxy_server::ServerConfig>,
     /// TUN device inbound (mihomo `tun:` / sing-box tun inbound).
     pub tun: Option<crate::inbound::tun::TunConfig>,
+    /// sing-box `endpoints` of type wireguard (the WG SERVER mode:
+    /// handshake responder + cryptokey routing into the engine).
+    pub wg_endpoints: Vec<crate::proto::wireguard::WgEndpointCfg>,
 }
 
 impl EngineConfig {

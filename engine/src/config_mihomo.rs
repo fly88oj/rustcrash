@@ -270,6 +270,7 @@ pub fn load(text: &str) -> Result<EngineConfig> {
         geo: Default::default(),
         proxy_servers: parse_proxy_servers(raw.listeners.as_deref())?,
         tun,
+        wg_endpoints: Vec::new(),
     })
 }
 
@@ -631,9 +632,9 @@ fn parse_obfs(entry: &BTreeMap<String, Yaml>) -> Result<Option<crate::outbound::
         };
     };
     if plugin != "obfs" {
-        return Err(Error::config(format!(
-            "shadowsocks plugin {plugin:?} is not supported (only simple-obfs)"
-        )));
+        // Not the in-process simple-obfs: an external SIP003 child
+        // (parse_sip003_plugin owns those) — no in-process obfs here.
+        return Ok(None);
     }
     let (mut http, mut host) = (true, None);
     if let Some(Yaml::Mapping(opts)) = entry.get("plugin-opts") {
@@ -715,6 +716,101 @@ fn yaml_str(entry: &BTreeMap<String, Yaml>, key: &str) -> Option<String> {
         Yaml::Bool(b) => Some(b.to_string()),
         _ => None,
     })
+}
+
+/// mihomo `plugin`/`plugin-opts` → an external SIP003 child process
+/// (any plugin name other than the in-process `obfs`): obfs-local /
+/// simple-obfs, v2ray-plugin, or a raw program with a `k=v;k2=v2`
+/// options string per the SIP003 spec.
+fn parse_sip003_plugin(
+    entry: &BTreeMap<String, Yaml>,
+    name: &str,
+) -> Result<Option<crate::proto::sip003::Sip003Plugin>> {
+    let Some(plugin) = yaml_str(entry, "plugin") else {
+        return Ok(None);
+    };
+    match plugin.as_str() {
+        "" | "obfs" => Ok(None), // in-process simple-obfs
+        "obfs-local" | "simple-obfs" => {
+            let mode = plugin_opt(entry, "mode").unwrap_or_else(|| "http".into());
+            let host = plugin_opt(entry, "host");
+            crate::proto::sip003::Sip003Plugin::obfs(&mode, host.as_deref())
+                .map(Some)
+                .map_err(|e| Error::config(format!("proxy {name:?}: {e}")))
+        }
+        "v2ray-plugin" => {
+            let get = |k: &str| plugin_opt(entry, k);
+            let opts = crate::proto::sip003::V2rayPluginOpts {
+                mode: get("mode"),
+                tls: plugin_bool(entry, "tls"),
+                host: get("host"),
+                path: get("path"),
+                loglevel: get("loglevel"),
+                mux: !plugin_bool_str(entry, "mux", "false"),
+            };
+            crate::proto::sip003::Sip003Plugin::v2ray("v2ray-plugin", &opts)
+                .map(Some)
+                .map_err(|e| Error::config(format!("proxy {name:?}: {e}")))
+        }
+        program => {
+            let opts = entry
+                .get("plugin-opts")
+                .and_then(Yaml::as_mapping)
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| {
+                            let k = k.as_str()?;
+                            let v = match v {
+                                Yaml::String(s) => s.clone(),
+                                Yaml::Bool(b) => b.to_string(),
+                                Yaml::Number(n) => n.to_string(),
+                                _ => return None,
+                            };
+                            Some(format!("{k}={v}"))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(";")
+                })
+                .unwrap_or_default();
+            crate::proto::sip003::Sip003Plugin::raw(program, &opts)
+                .map(Some)
+                .map_err(|e| Error::config(format!("proxy {name:?}: {e}")))
+        }
+    }
+}
+
+fn plugin_opt(entry: &BTreeMap<String, Yaml>, key: &str) -> Option<String> {
+    entry
+        .get("plugin-opts")
+        .and_then(Yaml::as_mapping)
+        .and_then(|m| m.get(Yaml::String(key.into())))
+        .and_then(|v| match v {
+            Yaml::String(s) => Some(s.clone()),
+            Yaml::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
+}
+
+fn plugin_bool(entry: &BTreeMap<String, Yaml>, key: &str) -> bool {
+    entry
+        .get("plugin-opts")
+        .and_then(Yaml::as_mapping)
+        .and_then(|m| m.get(Yaml::String(key.into())))
+        .and_then(Yaml::as_bool)
+        .unwrap_or(false)
+}
+
+fn plugin_bool_str(entry: &BTreeMap<String, Yaml>, key: &str, default: &str) -> bool {
+    entry
+        .get("plugin-opts")
+        .and_then(Yaml::as_mapping)
+        .and_then(|m| m.get(Yaml::String(key.into())))
+        .and_then(|v| match v {
+            Yaml::Bool(b) => Some(*b),
+            Yaml::String(s) => Some(s == "true"),
+            _ => None,
+        })
+        .unwrap_or(default == "true")
 }
 
 /// Scalar yaml helpers for the wave-7 outbound options.
@@ -891,8 +987,10 @@ fn parse_proxy(
     let name = yaml_str(entry, "name")
         .unwrap_or_else(|| format!("proxy-{index}"));
     let ptype = yaml_str(entry, "type").unwrap_or_default();
-    // Wireguard carries server/port on peers[0], not the entry itself.
-    let is_wireguard = ptype == "wireguard";
+    // Wireguard carries server/port on peers[0], not the entry itself;
+    // tailscale dials itself through the tsnet stack (no server field
+    // upstream either).
+    let is_wireguard = ptype == "wireguard" || ptype == "tailscale";
     let server = if is_wireguard {
         String::new()
     } else {
@@ -901,6 +999,10 @@ fn parse_proxy(
         })?
     };
     let port: u16 = if is_wireguard {
+        0
+    } else if ptype == "mieru" && entry.get("port-range").is_some() {
+        // mieru: `port-range` substitutes for `port` (adapter/outbound/
+        // mieru.go:152-156); the range must carry a parseable begin.
         0
     } else {
         entry
@@ -920,13 +1022,20 @@ fn parse_proxy(
     let transport = parse_transport(entry)?;
 
     let kind = match ptype.as_str() {
-        "ss" => OutboundKind::Shadowsocks {
-            method: SsMethod::parse(&yaml_str(entry, "cipher").unwrap_or_default())?,
-            password: yaml_str(entry, "password").unwrap_or_default(),
-            obfs: parse_obfs(entry)?,
-            server,
-            port,
-        },
+        "ss" => {
+            // `plugin: obfs` stays the in-process simple-obfs (mihomo's
+            // mapping); any other plugin name is an external SIP003
+            // child process (obfs-local, v2ray-plugin, ...).
+            let plugin = parse_sip003_plugin(entry, &name)?;
+            OutboundKind::Shadowsocks {
+                method: SsMethod::parse(&yaml_str(entry, "cipher").unwrap_or_default())?,
+                password: yaml_str(entry, "password").unwrap_or_default(),
+                obfs: parse_obfs(entry)?,
+                plugin,
+                server,
+                port,
+            }
+        }
         "vmess" => {
             let uuid = yaml_str(entry, "uuid").unwrap_or_default();
             let uuid = uuid::Uuid::parse_str(&uuid)
@@ -1232,17 +1341,26 @@ fn parse_proxy(
                     .unwrap_or(true),
             })
         }
-        "snell" => OutboundKind::Snell(crate::proto::snell::SnellOut {
-            psk: yaml_str(entry, "psk").unwrap_or_default(),
-            version: entry
+        "snell" => {
+            let raw_version = entry
                 .get("version")
                 .and_then(Yaml::as_u64)
                 .map(|v| v as u8)
-                .unwrap_or(4),
-            udp,
-            server,
-            port,
-        }),
+                .unwrap_or(0);
+            // parse_version applies mihomo's DEFAULT_SNELL_VERSION (1) and
+            // the v5→v4 mapping; validate_udp gates UDP to v3+.
+            let version = crate::proto::snell::parse_version(raw_version)
+                .map_err(|e| Error::config(format!("proxy {name:?}: {e}")))?;
+            crate::proto::snell::validate_udp(version, udp)
+                .map_err(|e| Error::config(format!("proxy {name:?}: {e}")))?;
+            OutboundKind::Snell(crate::proto::snell::SnellOut {
+                psk: yaml_str(entry, "psk").unwrap_or_default(),
+                version,
+                udp,
+                server,
+                port,
+            })
+        }
         "anytls" => OutboundKind::AnyTls(crate::proto::anytls::AnyTlsOut {
             password: yaml_str(entry, "password").unwrap_or_default(),
             sni: yaml_str(entry, "sni").unwrap_or_default(),
@@ -1260,12 +1378,25 @@ fn parse_proxy(
             let transport = crate::proto::mieru::MieruTransport::parse(
                 &yaml_str(entry, "transport").unwrap_or_else(|| "TCP".into()),
             )?;
+            let port_range = match yaml_str(entry, "port-range") {
+                Some(spec) => Some(crate::proto::mieru::parse_port_range(&spec)?),
+                None => None,
+            };
+            crate::proto::mieru::validate_ports(port, port_range)?;
+            // `multiplexing` (mihomo MieruOption): low is mieru's default;
+            // carried on the outbound for the pool dial (see outbound.rs).
+            let multiplexing = yaml_str(entry, "multiplexing")
+                .map(|s| crate::proto::mieru::Multiplexing::parse(&s))
+                .transpose()?
+                .unwrap_or_default();
             OutboundKind::Mieru(crate::proto::mieru::MieruOut {
                 username: yaml_str(entry, "username").unwrap_or_default(),
                 password: yaml_str(entry, "password").unwrap_or_default(),
                 transport,
                 server,
                 port,
+                port_range,
+                multiplexing,
             })
         }
         "restls" => OutboundKind::Restls {
@@ -1528,8 +1659,24 @@ fn parse_proxy(
                 dns: yaml_str_list(entry, "dns"),
             })
         }
+        "tailscale" => {
+            OutboundKind::Tailscale(crate::proto::tailscale::TailscaleConfig {
+                name: name.clone(),
+                hostname: yaml_str(entry, "hostname"),
+                auth_key: yaml_str(entry, "auth-key"),
+                control_url: yaml_str(entry, "control-url"),
+                state_dir: yaml_str(entry, "state-dir"),
+                ephemeral: yaml_bool(entry, "ephemeral"),
+                udp: yaml_bool(entry, "udp"),
+                accept_routes: entry.get("accept-routes").and_then(Yaml::as_bool),
+                exit_node: yaml_str(entry, "exit-node"),
+                exit_node_allow_lan_access: entry
+                    .get("exit-node-allow-lan-access")
+                    .and_then(Yaml::as_bool),
+            })
+        }
         other => {
-            let supported = "ss, vmess, vless, trojan, socks5, http, hysteria2, tuic, wireguard, snell, anytls, mieru, restls, shadowquic, sudoku, gost-relay, trusttunnel, masque, openvpn";
+            let supported = "ss, vmess, vless, trojan, socks5, http, hysteria2, tuic, wireguard, snell, anytls, mieru, restls, shadowquic, sudoku, gost-relay, trusttunnel, masque, openvpn, tailscale";
             return Err(Error::config(format!(
                 "proxy {name:?}: type {other:?} is not supported by the Rust engine yet \
                  (supported: {supported})"
@@ -2111,6 +2258,108 @@ rules:
                 assert!(ech.enable);
                 assert_eq!(ech.config, "aGVsbG8=");
                 assert!(tlsmirror.is_some(), "tlsmirror-opts parsed");
+            }
+            other => panic!("wrong kind: {other:?}"),
+        }
+    }
+
+    /// Wave-9: snell v1/v2 default + UDP gates, mieru port-range/
+    /// multiplexing, the ss SIP003 plugin surface, and the tailscale
+    /// outbound config.
+    #[test]
+    fn wave9_snell_mieru_plugin_tailscale_parse() {
+        // snell: default version is 1 (mihomo DEFAULT_SNELL_VERSION);
+        // v5 maps to the v4 wire; UDP below v3 is rejected.
+        let s1 = load(
+            "mixed-port: 7890\nproxies:\n  - {name: s, type: snell, server: x, port: 1, psk: k}\nrules:\n  - MATCH,s\n",
+        )
+        .unwrap();
+        match &s1.outbounds.iter().find(|o| o.name == "s").unwrap().kind {
+            crate::outbound::OutboundKind::Snell(c) => assert_eq!(c.version, 1),
+            other => panic!("wrong kind: {other:?}"),
+        }
+        let s5 = load(
+            "mixed-port: 7890\nproxies:\n  - {name: s, type: snell, server: x, port: 1, psk: k, version: 5}\nrules:\n  - MATCH,s\n",
+        )
+        .unwrap();
+        match &s5.outbounds.iter().find(|o| o.name == "s").unwrap().kind {
+            crate::outbound::OutboundKind::Snell(c) => assert_eq!(c.version, 4, "v5 rides v4"),
+            other => panic!("wrong kind: {other:?}"),
+        }
+        let err = load(
+            "mixed-port: 7890\nproxies:\n  - {name: s, type: snell, server: x, port: 1, psk: k, version: 2, udp: true}\nrules:\n  - MATCH,s\n",
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(err.contains("not support UDP"), "{err}");
+
+        // mieru port-range + multiplexing.
+        let m = load(
+            "mixed-port: 7890\nproxies:\n  - {name: m, type: mieru, server: x, port-range: 20000-20010, username: u, password: p, multiplexing: MULTIPLEXING_HIGH}\nrules:\n  - MATCH,m\n",
+        )
+        .unwrap();
+        match &m.outbounds.iter().find(|o| o.name == "m").unwrap().kind {
+            crate::outbound::OutboundKind::Mieru(c) => {
+                assert_eq!(c.port_range, Some((20000, 20010)));
+                assert_eq!(c.port, 0);
+                assert_eq!(c.multiplexing, crate::proto::mieru::Multiplexing::High);
+            }
+            other => panic!("wrong kind: {other:?}"),
+        }
+
+        // ss external plugin (SIP003): anything but in-process "obfs".
+        let ss = load(
+            r#"mixed-port: 7890
+proxies:
+  - name: p
+    type: ss
+    server: x
+    port: 1
+    cipher: aes-256-gcm
+    password: pw
+    plugin: v2ray-plugin
+    plugin-opts:
+      mode: websocket
+      host: h.example
+      path: /ws
+      tls: true
+rules:
+  - MATCH,p
+"#,
+        )
+        .unwrap();
+        match &ss.outbounds.iter().find(|o| o.name == "p").unwrap().kind {
+            crate::outbound::OutboundKind::Shadowsocks { plugin, .. } => {
+                let plugin = plugin.as_ref().expect("sip003 plugin parsed");
+                assert_eq!(plugin.program(), "v2ray-plugin");
+            }
+            other => panic!("wrong kind: {other:?}"),
+        }
+
+        // tailscale config surface.
+        let ts = load(
+            r#"mixed-port: 7890
+proxies:
+  - name: t
+    type: tailscale
+    hostname: node1
+    control-url: https://ctrl.example
+    state-dir: /tmp/ts
+    ephemeral: true
+    accept-routes: true
+    exit-node: "auto:"
+rules:
+  - MATCH,t
+"#,
+        )
+        .unwrap();
+        match &ts.outbounds.iter().find(|o| o.name == "t").unwrap().kind {
+            crate::outbound::OutboundKind::Tailscale(c) => {
+                assert_eq!(c.hostname.as_deref(), Some("node1"));
+                assert!(c.ephemeral);
+                assert_eq!(c.accept_routes, Some(true));
+                assert_eq!(c.exit_node.as_deref(), Some("auto:"));
             }
             other => panic!("wrong kind: {other:?}"),
         }

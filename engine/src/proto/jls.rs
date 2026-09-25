@@ -77,12 +77,15 @@
 //! ## Scope and deviations
 //!
 //! * **uTLS fingerprints** (`client-fingerprint`,
-//!   `transport/jls/utls.go`): not ported — rustls emits its own TLS 1.3
-//!   hello offering exactly one X25519 key share. The JLS authentication
-//!   covers whatever hello is sent, so this changes the camouflage
-//!   fingerprint, not the credentials. mihomo's plain (non-uTLS) path
-//!   (`transport/jls/jls.go:95-119`) runs the identical JLS logic over
-//!   the stdlib hello.
+//!   `transport/jls/utls.go`): ported — see "The fingerprint path" below.
+//!   When [`JlsOut::fingerprint`] is set, the cover ClientHello is the
+//!   Chrome/Firefox template from `proto/reality/profiles.rs` (uTLS
+//!   `HelloChrome_120` / `HelloFirefox_120` parrots) instead of rustls'
+//!   own hello, and the TLS 1.3 session runs on the engine's own record
+//!   stack (`proto/reality/tls13.rs`) so the JLS stamping happens on hello
+//!   bytes we fully control. Without a fingerprint the plain rustls
+//!   two-pass path above runs (mihomo's non-uTLS branch,
+//!   `transport/jls/jls.go:95-119`).
 //! * **Server-side JLS / fallback relay** (`transport/jls/jls.go:176-197
 //!   Server`, rate limiter `jls.go:226-336`, handshake recorder
 //!   `jls.go:338-389`): listener-side; out of scope for an outbound
@@ -91,12 +94,55 @@
 //! * **0-RTT / session tickets**: never offered (resumption disabled;
 //!   the JLS session marker `jls-tls/jls.go:84-121` is a client-ticket
 //!   optimization only), so `jlsZeroPSKBinders` (`jls.go:352-376`) never
-//!   fires and PSK binders never appear in the authData.
+//!   fires and PSK binders never appear in the authData — exactly like
+//!   the uTLS path, which sets `SessionTicketsDisabled: true`
+//!   (`utls.go:52-54,61`).
 //! * **Client auth-failure camouflage HTTP request** (`utls.go:107-117`,
-//!   `jlsClientHTTPFallback utls.go:120-150`): uTLS-path only; this port
-//!   fails the dial immediately with [`ERR_AUTH_FAILED`] (mihomo's plain
-//!   path likewise just returns the error,
-//!   `transport/jls/jls.go:115-117`).
+//!   `jlsClientHTTPFallback utls.go:120-150`): scope-out inherited from
+//!   the plain path — on a non-JLS server this port fails the dial
+//!   immediately with [`ERR_AUTH_FAILED`] instead of completing the TLS
+//!   handshake against the fallback certificate, issuing a plausible HTTP
+//!   request, and only then returning `ErrJLSAuthFailed`
+//!   (`utls.go:106-112`). The observable dial result is the same error.
+//!
+//! ## The fingerprint path (mihomo `transport/jls/utls.go`)
+//!
+//! `newUTLSClient` (`utls.go:38-118`) drives uTLS through a fingerprint
+//! template; this port reproduces it over the engine's own TLS 1.3 stack
+//! (`proto/reality/tls13::connect`), which takes a fully-formed hello:
+//!
+//! 1. Build the profile hello from `reality::profiles` with a fresh random
+//!    (`BuildHandshakeState`, `utls.go:70-78`). The GREASE values and the
+//!    Chrome extension shuffle stay pinned to that first random draw
+//!    (`build_client_hello_opts`'s `structure_seed`) — uTLS' `SetClientRandom`
+//!    (`utls.go:95-97`) also leaves the rest of the fingerprint untouched.
+//! 2. `authData` = the serialized hello with the random zeroed
+//!    (`jlsClientHelloAuthData`, `utls.go:243-250`); `fakeRandom` is sealed
+//!    over the first 16 bytes of the drawn random
+//!    (`jlsBuildFakeRandom`, `utls.go:270-290`).
+//! 3. Rebuild the hello with the random replaced by the fakeRandom and
+//!    verify the two passes differ in exactly the 32 random bytes — the
+//!    byte-compatibility contract the server's authData check depends on.
+//! 4. ALPN: `config.ALPN` or [`DEFAULT_ALPN`] (`utls.go:48-51`), with
+//!    Chrome's ALPS extension kept only while `h2` is advertised
+//!    (`overrideUTLSALPN`, `utls.go:208-241`).
+//! 5. The templates always offer TLS 1.3 first, so upstream's
+//!    `utlsClientHelloSupportsTLS13` gate (`utls.go:81-83,152-159`)
+//!    cannot fail here; `tls13.rs` is TLS 1.3-only by construction, which
+//!    also preserves the post-handshake version check (`utls.go:113-116`).
+//! 6. The ServerHello random is verified by a transparent transport guard
+//!    that inspects the first handshake message — `VerifyConnection`
+//!    (`utls.go:169-188`) — using the same `hello_auth_data` /
+//!    `check_fake_random` codec as the plain path. On failure the dial
+//!    returns [`ERR_AUTH_FAILED`] (see the fallback scope-out above).
+//!    Certificate-chain trust is *not* enforced on the success path — JLS
+//!    itself authenticates the peer and the JLS server's camouflage
+//!    certificate is generated at random (`utls.go:58-60`
+//!    `InsecureSkipVerify: true`; the CertificateVerify *signature* is
+//!    still verified by `tls13.rs`, like uTLS). HelloRetryRequest is
+//!    rejected outright by `tls13.rs` (JLS v3 does not permit HRR,
+//!    `utls.go:170-174`); upstream instead falls back to certificate
+//!    verification, which for a JLS server cannot succeed either.
 
 use std::cell::{Cell, RefCell};
 use std::io;
@@ -119,6 +165,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tracing::debug;
 
 use crate::error::{Error, Result};
+use crate::proto::reality::profiles::{self, UtslProfile};
+use crate::proto::reality::tls13::{self as engine_tls13, ServerAuth};
 use crate::stream::BoxProxyStream;
 
 /// `transport/jls/jls.go:28 DefaultALPN`.
@@ -468,6 +516,12 @@ pub struct JlsOut {
     /// Empty selects [`DEFAULT_ALPN`] (`transport/jls/jls.go:98-101`).
     pub alpn: Vec<String>,
     pub skip_cert_verify: bool,
+    /// `client-fingerprint` (`jls.ClientConfig.ClientFingerprint`,
+    /// `transport/jls/jls.go:40`): `Some(profile)` selects the uTLS-path
+    /// branch of `NewClient` (`transport/jls/utls.go:38-118`) — the cover
+    /// hello is the Chrome/Firefox template and the session runs on the
+    /// engine's TLS 1.3 stack. `None` keeps mihomo's plain rustls path.
+    pub fingerprint: Option<UtslProfile>,
 }
 
 /// TLS 1.3-only client config with the JLS crypto provider (scripted
@@ -790,6 +844,277 @@ impl AsyncWrite for JlsTlsStream {
     }
 }
 
+// ------------------------------------------------ fingerprint (uTLS) path
+
+/// Build the JLS-stamped profile ClientHello — the hello half of
+/// `newUTLSClient` (`transport/jls/utls.go:70-101`). Returns the wire
+/// hello (random = fakeRandom) plus the X25519 private half of its key
+/// share, which `engine_tls13::connect` needs to complete the handshake.
+///
+/// uTLS builds the fingerprint, derives the authData + fakeRandom from the
+/// *serialized* hello, then calls `SetClientRandom` and rebuilds
+/// (`utls.go:70-101`); the rebuild must differ in exactly the 32 random
+/// bytes. The engine equivalent pins the GREASE values and the Chrome
+/// extension shuffle to the first random draw
+/// (`profiles::build_client_hello_opts`'s `structure_seed`) and verifies
+/// the byte-compatibility contract before anything is sent.
+fn build_profile_hello(
+    profile: UtslProfile,
+    sni: &str,
+    alpn: &[String],
+    user: &JlsUser,
+) -> Result<(Vec<u8>, [u8; 32])> {
+    // The fingerprint's single real key share (X25519).
+    let mut scalar = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut scalar);
+    let public = curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(scalar).0;
+    // A browser's 32-byte legacy session id (middlebox compatibility);
+    // uTLS draws it per connection. JLS leaves it untouched (REALITY's
+    // sealed session id is a different protocol).
+    let mut session_id = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut session_id);
+
+    // Pass 1 — `BuildHandshakeState` (`utls.go:70-78`): the hello as the
+    // fingerprint engine emits it, with a fresh random.
+    let mut random = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut random);
+    // `overrideUTLSALPN` (`utls.go:208-241`): ALPS stays only with h2.
+    let alps = alpn.iter().any(|a| a == "h2");
+    let hello1 = profiles::build_client_hello_opts(
+        profile,
+        sni,
+        &random,
+        &session_id,
+        &public,
+        Some(alpn),
+        None,
+        alps,
+    );
+    // `jlsClientHelloAuthData` (`utls.go:243-250`) +
+    // `jlsBuildFakeRandom` over the first half of the drawn random
+    // (`utls.go:84-94`).
+    let auth_data = hello_auth_data(&hello1, HS_CLIENT_HELLO)?;
+    let fake_random = build_fake_random(user, &random[..RANDOM_SEED_LEN], &auth_data)?;
+
+    // Pass 2 — `SetClientRandom` + rebuild (`utls.go:95-100`).
+    let hello2 = profiles::build_client_hello_opts(
+        profile,
+        sni,
+        &fake_random,
+        &session_id,
+        &public,
+        Some(alpn),
+        Some(&random),
+        alps,
+    );
+    if hello2.len() != hello1.len()
+        || hello2[..HELLO_RANDOM_OFFSET] != hello1[..HELLO_RANDOM_OFFSET]
+        || hello2[HELLO_RANDOM_OFFSET + HELLO_RANDOM_LEN..]
+            != hello1[HELLO_RANDOM_OFFSET + HELLO_RANDOM_LEN..]
+        || hello2[HELLO_RANDOM_OFFSET..HELLO_RANDOM_OFFSET + HELLO_RANDOM_LEN] != fake_random
+    {
+        return Err(Error::crypto(
+            "jls: could not stamp the fingerprint ClientHello random",
+        ));
+    }
+    Ok((hello2, scalar))
+}
+
+/// Transparent transport guard performing the ServerHello half of
+/// `utlsJLSVerifier.VerifyConnection` (`utls.go:169-188`): the first
+/// handshake message on the wire must be a ServerHello whose random
+/// verifies as the JLS fakeRandom over the message's own random-zeroed
+/// bytes. Bytes are inspected, never modified — `engine_tls13::connect`
+/// consumes them unchanged.
+struct JlsServerHelloGuard {
+    io: BoxProxyStream,
+    user: JlsUser,
+    /// Bytes read ahead of the TLS state machine, served first.
+    pending: BytesMut,
+    /// First handshake message authenticated (or moot: alert/EOF seen).
+    verified: bool,
+    /// Sticky auth failure, surfaced on every later operation.
+    failed: Option<String>,
+}
+
+impl JlsServerHelloGuard {
+    fn new(io: BoxProxyStream, user: JlsUser) -> Self {
+        JlsServerHelloGuard {
+            io,
+            user,
+            pending: BytesMut::new(),
+            verified: false,
+            failed: None,
+        }
+    }
+
+    /// Walk the buffered records until the first handshake message is
+    /// complete. `Ok(true)` = the guard is satisfied (ServerHello
+    /// authenticated, or the peer is already failing — alert / unexpected
+    /// record — and `tls13.rs` will surface the error); `Ok(false)` = more
+    /// bytes needed; `Err` = JLS authentication failed.
+    fn inspect(&mut self) -> Result<bool> {
+        let mut handshake = Vec::new();
+        let mut off = 0usize;
+        loop {
+            let rest = &self.pending[off..];
+            if rest.len() < RECORD_HEADER_LEN {
+                return Ok(false);
+            }
+            let len = usize::from(u16::from_be_bytes([rest[3], rest[4]]));
+            if rest.len() < RECORD_HEADER_LEN + len {
+                return Ok(false);
+            }
+            match rest[0] {
+                // RFC 8446 §D.4 middlebox compatibility: skip.
+                20 => {}
+                // An alert can never precede a ServerHello we must
+                // authenticate; hand it to the TLS state machine.
+                21 => {
+                    self.verified = true;
+                    return Ok(true);
+                }
+                22 => {
+                    handshake.extend_from_slice(&rest[RECORD_HEADER_LEN..RECORD_HEADER_LEN + len]);
+                    if handshake.len() >= HELLO_HEADER_LEN {
+                        let mlen = (usize::from(handshake[1]) << 16)
+                            | (usize::from(handshake[2]) << 8)
+                            | usize::from(handshake[3]);
+                        if handshake.len() >= HELLO_HEADER_LEN + mlen {
+                            let msg = &handshake[..HELLO_HEADER_LEN + mlen];
+                            if msg.first() != Some(&HS_SERVER_HELLO) {
+                                return Err(Error::protocol(
+                                    "jls: first server handshake message is not a ServerHello",
+                                ));
+                            }
+                            let auth_data = hello_auth_data(msg, HS_SERVER_HELLO)?;
+                            let random = &msg[HELLO_RANDOM_OFFSET..][..HELLO_RANDOM_LEN];
+                            if !check_fake_random(&self.user, random, &auth_data) {
+                                return Err(Error::crypto(ERR_AUTH_FAILED));
+                            }
+                            self.verified = true;
+                            return Ok(true);
+                        }
+                    }
+                }
+                // Anything else: let the TLS state machine judge it.
+                _ => {
+                    self.verified = true;
+                    return Ok(true);
+                }
+            }
+            off += RECORD_HEADER_LEN + len;
+        }
+    }
+}
+
+impl AsyncRead for JlsServerHelloGuard {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(ref err) = this.failed {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, err.clone())));
+            }
+            if !this.verified {
+                match this.inspect() {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let mut tmp = [0u8; 16 * 1024];
+                        let mut rb = ReadBuf::new(&mut tmp);
+                        ready!(Pin::new(&mut this.io).poll_read(cx, &mut rb))?;
+                        if rb.filled().is_empty() {
+                            // EOF before any ServerHello: the handshake is
+                            // over; pass the EOF through.
+                            this.verified = true;
+                            return Poll::Ready(Ok(()));
+                        }
+                        this.pending.extend_from_slice(rb.filled());
+                        continue;
+                    }
+                    Err(e) => {
+                        this.failed = Some(e.to_string());
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            e.to_string(),
+                        )));
+                    }
+                }
+            }
+            if !this.pending.is_empty() {
+                let n = this.pending.len().min(buf.remaining());
+                let chunk: Vec<u8> = this.pending.split_to(n).to_vec();
+                buf.put_slice(&chunk);
+                return Poll::Ready(Ok(()));
+            }
+            return Pin::new(&mut this.io).poll_read(cx, buf);
+        }
+    }
+}
+
+impl AsyncWrite for JlsServerHelloGuard {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+    }
+}
+
+/// The fingerprint branch of `NewClient` (`transport/jls/jls.go:95-97` →
+/// `newUTLSClient`, `utls.go:38-118`): JLS over the engine's own TLS 1.3
+/// stack with a profile ClientHello.
+async fn connect_fingerprint(
+    cfg: &JlsOut,
+    profile: UtslProfile,
+    user: &JlsUser,
+    transport: BoxProxyStream,
+) -> Result<BoxProxyStream> {
+    // `utls.go:48-51`: nil ALPN selects DefaultALPN.
+    let alpn: Vec<String> = if cfg.alpn.is_empty() {
+        DEFAULT_ALPN.iter().map(|s| s.to_string()).collect()
+    } else {
+        cfg.alpn.clone()
+    };
+    let (hello, secret) = build_profile_hello(profile, &cfg.sni, &alpn, user)?;
+    let guard = JlsServerHelloGuard::new(transport, user.clone());
+    debug!(
+        target: "engine",
+        sni = %cfg.sni, profile = profile.as_str(),
+        "jls: TLS 1.3 fingerprint handshake starting"
+    );
+    // `utls.go:58-60`: the fingerprint path runs with
+    // InsecureSkipVerify — JLS authenticates the peer and the camouflage
+    // certificate is random; the CertificateVerify *signature* is still
+    // checked inside tls13.rs. `skip_cert_verify` has no effect here,
+    // matching upstream.
+    let stream = engine_tls13::connect(
+        Box::new(guard),
+        &hello,
+        &secret,
+        ServerAuth::AcceptAny,
+    )
+    .await?;
+    debug!(
+        target: "engine",
+        sni = %cfg.sni, profile = profile.as_str(),
+        "jls: authenticated fingerprint tunnel established"
+    );
+    Ok(Box::new(stream))
+}
+
 // ----------------------------------------------------------------- connect
 
 /// Perform the JLS-authenticated TLS 1.3 client handshake over
@@ -798,15 +1123,29 @@ impl AsyncWrite for JlsTlsStream {
 /// `transport/jls/jls.go:82-119 NewClient`: SNI/username/password are
 /// required, the ClientHello random carries the credentials, and the
 /// ServerHello random must verify or the dial fails with
-/// [`ERR_AUTH_FAILED`].
+/// [`ERR_AUTH_FAILED`]. `JlsOut::fingerprint` selects the uTLS branch
+/// (`newUTLSClient`, `utls.go:38-118`); without it mihomo's plain
+/// TLS branch (`jls.go:98-119`) runs.
 pub async fn connect(cfg: &JlsOut, transport: BoxProxyStream) -> Result<BoxProxyStream> {
     if cfg.sni.is_empty() {
         return Err(Error::config("jls: server name is required"));
     }
     let user = JlsUser::new(&cfg.username, &cfg.password)?;
+    match cfg.fingerprint {
+        Some(profile) => connect_fingerprint(cfg, profile, &user, transport).await,
+        None => connect_plain(cfg, &user, transport).await,
+    }
+}
 
+/// mihomo's plain TLS branch (`transport/jls/jls.go:98-119`): JLS stamped
+/// onto a stock rustls hello via the two-pass machinery above.
+async fn connect_plain(
+    cfg: &JlsOut,
+    user: &JlsUser,
+    transport: BoxProxyStream,
+) -> Result<BoxProxyStream> {
     let config = jls_client_config(cfg)?;
-    let (mut tls, flight) = build_stamped_client_hello(&config, &cfg.sni, &user)?;
+    let (mut tls, flight) = build_stamped_client_hello(&config, &cfg.sni, user)?;
     let mut transport = transport;
     let mut rbuf = BytesMut::with_capacity(16 * 1024);
 
@@ -840,7 +1179,7 @@ pub async fn connect(cfg: &JlsOut, transport: BoxProxyStream) -> Result<BoxProxy
             let auth_data =
                 hello_auth_data(&record[RECORD_HEADER_LEN..], HS_SERVER_HELLO)
                     .map_err(|_| Error::protocol("jls: malformed ServerHello"))?;
-            if !check_fake_random(&user, &random, &auth_data) {
+            if !check_fake_random(user, &random, &auth_data) {
                 return Err(Error::crypto(ERR_AUTH_FAILED));
             }
         }
@@ -1095,7 +1434,7 @@ mod tests {
     /// src/server/hs.rs:495-498). Runs behind a genuine rustls server
     /// and echoes decrypted application data.
     async fn jls_server_mimic(
-        mut io: DuplexStream,
+        mut io: impl AsyncRead + AsyncWrite + Unpin,
         user: JlsUser,
         config: Arc<rustls::ServerConfig>,
     ) -> std::result::Result<(), String> {
@@ -1247,6 +1586,7 @@ mod tests {
             sni: "jls.test".into(),
             alpn: Vec::new(),
             skip_cert_verify: true,
+            fingerprint: None,
         }
     }
 
@@ -1389,6 +1729,261 @@ mod tests {
             }
             let _ = io.flush().await;
         }
+    }
+
+    // ---------------------------------------------- fingerprint (uTLS) path
+
+    /// Server-side transport that records the first complete TLS record it
+    /// sees (the ClientHello flight) and forwards it, so tests can pin the
+    /// cover hello's profile shape.
+    struct PeekFirstRecord {
+        io: DuplexStream,
+        buf: BytesMut,
+        first: Option<Vec<u8>>,
+        tx: Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
+    }
+
+    impl PeekFirstRecord {
+        fn new(io: DuplexStream, tx: tokio::sync::oneshot::Sender<Vec<u8>>) -> Self {
+            PeekFirstRecord {
+                io,
+                buf: BytesMut::new(),
+                first: None,
+                tx: Some(tx),
+            }
+        }
+    }
+
+    impl AsyncRead for PeekFirstRecord {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if this.buf.is_empty() {
+                let mut tmp = [0u8; 16 * 1024];
+                let mut rb = ReadBuf::new(&mut tmp);
+                ready!(Pin::new(&mut this.io).poll_read(cx, &mut rb))?;
+                if rb.filled().is_empty() {
+                    return Poll::Ready(Ok(()));
+                }
+                this.buf.extend_from_slice(rb.filled());
+            }
+            if this.first.is_none() && this.buf.len() >= RECORD_HEADER_LEN {
+                let len = usize::from(u16::from_be_bytes([this.buf[3], this.buf[4]]));
+                if this.buf.len() >= RECORD_HEADER_LEN + len {
+                    let record = this.buf[..RECORD_HEADER_LEN + len].to_vec();
+                    this.first = Some(record.clone());
+                    if let Some(tx) = this.tx.take() {
+                        let _ = tx.send(record);
+                    }
+                }
+            }
+            let n = this.buf.len().min(buf.remaining());
+            let chunk = this.buf.split_to(n).to_vec();
+            buf.put_slice(&chunk);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for PeekFirstRecord {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().io).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+        }
+    }
+
+    fn fp_cfg(username: &str, password: &str, profile: UtslProfile) -> JlsOut {
+        // The selection API the integrator wires from `client-fingerprint`.
+        JlsOut {
+            fingerprint: Some(profile),
+            ..test_cfg(username, password)
+        }
+    }
+
+    /// Spawn the JLS mimic behind a first-record capture and connect the
+    /// fingerprint client to it.
+    async fn connect_fp_through_mimic(
+        cfg: &JlsOut,
+    ) -> (
+        BoxProxyStream,
+        tokio::sync::oneshot::Receiver<Vec<u8>>,
+    ) {
+        let (client, server) = tokio::io::duplex(256 * 1024);
+        let server_config = test_server_config();
+        let user = JlsUser::new(&cfg.username, &cfg.password).unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let peek = PeekFirstRecord::new(server, tx);
+            if let Err(e) = jls_server_mimic(peek, user, server_config).await {
+                panic!("jls mimic failed: {e}");
+            }
+        });
+        let stream = tokio::time::timeout(
+            Duration::from_secs(20),
+            connect(cfg, Box::new(client) as BoxProxyStream),
+        )
+        .await
+        .expect("jls fingerprint connect timed out")
+        .expect("jls fingerprint connect failed");
+        (stream, rx)
+    }
+
+    #[tokio::test]
+    async fn fingerprint_chrome_roundtrip_against_jls_server() {
+        // Fake credentials only (loopback, never a real secret).
+        let cfg = fp_cfg("user1", "pass1", UtslProfile::parse("chrome").unwrap());
+        let (mut stream, rx) = connect_fp_through_mimic(&cfg).await;
+
+        // The cover flight must be the Chrome parrot: handshake-shaped,
+        // GREASE-led cipher list, ALPS + compress_certificate, 32-byte
+        // legacy session id, and a fingerprint-scale hello.
+        let record = tokio::time::timeout(Duration::from_secs(10), rx)
+            .await
+            .expect("no ClientHello captured")
+            .unwrap();
+        assert_eq!(&record[..3], &[0x16, 0x03, 0x01], "handshake record");
+        let hello = &record[RECORD_HEADER_LEN..];
+        assert_eq!(hello[0], HS_CLIENT_HELLO);
+        let len24 = (usize::from(hello[1]) << 16)
+            | (usize::from(hello[2]) << 8)
+            | usize::from(hello[3]);
+        assert_eq!(len24, hello.len() - 4, "handshake length");
+        // Handshake message layout: 4 header + 2 version + 32 random +
+        // 1 sid length + 32 session id + 2 cipher-list length.
+        assert_eq!(hello[38], 32, "32-byte legacy session id");
+        let cs0 = [hello[73], hello[74]];
+        assert!(
+            cs0[0] == cs0[1] && cs0[0] & 0x0f == 0x0a,
+            "cipher list leads with GREASE {cs0:02x?}"
+        );
+        // The random is the fakeRandom (sealed), never plain zero bytes.
+        assert!(hello[HELLO_RANDOM_OFFSET..HELLO_RANDOM_OFFSET + HELLO_RANDOM_LEN]
+            .iter()
+            .any(|b| *b != 0));
+        assert!(hello.windows(2).any(|w| w == [0x44, 0x69]), "ALPS present");
+        assert!(
+            hello.windows(2).any(|w| w == [0x00, 0x1b]),
+            "compress_certificate present"
+        );
+        assert!(hello.len() >= 400, "fingerprint-scale hello");
+
+        // Authenticated tunnel + echo, small and multi-record payloads.
+        stream.write_all(b"ping via chrome jls").await.unwrap();
+        let mut buf = [0u8; 19];
+        tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf, b"ping via chrome jls");
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let (mut rd, mut wr) = tokio::io::split(stream);
+        let expected = payload.clone();
+        let echo = tokio::spawn(async move {
+            let mut got = vec![0u8; expected.len()];
+            rd.read_exact(&mut got).await.unwrap();
+            got
+        });
+        wr.write_all(&payload).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(20), echo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, payload);
+    }
+
+    #[tokio::test]
+    async fn fingerprint_firefox_roundtrip_against_jls_server() {
+        let cfg = fp_cfg("user1", "pass1", UtslProfile::parse("firefox").unwrap());
+        let (mut stream, rx) = connect_fp_through_mimic(&cfg).await;
+        let record = tokio::time::timeout(Duration::from_secs(10), rx)
+            .await
+            .expect("no ClientHello captured")
+            .unwrap();
+        let hello = &record[RECORD_HEADER_LEN..];
+        // Firefox: no GREASE anywhere in the cipher list (0x1301 first).
+        assert_eq!(&hello[73..75], &[0x13, 0x01], "TLS_AES_128_GCM first");
+        // record_size_limit 0x4001: ext type ‖ u16 len ‖ limit.
+        assert!(
+            hello.windows(6).any(|w| w == [0x00, 0x1c, 0x00, 0x02, 0x40, 0x01]),
+            "record_size_limit 0x4001 present"
+        );
+        assert!(
+            !hello.windows(2).any(|w| w == [0x44, 0x69]),
+            "no ALPS in the Firefox parrot"
+        );
+
+        stream.write_all(b"ping via firefox jls").await.unwrap();
+        let mut buf = [0u8; 20];
+        tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf, b"ping via firefox jls");
+    }
+
+    #[tokio::test]
+    async fn fingerprint_plain_tls_server_reports_auth_failure() {
+        // Same contract as the plain path: a genuine rustls server without
+        // the JLS stamp cannot authenticate, so the dial must fail with
+        // exactly ErrJLSAuthFailed (utls.go:106-112 — minus the scoped-out
+        // camouflage HTTP request).
+        let cfg = fp_cfg("user1", "pass1", UtslProfile::Chrome);
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let server_config = plain_tls_server_config();
+        tokio::spawn(async move {
+            plain_tls_echo_server(server, server_config).await;
+        });
+        let err = match connect(&cfg, Box::new(client) as BoxProxyStream).await {
+            Ok(_) => panic!("a plain TLS server must not pass JLS authentication"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains(ERR_AUTH_FAILED), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fingerprint_wrong_password_is_rejected_by_the_server() {
+        // The server-side mimic cannot verify the ClientHello fakeRandom;
+        // it aborts before answering and the client dial must fail.
+        let cfg = fp_cfg("user1", "real-pass", UtslProfile::Chrome);
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let server_config = test_server_config();
+        let server_user = JlsUser::new("user1", "other-pass").unwrap();
+        tokio::spawn(async move {
+            let _ = jls_server_mimic(server, server_user, server_config).await;
+        });
+        let err = match connect(&cfg, Box::new(client) as BoxProxyStream).await {
+            Ok(_) => panic!("a wrong password must not authenticate"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("handshake")
+                || err.to_string().contains("closed")
+                || err.to_string().contains("EOF")
+                || err.to_string().contains(ERR_AUTH_FAILED),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn fingerprint_selection_api_defaults_to_plain() {
+        // test_cfg (plain path) carries no fingerprint; the parse spellings
+        // match mihomo's client-fingerprint option.
+        assert!(test_cfg("u", "p").fingerprint.is_none());
+        assert_eq!(UtslProfile::parse("chrome"), Some(UtslProfile::Chrome));
+        assert_eq!(UtslProfile::parse("Firefox"), Some(UtslProfile::Firefox));
     }
 }
 

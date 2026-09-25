@@ -237,7 +237,40 @@ pub fn build_client_hello_alpn(
     key_share_public: &[u8; 32],
     alpn: Option<&[String]>,
 ) -> Vec<u8> {
-    let grease = grease_values(random);
+    build_client_hello_opts(profile, sni, random, session_id, key_share_public, alpn, None, true)
+}
+
+/// The full builder every wrapper above funnels into.
+///
+/// Two extra knobs beyond [`build_client_hello_alpn`], both needed by JLS
+/// (`proto/jls.rs`, ported from mihomo `transport/jls/utls.go`):
+///
+/// * `structure_seed` — the GREASE values and (for Chrome) the extension
+///   shuffle are normally derived from the hello `random`. JLS *replaces*
+///   the random after the hello structure is built (uTLS `SetClientRandom`,
+///   `utls.go:95-97`), so it must pin the structure to the original random
+///   draw: `None` derives from `random` (the parrot behavior), `Some(seed)`
+///   keeps GREASE and the shuffle fixed while `random` changes. A rebuild
+///   that only swaps the random then differs from the first pass in exactly
+///   the 32 random bytes — the property JLS' authData (random-zeroed hello)
+///   depends on.
+/// * `alps` — Chrome's `application_settings` (0x4469) extension. mihomo's
+///   uTLS path keeps ALPS only while `h2` stays advertised
+///   (`overrideUTLSALPN`, `utls.go:208-241`); callers whose ALPN list drops
+///   h2 pass `false`. Firefox never sends ALPS; the flag is ignored there.
+#[allow(clippy::too_many_arguments)]
+pub fn build_client_hello_opts(
+    profile: UtslProfile,
+    sni: &str,
+    random: &[u8; 32],
+    session_id: &[u8; 32],
+    key_share_public: &[u8; 32],
+    alpn: Option<&[String]>,
+    structure_seed: Option<&[u8; 32]>,
+    alps: bool,
+) -> Vec<u8> {
+    let structure_seed: [u8; 32] = structure_seed.copied().unwrap_or(*random);
+    let grease = grease_values(&structure_seed);
     let default_alpn = ["h2".to_string(), "http/1.1".to_string()];
     let alpn: &[String] = alpn.unwrap_or(&default_alpn);
 
@@ -273,9 +306,11 @@ pub fn build_client_hello_alpn(
             // a BYTE count, as uTLS writes it (`extLen = 2 * len(Algorithms)`):
             // a count-of-1 body makes strict parsers reject the hello.
             exts.push((false, ext(EXT_COMPRESS_CERTIFICATE, &[0x02, 0x00, 0x02])));
-            exts.push((false, alpn_extension(EXT_APPLICATION_SETTINGS, &["h2".to_string()])));
+            if alps {
+                exts.push((false, alpn_extension(EXT_APPLICATION_SETTINGS, &["h2".to_string()])));
+            }
             exts.push((true, grease_extension(grease.extension2, &[0x00])));
-            shuffle_chrome_extensions(&mut exts, random);
+            shuffle_chrome_extensions(&mut exts, &structure_seed);
         }
         UtslProfile::Firefox => {
             exts.push((true, sni_extension(sni)));
@@ -807,5 +842,76 @@ mod tests {
         assert_eq!(UtslProfile::parse("firefox "), Some(UtslProfile::Firefox));
         assert_eq!(UtslProfile::parse("random"), None);
         assert_eq!(UtslProfile::Chrome.as_str(), "chrome");
+    }
+
+    #[test]
+    fn pinned_structure_seed_swaps_only_the_random() {
+        // JLS' stamping contract (mihomo transport/jls/utls.go:70-101): the
+        // hello is built once, the random is replaced, and everything else —
+        // GREASE values, shuffle, padding — must stay byte-identical, so the
+        // random-zeroed authData of the two passes is the same message.
+        let (random, sid, key) = fixed();
+        let mut fake = [0x5au8; 32];
+        fake[31] = 0x01;
+        for profile in [UtslProfile::Chrome, UtslProfile::Firefox] {
+            let pass1 = build_client_hello_opts(
+                profile, "www.example.com", &random, &sid, &key, None, None, true,
+            );
+            let pass2 = build_client_hello_opts(
+                profile,
+                "www.example.com",
+                &fake,
+                &sid,
+                &key,
+                None,
+                Some(&random),
+                true,
+            );
+            assert_eq!(pass1.len(), pass2.len(), "{profile:?}");
+            assert_eq!(&pass1[..6], &pass2[..6], "{profile:?}");
+            assert_eq!(&pass1[38..], &pass2[38..], "{profile:?}");
+            assert_eq!(&pass2[6..38], &fake[..], "{profile:?}");
+            assert_eq!(&pass1[6..38], &random[..], "{profile:?}");
+        }
+    }
+
+    #[test]
+    fn alps_is_droppable_and_alpn_override_pins_the_list() {
+        let (random, sid, key) = fixed();
+        let http1 = vec!["http/1.1".to_string()];
+        let hello = build_client_hello_opts(
+            UtslProfile::Chrome,
+            "x.test",
+            &random,
+            &sid,
+            &key,
+            Some(&http1),
+            None,
+            false,
+        );
+        let p = parse(&hello);
+        let types: Vec<u16> = p.extensions.iter().map(|(t, _)| *t).collect();
+        // overrideUTLSALPN (utls.go:222-231): no h2 in the list → ALPS (0x4469)
+        // is dropped from the template.
+        assert!(!types.contains(&EXT_APPLICATION_SETTINGS));
+        let alpn = &p.extensions.iter().find(|(t, _)| *t == EXT_ALPN).unwrap().1;
+        assert_eq!(
+            alpn,
+            &[0x00, 0x09, 0x08, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1'][..]
+        );
+        // Default knobs reproduce build_client_hello_alpn exactly.
+        assert_eq!(
+            build_client_hello_opts(
+                UtslProfile::Chrome,
+                "x.test",
+                &random,
+                &sid,
+                &key,
+                Some(&http1),
+                None,
+                true,
+            ),
+            build_client_hello_alpn(UtslProfile::Chrome, "x.test", &random, &sid, &key, Some(&http1))
+        );
     }
 }

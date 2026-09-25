@@ -179,6 +179,24 @@ impl Engine {
                 "server {} ({}) listening on {addr}", server.tag, server.protocol_name());
         }
 
+        // WireGuard endpoints (sing-box `endpoints`): the WG server mode —
+        // handshake responder + cryptokey routing into this relay.
+        for ep in &self.cfg.wg_endpoints {
+            let relay = self.clone() as Arc<dyn RelayHandler>;
+            let cfg = ep.clone();
+            let tag = ep.tag.clone();
+            // serve_endpoint runs the socket loop forever; spawn so
+            // later endpoints and the rest of startup continue.
+            tokio::spawn(async move {
+                match crate::proto::wireguard::serve_endpoint(&cfg, relay).await {
+                    Ok(addr) => tracing::info!(target: "engine",
+                        "endpoint {tag} (wireguard) listening on {addr}"),
+                    Err(e) => tracing::error!(target: "engine",
+                        "endpoint {tag} (wireguard) failed: {e}"),
+                }
+            });
+        }
+
         // TUN device inbound (netstack bridged into the same relay).
         if let Some(tun_cfg) = &self.cfg.tun {
             let relay = self.clone() as Arc<dyn RelayHandler>;
@@ -948,6 +966,7 @@ mod tests {
             geo: Default::default(),
             proxy_servers: vec![],
             tun: None,
+            wg_endpoints: vec![],
         }
         .with_builtin_outbounds()
     }

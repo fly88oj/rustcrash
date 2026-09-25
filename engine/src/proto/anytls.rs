@@ -1,5 +1,5 @@
 //! AnyTLS outbound, ported from mihomo's `transport/anytls`
-//! (`client.go`, `session/{frame.go,session.go,stream.go}`,
+//! (`client.go`, `session/{frame.go,session.go,stream.go,client.go}`,
 //! `padding/padding.go`) and the anytls-go protocol spec
 //! (`anytls/anytls-go docs/protocol.md`).
 //!
@@ -22,6 +22,20 @@
 //!    sizes look like ordinary HTTPS; the server can push a new scheme
 //!    via `cmdUpdatePaddingScheme` when the client's md5 differs.
 //!
+//! ## Session multiplexing + idle pool
+//!
+//! A session ([`AnyTlsSession`]) carries any number of streams
+//! distinguished by stream id — `OpenStream` assigns `streamId.Add(1)`
+//! (session.go:135-169) and the recv loop dispatches `cmdPSH`/`cmdFIN`
+//! by id. [`AnyTlsStream`] is one stream handle over the shared session
+//! (a `net.Conn` over the session pipe, stream.go:14-38). The
+//! [`AnyTlsSessionPool`] ports `session/client.go`: reuse an idle
+//! session, open streams on the live session while it has capacity,
+//! dial fresh when it is saturated/closed, recycle a session to the
+//! idle set when its last stream ends (stream.dieHook,
+//! session/client.go:90-109), and expire idle sessions on a timer
+//! (`idleCleanup`, session/client.go:171-206) honouring `min-idle`.
+//!
 //! UDP rides the same sessions as sing-box **udp-over-tcp v2**
 //! (adapter/outbound/anytls.go `ListenPacketContext` →
 //! `uot.RequestDestination(2)`): the stream target is the magic domain
@@ -31,27 +45,30 @@
 //!
 //! ## Deferred (out of scope here)
 //!
-//! * **Session reuse/multiplexing**: mihomo pools idle sessions and
-//!   opens multiple streams (session/client.go). This module opens one
-//!   stream (sid 1) per connect — the outbound layer owns any pooling.
 //! * **Heartbeats**: `cmdHeartRequest` is answered (`cmdHeartResponse`)
-//!   but never sent; the v2 SYNACK liveness watchdog is not implemented.
+//!   but never sent; the v2 SYNACK liveness watchdog (3s
+//!   `DeadlineWatcher`, session.go:143-152) is not implemented.
 //! * **ALPN / client certs / fingerprint pinning / ECH / shadow-tls and
 //!   restls wrappers**: `AnyTlsOut` carries only the fields below;
 //!   the integrator layers extra transports before [`connect`] if
 //!   needed. `client-metadata` defaults to the empty string, matching
 //!   mihomo's default.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{ready, Context, Poll};
+use std::time::{Duration, Instant};
 
 use bytes::{Buf, BytesMut};
 use md5::Md5;
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, error, warn};
 
 use crate::addr::{encode_socks_addr, Host, NetAddr};
@@ -119,6 +136,7 @@ pub struct AnyTlsOut {
 /// A parsed padding scheme (`PaddingFactory`). `GenerateRecordPayloadSizes`
 /// re-parses the entry on every call, exactly like the Go code — malformed
 /// entries are skipped, not fatal.
+#[derive(Clone)]
 struct PaddingFactory {
     raw: Vec<u8>,
     stop: u32,
@@ -234,202 +252,522 @@ fn psh_frames_into(out: &mut Vec<u8>, sid: u32, data: &[u8]) {
 }
 
 // ---------------------------------------------------------------------------
-// The anytls client stream
+// Session multiplexing (transport/anytls/session/{session,stream}.go)
 // ---------------------------------------------------------------------------
 
-/// A client anytls stream carrying one stream (sid 1) over the TLS
-/// session. Reads dispatch every session command; writes apply the
-/// padding scheme exactly like `Session.writeConn`.
-pub struct AnyTlsStream {
-    inner: BoxProxyStream,
-    padding: PaddingFactory,
-    /// `sendPadding` (session.go:46): false once pkt >= stop.
-    send_padding: bool,
-    /// `pktCounter` — one increment per actual writeConn call.
-    pkt_counter: u32,
-    sid: u32,
-    rbuf: BytesMut,
-    /// PSH payloads for our stream, pending the consumer.
-    out: BytesMut,
-    /// Control frames queued by the read path (heart responses).
-    ctrl: VecDeque<Vec<u8>>,
-    /// Wire segments pending the transport (one per padding chunk).
-    wsegs: VecDeque<Vec<u8>>,
-    /// `buffering` (session.go:449-455): the settings frame waits for
-    /// the first stream write to flush alongside it.
-    settings_buffered: Option<Vec<u8>>,
-    pending_plain: usize,
-    eof: bool,
-    /// `cmdSYNACK` carrying an error — raised after `out` drains.
-    synack_err: Option<String>,
-    failed: bool,
+/// One inbound event for a stream — what Go's session pipe delivers
+/// (session.go:171-360 recvLoop → stream.pipeW / closeWithError).
+enum StreamEvent {
+    Data(Vec<u8>),
+    /// cmdFIN — the peer closed the stream (closeLocally → pipe EOF).
+    Fin,
+    /// cmdSYNACK carrying an error payload
+    /// ("remote: …", session.go:233-246).
+    RemoteError(String),
 }
 
-impl AnyTlsStream {
-    fn new(inner: BoxProxyStream) -> Self {
-        AnyTlsStream {
-            inner,
-            padding: PaddingFactory::new(DEFAULT_PADDING_SCHEME)
-                .expect("the default padding scheme is well-formed"),
-            send_padding: true,
-            pkt_counter: 0,
-            sid: 1,
-            rbuf: BytesMut::with_capacity(16 * 1024),
-            out: BytesMut::with_capacity(16 * 1024),
-            ctrl: VecDeque::new(),
-            wsegs: VecDeque::new(),
-            settings_buffered: None,
-            pending_plain: 0,
-            eof: false,
-            synack_err: None,
-            failed: false,
-        }
+/// A queued write for the session's writer task — the serialised
+/// `writeConn` path under `connLock` (session.go:445-519).
+enum WriteCmd {
+    /// `writeConn(b)`: PSH/FIN/control frames. While `buffering`, the
+    /// bytes append to the session buffer instead of hitting the wire
+    /// (session.go:449-451).
+    Bytes(Vec<u8>),
+    /// `OpenStream`'s first write: the buffered settings + cmdSYN +
+    /// first cmdPSH leave as ONE padded writeConn (session.go:93-97,
+    /// 135-158); the ack resolves once the transport accepted it.
+    Open {
+        frames: Vec<u8>,
+        ack: oneshot::Sender<io::Result<()>>,
+    },
+    /// Flush the transport, acking completion (the poll_flush bridge).
+    Flush(oneshot::Sender<io::Result<()>>),
+    /// Close the transport (Session.Close → conn.Close).
+    Shutdown,
+}
+
+/// A session returned to the pool's idle set with its idle timestamp
+/// (`session.idleSince`, session/client.go:104-105).
+type RecycledSession = (Arc<SessionCore>, Instant);
+
+/// The shared state of one live anytls session — mihomo `Session`
+/// (session.go:22-54), client side. The recv task, the writer task, the
+/// pool and every stream handle hold an `Arc` to this.
+struct SessionCore {
+    /// Mailbox to the writer task (connLock serialisation).
+    tx: mpsc::UnboundedSender<WriteCmd>,
+    /// Per-stream event pipes (streams map).
+    streams: StdMutex<HashMap<u32, mpsc::UnboundedSender<StreamEvent>>>,
+    /// `streamId` — `fetch_add(1) + 1`, so sids start at 1
+    /// (session.go:140).
+    next_sid: AtomicU32,
+    /// Live stream count; zero = the session is idle/recyclable.
+    active: AtomicUsize,
+    dead: watch::Sender<bool>,
+    dead_rx: watch::Receiver<bool>,
+    /// The padding factory shared with the writer task (server updates
+    /// land here, session.go:315-329).
+    padding: Arc<StdMutex<PaddingFactory>>,
+    /// Peer version from cmdSettings/cmdServerSettings (v2 sends SYNACK).
+    peer_version: AtomicU32,
+    die_reason: Arc<StdMutex<String>>,
+    /// Recycling hook — stream.dieHook (session/client.go:90-109): set
+    /// when the session belongs to a pool; the last stream to close
+    /// sends the session back to the idle set.
+    recycle: StdMutex<Option<mpsc::UnboundedSender<RecycledSession>>>,
+    /// idleSince (session.go:38-39) — set when the last stream ended.
+    idle_since: StdMutex<Option<Instant>>,
+}
+
+impl SessionCore {
+    fn is_dead(&self) -> bool {
+        *self.dead_rx.borrow()
     }
 
-    /// The auth packet (client.go:68-98): `sha256(password) ||
-    /// be16(padding0) || padding0` — one TLS write.
-    fn auth_packet(&self, password: &str) -> Result<Vec<u8>> {
-        let padding0 = self.padding.generate(0).first().copied().unwrap_or(0);
-        if padding0 < 0 || padding0 > u16::MAX as isize {
-            return Err(Error::protocol("anytls: padding0 out of range"));
-        }
-        let mut packet = Vec::with_capacity(32 + 2 + padding0 as usize);
-        packet.extend_from_slice(&Sha256::digest(password.as_bytes()));
-        packet.extend_from_slice(&(padding0 as u16).to_be_bytes());
-        packet.resize(32 + 2 + padding0 as usize, 0);
-        Ok(packet)
+    fn death_reason(&self) -> String {
+        self.die_reason.lock().unwrap().clone()
     }
 
-    /// `writeConn` (session.go:445-519): split/pad one write into wire
-    /// segments. Padding applies to the first `stop` writes only, and
-    /// each segment is a separate transport write so the TLS layer sees
-    /// the intended record sizes.
-    fn pad_write(&mut self, b: &[u8]) -> Result<Vec<Vec<u8>>> {
-        if !self.send_padding {
-            return Ok(vec![b.to_vec()]);
+    /// `Session.Close` (session.go:110-132): idempotent; every stream is
+    /// closed locally (their pipes end) and the transport shuts down.
+    fn kill(&self, reason: &str) {
+        if self.is_dead() {
+            return;
         }
-        self.pkt_counter += 1;
-        if self.pkt_counter >= self.padding.stop {
-            // session.go:513-515: stop padding from now on.
-            self.send_padding = false;
-            return Ok(vec![b.to_vec()]);
-        }
-        let sizes = self.padding.generate(self.pkt_counter);
-        let mut segments = Vec::with_capacity(sizes.len() + 1);
-        let mut rest = b;
-        for l in sizes {
-            if l == CHECK_MARK {
-                // session.go:465-471: no payload left → stop; else skip.
-                if rest.is_empty() {
-                    break;
-                }
-                continue;
-            }
-            let l = usize::try_from(l).unwrap_or(0);
-            if rest.len() > l {
-                // This packet is all payload.
-                segments.push(rest[..l].to_vec());
-                rest = &rest[l..];
-            } else if !rest.is_empty() {
-                // Last of the payload plus a cmdWaste tail.
-                let mut seg = rest.to_vec();
-                let padding_len = l.saturating_sub(rest.len() + HEADER_SIZE);
-                if padding_len > 0 {
-                    seg.extend_from_slice(&waste_frame(padding_len));
-                }
-                segments.push(seg);
-                rest = &[];
-            } else {
-                // This packet is all padding.
-                segments.push(waste_frame(l));
-                rest = &[];
-            }
-        }
-        if !rest.is_empty() {
-            segments.push(rest.to_vec());
-        }
-        Ok(segments)
+        *self.die_reason.lock().unwrap() = reason.to_string();
+        let _ = self.dead.send(true);
+        self.streams.lock().unwrap().clear();
+        let _ = self.tx.send(WriteCmd::Shutdown);
     }
+}
 
-    /// Dispatch one decrypted session frame (session.go:171-360,
-    /// client side).
-    fn handle_frame(&mut self, cmd: u8, sid: u32, data: &[u8]) {
-        match cmd {
-            CMD_PSH => {
-                if sid == self.sid {
-                    self.out.extend_from_slice(data);
-                }
-            }
-            CMD_FIN => {
-                if sid == self.sid {
-                    self.eof = true;
-                }
-            }
-            CMD_WASTE => {}
-            CMD_SYNACK => {
-                if !data.is_empty() && sid == self.sid {
-                    let msg = String::from_utf8_lossy(data).into_owned();
-                    self.synack_err = Some(format!("anytls: remote: {msg}"));
-                }
-            }
-            CMD_ALERT => {
-                error!(
-                    target: "engine",
-                    "anytls: server alert: {}",
-                    String::from_utf8_lossy(data)
-                );
-                self.eof = true;
-            }
-            CMD_UPDATE_PADDING => {
-                match PaddingFactory::new(data) {
-                    Some(p) => {
-                        debug!(target: "engine", md5 = %p.md5, "anytls: padding scheme updated");
-                        self.padding = p;
-                    }
-                    None => {
-                        warn!(target: "engine", "anytls: padding scheme update failed to parse");
-                    }
-                }
-            }
-            CMD_SERVER_SETTINGS => {
-                debug!(
-                    target: "engine",
-                    "anytls: server settings: {}",
-                    String::from_utf8_lossy(data)
-                );
-            }
-            CMD_HEART_REQUEST => {
-                let mut resp = Vec::with_capacity(HEADER_SIZE);
-                frame_into(&mut resp, CMD_HEART_RESPONSE, sid, &[]);
-                self.ctrl.push_back(resp);
-            }
-            _ => {}
-        }
+/// The writer task's private state — `sendPadding`, `pktCounter`,
+/// `buffering`/`buffer` (session.go:44-49) plus the transport's write
+/// half (connLock).
+struct WriterState {
+    conn: tokio::io::WriteHalf<BoxProxyStream>,
+    send_padding: bool,
+    pkt_counter: u32,
+    buffer: Vec<u8>,
+    buffering: bool,
+    padding: Arc<StdMutex<PaddingFactory>>,
+    dead: watch::Sender<bool>,
+    die_reason: Arc<StdMutex<String>>,
+}
+
+/// `writeConn`'s padding split (session.go:457-518): the first `stop`
+/// writes are segmented per the scheme (each segment its own transport
+/// write so TLS record sizes match the scheme); after that, plain
+/// writes. `pkt < stop` gates the padding exactly like Go's counter.
+fn padded_segments(
+    padding: &PaddingFactory,
+    send_padding: &mut bool,
+    pkt_counter: &mut u32,
+    b: &[u8],
+) -> Result<Vec<Vec<u8>>> {
+    if !*send_padding {
+        return Ok(vec![b.to_vec()]);
     }
-
-    /// Parse every complete frame out of `rbuf`; false on a malformed
-    /// header.
-    fn try_parse(&mut self) -> Result<bool> {
-        let mut progress = false;
-        while self.rbuf.len() >= HEADER_SIZE {
-            let cmd = self.rbuf[0];
-            let sid = u32::from_be_bytes([self.rbuf[1], self.rbuf[2], self.rbuf[3], self.rbuf[4]]);
-            let len = u16::from_be_bytes([self.rbuf[5], self.rbuf[6]]) as usize;
-            if self.rbuf.len() < HEADER_SIZE + len {
+    *pkt_counter += 1;
+    if *pkt_counter >= padding.stop {
+        // session.go:513-515: stop padding from now on.
+        *send_padding = false;
+        return Ok(vec![b.to_vec()]);
+    }
+    let sizes = padding.generate(*pkt_counter);
+    let mut segments = Vec::with_capacity(sizes.len() + 1);
+    let mut rest = b;
+    for l in sizes {
+        if l == CHECK_MARK {
+            // session.go:465-471: no payload left → stop; else skip.
+            if rest.is_empty() {
                 break;
             }
-            self.rbuf.advance(HEADER_SIZE);
-            let data = self.rbuf[..len].to_vec();
-            self.rbuf.advance(len);
-            self.handle_frame(cmd, sid, &data);
-            progress = true;
+            continue;
         }
-        Ok(progress)
+        let l = usize::try_from(l).unwrap_or(0);
+        if rest.len() > l {
+            // This packet is all payload.
+            segments.push(rest[..l].to_vec());
+            rest = &rest[l..];
+        } else if !rest.is_empty() {
+            // Last of the payload plus a cmdWaste tail.
+            let mut seg = rest.to_vec();
+            let padding_len = l.saturating_sub(rest.len() + HEADER_SIZE);
+            if padding_len > 0 {
+                seg.extend_from_slice(&waste_frame(padding_len));
+            }
+            segments.push(seg);
+            rest = &[];
+        } else {
+            // This packet is all padding.
+            segments.push(waste_frame(l));
+            rest = &[];
+        }
     }
+    if !rest.is_empty() {
+        segments.push(rest.to_vec());
+    }
+    Ok(segments)
+}
+
+impl WriterState {
+    async fn write_conn(&mut self, b: &[u8]) -> io::Result<()> {
+        // Clone the factory out of the lock: the padding scheme can be
+        // swapped by the recv task mid-write (upstream reads the atomic
+        // pointer per writeConn, session.go:460).
+        let padding = self.padding.lock().unwrap().clone();
+        let segments =
+            padded_segments(&padding, &mut self.send_padding, &mut self.pkt_counter, b)
+                .map_err(io_invalid)?;
+        for seg in segments {
+            self.conn.write_all(&seg).await?;
+        }
+        self.conn.flush().await
+    }
+
+    async fn fail(self, reason: String) {
+        *self.die_reason.lock().unwrap() = reason;
+        let _ = self.dead.send(true);
+        // The recv task observes the flag and finishes Session.Close.
+    }
+}
+
+/// The writer task: drains [`WriteCmd`]s, one writeConn each. Writer
+/// errors mark the session dead (writeControlFrame → s.Close,
+/// session.go:431-439). Exits when the mailbox closes (every handle to
+/// the session is gone) or on Shutdown.
+async fn writer_loop(mut rx: mpsc::UnboundedReceiver<WriteCmd>, mut st: WriterState) {
+    while let Some(cmd) = rx.recv().await {
+        match cmd {
+            WriteCmd::Bytes(frames) => {
+                if st.buffering {
+                    // session.go:449-451 — hold back until the first
+                    // stream write flushes the buffer.
+                    st.buffer.extend_from_slice(&frames);
+                    continue;
+                }
+                let mut b = std::mem::take(&mut st.buffer); // 452-455
+                b.extend_from_slice(&frames);
+                if let Err(e) = st.write_conn(&b).await {
+                    st.fail(format!("anytls: session write error: {e}")).await;
+                    return;
+                }
+            }
+            WriteCmd::Open { frames, ack } => {
+                // session.go:158 — `s.buffering = false` so the proxy's
+                // first write flushes settings + SYN + PSH together.
+                st.buffering = false;
+                let mut b = std::mem::take(&mut st.buffer);
+                b.extend_from_slice(&frames);
+                match st.write_conn(&b).await {
+                    Ok(()) => {
+                        let _ = ack.send(Ok(()));
+                    }
+                    Err(e) => {
+                        let _ = ack.send(Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            e.to_string(),
+                        )));
+                        st.fail(format!("anytls: session write error: {e}")).await;
+                        return;
+                    }
+                }
+            }
+            WriteCmd::Flush(ack) => {
+                let res = st.conn.flush().await;
+                let _ = ack.send(res);
+            }
+            WriteCmd::Shutdown => {
+                let _ = st.conn.shutdown().await;
+                return;
+            }
+        }
+    }
+    // Mailbox closed: the session is gone — close the transport.
+    let _ = st.conn.shutdown().await;
+}
+
+/// The recv task — recvLoop (session.go:171-360), client side. Reads
+/// frames off the transport, dispatches per-stream data, answers
+/// heartbeats, adopts padding updates, and closes the session on
+/// transport EOF/error or an alert.
+async fn recv_loop(
+    mut rd: tokio::io::ReadHalf<BoxProxyStream>,
+    core: Arc<SessionCore>,
+    mut dead_rx: watch::Receiver<bool>,
+) {
+    let mut rbuf = BytesMut::with_capacity(16 * 1024);
+    'session: loop {
+        // Dispatch every complete buffered frame first.
+        while let Some((cmd, sid, len)) = parse_header(&rbuf) {
+            if rbuf.len() < HEADER_SIZE + len {
+                break;
+            }
+            rbuf.advance(HEADER_SIZE);
+            let data = rbuf[..len].to_vec();
+            rbuf.advance(len);
+            match cmd {
+                CMD_PSH => {
+                    // session.go:190-205 — pipe into the stream if live.
+                    if !data.is_empty() {
+                        let streams = core.streams.lock().unwrap();
+                        if let Some(tx) = streams.get(&sid) {
+                            let _ = tx.send(StreamEvent::Data(data));
+                        }
+                    }
+                }
+                CMD_FIN => {
+                    // session.go:248-255 — remove + closeLocally.
+                    let tx = core.streams.lock().unwrap().remove(&sid);
+                    if let Some(tx) = tx {
+                        let _ = tx.send(StreamEvent::Fin);
+                    }
+                }
+                CMD_SYNACK => {
+                    // session.go:226-247 — error payload closes the
+                    // stream with "remote: msg".
+                    if !data.is_empty() {
+                        let streams = core.streams.lock().unwrap();
+                        if let Some(tx) = streams.get(&sid) {
+                            let _ = tx.send(StreamEvent::RemoteError(format!(
+                                "anytls: remote: {}",
+                                String::from_utf8_lossy(&data)
+                            )));
+                        }
+                    }
+                }
+                CMD_WASTE => {}
+                CMD_ALERT => {
+                    // session.go:302-313 — log and end the session.
+                    error!(
+                        target: "engine",
+                        "anytls: server alert: {}",
+                        String::from_utf8_lossy(&data)
+                    );
+                    core.kill("anytls: server alert");
+                    break 'session;
+                }
+                CMD_UPDATE_PADDING => {
+                    // session.go:315-329.
+                    match PaddingFactory::new(&data) {
+                        Some(p) => {
+                            debug!(target: "engine", md5 = %p.md5, "anytls: padding scheme updated");
+                            *core.padding.lock().unwrap() = p;
+                        }
+                        None => {
+                            warn!(target: "engine", "anytls: padding scheme update failed to parse");
+                        }
+                    }
+                }
+                CMD_HEART_REQUEST => {
+                    // session.go:330-332.
+                    let mut resp = Vec::with_capacity(HEADER_SIZE);
+                    frame_into(&mut resp, CMD_HEART_RESPONSE, sid, &[]);
+                    let _ = core.tx.send(WriteCmd::Bytes(resp));
+                }
+                CMD_SERVER_SETTINGS => {
+                    // session.go:337-352 — record the peer version.
+                    let text = String::from_utf8_lossy(&data).into_owned();
+                    if let Some(v) = text.split('\n').find_map(|l| l.strip_prefix("v=")) {
+                        if let Ok(v) = v.trim().parse::<u32>() {
+                            core.peer_version.store(v, Ordering::Relaxed);
+                        }
+                    }
+                }
+                // cmdSettings is client→server; cmdSYN is server-only
+                // reception; cmdHeartResponse is unimplemented upstream
+                // too; unknown commands consume their payload (upstream
+                // would desync — see the module delta notes).
+                _ => {}
+            }
+        }
+
+        // Pull more wire bytes, or observe a session kill.
+        let mut tmp = [0u8; 16 * 1024];
+        tokio::select! {
+            changed = dead_rx.changed() => {
+                if changed.is_ok() && *dead_rx.borrow() {
+                    break 'session;
+                }
+            }
+            r = rd.read(&mut tmp) => match r {
+                Ok(0) => {
+                    core.kill("anytls: server closed the session");
+                    break 'session;
+                }
+                Ok(n) => rbuf.extend_from_slice(&tmp[..n]),
+                Err(e) => {
+                    core.kill(&format!("anytls: session read error: {e}"));
+                    break 'session;
+                }
+            },
+        }
+    }
+}
+
+/// Frame header off the buffer: `(cmd, sid, data_len)` once buffered.
+fn parse_header(rbuf: &BytesMut) -> Option<(u8, u32, usize)> {
+    if rbuf.len() < HEADER_SIZE {
+        return None;
+    }
+    let cmd = rbuf[0];
+    let sid = u32::from_be_bytes([rbuf[1], rbuf[2], rbuf[3], rbuf[4]]);
+    let len = u16::from_be_bytes([rbuf[5], rbuf[6]]) as usize;
+    Some((cmd, sid, len))
+}
+
+/// A live multiplexed anytls session. Cheap to clone — every clone is
+/// another handle to the same session (streams, tasks and all).
+#[derive(Clone)]
+pub struct AnyTlsSession {
+    core: Arc<SessionCore>,
+}
+
+impl AnyTlsSession {
+    /// `NewClientSession` + `Run` (session.go:56-97): spawn the recv
+    /// loop and buffer cmdSettings for the first stream open. `tls` must
+    /// already carry the handshake AND the auth write.
+    fn start(tls: BoxProxyStream) -> Self {
+        let (r, w) = tokio::io::split(tls);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (dead, dead_rx) = watch::channel(false);
+        let padding = Arc::new(StdMutex::new(
+            PaddingFactory::new(DEFAULT_PADDING_SCHEME)
+                .expect("the default padding scheme is well-formed"),
+        ));
+        let core = Arc::new(SessionCore {
+            tx: tx.clone(),
+            streams: StdMutex::new(HashMap::new()),
+            next_sid: AtomicU32::new(0),
+            active: AtomicUsize::new(0),
+            dead: dead.clone(),
+            dead_rx: dead_rx.clone(),
+            padding: padding.clone(),
+            peer_version: AtomicU32::new(0),
+            die_reason: Arc::new(StdMutex::new(String::new())),
+            recycle: StdMutex::new(None),
+            idle_since: StdMutex::new(None),
+        });
+        // Run() — the settings frame is buffered (writeConn appends
+        // while `buffering`), then the recv loop starts (session.go:80-97).
+        let settings = format!("v=2\nclient=\npadding-md5={}", padding.lock().unwrap().md5);
+        let mut settings_frame = Vec::with_capacity(HEADER_SIZE + settings.len());
+        frame_into(&mut settings_frame, CMD_SETTINGS, 0, settings.as_bytes());
+        let _ = tx.send(WriteCmd::Bytes(settings_frame));
+        let writer = WriterState {
+            conn: w,
+            send_padding: true,
+            pkt_counter: 0,
+            buffer: Vec::new(),
+            buffering: true,
+            padding,
+            dead,
+            die_reason: core.die_reason.clone(),
+        };
+        tokio::spawn(writer_loop(rx, writer));
+        tokio::spawn(recv_loop(r, core.clone(), dead_rx));
+        AnyTlsSession { core }
+    }
+
+    /// `OpenStream` + the CreateProxy target write (session.go:135-169,
+    /// client.go:55-66): a fresh stream id, `cmdSYN` + the first
+    /// `cmdPSH(target socksaddr)` flushed together with the buffered
+    /// settings as one padded write.
+    async fn open_stream(&self, target: &NetAddr) -> Result<AnyTlsStream> {
+        if self.core.is_dead() {
+            return Err(Error::network("anytls: session closed"));
+        }
+        let sid = self.core.next_sid.fetch_add(1, Ordering::Relaxed) + 1;
+        let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+        self.core.streams.lock().unwrap().insert(sid, ev_tx);
+        let mut wire = Vec::with_capacity(HEADER_SIZE * 2 + 32);
+        frame_into(&mut wire, CMD_SYN, sid, &[]);
+        let mut addr = Vec::with_capacity(32);
+        encode_socks_addr(&mut addr, &target.host, target.port);
+        psh_frames_into(&mut wire, sid, &addr);
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.core
+            .tx
+            .send(WriteCmd::Open { frames: wire, ack: ack_tx })
+            .map_err(|_| Error::network("anytls: session closed"))?;
+        ack_rx
+            .await
+            .map_err(|_| Error::network("anytls: session closed while opening the stream"))?
+            .map_err(Error::from)?;
+        self.core.active.fetch_add(1, Ordering::Relaxed);
+        debug!(target: "engine", sid, "anytls: stream opened toward {target}");
+        Ok(AnyTlsStream {
+            core: self.core.clone(),
+            sid,
+            rx: ev_rx,
+            out: BytesMut::with_capacity(16 * 1024),
+            fin: false,
+            fin_sent: false,
+            remote_err: None,
+            flush_ack: None,
+        })
+    }
+
+    /// The padding scheme's md5 currently in force (diagnostics/tests).
+    pub fn padding_md5(&self) -> String {
+        self.core.padding.lock().unwrap().md5.clone()
+    }
+
+    /// Whether the session has died (transport closed / alert).
+    pub fn is_dead(&self) -> bool {
+        self.core.is_dead()
+    }
+
+    /// Live stream count on this session.
+    pub fn active_streams(&self) -> usize {
+        self.core.active.load(Ordering::Relaxed)
+    }
+
+    /// `Session.Close` (session.go:110-132).
+    pub fn close(&self) {
+        self.core.kill("anytls: session closed locally");
+    }
+}
+
+/// A client anytls stream: one sid over the shared session — mihomo
+/// `Stream` (stream.go:14-38), a net.Conn over the session pipe. Reads
+/// dispatch by the recv task; writes are queued to the session's
+/// serialised writeConn path; `shutdown()` sends cmdFIN.
+pub struct AnyTlsStream {
+    core: Arc<SessionCore>,
+    sid: u32,
+    rx: mpsc::UnboundedReceiver<StreamEvent>,
+    out: BytesMut,
+    /// cmdFIN seen (or local shutdown) — clean EOF once `out` drains.
+    fin: bool,
+    /// cmdFIN already queued (Close → closeWithError, stream.go:63-101).
+    fin_sent: bool,
+    remote_err: Option<String>,
+    /// Pending flush ack from the writer task.
+    flush_ack: Option<oneshot::Receiver<io::Result<()>>>,
 }
 
 fn io_invalid(e: Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+}
+
+impl AnyTlsStream {
+    /// Queue a FIN if none was sent — `closeWithError` → `streamClosed`
+    /// → `cmdFIN` (stream.go:63-101, session.go:362-371).
+    fn send_fin(&mut self) {
+        if !self.fin_sent {
+            self.fin_sent = true;
+            let mut fin = Vec::with_capacity(HEADER_SIZE);
+            frame_into(&mut fin, CMD_FIN, self.sid, &[]);
+            let _ = self.core.tx.send(WriteCmd::Bytes(fin));
+        }
+    }
+
+    /// The padding scheme md5 this stream's session currently uses.
+    pub fn padding_md5(&self) -> String {
+        self.core.padding.lock().unwrap().md5.clone()
+    }
 }
 
 impl AsyncRead for AnyTlsStream {
@@ -449,120 +787,155 @@ impl AsyncRead for AnyTlsStream {
                 this.out.advance(n);
                 return Poll::Ready(Ok(()));
             }
-            if this.synack_err.is_some() {
-                this.failed = true;
-                let msg = this.synack_err.take().unwrap_or_default();
-                return Poll::Ready(Err(io_invalid(Error::protocol(msg))));
+            if let Some(err) = this.remote_err.take() {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::NotConnected, err)));
             }
-            if this.eof {
+            if this.fin {
                 return Poll::Ready(Ok(()));
             }
-            match this.try_parse().map_err(io_invalid) {
-                Ok(true) => continue,
-                Ok(false) => {
-                    let mut tmp = [0u8; 16 * 1024];
-                    let mut rb = ReadBuf::new(&mut tmp);
-                    ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
-                    if rb.filled().is_empty() {
-                        // Server closed the session (auth failure, alert,
-                        // or transport death) — a clean EOF upstream.
-                        this.eof = true;
-                        return Poll::Ready(Ok(()));
+            match Pin::new(&mut this.rx).poll_recv(cx) {
+                Poll::Ready(Some(StreamEvent::Data(d))) => {
+                    this.out.extend_from_slice(&d);
+                }
+                Poll::Ready(Some(StreamEvent::Fin)) => {
+                    this.fin = true;
+                }
+                Poll::Ready(Some(StreamEvent::RemoteError(m))) => {
+                    this.remote_err = Some(m);
+                }
+                Poll::Ready(None) => {
+                    // Every sender is gone: either our FIN was processed
+                    // (clean EOF) or the session died (net.ErrClosed in
+                    // Go — Stream.Read, stream.go:41-47).
+                    if this.core.is_dead() {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            format!("anytls: session closed: {}", this.core.death_reason()),
+                        )));
                     }
-                    this.rbuf.extend_from_slice(rb.filled());
+                    this.fin = true;
                 }
-                Err(e) => {
-                    this.failed = true;
-                    return Poll::Ready(Err(e));
-                }
+                Poll::Pending => return Poll::Pending,
             }
         }
-    }
-}
-
-impl AnyTlsStream {
-    /// Drain pending wire segments (and queued control frames) to the
-    /// transport.
-    fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        while let Some(seg) = self.wsegs.front_mut() {
-            let n = ready!(Pin::new(&mut self.inner).poll_write(cx, seg))?;
-            if n == 0 {
-                self.failed = true;
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "anytls: transport accepted zero bytes",
-                )));
-            }
-            seg.drain(..n);
-            if seg.is_empty() {
-                self.wsegs.pop_front();
-            }
-        }
-        Poll::Ready(Ok(()))
     }
 }
 
 impl AsyncWrite for AnyTlsStream {
+    /// `Stream.Write` (stream.go:50-61): the payload becomes cmdPSH
+    /// frames handed to the session's serialised writeConn — one
+    /// contiguous frame sequence per write, exactly like Go's
+    /// writeDataFrame under connLock.
     fn poll_write(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        if this.failed {
+        if this.fin_sent {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "anytls: stream failed",
+                "anytls: stream closed",
+            )));
+        }
+        if this.core.is_dead() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("anytls: session closed: {}", this.core.death_reason()),
             )));
         }
         if buf.is_empty() {
+            // writeDataFrame(0) is a no-op (session.go:383-385).
             return Poll::Ready(Ok(0));
         }
-        // Queued heart responses go out first (their own writeConn).
-        while let Some(ctrl) = this.ctrl.pop_front() {
-            let segs = this.pad_write(&ctrl).map_err(io_invalid)?;
-            this.wsegs.extend(segs);
+        let mut frames = Vec::with_capacity(buf.len() + HEADER_SIZE);
+        psh_frames_into(&mut frames, this.sid, buf);
+        if this.core.tx.send(WriteCmd::Bytes(frames)).is_err() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "anytls: session closed",
+            )));
         }
-        if this.wsegs.is_empty() {
-            let mut frames = Vec::with_capacity(buf.len() + HEADER_SIZE);
-            psh_frames_into(&mut frames, this.sid, buf);
-            let segs = this.pad_write(&frames).map_err(io_invalid)?;
-            this.wsegs.extend(segs);
-            this.pending_plain = buf.len();
-        }
-        ready!(this.poll_drain(cx))?;
-        Poll::Ready(Ok(this.pending_plain))
+        Poll::Ready(Ok(buf.len()))
     }
 
+    /// Flush bridge: hand the writer task a Flush command and resolve
+    /// when the transport accepted every queued write.
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        while let Some(ctrl) = this.ctrl.pop_front() {
-            let segs = this.pad_write(&ctrl).map_err(io_invalid)?;
-            this.wsegs.extend(segs);
+        if this.flush_ack.is_none() {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            if this.core.tx.send(WriteCmd::Flush(ack_tx)).is_err() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "anytls: session closed",
+                )));
+            }
+            this.flush_ack = Some(ack_rx);
         }
-        ready!(this.poll_drain(cx))?;
-        Pin::new(&mut this.inner).poll_flush(cx)
+        let ack = this.flush_ack.as_mut().expect("set above");
+        match ready!(Pin::new(ack).poll(cx)) {
+            Ok(res) => {
+                this.flush_ack = None;
+                Poll::Ready(res)
+            }
+            Err(_) => {
+                // The writer died without acking.
+                this.flush_ack = None;
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "anytls: session closed during flush",
+                )))
+            }
+        }
     }
 
+    /// `Stream.Close` → closeWithError → cmdFIN (stream.go:63-101).
+    /// Reads still drain what the peer sent before its FIN.
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if !this.eof {
-            // Stream.Close → cmdFIN (session.go:362-371).
-            let mut fin = Vec::with_capacity(HEADER_SIZE);
-            frame_into(&mut fin, CMD_FIN, this.sid, &[]);
-            let segs = this.pad_write(&fin).map_err(io_invalid)?;
-            this.wsegs.extend(segs);
-            this.eof = true;
-        }
-        // Same drain as poll_flush, without re-borrowing self.
-        while let Some(ctrl) = this.ctrl.pop_front() {
-            let segs = this.pad_write(&ctrl).map_err(io_invalid)?;
-            this.wsegs.extend(segs);
-        }
-        ready!(this.poll_drain(cx))?;
-        ready!(Pin::new(&mut this.inner).poll_flush(cx))?;
-        Pin::new(&mut this.inner).poll_shutdown(cx)
+        this.send_fin();
+        this.fin = true;
+        Pin::new(&mut *this).poll_flush(cx)
     }
+}
+
+impl Drop for AnyTlsStream {
+    /// The stream end-of-life bookkeeping: FIN if unsent, deregister,
+    /// and the dieHook — session/client.go:90-109: when the last stream
+    /// ends, recycle the session to its pool; a session without a pool
+    /// (one-shot) closes instead (`disableReuse` → session.Close,
+    /// client.go:93-95).
+    fn drop(&mut self) {
+        self.send_fin();
+        self.core.streams.lock().unwrap().remove(&self.sid);
+        if self.core.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let recycle = self.core.recycle.lock().unwrap().clone();
+            match recycle {
+                Some(tx) => {
+                    let _ = tx.send((self.core.clone(), Instant::now()));
+                    // If the pool is gone the send fails silently; the
+                    // session is then dropped by the last Arc holder.
+                }
+                None => self.core.kill("anytls: all streams closed"),
+            }
+        }
+    }
+}
+
+/// The auth packet (client.go:77-97): `sha256(password) ||
+/// be16(padding0) || padding0` — one TLS write, using the initial
+/// scheme's `0=` entry.
+fn auth_packet(padding: &PaddingFactory, password: &str) -> Result<Vec<u8>> {
+    let padding0 = padding.generate(0).first().copied().unwrap_or(0);
+    if padding0 < 0 || padding0 > u16::MAX as isize {
+        return Err(Error::protocol("anytls: padding0 out of range"));
+    }
+    let mut packet = Vec::with_capacity(32 + 2 + padding0 as usize);
+    packet.extend_from_slice(&Sha256::digest(password.as_bytes()));
+    packet.extend_from_slice(&(padding0 as u16).to_be_bytes());
+    packet.resize(32 + 2 + padding0 as usize, 0);
+    Ok(packet)
 }
 
 /// Open an anytls session over an established transport and open its
@@ -572,20 +945,23 @@ impl AsyncWrite for AnyTlsStream {
 /// handshake via [`tls_connect`], the auth packet, `cmdSettings` +
 /// `cmdSYN` + first `cmdPSH(target)`), then relay. The target address is
 /// the sing `SocksaddrSerializer` form (`atyp 1/3/4 || addr || port`),
-/// i.e. [`crate::addr::encode_socks_addr`].
+/// i.e. [`crate::addr::encode_socks_addr`]. The session is one-shot:
+/// when the returned stream closes, the session closes too (mihomo's
+/// `disableReuse` path, session/client.go:93-95).
 pub async fn connect(
     cfg: &AnyTlsOut,
     transport: BoxProxyStream,
     target: &NetAddr,
 ) -> Result<BoxProxyStream> {
-    let stream = open_session(cfg, transport).await?;
-    let stream = stream.open_stream(target).await?;
+    let session = open_session(cfg, transport).await?;
+    let stream = session.open_stream(target).await?;
     Ok(Box::new(stream))
 }
 
-/// TLS + auth + buffered settings (the parts shared by the TCP and UDP
-/// entry points).
-async fn open_session(cfg: &AnyTlsOut, transport: BoxProxyStream) -> Result<AnyTlsStream> {
+/// TLS + auth + session start (the parts shared by the TCP, UDP and
+/// pooled entry points) — `createOutboundTLSConnection` (client.go:68-99)
+/// plus `NewClientSession`/`Run`.
+async fn open_session(cfg: &AnyTlsOut, transport: BoxProxyStream) -> Result<AnyTlsSession> {
     if cfg.password.is_empty() {
         return Err(Error::config("anytls: password is required"));
     }
@@ -604,7 +980,7 @@ async fn open_session(cfg: &AnyTlsOut, transport: BoxProxyStream) -> Result<AnyT
         server = %cfg.server, port = %cfg.port, sni = %server_name, skip_verify = cfg.skip_verify,
         "anytls: opening session"
     );
-    let tls = if let Some(opts) = cfg.ech.as_ref().filter(|o| o.enable) {
+    let mut tls = if let Some(opts) = cfg.ech.as_ref().filter(|o| o.enable) {
         // ECH: the engine's own TLS 1.3 stack carries the outer/inner
         // ClientHello pair (ech-opts on anytls). Self-dialing like the
         // jls/jls-quic split upstream: ECH owns the transport.
@@ -648,6 +1024,7 @@ async fn open_session(cfg: &AnyTlsOut, transport: BoxProxyStream) -> Result<AnyT
                 sni: server_name.clone(),
                 alpn: Vec::new(),
                 skip_cert_verify: cfg.skip_verify,
+                fingerprint: None,
             },
             transport,
         )
@@ -666,39 +1043,15 @@ async fn open_session(cfg: &AnyTlsOut, transport: BoxProxyStream) -> Result<AnyT
         .await?
     };
 
-    let mut stream = AnyTlsStream::new(tls);
-    // 1. Auth (client.go:77-97): one TLS write.
-    let auth = stream.auth_packet(&cfg.password)?;
-    stream.inner.write_all(&auth).await?;
-    stream.inner.flush().await?;
-    // 2. cmdSettings, buffered until the first stream write (Session.Run,
-    //    session.go:80-97 + the buffering flag from NewClientSession).
-    let settings = format!("v=2\nclient=\npadding-md5={}", stream.padding.md5);
-    let mut settings_frame = Vec::with_capacity(HEADER_SIZE + settings.len());
-    frame_into(&mut settings_frame, CMD_SETTINGS, 0, settings.as_bytes());
-    stream.settings_buffered = Some(settings_frame);
-    Ok(stream)
-}
-
-impl AnyTlsStream {
-    /// Flush the buffered settings + SYN + first PSH in one padded write
-    /// (OpenStream + CreateProxy: session.go:135-169, client.go:55-66 —
-    /// `s.buffering = false` only after the SYN, so the three frames
-    /// share one writeConn).
-    async fn open_stream(mut self, target: &NetAddr) -> Result<Self> {
-        let mut wire = self.settings_buffered.take().unwrap_or_default();
-        frame_into(&mut wire, CMD_SYN, self.sid, &[]);
-        let mut addr = Vec::with_capacity(32);
-        encode_socks_addr(&mut addr, &target.host, target.port);
-        psh_frames_into(&mut wire, self.sid, &addr);
-        let segs = self.pad_write(&wire)?;
-        for seg in segs {
-            self.inner.write_all(&seg).await?;
-        }
-        self.inner.flush().await?;
-        debug!(target: "engine", "anytls: stream opened toward {target}");
-        Ok(self)
-    }
+    // Auth (client.go:77-97): one TLS write before anything else.
+    let auth = auth_packet(
+        &PaddingFactory::new(DEFAULT_PADDING_SCHEME).expect("default scheme is well-formed"),
+        &cfg.password,
+    )?;
+    tls.write_all(&auth).await?;
+    tls.flush().await?;
+    // NewClientSession + Run: buffer cmdSettings, start the loops.
+    Ok(AnyTlsSession::start(tls))
 }
 
 // ---------------------------------------------------------------------------
@@ -811,13 +1164,296 @@ impl AnyTlsUdp {
 /// the uot v2 magic domain (adapter/outbound/anytls.go
 /// `ListenPacketContext` → `uot.RequestDestination(2)`).
 pub async fn udp_stream(cfg: &AnyTlsOut, transport: BoxProxyStream) -> Result<AnyTlsUdp> {
-    let stream = open_session(cfg, transport).await?;
+    let session = open_session(cfg, transport).await?;
     let target = NetAddr::domain(UOT_MAGIC_ADDRESS, 0)?;
-    let stream = stream.open_stream(&target).await?;
+    let stream = session.open_stream(&target).await?;
     Ok(AnyTlsUdp {
         stream: Box::new(stream),
         request_written: false,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Idle session pool (transport/anytls/session/client.go)
+// ---------------------------------------------------------------------------
+
+/// A boxed transport dial — the pool's session factory input. The
+/// default dials plain TCP to `(server, port)`; tests and integrators
+/// inject obfs/TLS-fronted dialers.
+pub type AnyTlsDialFuture =
+    Pin<Box<dyn std::future::Future<Output = Result<BoxProxyStream>> + Send>>;
+pub type AnyTlsTransportDialer = Arc<dyn Fn() -> AnyTlsDialFuture + Send + Sync>;
+
+async fn dial_tcp(server: &str, port: u16) -> Result<BoxProxyStream> {
+    let tcp = tokio::net::TcpStream::connect((server, port))
+        .await
+        .map_err(|e| Error::network(format!("dial {server}:{port}: {e}")))?;
+    Ok(Box::new(tcp))
+}
+
+struct AnyTlsPoolCore {
+    cfg: AnyTlsOut,
+    dialer: AnyTlsTransportDialer,
+    /// Every usable session (live or idle), newest first — the
+    /// `sessions` map plus the `idleSession` skiplist in one list
+    /// ordered like the skiplist (`MaxUint64-seq`, newest first).
+    sessions: StdMutex<VecDeque<Arc<SessionCore>>>,
+    recycle_tx: mpsc::UnboundedSender<RecycledSession>,
+    /// The receiver side, under an async lock (only drained at
+    /// connect/cleanup points).
+    recycle_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<RecycledSession>>,
+    /// Idle policy as atomics so a constructed pool can still be
+    /// retuned (with_idle_policy) while the janitor task runs; the
+    /// janitor re-reads them every round.
+    idle_timeout_ms: AtomicU64,
+    /// Atomic millis so the janitor re-reads the interval every round
+    /// (with_idle_policy may retune a constructed-but-unshared pool).
+    check_interval_ms: AtomicU64,
+    min_idle: AtomicUsize,
+    /// Streams a single session may carry before the pool prefers a
+    /// fresh one. Upstream's client is strictly one-stream-per-session
+    /// (`CreateStream` only takes idle sessions, client.go:75-84);
+    /// the engine default allows multiplexing.
+    max_streams: AtomicUsize,
+}
+
+impl AnyTlsPoolCore {
+    /// Fold every recycled session back into the list
+    /// (`stream.dieHook` → idleSession.Insert, client.go:103-106).
+    async fn drain_recycles(&self) {
+        let mut rx = self.recycle_rx.lock().await;
+        while let Ok((core, since)) = rx.try_recv() {
+            if core.is_dead() {
+                continue;
+            }
+            *core.idle_since.lock().unwrap() = Some(since);
+            let mut sessions = self.sessions.lock().unwrap();
+            sessions.retain(|s| !Arc::ptr_eq(s, &core));
+            sessions.push_front(core); // newest first (MaxUint64-seq)
+        }
+    }
+
+    /// `idleCleanupExpTime` (client.go:175-206): newest first, keep live
+    /// sessions, keep the `min_idle` newest idle ones (refreshing their
+    /// idle clock), close the expired rest.
+    fn cleanup(&self) {
+        let idle_timeout =
+            Duration::from_millis(self.idle_timeout_ms.load(Ordering::Relaxed).max(1));
+        let min_idle = self.min_idle.load(Ordering::Relaxed);
+        let mut sessions = self.sessions.lock().unwrap();
+        let mut kept = 0usize; // sessions kept this round (activeCount)
+        let mut i = 0;
+        while i < sessions.len() {
+            let s = &sessions[i];
+            if s.active.load(Ordering::Relaxed) > 0 || s.is_dead() {
+                i += 1;
+                continue;
+            }
+            let since = *s.idle_since.lock().unwrap();
+            let Some(since) = since else {
+                i += 1;
+                continue;
+            };
+            if since.elapsed() < idle_timeout {
+                kept += 1;
+                i += 1;
+                continue;
+            }
+            if kept < min_idle {
+                // Keep it around another round (client.go:192-196).
+                *s.idle_since.lock().unwrap() = Some(Instant::now());
+                kept += 1;
+                i += 1;
+                continue;
+            }
+            let s = sessions.remove(i).expect("indexed above");
+            debug!(target: "engine", "anytls: closing expired idle session");
+            s.kill("anytls: idle session expired");
+        }
+    }
+}
+
+/// The anytls session pool — mihomo `session.Client`
+/// (session/client.go): idle-session reuse, per-session stream
+/// multiplexing, idle expiry and `min-idle` keep-alive.
+///
+/// Upstream behaviour notes (all ported):
+///
+/// * `CreateStream` (client.go:64-112) reuses an idle session before
+///   dialing; on stream end the session returns to the idle set
+///   (`stream.dieHook`). Where upstream's client strictly takes only
+///   *idle* sessions (one active stream each), this pool additionally
+///   opens further streams on a live session until `max_streams`
+///   (`with_max_streams(1)` restores upstream's exact behaviour).
+/// * `idleCleanup` (client.go:171-206) runs every
+///   `idle-session-check-interval` (30s default) closing sessions idle
+///   longer than `idle-session-timeout` (30s default), always keeping
+///   `min-idle-session` (0 default).
+/// * A dead/closed session is skipped and the next dial opens a fresh
+///   one (`getIdleSession`/`createSession`, client.go:114-151).
+#[derive(Clone)]
+pub struct AnyTlsSessionPool {
+    core: Arc<AnyTlsPoolCore>,
+}
+
+impl AnyTlsSessionPool {
+    /// A pool dialing plain TCP to `cfg.server:cfg.port` with mihomo's
+    /// default idle policy — 30s check interval and 30s timeout (the
+    /// clamps of session/client.go:50-55 applied to the config
+    /// defaults), min-idle 0.
+    pub fn new(cfg: AnyTlsOut) -> Result<Self> {
+        let server = cfg.server.clone();
+        let port = cfg.port;
+        Self::with_dialer(cfg, move || {
+            let server = server.clone();
+            Box::pin(async move { dial_tcp(&server, port).await })
+        })
+    }
+
+    /// A pool whose raw transports come from `dialer` (the TLS+auth
+    /// layer is applied per session, like `createOutboundTLSConnection`
+    /// wrapping `dialer.DialContext`).
+    pub fn with_dialer(
+        cfg: AnyTlsOut,
+        dialer: impl Fn() -> AnyTlsDialFuture + Send + Sync + 'static,
+    ) -> Result<Self> {
+        if cfg.password.is_empty() {
+            return Err(Error::config("anytls: password is required"));
+        }
+        let (recycle_tx, recycle_rx) = mpsc::unbounded_channel();
+        let pool = AnyTlsSessionPool {
+            core: Arc::new(AnyTlsPoolCore {
+                cfg,
+                dialer: Arc::new(dialer),
+                sessions: StdMutex::new(VecDeque::new()),
+                recycle_tx,
+                recycle_rx: tokio::sync::Mutex::new(recycle_rx),
+                idle_timeout_ms: AtomicU64::new(30_000),
+                check_interval_ms: AtomicU64::new(30_000),
+                min_idle: AtomicUsize::new(0),
+                max_streams: AtomicUsize::new(usize::MAX),
+            }),
+        };
+        pool.spawn_janitor();
+        Ok(pool)
+    }
+
+    fn spawn_janitor(&self) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            // No runtime: cleanup degrades to the lazy drain at every
+            // connect (expiry then happens on use, like snell's pool).
+            return;
+        }
+        let weak = Arc::downgrade(&self.core);
+        tokio::spawn(async move {
+            loop {
+                let interval = {
+                    // Scope the strong ref: holding it across the sleep
+                    // would pin the pool forever.
+                    let Some(core) = weak.upgrade() else { break };
+                    let interval = Duration::from_millis(
+                        core.check_interval_ms.load(Ordering::Relaxed).max(1),
+                    );
+                    core.drain_recycles().await;
+                    core.cleanup();
+                    interval
+                };
+                tokio::time::sleep(interval).await;
+            }
+        });
+    }
+
+    /// Exact idle policy (mihomo clamps values ≤ 5s to 30s inside
+    /// `NewClient`, session/client.go:50-55; this builder takes the
+    /// values verbatim so embedders and tests can use short timers).
+    pub fn with_idle_policy(
+        self,
+        check_interval: Duration,
+        idle_timeout: Duration,
+        min_idle: usize,
+    ) -> Self {
+        self.core
+            .check_interval_ms
+            .store(check_interval.as_millis() as u64, Ordering::Relaxed);
+        self.core
+            .idle_timeout_ms
+            .store(idle_timeout.as_millis() as u64, Ordering::Relaxed);
+        self.core.min_idle.store(min_idle, Ordering::Relaxed);
+        self
+    }
+
+    /// Cap the streams per session (`1` reproduces upstream's
+    /// one-stream-per-session client).
+    pub fn with_max_streams(self, max_streams: usize) -> Self {
+        self.core
+            .max_streams
+            .store(max_streams.max(1), Ordering::Relaxed);
+        self
+    }
+
+    /// Sessions currently held (live + idle), for observability.
+    pub fn session_count(&self) -> usize {
+        self.core.sessions.lock().unwrap().len()
+    }
+
+    /// Open a stream toward `target` — `CreateStream` +
+    /// `CreateProxy` (session/client.go:64-112, client.go:55-66).
+    /// Reuses an idle session, else a live one under capacity, else
+    /// dials a fresh session.
+    pub async fn connect(&self, target: &NetAddr) -> Result<BoxProxyStream> {
+        self.core.drain_recycles().await;
+        let candidate = {
+            let sessions = self.core.sessions.lock().unwrap();
+            let mut idle: Option<Arc<SessionCore>> = None;
+            let mut live: Option<(usize, Arc<SessionCore>)> = None;
+            for s in sessions.iter() {
+                if s.is_dead() {
+                    continue;
+                }
+                let active = s.active.load(Ordering::Relaxed);
+                if active == 0 {
+                    // getIdleSession — the newest idle session wins
+                    // (skiplist pops the front, client.go:114-123).
+                    idle = Some(s.clone());
+                    break;
+                }
+                if active < self.core.max_streams.load(Ordering::Relaxed)
+                    && live.as_ref().is_none_or(|(a, _)| active < *a)
+                {
+                    live = Some((active, s.clone()));
+                }
+            }
+            idle.or(live.map(|(_, s)| s))
+        };
+        let session = match candidate {
+            Some(core) => AnyTlsSession { core },
+            None => {
+                // createSession (client.go:125-151).
+                let transport = (self.core.dialer)().await?;
+                let session = open_session(&self.core.cfg, transport).await?;
+                let mut sessions = self.core.sessions.lock().unwrap();
+                sessions.retain(|s| !s.is_dead());
+                sessions.push_front(session.core.clone()); // newest first
+                session
+            }
+        };
+        if session.core.is_dead() {
+            return Err(Error::network("anytls: session closed before dial"));
+        }
+        // dieHook registration (client.go:90-109).
+        *session.core.recycle.lock().unwrap() = Some(self.core.recycle_tx.clone());
+        let stream = session.open_stream(target).await?;
+        Ok(Box::new(stream))
+    }
+
+    /// `Client.Close` (client.go:153-169): close every session.
+    pub async fn close(&self) {
+        self.core.drain_recycles().await;
+        let sessions: Vec<_> = self.core.sessions.lock().unwrap().drain(..).collect();
+        for s in sessions {
+            s.kill("anytls: pool closed");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1208,15 +1844,15 @@ mod tests {
         .await;
         let target = NetAddr::domain("echo.example", 443).unwrap();
         // Drive the session directly so the adopted scheme is observable.
-        let stream = open_session(&cfg, Box::new(transport)).await.unwrap();
-        let mut stream = stream.open_stream(&target).await.unwrap();
+        let session = open_session(&cfg, Box::new(transport)).await.unwrap();
+        let mut stream = session.open_stream(&target).await.unwrap();
         // Read something so the cmdUpdatePaddingScheme frame is consumed.
         stream.write_all(b"hello").await.unwrap();
         let mut buf = [0u8; 5];
         read_timeout(&mut stream, &mut buf).await.unwrap();
         assert_eq!(&buf, b"hello");
         // The client adopted the server's scheme (session.go:315-329).
-        assert_eq!(stream.padding.md5, format!("{:x}", Md5::digest(scheme)));
+        assert_eq!(stream.padding_md5(), format!("{:x}", Md5::digest(scheme)));
     }
 
     #[tokio::test]
@@ -1251,19 +1887,34 @@ mod tests {
         })
         .await;
         let target = NetAddr::domain("echo.example", 443).unwrap();
-        // connect() itself succeeds (mihomo too — auth failure surfaces at
-        // relay time): the server simply closes after the bad hash.
-        let mut stream = connect(&cfg, Box::new(transport), &target)
-            .await
-            .unwrap();
-        stream.write_all(b"ping").await.unwrap();
+        // The server drops the conn right after the bad hash. The open
+        // write may fail eagerly (OpenStream's writeControlFrame errors
+        // the same way in Go) — either way, no tunnel data.
+        let mut stream = match connect(&cfg, Box::new(transport), &target).await {
+            Ok(s) => s,
+            Err(e) => {
+                assert!(
+                    e.to_string().contains("session")
+                        || e.to_string().contains("broken pipe")
+                        || e.to_string().contains("close_notify"),
+                    "unexpected error: {e}"
+                );
+                return;
+            }
+        };
+        let _ = stream.write_all(b"ping").await; // may fail or buffer
         let mut buf = [0u8; 16];
         match read_timeout(&mut stream, &mut buf).await {
             Ok(0) => {}
             Ok(_) => panic!("a wrong password must not produce data"),
             // The mimic drops the TCP connection; rustls reports the
-            // missing TLS close_notify as an error. Either way: no data.
-            Err(e) => assert!(e.to_string().contains("close_notify"), "{e}"),
+            // missing TLS close_notify, the session surfaces the death.
+            Err(e) => assert!(
+                e.to_string().contains("close_notify")
+                    || e.to_string().contains("session closed")
+                    || e.to_string().contains("broken pipe"),
+                "{e}"
+            ),
         }
     }
 
@@ -1278,6 +1929,298 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("password"), "{err}");
+    }
+
+    // ------------------------------------------------------ session pool
+
+    /// Multi-stream anytls server mimic for the pool tests: the TLS +
+    /// auth + settings handshake once per session, then any number of
+    /// streams — cmdSYN registers the sid (first cmdPSH is the target,
+    /// later ones echo), cmdFIN echoes FIN. `close_after_all_streams`
+    /// drops the TLS conn once every stream ended (forces the pool's
+    /// fresh-dial path).
+    async fn anytls_pool_mimic(io: DuplexStream, opts: PoolMimicOptions) -> Result<()> {
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_tls_config());
+        let mut tls = acceptor.accept(io).await.map_err(Error::from)?;
+        let mut auth = vec![0u8; 32 + 2];
+        read_frame_timeout(&mut tls, &mut auth).await?;
+        if &auth[..32] != Sha256::digest(opts.password.as_bytes()).as_slice() {
+            return Ok(());
+        }
+        let padding0 = u16::from_be_bytes([auth[32], auth[33]]) as usize;
+        if padding0 > 0 {
+            let mut zeros = vec![0u8; padding0];
+            read_frame_timeout(&mut tls, &mut zeros).await?;
+        }
+        let (cmd, sid, data) = read_frame(&mut tls).await?;
+        assert_eq!((cmd, sid), (CMD_SETTINGS, 0));
+        let _ = data;
+        let mut frame = Vec::new();
+        frame_into(&mut frame, CMD_SERVER_SETTINGS, 0, b"v=2");
+        tls.write_all(&frame).await?;
+
+        let mut streams: HashMap<u32, Option<NetAddr>> = HashMap::new();
+        loop {
+            let (cmd, sid, data) = match read_frame(&mut tls).await {
+                Ok(f) => f,
+                Err(_) => return Ok(()),
+            };
+            match cmd {
+                CMD_SYN => {
+                    assert!(streams.insert(sid, None).is_none(), "sid {sid} reused");
+                    let mut frame = Vec::new();
+                    frame_into(&mut frame, CMD_SYNACK, sid, &[]);
+                    tls.write_all(&frame).await?;
+                }
+                CMD_PSH => {
+                    let entry = streams
+                        .get_mut(&sid)
+                        .unwrap_or_else(|| panic!("PSH for unknown sid {sid}"));
+                    if entry.is_none() {
+                        let (target, consumed) = crate::addr::decode_socks_addr(&data).unwrap();
+                        assert_eq!(consumed, data.len(), "first PSH is the whole target");
+                        *entry = Some(target);
+                        continue; // the address frame itself is not echoed
+                    }
+                    let mut frame = Vec::new();
+                    psh_frames_into(&mut frame, sid, &data);
+                    tls.write_all(&frame).await?;
+                    tls.flush().await?;
+                }
+                CMD_FIN => {
+                    assert!(streams.remove(&sid).is_some(), "FIN for unknown sid {sid}");
+                    let mut frame = Vec::new();
+                    frame_into(&mut frame, CMD_FIN, sid, &[]);
+                    tls.write_all(&frame).await?;
+                    tls.flush().await?;
+                    if opts.close_after_all_streams && streams.is_empty() {
+                        return Ok(()); // drop the TLS conn
+                    }
+                }
+                CMD_WASTE => {}
+                other => panic!("unexpected frame {other} sid {sid}"),
+            }
+        }
+    }
+
+    struct PoolMimicOptions {
+        password: String,
+        close_after_all_streams: bool,
+    }
+
+    /// read_exact with the suite's timeout (auth reads land in pieces).
+    async fn read_frame_timeout(
+        tls: &mut tokio_rustls::server::TlsStream<DuplexStream>,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(10), tls.read_exact(buf))
+            .await
+            .expect("mimic read timeout")?;
+        Ok(())
+    }
+
+    /// A pool whose dialer spawns a fresh mimic per session, counting
+    /// dials.
+    fn pool_with_mimic(
+        cfg: &AnyTlsOut,
+        close_after_all_streams: bool,
+    ) -> (AnyTlsSessionPool, Arc<std::sync::atomic::AtomicUsize>) {
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter2 = counter.clone();
+        let password = cfg.password.clone();
+        let pool = AnyTlsSessionPool::with_dialer(cfg.clone(), move || {
+            let counter = counter2.clone();
+            let password = password.clone();
+            let close = close_after_all_streams;
+            Box::pin(async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let (client, server) = tokio::io::duplex(256 * 1024);
+                let opts = PoolMimicOptions {
+                    password,
+                    close_after_all_streams: close,
+                };
+                tokio::spawn(async move {
+                    if let Err(e) = anytls_pool_mimic(server, opts).await {
+                        panic!("anytls pool mimic failed: {e}");
+                    }
+                });
+                // The pool applies the TLS layer per session
+                // (open_session); hand it the raw duplex.
+                Ok(Box::new(client) as BoxProxyStream)
+            })
+        })
+        .unwrap();
+        (pool, counter)
+    }
+
+    fn dial_count(counter: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+        counter.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[tokio::test]
+    async fn pool_two_targets_share_one_session() {
+        // Both streams multiplex over ONE session: one dial, distinct
+        // sids, independent relay (session.go OpenStream/recvLoop).
+        let password = test_password();
+        let cfg = test_cfg(&password);
+        let (pool, counter) = pool_with_mimic(&cfg, false);
+        let t1 = NetAddr::domain("one.example", 443).unwrap();
+        let t2 = NetAddr::domain("two.example", 80).unwrap();
+        let mut s1 = pool.connect(&t1).await.unwrap();
+        let mut s2 = pool.connect(&t2).await.unwrap();
+        assert_eq!(dial_count(&counter), 1, "one session serves both");
+        assert_eq!(pool.session_count(), 1);
+
+        s1.write_all(b"stream-one").await.unwrap();
+        s2.write_all(b"stream-two").await.unwrap();
+        let mut b1 = [0u8; 10];
+        let mut b2 = [0u8; 10];
+        s1.flush().await.unwrap();
+        s2.flush().await.unwrap();
+        read_timeout(&mut s1, &mut b1).await.unwrap();
+        read_timeout(&mut s2, &mut b2).await.unwrap();
+        assert_eq!(&b1, b"stream-one");
+        assert_eq!(&b2, b"stream-two");
+        // Concurrent large transfers on both streams stay independent.
+        let payload: Vec<u8> = (0..70 * 1024).map(|i| (i % 251) as u8).collect();
+        let moved = payload.clone();
+        let echo = tokio::spawn(async move {
+            let mut got = vec![0u8; moved.len()];
+            s2.write_all(&moved).await.unwrap();
+            s2.read_exact(&mut got).await.unwrap();
+            got
+        });
+        let mut got1 = vec![0u8; payload.len()];
+        s1.write_all(&payload).await.unwrap();
+        s1.read_exact(&mut got1).await.unwrap();
+        let got2 = tokio::time::timeout(Duration::from_secs(20), echo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got1, payload);
+        assert_eq!(got2, payload);
+    }
+
+    #[tokio::test]
+    async fn pool_recycles_idle_session() {
+        // Stream end → dieHook → the session parks in the idle set;
+        // the next connect reuses it (client.go:90-112) with a fresh
+        // stream id (no second dial).
+        let password = test_password();
+        let cfg = test_cfg(&password);
+        let (pool, counter) = pool_with_mimic(&cfg, false);
+        let target = NetAddr::domain("echo.example", 443).unwrap();
+        {
+            let mut s = pool.connect(&target).await.unwrap();
+            s.write_all(b"first").await.unwrap();
+            let mut buf = [0u8; 5];
+            read_timeout(&mut s, &mut buf).await.unwrap();
+            assert_eq!(&buf, b"first");
+        } // drop → FIN → recycle
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        {
+            let mut s = pool.connect(&target).await.unwrap();
+            s.write_all(b"secnd").await.unwrap();
+            let mut buf = [0u8; 5];
+            read_timeout(&mut s, &mut buf).await.unwrap();
+            assert_eq!(&buf, b"secnd");
+        }
+        assert_eq!(dial_count(&counter), 1, "the idle session was reused");
+    }
+
+    #[tokio::test]
+    async fn pool_dials_fresh_when_session_dies() {
+        // The server closes the session after the first stream; the
+        // next connect must open a fresh one (getIdleSession skips
+        // dead sessions, createSession dials).
+        let password = test_password();
+        let cfg = test_cfg(&password);
+        let (pool, counter) = pool_with_mimic(&cfg, true);
+        let target = NetAddr::domain("echo.example", 443).unwrap();
+        {
+            let mut s = pool.connect(&target).await.unwrap();
+            s.write_all(b"only").await.unwrap();
+            let mut buf = [0u8; 4];
+            let _ = read_timeout(&mut s, &mut buf).await;
+            let _ = s.shutdown().await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await; // the mimic drops the TLS conn
+        let mut s = pool.connect(&target).await.unwrap();
+        s.write_all(b"next").await.unwrap();
+        let mut buf = [0u8; 4];
+        read_timeout(&mut s, &mut buf).await.unwrap();
+        assert_eq!(&buf, b"next");
+        assert_eq!(dial_count(&counter), 2, "a fresh session was dialed");
+    }
+
+    #[tokio::test]
+    async fn pool_idle_expiry_closes_sessions() {
+        // idleCleanup (client.go:171-206): an idle session past
+        // idle-session-timeout is closed; the next connect dials fresh.
+        let password = test_password();
+        let cfg = test_cfg(&password);
+        let (pool, counter) = pool_with_mimic(&cfg, false);
+        let pool = pool.with_idle_policy(Duration::from_millis(60), Duration::from_millis(120), 0);
+        let target = NetAddr::domain("echo.example", 443).unwrap();
+        {
+            let mut s = pool.connect(&target).await.unwrap();
+            s.write_all(b"one").await.unwrap();
+            let mut buf = [0u8; 3];
+            read_timeout(&mut s, &mut buf).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await; // janitor rounds pass
+        assert_eq!(pool.session_count(), 0, "the idle session expired");
+        let mut s = pool.connect(&target).await.unwrap();
+        s.write_all(b"two").await.unwrap();
+        let mut buf = [0u8; 3];
+        read_timeout(&mut s, &mut buf).await.unwrap();
+        assert_eq!(&buf, b"two");
+        assert_eq!(dial_count(&counter), 2, "expiry forced a fresh dial");
+    }
+
+    #[tokio::test]
+    async fn pool_max_streams_one_matches_upstream() {
+        // Upstream's client only ever takes IDLE sessions
+        // (client.go:75-84), so two concurrent streams mean two
+        // sessions; with_max_streams(1) reproduces that exactly.
+        let password = test_password();
+        let cfg = test_cfg(&password);
+        let (pool, counter) = pool_with_mimic(&cfg, false);
+        let pool = pool.with_max_streams(1);
+        let t1 = NetAddr::domain("one.example", 443).unwrap();
+        let t2 = NetAddr::domain("two.example", 80).unwrap();
+        let mut s1 = pool.connect(&t1).await.unwrap();
+        let mut s2 = pool.connect(&t2).await.unwrap();
+        s1.write_all(b"a").await.unwrap();
+        s2.write_all(b"b").await.unwrap();
+        let mut b1 = [0u8; 1];
+        let mut b2 = [0u8; 1];
+        read_timeout(&mut s1, &mut b1).await.unwrap();
+        read_timeout(&mut s2, &mut b2).await.unwrap();
+        assert_eq!(&b1, b"a");
+        assert_eq!(&b2, b"b");
+        assert_eq!(dial_count(&counter), 2, "one stream per session");
+    }
+
+    #[tokio::test]
+    async fn pool_close_kills_sessions() {
+        // Client.Close (client.go:153-169).
+        let password = test_password();
+        let cfg = test_cfg(&password);
+        let (pool, _counter) = pool_with_mimic(&cfg, false);
+        let target = NetAddr::domain("echo.example", 443).unwrap();
+        let s = pool.connect(&target).await.unwrap();
+        assert_eq!(pool.session_count(), 1);
+        pool.close().await;
+        assert_eq!(pool.session_count(), 0);
+        // The held stream sees the session death on its next read.
+        let mut s = s;
+        let mut buf = [0u8; 8];
+        match read_timeout(&mut s, &mut buf).await {
+            Ok(0) => {}
+            Ok(_) => panic!("a closed session must not deliver data"),
+            Err(e) => assert!(e.to_string().contains("session closed"), "{e}"),
+        }
     }
 
     async fn read_timeout(stream: &mut (impl AsyncRead + Unpin), buf: &mut [u8]) -> io::Result<usize> {

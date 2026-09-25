@@ -27,6 +27,53 @@ All notable changes to RustCrash. Format based on
   passthrough (the framing half of the splice; the raw-transport
   rebind is tracked).
 
+### Engine — wave 9: snell v1-v5 + pools, anytls session mux, jls uTLS, mieru port-ranges/mux, TUN Windows/macOS, WireGuard endpoint, SIP003, .mrs writing
+
+- **snell v1/v2/v5 + connection pool**: the pre-v3 wire formats (v1
+  Chacha20-Poly1305 KDF, v2 reuse-session header), v5 accepted as the
+  v4 wire (upstream's mapping), zero-chunk half-close recycling, and
+  the SnellPool (15s idle expiry, 10 idle conns) wired per outbound;
+  the config default version is now mihomo's 1 (was 4) and UDP below
+  v3 rejects with the upstream message.
+- **anytls session multiplexing + idle pool**: multiple streams share
+  one session (stream-id registry, serialized padded writes, per-stream
+  channels, FIN on drop) with an idle-preferring session pool and a
+  janitor; wired per outbound.
+- **jls uTLS-fingerprint hellos**: `client-fingerprint` now rides the
+  engine's own TLS 1.3 stack with Chrome/Firefox parrot hellos — the
+  two-pass stamping pins the profile structure (GREASE, ALPS,
+  extension order) while swapping only the random, exactly uTLS'
+  SetClientRandom semantics; auth-failure detection on plain servers
+  preserved.
+- **mieru port-ranges + multiplexing**: `port-range` (FlatPortBindings
+  picker) and `multiplexing` (off/low/middle/high) with the MieruMux
+  client — weighted underlay reuse, traffic-volume disabling, clean
+  sweeps, per-session demux over TCP and UDP underlays.
+- **TUN device backends for Windows and macOS**: WinTUN via
+  runtime-loaded wintun.dll with hand-declared bindings, utun via
+  AF_SYSTEM/SYSPROTO_CONTROL + CTLIOCGINFO; every struct/ioctl layout
+  unit-pinned, both targets cargo-check clean (cross-verified with
+  stubbed C toolchains), Linux path byte-identical.
+- **WireGuard endpoint (server) mode**: production handshake responder
+  (MAC1/cookie under 64/s load with ratelimiter semantics, roaming,
+  replay guards, cryptokey routing) bridged into the engine through an
+  accepting smoltcp stack; sing-box `endpoints: [{type: wireguard}]`
+  parsed and spawned.
+- **SIP003 external plugins**: `plugin:` names other than the
+  in-process `obfs` spawn a real child process (obfs-local,
+  v2ray-plugin, or any raw program) with the spec env table and
+  PATH resolution; the ss handshake rides the plugin tunnel.
+- **.mrs writing**: `write_mrs` produces byte-identical upstream
+  payloads (domain trie + ip-cidr layouts) inside a hand-rolled
+  pure-Rust zstd store-frame encoder (ruzstd is decode-only; the C
+  zstd crate would break musl-static). Also fixes a reader u128
+  overflow on `::/0`-spanning ranges from real .mrs files.
+- **tailscale start**: the full config surface parses (`type:
+  tailscale` with hostname/auth-key/control-url/state-dir/ephemeral/
+  exit-node...); connect fails with the precise cited blocker and the
+  module docs map the tsnet dependency chain (what is portable from
+  the engine's wireguard/tls13/http2 pieces vs tailcfg/DERP/ipn gaps).
+
 ### Engine — wave 8: ECH runtime, OpenVPN, snell/mieru UDP, sudoku tunnel modes, tlsmirror enrolment, restls/tlsmirror listeners
 
 - **ECH is live** on the TCP-TLS outbounds (vless/trojan/vmess/anytls,

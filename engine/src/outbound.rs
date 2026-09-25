@@ -89,6 +89,10 @@ pub enum OutboundKind {
         password: String,
         /// simple-obfs wrapper (mihomo `plugin: obfs`).
         obfs: Option<ObfsMode>,
+        /// SIP003 external plugin (any `plugin:` name other than the
+        /// in-process `obfs`): the ss stream rides the child process's
+        /// local listener instead of a direct TCP dial.
+        plugin: Option<crate::proto::sip003::Sip003Plugin>,
     },
     Vmess {
         server: String,
@@ -185,6 +189,9 @@ pub enum OutboundKind {
     TrustTunnel(crate::proto::trusttunnel::TrustTunnelOut),
     Masque(crate::proto::masque::MasqueOption),
     OpenVpn(crate::proto::openvpn::OpenVpnOut),
+    /// Tailscale overlay outbound (config surface + the tsnet
+    /// dependency map; connect fails with the precise blocker).
+    Tailscale(crate::proto::tailscale::TailscaleConfig),
 }
 
 /// Shared, lazily-dialed QUIC connection for the hysteria2/tuic outbounds
@@ -201,6 +208,11 @@ struct W7Clients {
     shadowquic: tokio::sync::Mutex<Option<std::sync::Arc<crate::proto::shadowquic::Client>>>,
     trusttunnel: tokio::sync::Mutex<Option<std::sync::Arc<crate::proto::trusttunnel::TrustTunnelPool>>>,
     masque: tokio::sync::Mutex<Option<std::sync::Arc<crate::proto::masque::MasqueClient>>>,
+    /// Wave-9 pools: snell conn pool (reuse-capable versions), anytls
+    /// session pool, mieru mux.
+    snell: tokio::sync::Mutex<Option<std::sync::Arc<crate::proto::snell::SnellPool>>>,
+    anytls: tokio::sync::Mutex<Option<std::sync::Arc<crate::proto::anytls::AnyTlsSessionPool>>>,
+    mieru: tokio::sync::Mutex<Option<std::sync::Arc<crate::proto::mieru::MieruMux>>>,
 }
 
 /// A runtime leaf outbound.
@@ -286,6 +298,66 @@ impl Outbound {
         );
         *slot = Some(c.clone());
         Ok(c)
+    }
+
+    /// Lazily-built snell connection pool (reuse-capable versions 2/4;
+    /// v1/v3 dial one-shot, like upstream's pool gating).
+    async fn snell_pool(
+        &self,
+        cfg: &crate::proto::snell::SnellOut,
+    ) -> Option<std::sync::Arc<crate::proto::snell::SnellPool>> {
+        if !matches!(cfg.version, 2 | 4) {
+            return None;
+        }
+        let mut slot = self.w7.snell.lock().await;
+        if let Some(p) = slot.as_ref() {
+            return Some(p.clone());
+        }
+        match crate::proto::snell::SnellPool::new(cfg.clone()) {
+            Ok(p) => {
+                let p = std::sync::Arc::new(p);
+                *slot = Some(p.clone());
+                Some(p)
+            }
+            Err(e) => {
+                tracing::debug!(target: "engine", "snell pool unavailable: {e}");
+                None
+            }
+        }
+    }
+
+    /// Lazily-built anytls session pool.
+    async fn anytls_pool(
+        &self,
+        cfg: &crate::proto::anytls::AnyTlsOut,
+    ) -> Result<std::sync::Arc<crate::proto::anytls::AnyTlsSessionPool>> {
+        let mut slot = self.w7.anytls.lock().await;
+        if let Some(p) = slot.as_ref() {
+            return Ok(p.clone());
+        }
+        let p = std::sync::Arc::new(crate::proto::anytls::AnyTlsSessionPool::new(
+            cfg.clone(),
+        )?);
+        *slot = Some(p.clone());
+        Ok(p)
+    }
+
+    /// Lazily-built mieru mux (the configured multiplexing level; Off
+    /// gives one underlay per dial, matching the standalone path).
+    async fn mieru_mux(
+        &self,
+        cfg: &crate::proto::mieru::MieruOut,
+    ) -> Result<std::sync::Arc<crate::proto::mieru::MieruMux>> {
+        let mut slot = self.w7.mieru.lock().await;
+        if let Some(m) = slot.as_ref() {
+            return Ok(m.clone());
+        }
+        let m = std::sync::Arc::new(crate::proto::mieru::MieruMux::new(
+            cfg,
+            cfg.multiplexing,
+        )?);
+        *slot = Some(m.clone());
+        Ok(m)
     }
 
     /// The connect-time ECH refusal, shared by the QUIC/h2-based
@@ -389,6 +461,7 @@ impl Outbound {
                 sni: effective_sni(tls, server, None),
                 alpn: tls.alpn.clone(),
                 skip_cert_verify: tls.skip_cert_verify,
+                fingerprint: None,
             };
             return crate::proto::jls::connect(&out, Box::new(tcp)).await;
         }
@@ -425,6 +498,7 @@ impl Outbound {
             OutboundKind::TrustTunnel(_) => "TrustTunnel",
             OutboundKind::Masque(_) => "Masque",
             OutboundKind::OpenVpn(_) => "OpenVpn",
+            OutboundKind::Tailscale(_) => "Tailscale",
         }
     }
 
@@ -636,6 +710,7 @@ async fn vless_front(
                 method,
                 password,
                 obfs,
+                plugin,
             } => {
                 let cfg = SsOut {
                     server: server.clone(),
@@ -643,8 +718,15 @@ async fn vless_front(
                     method: *method,
                     password: password.clone(),
                 };
-                let mut tcp = Self::dial_transport(server, *port, &TransportKind::Tcp, &TlsSettings::default())
-                    .await?;
+                let mut tcp = match plugin {
+                    // SIP003: the ss stream rides the plugin child's
+                    // local listener instead of a direct dial.
+                    Some(plg) => {
+                        Box::new(plg.connect(server, *port).await?) as BoxProxyStream
+                    }
+                    None => Self::dial_transport(server, *port, &TransportKind::Tcp, &TlsSettings::default())
+                        .await?,
+                };
                 // simple-obfs wraps the RAW stream, below the cipher
                 // (mihomo: obfs(conn) then StreamConn).
                 if let Some(mode) = obfs {
@@ -768,6 +850,7 @@ async fn vless_front(
                             sni: effective_sni(tls, server, None),
                             alpn: tls.alpn.clone(),
                             skip_cert_verify: tls.skip_cert_verify,
+                            fingerprint: None,
                         };
                         crate::proto::jls::connect(&out, Box::new(tcp)).await?
                     } else {
@@ -931,16 +1014,21 @@ async fn vless_front(
                 crate::proto::wireguard::connect(cfg, target).await
             }
             OutboundKind::Snell(cfg) => {
+                if let Some(pool) = self.snell_pool(cfg).await {
+                    let conn = pool.dial(target).await?;
+                    return Ok(Box::new(conn));
+                }
                 let tcp = Self::dial_transport(&cfg.server, cfg.port, &TransportKind::Tcp, &TlsSettings::default()).await?;
                 let s = crate::proto::snell::handshake(tcp, cfg, target, false).await?;
                 Ok(s)
             }
             OutboundKind::AnyTls(cfg) => {
-                let tcp = Self::dial_transport(&cfg.server, cfg.port, &TransportKind::Tcp, &TlsSettings::default()).await?;
-                crate::proto::anytls::connect(cfg, tcp, target).await
+                let pool = self.anytls_pool(cfg).await?;
+                pool.connect(target).await
             }
             OutboundKind::Mieru(cfg) => {
-                crate::proto::mieru::connect(cfg, target).await
+                let mux = self.mieru_mux(cfg).await?;
+                mux.connect(target).await
             }
             OutboundKind::Restls { server, port, cfg } => {
                 let tcp = Self::dial_transport(server, *port, &TransportKind::Tcp, &TlsSettings::default()).await?;
@@ -976,6 +1064,14 @@ async fn vless_front(
                 // Self-dialing (proto/transport per cfg) + a tunnel
                 // registry shared across targets, wireguard-style.
                 crate::proto::openvpn::connect(cfg, target).await
+            }
+            OutboundKind::Tailscale(cfg) => {
+                // Always the precise tsnet blocker today (see the module
+                // docs' implementation map).
+                crate::proto::tailscale::connect(cfg).await?;
+                Err(Error::config(
+                    "tailscale: connect returned without a tunnel (unreachable)",
+                ))
             }
         }
     }
@@ -1064,6 +1160,7 @@ async fn vless_front(
                 method,
                 password,
                 obfs,
+                ..
             } => {
                 if obfs.is_some() {
                     // simple-obfs is TCP-only upstream too.
@@ -1285,8 +1382,8 @@ async fn vless_front(
                 Ok(UdpChannel::SudokuUot(tokio::sync::Mutex::new(s)))
             }
             OutboundKind::Mieru(cfg) => {
-                let udp = crate::proto::mieru::connect_udp(cfg, initial).await?;
-                Ok(UdpChannel::Mieru(udp))
+                let mux = self.mieru_mux(cfg).await?;
+                Ok(UdpChannel::Mieru(mux.connect_udp(initial).await?))
             }
             OutboundKind::GostRelay(cfg) => {
                 let tcp = Self::dial_transport(&cfg.server, cfg.port, &TransportKind::Tcp, &TlsSettings::default()).await?;
@@ -1310,7 +1407,9 @@ async fn vless_front(
                 let udp = crate::proto::openvpn::OvpnUdp::bind(cfg).await?;
                 Ok(UdpChannel::OpenVpn(udp))
             }
-            OutboundKind::AnyTls(_) | OutboundKind::Restls { .. } => Err(
+            OutboundKind::AnyTls(_)
+            | OutboundKind::Restls { .. }
+            | OutboundKind::Tailscale(_) => Err(
                 Error::protocol(format!("{} does not support UDP", self.kind_name())),
             ),
             OutboundKind::Reject
@@ -1407,6 +1506,7 @@ fn other_kind_name(kind: &OutboundKind) -> &'static str {
         OutboundKind::TrustTunnel(_) => "TrustTunnel",
         OutboundKind::Masque(_) => "Masque",
         OutboundKind::OpenVpn(_) => "OpenVpn",
+        OutboundKind::Tailscale(_) => "Tailscale",
     }
 }
 
@@ -2141,6 +2241,7 @@ mod tests {
                 method: SsMethod::Aes256Gcm,
                 password: "p".into(),
                 obfs: None,
+                plugin: None,
             },
         })
         .unwrap();
