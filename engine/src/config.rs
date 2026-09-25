@@ -53,6 +53,9 @@ pub struct DnsConfig {
     pub nameservers: Vec<String>,
     pub fallback: Vec<String>,
     pub fakeip_range: String,
+    /// fake-ip store path (mihomo `profile.store-fake-ip` semantics; a
+    /// JSON file the pool loads at start and persists to on shutdown).
+    pub fakeip_store: Option<std::path::PathBuf>,
     /// fake-ip-filter entries: `geosite:xxx` or domain patterns.
     pub fakeip_filter: Vec<String>,
     /// Static hosts overrides (mihomo `hosts:`, sing-box `hosts`):
@@ -72,6 +75,7 @@ pub struct DnsConfig {
 impl Default for DnsConfig {
     fn default() -> Self {
         DnsConfig {
+            fakeip_store: None,
             enable: false,
             listen: None,
             enhanced_mode: EnhancedMode::FakeIp,

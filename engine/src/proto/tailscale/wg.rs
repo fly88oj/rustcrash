@@ -32,8 +32,9 @@
 //! Like `proto/wireguard.rs` (its module docs, "Netstack" bullet), the
 //! inner IP layer is a smoltcp `Interface` behind a queue-based
 //! `Device` shim — the non-gVisor stand-in for tsnet's `Netstack`.
-//! TCP dials become [`TsTcpStream`]; UDP-through-the-overlay is not
-//! wired this wave (gap list in `super`).
+//! TCP dials become [`TsTcpStream`]; UDP through the overlay becomes
+//! [`TsUdp`] (the same channel-per-socket shape as wireguard.rs's
+//! `WgUdp`, routed per destination by the overlay — see `super`).
 //!
 //! # Deltas vs upstream
 //!
@@ -53,9 +54,9 @@
 //!   REJECT_AFTER_TIME 180s, REKEY_TIMEOUT 5s, KEEPALIVE 10s — the
 //!   constants cross-checked in `proto/wireguard.rs:180-207`).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::{Context, Poll, Waker};
@@ -67,11 +68,13 @@ use rand::RngCore;
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
+use smoltcp::socket::udp;
 use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint};
+use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, Notify};
 
+use crate::addr::NetAddr;
 use crate::error::{Error, Result};
 
 use super::noise::{blake2s256, blake2s_into, hmac_blake2s};
@@ -521,6 +524,9 @@ pub struct TsTunnelConfig {
     pub endpoint: Option<SocketAddr>,
     /// The peer's home DERP relay.
     pub derp: Option<DerpRoute>,
+    /// Whether UDP may traverse this tunnel (the config's `udp:` flag;
+    /// wireguard.rs's WgOut.udp gates UdpOpen the same way).
+    pub udp_enabled: bool,
 }
 
 impl TsTunnelConfig {
@@ -538,7 +544,21 @@ enum TsCmd {
         remote: SocketAddr,
         reply: oneshot::Sender<Result<Arc<StreamShared>>>,
     },
+    UdpOpen {
+        reply: oneshot::Sender<Result<(u32, UdpDownlink)>>,
+    },
+    UdpSend {
+        id: u32,
+        dst: SocketAddr,
+        data: Vec<u8>,
+    },
+    UdpClose {
+        id: u32,
+    },
 }
+
+/// Where a [`TsUdp`]'s inbound datagrams arrive.
+type UdpDownlink = mpsc::Receiver<(NetAddr, Vec<u8>)>;
 
 /// A live overlay tunnel: one background task owning the WireGuard
 /// session, the carriers and the smoltcp netstack.
@@ -596,6 +616,101 @@ impl TsTunnel {
             .map_err(|_| Error::network("tailscale: tcp dial timed out"))?
             .map_err(|_| Error::network("tailscale: tunnel task dropped the dial"))??;
         Ok(TsTcpStream { shared })
+    }
+
+    /// Open a UDP socket inside the tunnel (fails when the tunnel was
+    /// configured with `udp_enabled: false`). `local_ipv6` is the
+    /// tunnel's inner v6 address, carried for target validation.
+    pub async fn udp_socket(&self, local_ipv6: Option<Ipv6Addr>) -> Result<TsUdp> {
+        let (id, down) = self.udp_open().await?;
+        Ok(TsUdp {
+            tunnel: self.clone(),
+            id,
+            local_ipv6,
+            down: Arc::new(tokio::sync::Mutex::new(down)),
+        })
+    }
+
+    async fn udp_open(&self) -> Result<(u32, UdpDownlink)> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd
+            .send(TsCmd::UdpOpen { reply: reply_tx })
+            .await
+            .map_err(|_| Error::network("tailscale: tunnel task is gone"))?;
+        tokio::time::timeout(TCP_CONNECT_TIMEOUT, reply_rx)
+            .await
+            .map_err(|_| Error::network("tailscale: udp open timed out"))?
+            .map_err(|_| Error::network("tailscale: tunnel task dropped the open"))?
+    }
+}
+
+/// A UDP socket inside one peer tunnel — the WgUdp shape (wireguard.rs:
+/// 2053-2110): send to any destination the tunnel's peer routes, receive
+/// every reply that comes back to this socket's port. `Clone` shares the
+/// socket (both halves send; the one receiver is shared, first reader
+/// wins) — the overlay keeps one clone for sends and one in its reply
+/// forwarder. The overlay-level handle that routes per destination
+/// across peers is [`super::TailscaleOverlay::udp_socket`]; this one is
+/// bound to a single peer's cryptokey.
+#[derive(Clone)]
+pub struct TsUdp {
+    tunnel: TsTunnel,
+    id: u32,
+    /// The tunnel's inner v6 address, for target validation on send.
+    local_ipv6: Option<Ipv6Addr>,
+    down: Arc<tokio::sync::Mutex<UdpDownlink>>,
+}
+
+impl TsUdp {
+    /// Send one datagram to `target` (a resolved IP; IPv6 needs the
+    /// tunnel's inner v6 address).
+    pub async fn send(&self, target: &NetAddr, data: &[u8]) -> Result<()> {
+        let dst = udp_target_addr(target, "send", self.local_ipv6)?;
+        self.tunnel
+            .cmd
+            .send(TsCmd::UdpSend {
+                id: self.id,
+                dst,
+                data: data.to_vec(),
+            })
+            .await
+            .map_err(|_| Error::network("tailscale: tunnel task is gone"))
+    }
+
+    /// Receive the next datagram addressed to this socket.
+    pub async fn recv(&self) -> Result<(NetAddr, Vec<u8>)> {
+        let mut down = self.down.lock().await;
+        down.recv()
+            .await
+            .ok_or_else(|| Error::network("tailscale: udp socket is closed"))
+    }
+}
+
+impl Drop for TsUdp {
+    fn drop(&mut self) {
+        let _ = self.tunnel.cmd.try_send(TsCmd::UdpClose { id: self.id });
+    }
+}
+
+/// Resolve a [`NetAddr`] target to a socket address, refusing v6 targets
+/// when no inner v6 address exists (wireguard.rs's target_addr,
+/// 4638-4652).
+fn udp_target_addr(
+    target: &NetAddr,
+    what: &str,
+    local_ipv6: Option<Ipv6Addr>,
+) -> Result<SocketAddr> {
+    match &target.host {
+        crate::addr::Host::Ip(IpAddr::V4(ip)) => Ok(SocketAddr::V4(SocketAddrV4::new(*ip, target.port))),
+        crate::addr::Host::Ip(IpAddr::V6(ip)) => match local_ipv6 {
+            Some(_) => Ok(SocketAddr::V6(SocketAddrV6::new(*ip, target.port, 0, 0))),
+            None => Err(Error::network(format!(
+                "tailscale: {what} to {ip}: the tunnel has no inner IPv6 address"
+            ))),
+        },
+        crate::addr::Host::Domain(d) => Err(Error::network(format!(
+            "tailscale: {what} to domain {d}: resolve before sending (the netstack routes IPs only)"
+        ))),
     }
 }
 
@@ -683,6 +798,11 @@ const STREAM_QUEUE_MAX: usize = 128 * 1024;
 const TCP_RX_BYTES: usize = 64 * 1024;
 const TCP_TX_BYTES: usize = 64 * 1024;
 const MAX_CONNS: usize = 128;
+/// The UDP socket budget, wireguard.rs parity (1130-1137).
+const UDP_PACKETS: usize = 64;
+const UDP_RX_BYTES: usize = 32 * 1024;
+const UDP_TX_BYTES: usize = 32 * 1024;
+const MAX_UDP_SOCKETS: usize = 64;
 const MIN_TICK: Duration = Duration::from_millis(1);
 const MAX_TICK: Duration = Duration::from_secs(1);
 
@@ -812,6 +932,13 @@ struct Conn {
     pending: Option<(oneshot::Sender<Result<Arc<StreamShared>>>, Instant)>,
 }
 
+/// One open UDP socket inside the stack (wireguard.rs:1249-1256 UdpSock).
+struct UdpSock {
+    handle: SocketHandle,
+    port: u16,
+    down: mpsc::Sender<(NetAddr, Vec<u8>)>,
+}
+
 struct Tunnel {
     iface: Interface,
     sockets: SocketSet<'static>,
@@ -822,6 +949,10 @@ struct Tunnel {
     local_ipv6: Option<Ipv6Addr>,
     udp: Option<(Arc<UdpSocket>, SocketAddr)>,
     derp: Option<DerpCarrier>,
+    udp_enabled: bool,
+    udp_socks: HashMap<u32, UdpSock>,
+    used_ports: HashSet<u16>,
+    next_udp_id: u32,
     pending_hs: Option<PendingHandshake>,
     hs_retry_at: Option<Instant>,
     session: Option<Session>,
@@ -874,6 +1005,10 @@ impl Tunnel {
             local_ipv6: cfg.local_ipv6,
             udp,
             derp,
+            udp_enabled: cfg.udp_enabled,
+            udp_socks: HashMap::new(),
+            used_ports: HashSet::new(),
+            next_udp_id: 0,
             pending_hs: None,
             hs_retry_at: None,
             session: None,
@@ -887,15 +1022,39 @@ impl Tunnel {
         })
     }
 
+    /// An ephemeral inner port, unique within this stack (wireguard.rs:
+    /// 1374-1381).
+    fn ephemeral_port(&mut self) -> u16 {
+        loop {
+            let port = 32768 + rand::random::<u16>() % 28_000;
+            if self.used_ports.insert(port) {
+                return port;
+            }
+        }
+    }
+
+    /// Source-address selection by destination family (wireguard.rs:
+    /// 1394-1403 local_address_for).
+    fn local_address_for(&self, dst: &SocketAddr) -> IpAddress {
+        match dst {
+            SocketAddr::V4(_) => IpAddress::Ipv4(self.local_ipv4),
+            SocketAddr::V6(_) => {
+                IpAddress::Ipv6(self.local_ipv6.unwrap_or(Ipv6Addr::UNSPECIFIED))
+            }
+        }
+    }
+
     fn now(&self) -> SmolInstant {
         SmolInstant::from_micros(self.start.elapsed().as_micros() as i64)
     }
 
-    /// One pass: poll the stack, pump TCP conns, drain egress.
+    /// One pass: poll the stack, pump TCP conns, pump UDP sockets,
+    /// drain egress.
     fn step(&mut self) -> Vec<Vec<u8>> {
         let now = self.now();
         self.iface.poll(now, &mut self.shim, &mut self.sockets);
         self.pump_conns();
+        self.drain_udp_rx();
         self.shim.egress.drain(..).collect()
     }
 
@@ -968,6 +1127,30 @@ impl Tunnel {
             self.conns.retain(|c| !dead.contains(&c.handle));
             for h in dead {
                 self.sockets.remove(h);
+            }
+        }
+    }
+
+    /// Deliver inbound datagrams from the smoltcp UDP sockets to their
+    /// channels (wireguard.rs:1788-1815 drain_udp_rx).
+    fn drain_udp_rx(&mut self) {
+        let ids: Vec<u32> = self.udp_socks.keys().copied().collect();
+        for id in ids {
+            let (handle, down) = match self.udp_socks.get(&id) {
+                Some(u) => (u.handle, &u.down),
+                None => continue,
+            };
+            let sock = self.sockets.get_mut::<udp::Socket>(handle);
+            while sock.can_recv() {
+                let (n, meta) = match sock.recv_slice(&mut self.pump) {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let from = match meta.endpoint.addr {
+                    IpAddress::Ipv4(src) => NetAddr::ip(IpAddr::V4(src), meta.endpoint.port),
+                    IpAddress::Ipv6(src) => NetAddr::ip(IpAddr::V6(src), meta.endpoint.port),
+                };
+                let _ = down.try_send((from, self.pump[..n].to_vec()));
             }
         }
     }
@@ -1183,6 +1366,70 @@ impl Tunnel {
                 // The SYN rides the next step; wake the loop.
                 self.wake.notify_one();
             }
+            TsCmd::UdpOpen { reply } => {
+                // The udp flag gate (wireguard.rs:1607-1609).
+                if !self.udp_enabled {
+                    let _ = reply.send(Err(Error::network(
+                        "tailscale: udp is disabled for this peer (the config's udp: flag)",
+                    )));
+                    return;
+                }
+                if self.udp_socks.len() >= MAX_UDP_SOCKETS {
+                    let _ = reply.send(Err(Error::network("tailscale: udp socket limit reached")));
+                    return;
+                }
+                let mut sock = udp::Socket::new(
+                    udp::PacketBuffer::new(
+                        vec![udp::PacketMetadata::EMPTY; UDP_PACKETS],
+                        vec![0; UDP_RX_BYTES],
+                    ),
+                    udp::PacketBuffer::new(
+                        vec![udp::PacketMetadata::EMPTY; UDP_PACKETS],
+                        vec![0; UDP_TX_BYTES],
+                    ),
+                );
+                let port = self.ephemeral_port();
+                // Bound on both families like wireguard.rs:1622-1625 (addr
+                // None), so replies of either family reach the socket.
+                if let Err(e) = sock.bind(IpListenEndpoint { addr: None, port }) {
+                    self.used_ports.remove(&port);
+                    let _ = reply.send(Err(Error::network(format!(
+                        "tailscale: udp bind: {e:?}"
+                    ))));
+                    return;
+                }
+                let handle = self.sockets.add(sock);
+                let id = self.next_udp_id;
+                self.next_udp_id += 1;
+                let (tx, rx) = mpsc::channel::<(NetAddr, Vec<u8>)>(64);
+                self.udp_socks.insert(id, UdpSock { handle, port, down: tx });
+                let _ = reply.send(Ok((id, rx)));
+                self.wake.notify_one();
+            }
+            TsCmd::UdpSend { id, dst, data } => {
+                let Some(handle) = self.udp_socks.get(&id).map(|u| u.handle) else {
+                    return;
+                };
+                let mut meta = udp::UdpMetadata::from(IpEndpoint::new(
+                    match dst {
+                        SocketAddr::V4(v4) => IpAddress::Ipv4(*v4.ip()),
+                        SocketAddr::V6(v6) => IpAddress::Ipv6(*v6.ip()),
+                    },
+                    dst.port(),
+                ));
+                meta.local_address = Some(self.local_address_for(&dst));
+                let sock = self.sockets.get_mut::<udp::Socket>(handle);
+                if let Err(e) = sock.send_slice(&data, meta) {
+                    tracing::debug!(target: "engine", "tailscale: udp send to {dst}: {e:?}");
+                }
+                self.wake.notify_one();
+            }
+            TsCmd::UdpClose { id } => {
+                if let Some(u) = self.udp_socks.remove(&id) {
+                    self.used_ports.remove(&u.port);
+                    self.sockets.remove(u.handle);
+                }
+            }
         }
     }
 
@@ -1317,6 +1564,29 @@ mod tests {
         let mut got6 = padded6;
         trim_ip_packet(&mut got6);
         assert_eq!(got6, v6);
+    }
+
+    #[test]
+    fn udp_target_validation_refuses_domains_and_bare_v6() {
+        // wireguard.rs's target_addr semantics: domains need resolving
+        // first; v6 targets need an inner v6 address.
+        let v4 = udp_target_addr(
+            &NetAddr::ip(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 53),
+            "send",
+            None,
+        )
+        .unwrap();
+        assert_eq!(v4.port(), 53);
+        let dom = udp_target_addr(&NetAddr::domain("peer.tail-scale.ts.net", 53).unwrap(), "send", None)
+            .unwrap_err();
+        assert!(dom.to_string().contains("resolve before sending"), "{dom}");
+        let v6 = udp_target_addr(
+            &NetAddr::ip("fd7a:115c:a1e0::1".parse::<std::net::IpAddr>().unwrap(), 53),
+            "send",
+            None,
+        )
+        .unwrap_err();
+        assert!(v6.to_string().contains("no inner IPv6 address"), "{v6}");
     }
 
     // The full data-plane proofs (direct UDP + DERP relay against the

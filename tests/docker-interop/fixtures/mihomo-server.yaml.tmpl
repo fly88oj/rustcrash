@@ -1,0 +1,172 @@
+# The REAL mihomo server (fetched release binary) for the interop suite.
+# One listener per protocol of the matrix, everything outbound direct.
+# Rendered by run.sh from __PLACEHOLDER__ tokens (ports live in ONE place).
+#
+# Ground truth from probing the real binary (v1.19.31):
+#   * hysteria2 / tuic / anytls listeners take `users` as a MAP
+#     (user -> password), unlike trojan/vmess/vless which take a LIST;
+#   * there is NO standalone `jls:` or `restls:` listener type
+#     ("unsupport proxy type"); jls and restls exist as FRONTING on the
+#     snell / anytls / trojan / vless listeners (jls-config / res-tls),
+#     so that is how this suite exercises those two wires;
+#   * the frontings and `certificate` are mutually exclusive security
+#     modes on anytls (listener/anytls/server.go), so the jls-fronted
+#     anytls listener carries no certificate.
+mode: direct
+log-level: debug
+external-controller: 127.0.0.1:39190
+
+listeners:
+  - name: ss-in
+    type: shadowsocks
+    listen: 127.0.0.1
+    port: __PORT_SS__
+    cipher: aes-256-gcm
+    password: interop-ss-psk-123456
+    udp: true
+
+  - name: ss2022-in
+    type: shadowsocks
+    listen: 127.0.0.1
+    port: __PORT_SS2022__
+    cipher: 2022-blake3-aes-256-gcm
+    password: c3MyMDIyLWludGVyb3AtdGVzdC0zMmJ5dGUta2V5ISE=
+    udp: true
+
+  - name: vmess-in
+    type: vmess
+    listen: 127.0.0.1
+    port: __PORT_VMESS__
+    users:
+      - uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+        alterId: 0
+
+  - name: vmess-ws-in
+    type: vmess
+    listen: 127.0.0.1
+    port: __PORT_VMESS_WS__
+    users:
+      - uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+        alterId: 0
+    ws-path: /ws
+
+  - name: vless-in
+    type: vless
+    listen: 127.0.0.1
+    port: __PORT_VLESS__
+    users:
+      - uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    certificate: /tmp/interop/certs/server.crt
+    private-key: /tmp/interop/certs/server.key
+
+  - name: vless-reality-in
+    type: vless
+    listen: 127.0.0.1
+    port: __PORT_VLESS_REALITY__
+    users:
+      - uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    reality-config:
+      dest: 127.0.0.1:__PORT_CAMO__
+      private-key: __REALITY_PRIVATE_KEY__
+      short-id:
+        - "0123456789abcdef"
+      server-names:
+        - tls.test
+
+  - name: trojan-in
+    type: trojan
+    listen: 127.0.0.1
+    port: __PORT_TROJAN__
+    udp: true
+    users:
+      - username: trojan-user
+        password: interop-trojan-pw-123456
+    certificate: /tmp/interop/certs/server.crt
+    private-key: /tmp/interop/certs/server.key
+
+  - name: hy2-in
+    type: hysteria2
+    listen: 127.0.0.1
+    port: __PORT_HY2__
+    users:
+      hy2-user: interop-hy2-pw-123456
+    certificate: /tmp/interop/certs/server.crt
+    private-key: /tmp/interop/certs/server.key
+
+  - name: tuic-in
+    type: tuic
+    listen: 127.0.0.1
+    port: __PORT_TUIC__
+    users:
+      b831381d-6324-4d53-ad4f-8cda48b30811: interop-tuic-pw-123456
+    certificate: /tmp/interop/certs/server.crt
+    private-key: /tmp/interop/certs/server.key
+    # mihomo's tuic listener DEFAULTS its TLS ALPN to h3 (listener/tuic/
+    # server.go: `tlsConfig.NextProtos = []string{"h3"}` when unset); the
+    # TUIC v5 spec (and the engine's client) use "tuic", so pin it or the
+    # handshake dies with TLS alert 120 (no_application_protocol).
+    alpn:
+      - tuic
+    congestion-controller: bbr
+    max-idle-time: 15000
+
+  - name: anytls-in
+    type: anytls
+    listen: 127.0.0.1
+    port: __PORT_ANYTLS__
+    users:
+      anytls-user: interop-anytls-pw-123456
+    certificate: /tmp/interop/certs/server.crt
+    private-key: /tmp/interop/certs/server.key
+
+  - name: snell-in
+    type: snell
+    listen: 127.0.0.1
+    port: __PORT_SNELL__
+    psk: interop-snell-psk-123456
+    version: 4
+
+  - name: snell-restls-in
+    type: snell
+    listen: 127.0.0.1
+    port: __PORT_SNELL_RESTLS__
+    psk: interop-snell-psk-123456
+    version: 4
+    res-tls:
+      enable: true
+      # restls `dest` is DIALABLE host:port: the server relays a rejected
+      # client's handshake there (metacubex/restls-client-go dials dest,
+      # default port 443 for bare hostnames — a bare "tls.test" would be
+      # DNS-resolved and fail here). Point it at the in-container camo.
+      dest: 127.0.0.1:__PORT_CAMO__
+      password: interop-restls-pw-123456
+
+  - name: snell-jls-in
+    type: snell
+    listen: 127.0.0.1
+    port: __PORT_SNELL_JLS__
+    psk: interop-snell-psk-123456
+    version: 4
+    jls-config:
+      enable: true
+      sni: tls.test
+      # jls `dest` IS a host:port: the fallback site a rejected client is
+      # relayed to (the in-container TLS camo site).
+      dest: 127.0.0.1:__PORT_CAMO__
+      users:
+        - username: interop-jls-user
+          password: interop-jls-pw-123456
+
+  - name: anytls-jls-in
+    type: anytls
+    listen: 127.0.0.1
+    port: __PORT_ANYTLS_JLS__
+    users:
+      anytls-user: interop-anytls-pw-123456
+    jls-config:
+      enable: true
+      sni: tls.test
+      dest: 127.0.0.1:__PORT_CAMO__
+      users:
+        - username: interop-jls-user
+          password: interop-jls-pw-123456

@@ -1071,6 +1071,12 @@ impl AsyncRead for WgStream {
                 buf.put_slice(&back[..n - take_front]);
             }
             g.to_proxy.drain(..n);
+            drop(g);
+            // Freed queue space is stack input: the socket behind it may hold
+            // data the service loop could not move (and a peer waiting on the
+            // window this drain just re-opened). Wake the stack task instead
+            // of letting the connection idle until the driver's 1s tick.
+            self.shared.wake.notify_one();
             return Poll::Ready(Ok(()));
         }
         if g.read_eof {
@@ -1756,6 +1762,12 @@ impl Stack {
             let gone = sock.state() == tcp::State::Closed;
             if gone {
                 g.read_eof = true;
+                // Closed without our own graceful FIN = the peer reset (or we
+                // aborted): writers must fail now instead of queuing into a
+                // dead socket forever (wave-12: mid-burst RST hung write_all).
+                if !c.fin_sent && !g.write_closed {
+                    g.aborted = true;
+                }
             }
 
             if (!g.to_proxy.is_empty() || g.read_eof) && g.read_waker.is_some() {
@@ -3149,8 +3161,16 @@ impl EpStack {
         }
     }
 
+    /// A port needs a fresh listener exactly when no LISTEN-state socket
+    /// covers it anymore: the moment a SYN takes the existing listener into
+    /// SynReceived, that socket only matches its own 4-tuple, so any further
+    /// concurrent SYN to the same port would otherwise fall through to
+    /// smoltcp's RST reply (wave-12: concurrent dials failing with
+    /// "dial failed (state Closed)").
     fn needs_listener(&self, port: u16) -> bool {
-        !self.listeners.iter().any(|(_, p)| *p == port)
+        !self.listeners.iter().any(|(h, p)| {
+            *p == port && self.sockets.get::<tcp::Socket>(*h).state() == tcp::State::Listen
+        })
     }
 
     fn add_listener(&mut self, port: u16) {
@@ -3383,6 +3403,12 @@ impl EpStack {
             let gone = sock.state() == tcp::State::Closed;
             if gone {
                 g.read_eof = true;
+                // Closed without our own graceful FIN = the peer reset (or we
+                // aborted): writers must fail now instead of queuing into a
+                // dead socket forever (wave-12: mid-burst RST hung write_all).
+                if !c.fin_sent && !g.write_closed {
+                    g.aborted = true;
+                }
             }
 
             if (!g.to_proxy.is_empty() || g.read_eof) && g.read_waker.is_some() {
@@ -4265,12 +4291,21 @@ mod tests {
             self.iface.poll(now, &mut self.shim, &mut self.sockets);
 
             // Promote accepted connections (a smoltcp listener socket becomes
-            // the connection) and re-arm a fresh listener each time.
-            if self.sockets.get::<tcp::Socket>(self.listener).state()
-                == tcp::State::Established
-            {
-                self.conns.push(self.listener);
-                self.listener = Self::add_listener(&mut self.sockets);
+            // the connection) and re-arm a fresh listener each time. Re-arm
+            // as soon as the listener leaves Listen (not only once
+            // Established): a second SYN racing the first handshake must find
+            // a listening socket, or smoltcp answers it with an RST — the
+            // same race fixed in the endpoint's needs_listener.
+            match self.sockets.get::<tcp::Socket>(self.listener).state() {
+                tcp::State::Listen => {}
+                tcp::State::Closed => {
+                    self.sockets.remove(self.listener);
+                    self.listener = Self::add_listener(&mut self.sockets);
+                }
+                _ => {
+                    self.conns.push(self.listener);
+                    self.listener = Self::add_listener(&mut self.sockets);
+                }
             }
 
             // TCP echo: whatever arrived on any connection goes straight back.
@@ -4425,6 +4460,169 @@ mod tests {
         assert_eq!(more, b"second chunk");
 
         stream.shutdown().await.unwrap();
+    }
+
+    /// REPRO (wave-12): a multi-segment write burst, then the full echo read
+    /// back. 64 KiB spans ~48 segments at MSS 1368 — the burst that stalled
+    /// scheduling-dependently in the wave-11 e2e environment. The timeout is
+    /// the stall detector: on failure it names the phase.
+    #[tokio::test]
+    async fn tcp_echo_multisegment_burst_write_all_then_read() {
+        let server = spawn_wg_echo_server(None).await;
+        let client_keys = x25519_keypair();
+        let cfg = server.cfg_for(&client_keys);
+        let target = NetAddr::ip(IpAddr::V4(SERVER_TUNNEL_IP), ECHO_TCP_PORT);
+
+        let mut stream = connect(&cfg, &target).await.expect("dial through the tunnel");
+        let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        tokio::time::timeout(Duration::from_secs(30), stream.write_all(&payload))
+            .await
+            .expect("write-all of a 64 KiB burst must not stall")
+            .unwrap();
+        let mut echoed = vec![0u8; payload.len()];
+        tokio::time::timeout(Duration::from_secs(30), stream.read_exact(&mut echoed))
+            .await
+            .expect("read-back of a 64 KiB burst must not stall")
+            .unwrap();
+        assert_eq!(echoed, payload);
+        stream.shutdown().await.unwrap();
+    }
+
+    /// REPRO (wave-12): 8 KiB chunks (6 segments each) with the echo read
+    /// interleaved after every write — the request/response relay shape.
+    #[tokio::test]
+    async fn tcp_echo_multisegment_burst_interleaved_chunks() {
+        let server = spawn_wg_echo_server(None).await;
+        let client_keys = x25519_keypair();
+        let cfg = server.cfg_for(&client_keys);
+        let target = NetAddr::ip(IpAddr::V4(SERVER_TUNNEL_IP), ECHO_TCP_PORT);
+
+        let mut stream = connect(&cfg, &target).await.expect("dial through the tunnel");
+        for round in 0..8u32 {
+            let chunk: Vec<u8> = (0..8 * 1024).map(|i| (i as u32 + round) as u8).collect();
+            tokio::time::timeout(Duration::from_secs(30), stream.write_all(&chunk))
+                .await
+                .expect("interleaved 8 KiB write must not stall")
+                .unwrap();
+            let mut echoed = vec![0u8; chunk.len()];
+            tokio::time::timeout(Duration::from_secs(30), stream.read_exact(&mut echoed))
+                .await
+                .expect("interleaved 8 KiB read must not stall")
+                .unwrap();
+            assert_eq!(echoed, chunk);
+        }
+        stream.shutdown().await.unwrap();
+    }
+
+    /// REPRO (wave-12): a burst far beyond the bridge queue (128 KiB) and the
+    /// socket buffers — write_all must block on the write waker and be
+    /// released by ACK-driven draining; the read side chases it.
+    #[tokio::test]
+    async fn tcp_echo_burst_far_beyond_queue_blocks_and_drains() {
+        let server = spawn_wg_echo_server(None).await;
+        let client_keys = x25519_keypair();
+        let cfg = server.cfg_for(&client_keys);
+        let target = NetAddr::ip(IpAddr::V4(SERVER_TUNNEL_IP), ECHO_TCP_PORT);
+
+        let stream = connect(&cfg, &target).await.expect("dial through the tunnel");
+        const TOTAL: usize = 512 * 1024;
+        let payload: Vec<u8> = (0..TOTAL).map(|i| (i % 253) as u8).collect();
+        let mut echoed = vec![0u8; TOTAL];
+
+        // Full duplex: write everything while reading everything, as the
+        // engine relay does (two tasks, one stream).
+        let (mut r, mut w) = tokio::io::split(stream);
+        let tx_payload = payload.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(30), w.write_all(&tx_payload))
+                .await
+                .expect("512 KiB write_all must not stall behind the queue")
+                .unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(30), r.read_exact(&mut echoed))
+            .await
+            .expect("512 KiB read-back must not stall")
+            .unwrap();
+        writer.await.unwrap();
+        assert_eq!(echoed, payload);
+    }
+
+    /// REPRO (wave-12): a deliberately slow reader — 1 KiB reads with yields
+    /// — forces the receive window to close and reopen (zero-window probing)
+    /// while the write side keeps producing.
+    #[tokio::test]
+    async fn tcp_echo_slow_reader_closes_and_reopens_window() {
+        let server = spawn_wg_echo_server(None).await;
+        let client_keys = x25519_keypair();
+        let cfg = server.cfg_for(&client_keys);
+        let target = NetAddr::ip(IpAddr::V4(SERVER_TUNNEL_IP), ECHO_TCP_PORT);
+
+        let stream = connect(&cfg, &target).await.expect("dial through the tunnel");
+        const TOTAL: usize = 256 * 1024;
+        let payload: Vec<u8> = (0..TOTAL).map(|i| (i % 249) as u8).collect();
+
+        let (mut r, mut w) = tokio::io::split(stream);
+        let tx_payload = payload.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(60), w.write_all(&tx_payload))
+                .await
+                .expect("write side must survive a zero-window peer")
+                .unwrap();
+        });
+        let mut echoed = Vec::with_capacity(TOTAL);
+        let mut chunk = vec![0u8; 1024];
+        while echoed.len() < TOTAL {
+            let n = tokio::time::timeout(Duration::from_secs(60), r.read(&mut chunk))
+                .await
+                .expect("slow reader must not stall behind a closed window")
+                .unwrap();
+            assert!(n > 0, "premature EOF at {}", echoed.len());
+            echoed.extend_from_slice(&chunk[..n]);
+            tokio::task::yield_now().await;
+        }
+        writer.await.unwrap();
+        assert_eq!(echoed, payload);
+    }
+
+    /// REPRO (wave-12): several concurrent multi-segment streams sharing one
+    /// tunnel — the conns vector is serviced in one pass; each stream must
+    /// still make progress under the others' bursts.
+    #[tokio::test]
+    async fn tcp_echo_concurrent_streams_multisegment() {
+        let server = spawn_wg_echo_server(None).await;
+        let client_keys = x25519_keypair();
+        let cfg = server.cfg_for(&client_keys);
+
+        const STREAMS: usize = 4;
+        const TOTAL: usize = 64 * 1024;
+        let mut handles = Vec::new();
+        for s in 0..STREAMS {
+            let cfg = cfg.clone();
+            handles.push(tokio::spawn(async move {
+                let target = NetAddr::ip(IpAddr::V4(SERVER_TUNNEL_IP), ECHO_TCP_PORT);
+                let mut stream =
+                    connect(&cfg, &target).await.expect("concurrent dial");
+                for round in 0..8u32 {
+                    let chunk: Vec<u8> = (0..TOTAL / 8)
+                        .map(|i| (i as u32 + round + s as u32) as u8)
+                        .collect();
+                    tokio::time::timeout(Duration::from_secs(30), stream.write_all(&chunk))
+                        .await
+                        .expect("concurrent stream write must not stall")
+                        .unwrap();
+                    let mut echoed = vec![0u8; chunk.len()];
+                    tokio::time::timeout(Duration::from_secs(30), stream.read_exact(&mut echoed))
+                        .await
+                        .expect("concurrent stream read must not stall")
+                        .unwrap();
+                    assert_eq!(echoed, chunk);
+                }
+                stream.shutdown().await.unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -4870,6 +5068,204 @@ mod tests {
         assert_eq!(more, b"again");
         stream.shutdown().await.unwrap();
         task.abort();
+    }
+
+    /// REPRO (wave-12): the e2e pairing — engine client tunnel against the
+    /// production endpoint, whose relayed connection echoes from a separate
+    /// task (like the engine relay) — under a multi-segment burst. This is
+    /// the exact shape that stalled scheduling-dependently in wave-11's e2e.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn endpoint_relays_engine_client_tcp_multisegment_burst() {
+        let server_statics = x25519_keypair();
+        let client_keys = x25519_keypair();
+        let mut psk = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut psk);
+        let cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
+        let (addr, task) = spawn_test_endpoint(&cfg).await;
+
+        let out = endpoint_client_cfg(v4_ep(addr), &client_keys, &server_statics.pk, &psk, false);
+        let target = NetAddr::ip(IpAddr::V4(SERVER_TUNNEL_IP), EP_TCP_PORT);
+        let mut stream = connect(&out, &target)
+            .await
+            .expect("engine client connects through the endpoint");
+
+        // 64 KiB write-all, then the full echo — multi-segment both ways.
+        let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        tokio::time::timeout(Duration::from_secs(30), stream.write_all(&payload))
+            .await
+            .expect("64 KiB write through client+endpoint must not stall")
+            .unwrap();
+        let mut echoed = vec![0u8; payload.len()];
+        tokio::time::timeout(Duration::from_secs(30), stream.read_exact(&mut echoed))
+            .await
+            .expect("64 KiB echo through client+endpoint must not stall")
+            .unwrap();
+        assert_eq!(echoed, payload);
+
+        // And the request/response shape: 8 KiB rounds.
+        for round in 0..8u32 {
+            let chunk: Vec<u8> = (0..8 * 1024).map(|i| (i as u32 + round) as u8).collect();
+            tokio::time::timeout(Duration::from_secs(30), stream.write_all(&chunk))
+                .await
+                .expect("8 KiB round write must not stall")
+                .unwrap();
+            let mut back = vec![0u8; chunk.len()];
+            tokio::time::timeout(Duration::from_secs(30), stream.read_exact(&mut back))
+                .await
+                .expect("8 KiB round echo must not stall")
+                .unwrap();
+            assert_eq!(back, chunk);
+        }
+        stream.shutdown().await.unwrap();
+        task.abort();
+    }
+
+    /// REPRO (wave-12): concurrent dials to one port through the production
+    /// endpoint — the engine's real shape (a browser opening several
+    /// connections to the same target). The second SYN used to hit the one
+    /// listener mid-handshake and drew an RST ("dial failed (state Closed)").
+    #[tokio::test]
+    async fn endpoint_accepts_concurrent_dials_to_one_port() {
+        let server_statics = x25519_keypair();
+        let client_keys = x25519_keypair();
+        let mut psk = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut psk);
+        let cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
+        let (addr, task) = spawn_test_endpoint(&cfg).await;
+
+        let out = endpoint_client_cfg(v4_ep(addr), &client_keys, &server_statics.pk, &psk, false);
+        let target = NetAddr::ip(IpAddr::V4(SERVER_TUNNEL_IP), EP_TCP_PORT);
+        let mut streams = Vec::new();
+        for _ in 0..4 {
+            streams.push(
+                tokio::time::timeout(Duration::from_secs(30), connect(&out, &target))
+                    .await
+                    .expect("concurrent dial must not be RST by a mid-handshake listener")
+                    .expect("dial through the endpoint"),
+            );
+        }
+        // Every stream echoes multi-segment bursts, interleaved.
+        for round in 0..4u32 {
+            for (i, stream) in streams.iter_mut().enumerate() {
+                let chunk: Vec<u8> =
+                    (0..8 * 1024).map(|k| (k as u32 + round + i as u32) as u8).collect();
+                stream.write_all(&chunk).await.unwrap();
+                let mut back = vec![0u8; chunk.len()];
+                stream.read_exact(&mut back).await.unwrap();
+                assert_eq!(back, chunk);
+            }
+        }
+        for mut s in streams {
+            s.shutdown().await.unwrap();
+        }
+        task.abort();
+    }
+
+    /// REPRO (wave-12): a relay that drops the stream after the first read —
+    /// the endpoint aborts the socket (RST) while the client writer is still
+    /// pushing a burst far bigger than every buffer. The writer must fail
+    /// with BrokenPipe promptly, not hang on a queue nobody drains.
+    #[tokio::test]
+    async fn reset_mid_burst_fails_the_writer_not_hangs() {
+        struct DropAfterFirstRead;
+        impl RelayHandler for DropAfterFirstRead {
+            fn handle_tcp(self: Arc<Self>, _meta: TcpMeta, mut client: BoxProxyStream) {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16];
+                    let _ = client.read(&mut buf).await;
+                    // Drop: the endpoint aborts the connection (RST).
+                });
+            }
+            fn handle_udp(
+                self: Arc<Self>,
+                _source: SocketAddr,
+                _inbound: String,
+                _uplink: mpsc::Receiver<(NetAddr, Vec<u8>)>,
+                _downlink: mpsc::Sender<(NetAddr, Vec<u8>)>,
+            ) {
+            }
+        }
+
+        let server_statics = x25519_keypair();
+        let client_keys = x25519_keypair();
+        let mut psk = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut psk);
+        let cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
+        let relay = Arc::new(DropAfterFirstRead);
+        let (addr, task) = spawn_endpoint(&cfg, relay).await.expect("endpoint starts");
+
+        let out = endpoint_client_cfg(v4_ep(addr), &client_keys, &server_statics.pk, &psk, false);
+        let target = NetAddr::ip(IpAddr::V4(SERVER_TUNNEL_IP), EP_TCP_PORT);
+        let mut stream = connect(&out, &target)
+            .await
+            .expect("dial through the endpoint");
+        let payload = vec![7u8; 512 * 1024];
+        let outcome = tokio::time::timeout(Duration::from_secs(15), stream.write_all(&payload)).await;
+        match outcome {
+            Err(_elapsed) => panic!("writer hung on a reset connection (stall)"),
+            // The write may complete into local queues before the RST lands;
+            // then the failure must surface on the next write or the read.
+            Ok(Ok(())) => {
+                let mut more = vec![0u8; 16];
+                let read = tokio::time::timeout(Duration::from_secs(15), stream.read(&mut more))
+                    .await
+                    .expect("read side must terminate after a reset");
+                assert!(
+                    matches!(read, Ok(0) | Err(_)),
+                    "connection was reset: read must error or EOF, not data"
+                );
+            }
+            Ok(Err(e)) => {
+                assert!(
+                    matches!(e.kind(), std::io::ErrorKind::BrokenPipe),
+                    "writer must see BrokenPipe on reset, got {e:?}"
+                );
+            }
+        }
+        task.abort();
+    }
+
+    /// GUARD (wave-12): the zero-window stall-recovery shape. The reader
+    /// drains in 16 KiB chunks with pauses, so the peer repeatedly hits our
+    /// closed window; every drain must promptly re-open it — poll_read pings
+    /// the stack task the moment queue space frees, instead of idling until
+    /// the driver's 1s tick or the peer's next probe. Bound is generous
+    /// (healthy: ~2s).
+    #[tokio::test]
+    async fn zero_window_reopens_promptly_after_drain() {
+        let server = spawn_wg_echo_server(None).await;
+        let client_keys = x25519_keypair();
+        let cfg = server.cfg_for(&client_keys);
+        let target = NetAddr::ip(IpAddr::V4(SERVER_TUNNEL_IP), ECHO_TCP_PORT);
+
+        let stream = connect(&cfg, &target).await.expect("dial through the tunnel");
+        const TOTAL: usize = 256 * 1024;
+        let payload: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
+
+        let (mut r, mut w) = tokio::io::split(stream);
+        let tx_payload = payload.clone();
+        let writer = tokio::spawn(async move {
+            w.write_all(&tx_payload).await.unwrap();
+        });
+        let started = std::time::Instant::now();
+        let mut echoed = Vec::with_capacity(TOTAL);
+        let mut chunk = vec![0u8; 16 * 1024];
+        while echoed.len() < TOTAL {
+            let n = tokio::time::timeout(Duration::from_secs(10), r.read(&mut chunk))
+                .await
+                .expect("a drained window must re-open without the 1s tick")
+                .unwrap();
+            assert!(n > 0, "premature EOF at {}", echoed.len());
+            echoed.extend_from_slice(&chunk[..n]);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let elapsed = started.elapsed();
+        writer.await.unwrap();
+        assert_eq!(echoed, payload);
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "window re-opening dragged: {elapsed:?} for 256 KiB — read drain not waking the stack"
+        );
     }
 
     /// UDP relayed through the endpoint into the engine, same client.

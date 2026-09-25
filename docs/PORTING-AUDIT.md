@@ -33,12 +33,12 @@ Status legend:
 | http.go | `proto/httpx.rs` | ✅ |
 | direct.go, reject.go | `outbound.rs` (DIRECT/REJECT/REJECT-DROP/PASS/COMPATIBLE) | ✅ |
 | base.go, util.go, rematch.go | `outbound.rs` Registry | ✅ (no rematch hook) |
-| dns.go | `dns/resolver.rs` (dns-out via engine DNS) | 🟡 no `dns` as a *proxied outbound* — resolved in-process |
+| dns.go | `dns/resolver.rs` + the `type: dns` OUTBOUND (wave-12: an in-process duplex answered by the engine resolver + the UDP datagram echo — mihomo's RelayDnsConn/RelayDnsPacket) | ✅ |
 | hysteria2.go | `proto/hysteria2.rs` over quinn (HTTP/3-style auth, salamander obfs, datagram UDP) | ✅ this pass |
 | tuic.go | `proto/tuic.rs` v5 (TLS-exporter token auth, native/quic UDP relay, heartbeats, dissociate) | ✅ this pass |
 | wireguard.go | `proto/wireguard.rs` — hand-rolled Noise_IKpsk2 handshake (KDF/MAC1/2 step-cited from the whitepaper), transport keys, anti-replay, cookie consumption, keepalive/rekey timers, smoltcp client stack for TCP+UDP, mihomo `reserved` bytes per sing-wireguard `client_bind.go` | ✅ this pass (self-consistent: verified against an in-test noise responder; IPv6 inner stack ✅ wave-7 (dual-stack interface, per-family source selection, v4/v6 share one tunnel) |
-| tailscale.go | `proto/tailscale.rs` + `tailscale/{noise,controlhttp,derp,tailcfg,state,control,wg}.rs` — wave-11: the ipn layer (machine/node key state store, /key fetch, RegisterRequest auth-key login, the /map long-poll with delta application, NetMap cryptokey routing) + the data plane (WireGuard session over direct UDP or DERP relay, smoltcp stack; e2e TCP relay via both paths against the engine's own WG endpoint). tailcfg is JSON, not protobuf (wire fact from controlclient/direct.go) | 🟡 (MagicDNS/subnet-route/exit-node enforcement/key-expiry/disco/browser-login remain, precisely enumerated in NOT_IMPLEMENTED) |
-| easytier.go | `proto/easytier.rs` — wave-10 config surface + component port; wave-11 MILESTONE 1: the direct-TCP peer tunnel (framing, plain-mode handshake with network digest, AES-GCM/ChaCha packet encryption byte-parity-proven against upstream's NIST vector, keepalive/backoff, IP-frame seam) — connect() now joins one peer for real | 🟡 (milestone 2: OSPF route gossip + smoltcp attach + listeners/udp transports, mapped in module docs; secure mode Noise_XX named) |
+| tailscale.go | `proto/tailscale.rs` + `tailscale/{noise,controlhttp,derp,tailcfg,state,control,wg}.rs` — wave-11: the ipn layer (machine/node key state store, /key fetch, RegisterRequest auth-key login, the /map long-poll with delta application, NetMap cryptokey routing) + the data plane (WireGuard session over direct UDP or DERP relay, smoltcp stack; e2e TCP relay via both paths against the engine's own WG endpoint). tailcfg is JSON, not protobuf (wire fact from controlclient/direct.go) | 🟡 wave-12: MagicDNS + subnet routes + exit-node enforcement + map-poll reconnect + UDP + the process-global overlay cache are IN (the outbound is wired: dial_tcp/dial_udp live); disco/key-expiry/browser-login remain in NOT_IMPLEMENTED |
+| easytier.go | `proto/easytier.rs` — wave-10 config surface + component port; wave-11 MILESTONE 1: the direct-TCP peer tunnel (framing, plain-mode handshake with network digest, AES-GCM/ChaCha packet encryption byte-parity-proven against upstream's NIST vector, keepalive/backoff, IP-frame seam) — connect() now joins one peer for real | 🟡 wave-12 M2 IN: peer RPC subset + two-node route gossip (v2.6.x permissive admission) + smoltcp attach + dial APIs — **validated against the REAL easytier-core v2.6.4 binary** (#[ignore] interop test). Remaining: listeners/udp-quic-ws transports, secure mode, multi-hop SPF, IPv6 overlay |
 | zerotier.go | `proto/zerotier.rs` — full config surface + every upstream validation (network id/node address/identity/MTU windows/orbit dedup/state-dir default); connect fails citing the libzt C dependency + the staged Rust-replacement milestones | 🟡 wave-10 (blocked by the no-C policy — the map is documented) |
 | tor | — | N/A upstream: neither mihomo (adapter/outbound/tor.go 404) nor sing-box (outbound/tor.go + protocol/tor/outbound.go 404) ships a tor outbound (probed 2026-09-24); nothing to port for 1:1 |
 | ssh.go | `proto/ssh.rs` via russh (password/PEM keys, direct-tcpip channels, known host keys) | ✅ this pass |
@@ -91,7 +91,7 @@ Status legend:
 | enhancer (fake-ip) | `dns/fakeip.rs` | ✅ (pool + reverse + filter) |
 | hosts | `config.rs` DnsConfig.hosts + resolver override | ✅ |
 | edns0_subnet.go | `dns/edns.rs` RFC 7871 (query-side ECS, sing-box `client_subnet`) | ✅ this pass |
-| rcode/filters | wire.rs | 🟡 NOERROR/NXDOMAIN only |
+| rcode/filters | wire.rs + upstream.rs — all six rcode:// pseudo-nameservers (success…refused, config.go tokens) answer with build_response | ✅ wave-12 |
 
 ### rules/
 
@@ -136,7 +136,7 @@ Status legend:
 | tunnel.go (mode rule/global/direct) | app.rs route_with + RuleMode | ✅ |
 | statistic | `stats.rs` + Clash API connections | ✅ |
 | config/config.go (YAML dialect) | `config_mihomo.rs` | 🟡 supported subset; unknown keys ignored, unsupported features hard-error |
-| external-controller API | `api.rs` | 🟡 proxies/connections/rules/traffic/mode/logs/configs subset |
+| external-controller API | `api.rs` — wave-12: /dns/query (real resolver exchange, miekg JSON), /cache/fakeip/flush, /group(+delay), /connections ws interval, /memory, /providers/*, / | 🟡 narrowed (connection close needs a cancel token; /cache/dns/flush needs resolver.clear_cache; PUT /configs reload; logs broadcast — each noted in-code) |
 
 ## 2. sing-box (`SagerNet/sing-box`)
 
@@ -176,7 +176,7 @@ Status legend:
 | user / package_name (android) / network_type (wifi/cellular) | ❌ |
 | rule *actions* (sniff/resolve/hijack-dns/route-options/reject variants) | 🟡 route+reject only; sniff is config-level |
 | dns rules (per-server routing, rewrite_ttl, client_subnet, disable_cache) | ❌ |
-| fakeip store persistence (bbolt) | memory-only | 🟡 |
+| fakeip store persistence | fakeip.rs — JSON store with load_from/persist_to (atomic), range-mismatch reset, corrupt-store loud errors; `profile.store-fake-ip` wires the path | ✅ wave-12 |
 
 ### dns/
 
@@ -236,7 +236,7 @@ stay available as the escape hatch during migration.
 | **P1** | TUN on Windows (WinTUN) / macOS (utun) | same netstack, different device backends |
 
 | P2 | hy2/tuic server listeners; SS-2022 multi-user server | hy2 server reuses the quinn plumbing; ss UDP server ✅ landed (legacy + 2022) |
-| P1 | WireGuard (outbound + endpoint) | outbound ✅ (dual-stack, wave-8); ENDPOINT ✅ wave-9: serve_endpoint — handshake responder (MAC1/cookie-under-load/ratelimit), roaming, cryptokey routing, EpStack accept netstack into the relay; sing-box `endpoints` parsed |
+| P1 | WireGuard (outbound + endpoint) | outbound ✅ (dual-stack, wave-8); ENDPOINT ✅ wave-9; the multi-segment TCP stall ✅ FIXED wave-12 (writer-hang on un-graceful close + listener re-arm race + read-side wake; 9 repro/soak tests, 20× stable). Same latent shapes remain in tailscale/wg.rs + openvpn.rs service_conns (noted for the next pass) |
 | P2 | DHCP / system / hosts-file DNS upstreams; DoH server | small, one module each |
 | P2 | snell / anytls / mieru / jls / restls / shadowquic transports | ✅ waves 6-8 (client side incl. snell UDP + mieru UDP); anytls/snell listeners do not exist upstream (audit corrected) |
 | P3 | series; overlay mesh cores (easytier Rust crates / zerotier libzt) | tor N/A upstream (probed); tailscale noise+derp+controlhttp ✅ wave-10, ipn remains; openvpn ✅ wave-8 |

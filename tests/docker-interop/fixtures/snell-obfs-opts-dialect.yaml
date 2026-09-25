@@ -1,0 +1,30 @@
+# EXPECTED-FAIL fixture (engine dialect pin): the mihomo-CANONICAL spelling
+# of the snell security-fronting options. Real mihomo reads these from
+# `obfs-opts:` (adapter/outbound/snell.go, SnellOption.ObfsOpts,
+# proxy:"obfs-opts"); the Rust engine currently reads them from
+# `plugin-opts:` (config_mihomo.rs plugin_opt()), so this config is
+# rejected at load time with the confusing
+#   "snell jls fronting requires obfs-opts username and password"
+# (the username/password ARE there — under obfs-opts, which the engine
+# ignores). The jls flavor is pinned because it fails LOUDLY; the res-tls
+# flavor with obfs-opts is silently accepted with EMPTY fronting
+# credentials (plugin_opt -> None -> password: ""), which would fail only
+# at connect time — see the README's bug list. run.sh asserts the
+# rejection and labels it EXPECTED-FAIL; when the engine reads obfs-opts
+# this config must be accepted and the check flips to PASS.
+mixed-port: 39901
+proxies:
+  - name: dialect-snell-jls
+    type: snell
+    server: 127.0.0.1
+    port: 39999
+    psk: interop-snell-psk-123456
+    version: 4
+    obfs-mode: jls
+    obfs-opts:
+      host: tls.test
+      username: interop-jls-user
+      password: interop-jls-pw-123456
+      skip-cert-verify: true
+rules:
+  - MATCH,DIRECT

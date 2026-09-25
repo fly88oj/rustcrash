@@ -15,6 +15,9 @@ use crate::transport::TlsSettings;
 /// One configured upstream.
 #[derive(Debug, Clone)]
 pub enum Upstream {
+    /// mihomo `rcode://<token>` pseudo-nameserver (dns/rcode.go
+    /// newRCodeClient): answers every query with that RCODE, no I/O.
+    Rcode(u8),
     /// Plain UDP (the classic resolver).
     Udp(SocketAddr),
     /// DNS-over-TCP (length-framed wireformat).
@@ -38,6 +41,7 @@ pub enum Upstream {
 impl std::fmt::Display for Upstream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Upstream::Rcode(c) => write!(f, "rcode://{}", crate::dns::wire::rcode_token(*c)),
             Upstream::Udp(a) => write!(f, "udp://{a}"),
             Upstream::Tcp(a) => write!(f, "tcp://{a}"),
             Upstream::Tls { addr, .. } => write!(f, "tls://{addr}"),
@@ -57,6 +61,12 @@ impl Upstream {
     /// already synced the query id.
     pub async fn exchange(&self, query: &[u8]) -> Result<Vec<u8>> {
         match self {
+            // rcodeClient.ExchangeContext: flip the query into a
+            // response carrying the RCODE — no network (dns/rcode.go).
+            Upstream::Rcode(code) => {
+                let msg = crate::dns::wire::parse(query)?;
+                Ok(crate::dns::wire::build_response(&msg, *code, &[]))
+            }
             Upstream::Udp(addr) => Self::exchange_udp(*addr, query).await,
             Upstream::Tcp(addr) => Self::exchange_tcp_stream(*addr, query).await,
             Upstream::Tls { addr, name } => {
@@ -393,6 +403,12 @@ pub fn parse_upstream(ns: &str) -> Option<Upstream> {
     }
     let (scheme, rest) = ns.split_once("://").unwrap_or(("", ns));
     match scheme {
+        // rcode://success|format_error|server_failure|name_error|
+        // not_implemented|refused (config.go's exact tokens).
+        "rcode" => {
+            let token = crate::dns::wire::parse_rcode_token(rest)?;
+            Some(Upstream::Rcode(token))
+        }
         // Hostnames resolve once at load, like mihomo's defaults.
         "" | "udp" => {
             let (_host, addr) = parse_host_addr(rest, 53)?;

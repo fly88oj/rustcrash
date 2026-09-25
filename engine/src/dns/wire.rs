@@ -37,7 +37,43 @@ pub struct ResourceRecord {
 pub const TYPE_A: u16 = 1;
 pub const TYPE_AAAA: u16 = 28;
 pub const RCODE_NOERROR: u8 = 0;
+pub const RCODE_FORMERR: u8 = 1;
+pub const RCODE_SERVFAIL: u8 = 2;
 pub const RCODE_NXDOMAIN: u8 = 3;
+pub const RCODE_NOTIMP: u8 = 4;
+pub const RCODE_REFUSED: u8 = 5;
+
+/// Parse an mihomo `rcode://<token>` name into its RFC 1035 code
+/// (mihomo `dns/rcode.go` `newRCodeClient`, validated with the same
+/// token set in `config/config.go`'s `rcode` scheme arm). Tokens are
+/// matched exactly like upstream (lowercase, no aliases) so an
+/// unknown name returns `None` and the caller can fail loudly.
+pub fn parse_rcode_token(token: &str) -> Option<u8> {
+    match token {
+        "success" => Some(RCODE_NOERROR),
+        "format_error" => Some(RCODE_FORMERR),
+        "server_failure" => Some(RCODE_SERVFAIL),
+        "name_error" => Some(RCODE_NXDOMAIN),
+        "not_implemented" => Some(RCODE_NOTIMP),
+        "refused" => Some(RCODE_REFUSED),
+        _ => None,
+    }
+}
+
+/// The mihomo token for a code, or `"unknown"` — used for logs and the
+/// API surface. Inverse of [`parse_rcode_token`] over the six tokens
+/// mihomo defines (extended rcodes 6–15 have no upstream token).
+pub fn rcode_token(rcode: u8) -> &'static str {
+    match rcode {
+        RCODE_NOERROR => "success",
+        RCODE_FORMERR => "format_error",
+        RCODE_SERVFAIL => "server_failure",
+        RCODE_NXDOMAIN => "name_error",
+        RCODE_NOTIMP => "not_implemented",
+        RCODE_REFUSED => "refused",
+        _ => "unknown",
+    }
+}
 
 impl DnsMessage {
     pub fn is_response(&self) -> bool {
@@ -124,7 +160,9 @@ pub fn parse(raw: &[u8]) -> Result<DnsMessage> {
 /// Read a (possibly compressed) domain name; returns the name and the
 /// number of bytes consumed in the ORIGINAL range. Bytes reached through
 /// a compression pointer belong to an earlier name and do not count.
-fn read_name(raw: &[u8], offset: usize) -> Result<(String, usize)> {
+/// `pub(crate)`: the Clash API's `/dns/query` renderer decodes
+/// name-rdata records (CNAME/NS/PTR) with it.
+pub(crate) fn read_name(raw: &[u8], offset: usize) -> Result<(String, usize)> {
     let mut labels: Vec<String> = Vec::new();
     let mut pos = offset;
     let mut consumed = 0usize;
@@ -331,5 +369,58 @@ mod tests {
         let (name, used) = read_name(&[0x00], 0).unwrap();
         assert_eq!(name, "");
         assert_eq!(used, 1);
+    }
+
+    /// The mihomo `rcode://` token table (dns/rcode.go newRCodeClient):
+    /// every token maps to its RFC 1035 code and back.
+    #[test]
+    fn rcode_token_table_roundtrips() {
+        let table = [
+            ("success", RCODE_NOERROR),
+            ("format_error", RCODE_FORMERR),
+            ("server_failure", RCODE_SERVFAIL),
+            ("name_error", RCODE_NXDOMAIN),
+            ("not_implemented", RCODE_NOTIMP),
+            ("refused", RCODE_REFUSED),
+        ];
+        for (token, code) in table {
+            assert_eq!(parse_rcode_token(token), Some(code), "token {token}");
+            assert_eq!(rcode_token(code), token, "code {code}");
+        }
+        // Unknown / malformed tokens are refused, not defaulted — the
+        // caller fails loudly like config.go's "unsupported RCode type".
+        assert_eq!(parse_rcode_token("SUCCESS"), None);
+        assert_eq!(parse_rcode_token("servfail"), None);
+        assert_eq!(parse_rcode_token(""), None);
+        assert_eq!(rcode_token(9), "unknown");
+    }
+
+    /// One response per rcode: the code survives the wire round-trip
+    /// and the question is echoed (mihomo's rcodeClient returns the
+    /// query message with Response+Rcode set).
+    #[test]
+    fn every_rcode_builds_and_roundtrips() {
+        let codes = [
+            (RCODE_NOERROR, "success"),
+            (RCODE_FORMERR, "format_error"),
+            (RCODE_SERVFAIL, "server_failure"),
+            (RCODE_NXDOMAIN, "name_error"),
+            (RCODE_NOTIMP, "not_implemented"),
+            (RCODE_REFUSED, "refused"),
+        ];
+        for (code, token) in codes {
+            let query = parse(&build_query(0x0BAD, "blocked.ad.test", TYPE_A)).unwrap();
+            let resp = build_response(&query, code, &[]);
+            let msg = parse(&resp).unwrap();
+            assert!(msg.is_response(), "{token}: QR set");
+            assert_eq!(msg.id, 0x0BAD, "{token}: id echoed");
+            assert_eq!(msg.rcode, code, "{token}: rcode on the wire");
+            assert_eq!(rcode_token(msg.rcode), token, "{token}: token back");
+            assert_eq!(msg.questions.len(), 1, "{token}: question echoed");
+            assert_eq!(msg.questions[0].name, "blocked.ad.test");
+            assert!(msg.answers.is_empty(), "{token}: no answers");
+            // The rcode rides in the low nibble of the flags word.
+            assert_eq!((msg.flags & 0xF) as u8, code, "{token}: flags nibble");
+        }
     }
 }

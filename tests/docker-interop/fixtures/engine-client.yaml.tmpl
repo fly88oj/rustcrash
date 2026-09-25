@@ -1,0 +1,235 @@
+# The Rust engine's kernel config (mihomo dialect) for the interop suite:
+# ONE engine instance, one outbound per real-mihomo listener (plus negative
+# variants with wrong credentials), all selectable through the Auto group
+# via the Clash API. Rendered by run.sh from __PLACEHOLDER__ tokens.
+mixed-port: 27890
+mode: rule
+log-level: debug
+external-controller: 127.0.0.1:29090
+
+dns:
+  enable: false
+
+proxies:
+  # --- TCP matrix ---
+  - name: node-ss
+    type: ss
+    server: 127.0.0.1
+    port: __PORT_SS__
+    cipher: aes-256-gcm
+    password: interop-ss-psk-123456
+    udp: true
+
+  - name: node-ss2022
+    type: ss
+    server: 127.0.0.1
+    port: __PORT_SS2022__
+    cipher: 2022-blake3-aes-256-gcm
+    password: c3MyMDIyLWludGVyb3AtdGVzdC0zMmJ5dGUta2V5ISE=
+    udp: true
+
+  - name: node-vmess
+    type: vmess
+    server: 127.0.0.1
+    port: __PORT_VMESS__
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    alterId: 0
+    cipher: aes-128-gcm
+
+  - name: node-vmess-ws
+    type: vmess
+    server: 127.0.0.1
+    port: __PORT_VMESS_WS__
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    alterId: 0
+    cipher: auto
+    network: ws
+    ws-opts:
+      path: /ws
+
+  - name: node-vless
+    type: vless
+    server: 127.0.0.1
+    port: __PORT_VLESS__
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    sni: tls.test
+    skip-cert-verify: true
+
+  - name: node-vless-reality
+    type: vless
+    server: 127.0.0.1
+    port: __PORT_VLESS_REALITY__
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    sni: tls.test
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: __REALITY_PUBLIC_KEY__
+      short-id: "0123456789abcdef"
+
+  - name: node-trojan
+    type: trojan
+    server: 127.0.0.1
+    port: __PORT_TROJAN__
+    password: interop-trojan-pw-123456
+    sni: tls.test
+    skip-cert-verify: true
+    udp: true
+
+  - name: node-hy2
+    type: hysteria2
+    server: 127.0.0.1
+    port: __PORT_HY2__
+    password: interop-hy2-pw-123456
+    sni: tls.test
+    skip-cert-verify: true
+    udp: true
+
+  - name: node-tuic
+    type: tuic
+    server: 127.0.0.1
+    port: __PORT_TUIC__
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    password: interop-tuic-pw-123456
+    sni: tls.test
+    skip-cert-verify: true
+    udp-relay-mode: native
+    udp: true
+
+  - name: node-anytls
+    type: anytls
+    server: 127.0.0.1
+    port: __PORT_ANYTLS__
+    password: interop-anytls-pw-123456
+    sni: tls.test
+    skip-cert-verify: true
+    udp: true
+
+  - name: node-snell
+    type: snell
+    server: 127.0.0.1
+    port: __PORT_SNELL__
+    psk: interop-snell-psk-123456
+    version: 4
+
+  # --- fronting matrix: restls / jls on the wire under snell / anytls ---
+  # NOTE: real mihomo spells the snell fronting options `obfs-opts:`
+  # (adapter/outbound/snell.go SnellOption.ObfsOpts, proxy:"obfs-opts");
+  # the engine currently reads them from `plugin-opts:` instead (see the
+  # EXPECTED-FAIL dialect check in run.sh). Both spellings are carried so
+  # the wire check runs today and turns green the moment the engine is
+  # fixed (the extra obfs-opts mapping is ignored by the engine).
+  - name: node-snell-restls
+    type: snell
+    server: 127.0.0.1
+    port: __PORT_SNELL_RESTLS__
+    psk: interop-snell-psk-123456
+    version: 4
+    obfs-mode: res-tls
+    obfs-opts:
+      password: interop-restls-pw-123456
+      host: tls.test
+      version-hint: tls13
+      skip-cert-verify: true
+    plugin-opts:
+      password: interop-restls-pw-123456
+      host: tls.test
+      version-hint: tls13
+      skip-cert-verify: true
+
+  - name: node-snell-jls
+    type: snell
+    server: 127.0.0.1
+    port: __PORT_SNELL_JLS__
+    psk: interop-snell-psk-123456
+    version: 4
+    obfs-mode: jls
+    obfs-opts:
+      host: tls.test
+      username: interop-jls-user
+      password: interop-jls-pw-123456
+      skip-cert-verify: true
+    plugin-opts:
+      host: tls.test
+      username: interop-jls-user
+      password: interop-jls-pw-123456
+      skip-cert-verify: true
+
+  - name: node-anytls-jls
+    type: anytls
+    server: 127.0.0.1
+    port: __PORT_ANYTLS_JLS__
+    password: interop-anytls-pw-123456
+    sni: tls.test
+    skip-cert-verify: true
+    jls-opts:
+      username: interop-jls-user
+      password: interop-jls-pw-123456
+
+  # --- negatives: same listeners, wrong credentials ---
+  - name: node-ss-wrongpw
+    type: ss
+    server: 127.0.0.1
+    port: __PORT_SS__
+    cipher: aes-256-gcm
+    password: wrong-password-000000
+
+  - name: node-trojan-wrongpw
+    type: trojan
+    server: 127.0.0.1
+    port: __PORT_TROJAN__
+    password: wrong-password-000000
+    sni: tls.test
+    skip-cert-verify: true
+
+  - name: node-vmess-wronguuid
+    type: vmess
+    server: 127.0.0.1
+    port: __PORT_VMESS__
+    uuid: 00000000-0000-4000-8000-000000000000
+    alterId: 0
+    cipher: aes-128-gcm
+
+  - name: node-anytls-wrongpw
+    type: anytls
+    server: 127.0.0.1
+    port: __PORT_ANYTLS__
+    password: wrong-password-000000
+    sni: tls.test
+    skip-cert-verify: true
+
+  - name: node-snell-wrongpsk
+    type: snell
+    server: 127.0.0.1
+    port: __PORT_SNELL__
+    psk: wrong-psk-000000
+    version: 4
+
+proxy-groups:
+  - name: Auto
+    type: select
+    proxies:
+      - node-ss
+      - node-ss2022
+      - node-vmess
+      - node-vmess-ws
+      - node-vless
+      - node-vless-reality
+      - node-trojan
+      - node-hy2
+      - node-tuic
+      - node-anytls
+      - node-snell
+      - node-snell-restls
+      - node-snell-jls
+      - node-anytls-jls
+      - node-ss-wrongpw
+      - node-trojan-wrongpw
+      - node-vmess-wronguuid
+      - node-anytls-wrongpw
+      - node-snell-wrongpsk
+      - DIRECT
+
+rules:
+  - MATCH,Auto

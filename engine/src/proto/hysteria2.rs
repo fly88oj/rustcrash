@@ -7,12 +7,13 @@
 //! optional salamander obfuscator (8 random salt bytes, blake2b-256
 //! keystream) wraps the UDP socket under QUINN.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::Bytes;
 use rand::rngs::OsRng;
@@ -187,6 +188,7 @@ async fn authenticate(conn: &quinn::Connection, cfg: &Hysteria2Cfg) -> Result<()
         .open_bi()
         .await
         .map_err(|e| Error::network(format!("hysteria2 auth stream: {e}")))?;
+    let stream_id = u64::from(send.id());
     let padding = random_padding(256, 2048);
     let request = build_auth_request(&cfg.password, 0, &padding);
     send.write_all(&request)
@@ -196,7 +198,16 @@ async fn authenticate(conn: &quinn::Connection, cfg: &Hysteria2Cfg) -> Result<()
     send.finish()
         .map_err(|e| Error::network(format!("hysteria2 auth fin: {e}")))?;
 
-    let resp = read_auth_response(&mut recv).await?;
+    // RFC 9204 §2: dynamic-table instructions arrive on the server's QPACK
+    // encoder stream (uni type 0x02) and must be applied before response
+    // field sections reference them. Consume the server's uni streams for
+    // the whole connection lifetime.
+    let table = Arc::new(Mutex::new(QpackDecoder::default()));
+    let table_updated = Arc::new(tokio::sync::Notify::new());
+    spawn_qpack_encoder_reader(conn.clone(), table.clone(), table_updated.clone());
+
+    let resp =
+        read_auth_response(&mut recv, &mut qpack_dec, stream_id, &table, &table_updated).await?;
     if resp.status != STATUS_AUTH_OK {
         return Err(Error::network(format!(
             "hysteria2 auth failed with status {}",
@@ -247,41 +258,156 @@ fn put_h3_frame(out: &mut Vec<u8>, frame_type: u64, payload: &[u8]) {
 }
 
 /// Read one HTTP/3 exchange from the auth stream until its HEADERS frame
-/// is complete, then extract `:status` and the hysteria headers.
-async fn read_auth_response(recv: &mut quinn::RecvStream) -> Result<AuthResponse> {
+/// is complete, then extract `:status` and the hysteria headers. Field
+/// sections whose Required Insert Count runs ahead of the inserts applied
+/// so far (RFC 9204 §2.1.2) block until the encoder stream delivers the
+/// missing instructions — response bytes keep buffering while waiting.
+async fn read_auth_response(
+    recv: &mut quinn::RecvStream,
+    qpack_dec: &mut quinn::SendStream,
+    stream_id: u64,
+    table: &Arc<Mutex<QpackDecoder>>,
+    table_updated: &Arc<tokio::sync::Notify>,
+) -> Result<AuthResponse> {
     let mut buf = Vec::with_capacity(512);
     let mut chunk = [0u8; 4096];
     loop {
-        match parse_h3_headers_frame(&buf)? {
-            Some(block) => {
-                let fields = decode_field_section(block)?;
-                let mut resp = AuthResponse::default();
-                for (name, value) in fields {
-                    match name.as_str() {
-                        ":status" => {
-                            resp.status = value
-                                .parse()
-                                .map_err(|_| Error::protocol(format!("h3 bad status {value:?}")))?;
-                        }
-                        HDR_UDP => resp.udp_enabled = value == "true",
-                        _ => {}
+        // Register for table updates BEFORE re-decoding so a notification
+        // that lands between decode and wait still wakes us.
+        let notified = table_updated.notified();
+        tokio::pin!(notified);
+        let decoded = match parse_h3_headers_frame(&buf)? {
+            Some(block) => lock_table(table).decode_field_section(block)?,
+            None => None,
+        };
+        let Some(decoded) = decoded else {
+            let blocked = parse_h3_headers_frame(&buf)?.is_some();
+            // `None` here means "no new response bytes, retry the decode"
+            // (a table update arrived); `Some(n)` extends the buffer.
+            let n: Option<usize> = if blocked {
+                // Blocked section: progress may come from either stream.
+                let event = tokio::time::timeout(QPACK_BLOCK_TIMEOUT, async {
+                    tokio::select! {
+                        () = &mut notified => None,
+                        r = recv.read(&mut chunk) => Some(r),
                     }
+                })
+                .await
+                .map_err(|_| Error::protocol("qpack: dynamic table stalled"))?;
+                match event {
+                    None => None,
+                    Some(r) => Some(
+                        r.map_err(|e| {
+                            Error::network(format!("hysteria2 auth read: {e}"))
+                        })?
+                        .ok_or_else(|| {
+                            Error::protocol("hysteria2 auth: EOF before response")
+                        })?,
+                    ),
                 }
-                return Ok(resp);
-            }
-            None => {
-                let n = recv
-                    .read(&mut chunk)
-                    .await
-                    .map_err(|e| Error::network(format!("hysteria2 auth read: {e}")))?
-                    .ok_or_else(|| Error::protocol("hysteria2 auth: EOF before response"))?;
+            } else {
+                Some(
+                    recv.read(&mut chunk)
+                        .await
+                        .map_err(|e| {
+                            Error::network(format!("hysteria2 auth read: {e}"))
+                        })?
+                        .ok_or_else(|| {
+                            Error::protocol("hysteria2 auth: EOF before response")
+                        })?,
+                )
+            };
+            if let Some(n) = n {
                 buf.extend_from_slice(&chunk[..n]);
                 if buf.len() > 16 * 1024 {
                     return Err(Error::protocol("hysteria2 auth: response too large"));
                 }
             }
+            continue;
+        };
+        if decoded.required_insert_count > 0 {
+            // RFC 9204 §4.4.1: acknowledge sections that used the table.
+            let mut ack = Vec::with_capacity(8);
+            put_prefixed_int(&mut ack, 0x80, 7, stream_id);
+            let _ = qpack_dec.write_all(&ack).await;
         }
+        let mut resp = AuthResponse::default();
+        for (name, value) in decoded.fields {
+            match name.as_str() {
+                ":status" => {
+                    resp.status = value
+                        .parse()
+                        .map_err(|_| Error::protocol(format!("h3 bad status {value:?}")))?;
+                }
+                HDR_UDP => resp.udp_enabled = value == "true",
+                _ => {}
+            }
+        }
+        return Ok(resp);
     }
+}
+
+/// Lock the shared QPACK decoder, recovering from a poisoned lock (a
+/// panicking task must not wedge the connection).
+fn lock_table(table: &Arc<Mutex<QpackDecoder>>) -> std::sync::MutexGuard<'_, QpackDecoder> {
+    table.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Upper bound on buffered encoder-stream bytes awaiting a complete
+/// instruction.
+const QPACK_ENCODER_BUFFER_MAX: usize = 64 * 1024;
+
+/// Consume the server's unidirectional streams: the QPACK encoder stream
+/// (type 0x02) feeds instructions into the shared table, waking blocked
+/// decoders (RFC 9204 §4.3); the control (0x00) and QPACK decoder (0x03)
+/// streams are drained.
+fn spawn_qpack_encoder_reader(
+    conn: quinn::Connection,
+    table: Arc<Mutex<QpackDecoder>>,
+    table_updated: Arc<tokio::sync::Notify>,
+) {
+    tokio::spawn(async move {
+        while let Ok(mut uni) = conn.accept_uni().await {
+            // H3 unidirectional stream types are single-byte QUIC varints
+            // (< 0x40); anything else is an unknown type to drain.
+            let mut head = [0u8; 1];
+            let Ok(Some(1)) = uni.read(&mut head).await else {
+                continue;
+            };
+            if head[0] != H3_STREAM_QPACK_ENCODER {
+                let mut sink = [0u8; 4096];
+                while let Ok(Some(_)) = uni.read(&mut sink).await {}
+                continue;
+            }
+            let mut pending: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                match uni.read(&mut chunk).await {
+                    Ok(Some(n)) => {
+                        pending.extend_from_slice(&chunk[..n]);
+                        if pending.len() > QPACK_ENCODER_BUFFER_MAX {
+                            lock_table(&table).fatal("qpack: encoder stream overflow");
+                            return;
+                        }
+                        let consumed = lock_table(&table).apply_encoder_instructions(&pending);
+                        match consumed {
+                            Ok(n) if n > 0 => {
+                                pending.drain(..n);
+                                table_updated.notify_one();
+                            }
+                            Ok(_) => {} // partial instruction: await more bytes
+                            Err(e) => {
+                                lock_table(&table).fatal(&e.to_string());
+                                table_updated.notify_one();
+                                return;
+                            }
+                        }
+                    }
+                    _ => return, // EOF or read error: encoder stream over
+                }
+            }
+        }
+    });
 }
 
 /// If `buf` holds a complete HEADERS frame (possibly preceded by other
@@ -311,7 +437,13 @@ fn parse_h3_headers_frame(buf: &[u8]) -> Result<Option<&[u8]>> {
 }
 
 // ---------------------------------------------------------------------------
-// QPACK (RFC 9204): literal-only encoder + static-table/literal decoder
+// QPACK (RFC 9204): literal-only encoder + full decoder (static AND
+// dynamic table). The dynamic half is what mihomo-era quic-go servers
+// trip: quic-go's http3 responseWriter auto-adds `Date` to every response
+// and its qpack encoder writes that name as a literal-with-name-reference
+// to static index 6 — a single 0x56 byte whose 4-bit index prefix the old
+// decoder misread as the T bit (T lives at 0x10, RFC 9204 §4.5.4),
+// killing every hy2 relay at "qpack: dynamic name reference".
 // ---------------------------------------------------------------------------
 
 /// The QPACK static table (RFC 9204 appendix A), 0-indexed.
@@ -495,70 +627,383 @@ fn read_string_literal(
     }
 }
 
-/// Decode a QPACK field section. Only static-table references and
-/// literals are accepted: this client advertises a zero dynamic table
-/// capacity, so a conforming encoder (quic-go, and hence the official
-/// hysteria2 server) never emits dynamic references here.
-fn decode_field_section(buf: &[u8]) -> Result<Vec<(String, String)>> {
-    let (required_inserts, off) = read_prefixed_int(buf, 0, 8)
-        .ok_or_else(|| Error::protocol("qpack: truncated prefix"))?;
-    if required_inserts != 0 {
-        return Err(Error::protocol("qpack: dynamic table required"));
-    }
-    let mut off = read_prefixed_int(buf, off, 7)
-        .map(|(_, n)| n)
-        .ok_or_else(|| Error::protocol("qpack: truncated base"))?;
-    let mut fields = Vec::new();
-    while off < buf.len() {
-        let b = buf[off];
-        if b & 0x80 != 0 {
-            // 1T: indexed field line.
-            let is_static = b & 0x40 != 0;
-            let (idx, n) = read_prefixed_int(buf, off, 6)
-                .ok_or_else(|| Error::protocol("qpack: truncated index"))?;
-            off = n;
-            if !is_static {
-                return Err(Error::protocol("qpack: dynamic reference"));
-            }
-            let (name, value) = QPACK_STATIC_TABLE
-                .get(idx as usize)
-                .ok_or_else(|| Error::protocol(format!("qpack: bad static index {idx}")))?;
-            fields.push((name.to_string(), value.to_string()));
-        } else if b & 0xc0 == 0x40 {
-            // 01NT: literal with name reference.
-            let is_static = b & 0x08 != 0;
-            let (idx, n) = read_prefixed_int(buf, off, 4)
-                .ok_or_else(|| Error::protocol("qpack: truncated name index"))?;
-            off = n;
-            if !is_static {
-                return Err(Error::protocol("qpack: dynamic name reference"));
-            }
-            let (name, _) = QPACK_STATIC_TABLE
-                .get(idx as usize)
-                .ok_or_else(|| Error::protocol(format!("qpack: bad static name index {idx}")))?;
-            let (value, n) = read_string_literal(buf, off, 7, 0x80)
-                .ok_or_else(|| Error::protocol("qpack: truncated value"))?;
-            off = n;
-            fields.push((name.to_string(), String::from_utf8_lossy(&value).into_owned()));
-        } else if b & 0xe0 == 0x20 {
-            // 001NH: literal with literal name.
-            let (name, n) = read_string_literal(buf, off, 3, 0x08)
-                .ok_or_else(|| Error::protocol("qpack: truncated name"))?;
-            off = n;
-            let (value, n) = read_string_literal(buf, off, 7, 0x80)
-                .ok_or_else(|| Error::protocol("qpack: truncated value"))?;
-            off = n;
-            fields.push((
-                String::from_utf8_lossy(&name).into_owned(),
-                String::from_utf8_lossy(&value).into_owned(),
-            ));
-        } else {
-            // 0001 (post-base indexed) / 0000N (post-base name ref):
-            // dynamic-table forms.
-            return Err(Error::protocol("qpack: dynamic table reference"));
+/// Dynamic-table capacity assumed until the encoder sends a Set Dynamic
+/// Table Capacity instruction (RFC 9204 §4.3.1). This client advertises
+/// SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0 (§5), which forbids a conforming
+/// encoder from using the dynamic table at all; the decoder still
+/// tolerates encoders that do — bounded by this cap.
+const QPACK_LENIENT_CAPACITY: u64 = 64 * 1024;
+/// Upper bound accepted for Set Dynamic Table Capacity in lenient mode
+/// (a conformant value never exceeds the advertised maximum, which is 0).
+const QPACK_LENIENT_MAX_CAPACITY: u64 = 1 << 20;
+/// How long a field section may stay blocked (RFC 9204 §2.1.2) waiting
+/// for encoder-stream instructions before the exchange fails.
+const QPACK_BLOCK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One decoded field section.
+#[derive(Debug, Default)]
+struct DecodedSection {
+    fields: Vec<(String, String)>,
+    /// Required Insert Count of the section (§4.5.1.1); nonzero sections
+    /// must be acknowledged on the decoder stream (§4.4.1).
+    required_insert_count: u64,
+}
+
+/// The QPACK decoding state: static-table lookups plus the RFC 9204
+/// dynamic table (§3.2) driven by encoder-stream instructions (§4.3).
+#[derive(Debug)]
+struct QpackDecoder {
+    /// Dynamic entries, newest first (front = highest absolute index).
+    entries: VecDeque<(String, String)>,
+    /// Current table size in bytes (§3.2.1: name + value + 32 per entry).
+    size: u64,
+    /// Capacity last declared via Set Dynamic Table Capacity.
+    capacity: u64,
+    /// Total inserts ever applied — the absolute index the next entry
+    /// will receive (§3.2.4).
+    insert_count: u64,
+    /// The maximum capacity we advertised in SETTINGS (0: none sent).
+    max_table_capacity: u64,
+    /// Set when the encoder stream becomes unrecoverable; every decode
+    /// then fails instead of mis-decoding.
+    fatal: Option<String>,
+}
+
+impl Default for QpackDecoder {
+    fn default() -> Self {
+        QpackDecoder {
+            entries: VecDeque::new(),
+            size: 0,
+            capacity: QPACK_LENIENT_CAPACITY,
+            insert_count: 0,
+            max_table_capacity: 0,
+            fatal: None,
         }
     }
-    Ok(fields)
+}
+
+impl QpackDecoder {
+    /// A decoder advertising a nonzero SETTINGS_QPACK_MAX_TABLE_CAPACITY
+    /// (tests; the client itself advertises 0).
+    #[cfg(test)]
+    fn with_max_capacity(max: u64) -> Self {
+        QpackDecoder {
+            max_table_capacity: max,
+            ..QpackDecoder::default()
+        }
+    }
+
+    /// Poison the decoder: the encoder stream is broken.
+    fn fatal(&mut self, why: &str) {
+        if self.fatal.is_none() {
+            self.fatal = Some(why.to_string());
+        }
+    }
+
+    /// §3.2.1 entry size.
+    fn entry_size(name: &str, value: &str) -> u64 {
+        32 + name.len() as u64 + value.len() as u64
+    }
+
+    /// Insert an entry (§3.2.2): entries larger than the capacity are a
+    /// protocol error; otherwise the oldest entries are evicted until the
+    /// table fits the capacity again.
+    fn insert(&mut self, name: String, value: String) -> Result<()> {
+        if Self::entry_size(&name, &value) > self.capacity {
+            return Err(Error::protocol(
+                "qpack: insert exceeds dynamic table capacity",
+            ));
+        }
+        self.size += Self::entry_size(&name, &value);
+        self.entries.push_front((name, value));
+        self.insert_count += 1;
+        while self.size > self.capacity {
+            let Some((name, value)) = self.entries.pop_back() else {
+                break;
+            };
+            self.size -= Self::entry_size(&name, &value);
+        }
+        Ok(())
+    }
+
+    /// Evict until the table fits (§3.2.2, after a capacity reduction).
+    fn evict_to_capacity(&mut self) {
+        while self.size > self.capacity {
+            let Some((name, value)) = self.entries.pop_back() else {
+                break;
+            };
+            self.size -= Self::entry_size(&name, &value);
+        }
+    }
+
+    /// Resolve an absolute dynamic-table index (§3.2.4).
+    fn lookup_absolute(&self, abs: u64) -> Result<&(String, String)> {
+        let len = self.entries.len() as u64;
+        let Some(oldest) = self.insert_count.checked_sub(len) else {
+            return Err(Error::protocol("qpack: dynamic table state invalid"));
+        };
+        if abs < oldest || abs >= self.insert_count {
+            return Err(Error::protocol(format!(
+                "qpack: dynamic index {abs} out of range"
+            )));
+        }
+        let pos = (self.insert_count - 1 - abs) as usize;
+        self.entries
+            .get(pos)
+            .ok_or_else(|| Error::protocol("qpack: dynamic table state invalid"))
+    }
+
+    /// Relative index as used inside encoder instructions (§3.2.5):
+    /// relative 0 is the most recently inserted entry.
+    fn lookup_encoder_relative(&self, rel: u64) -> Result<&(String, String)> {
+        let abs = rel
+            .checked_add(1)
+            .and_then(|r| self.insert_count.checked_sub(r))
+            .ok_or_else(|| Error::protocol(format!("qpack: encoder index {rel} before table")))?;
+        self.lookup_absolute(abs)
+    }
+
+    /// Apply encoder-stream instructions (§4.3) from `data`, returning
+    /// the number of bytes consumed. A truncated instruction at the tail
+    /// stays unconsumed until more encoder-stream bytes arrive.
+    fn apply_encoder_instructions(&mut self, data: &[u8]) -> Result<usize> {
+        if let Some(why) = &self.fatal {
+            return Err(Error::protocol(why.clone()));
+        }
+        let mut off = 0usize;
+        while off < data.len() {
+            let b = data[off];
+            if b & 0x80 != 0 {
+                // §4.3.2 insert with name reference: 1T + 6-bit index,
+                // then the value as a string literal.
+                let is_static = b & 0x40 != 0;
+                let Some((idx, n)) = read_prefixed_int(data, off, 6) else {
+                    break;
+                };
+                let Some((value, n2)) = read_string_literal(data, n, 7, 0x80) else {
+                    break;
+                };
+                let name = if is_static {
+                    QPACK_STATIC_TABLE
+                        .get(idx as usize)
+                        .ok_or_else(|| {
+                            Error::protocol(format!("qpack: bad static name index {idx}"))
+                        })?
+                        .0
+                        .to_string()
+                } else {
+                    self.lookup_encoder_relative(idx)?.0.clone()
+                };
+                self.insert(name, String::from_utf8_lossy(&value).into_owned())?;
+                off = n2;
+            } else if b & 0xc0 == 0x40 {
+                // §4.3.3 insert with literal name: 01H + name string
+                // literal, then the value string literal.
+                let Some((name, n)) = read_string_literal(data, off, 5, 0x20) else {
+                    break;
+                };
+                let Some((value, n2)) = read_string_literal(data, n, 7, 0x80) else {
+                    break;
+                };
+                self.insert(
+                    String::from_utf8_lossy(&name).into_owned(),
+                    String::from_utf8_lossy(&value).into_owned(),
+                )?;
+                off = n2;
+            } else if b & 0xe0 == 0x20 {
+                // §4.3.1 set dynamic table capacity: 001 + 5-bit integer.
+                let Some((cap, n)) = read_prefixed_int(data, off, 5) else {
+                    break;
+                };
+                if self.max_table_capacity > 0 && cap > self.max_table_capacity {
+                    return Err(Error::protocol(
+                        "qpack: capacity exceeds advertised maximum",
+                    ));
+                }
+                if cap > QPACK_LENIENT_MAX_CAPACITY {
+                    return Err(Error::protocol("qpack: dynamic table capacity too large"));
+                }
+                self.capacity = cap;
+                self.evict_to_capacity();
+                off = n;
+            } else {
+                // §4.3.4 duplicate: 000 + 5-bit relative index.
+                let Some((rel, n)) = read_prefixed_int(data, off, 5) else {
+                    break;
+                };
+                let (name, value) = self.lookup_encoder_relative(rel)?.clone();
+                self.insert(name, value)?;
+                off = n;
+            }
+        }
+        Ok(off)
+    }
+
+    /// Decode one field section (§4.5). Returns `Ok(None)` while the
+    /// section is blocked — its Required Insert Count runs ahead of the
+    /// inserts applied so far (§2.1.2); the caller waits for more
+    /// encoder-stream bytes and retries on the same buffer.
+    fn decode_field_section(&mut self, buf: &[u8]) -> Result<Option<DecodedSection>> {
+        if let Some(why) = &self.fatal {
+            return Err(Error::protocol(why.clone()));
+        }
+        let (enc_ric, off) = read_prefixed_int(buf, 0, 8)
+            .ok_or_else(|| Error::protocol("qpack: truncated prefix"))?;
+        let ric = Self::decode_required_insert_count(
+            enc_ric,
+            self.insert_count,
+            self.max_table_capacity,
+        )?;
+        if ric > self.insert_count {
+            return Ok(None); // blocked until the encoder stream catches up
+        }
+        // §4.5.1.1 "Base": one Sign bit + 7-bit delta, relative to the
+        // Required Insert Count.
+        let sign = buf
+            .get(off)
+            .is_some_and(|b| b & 0x80 != 0);
+        let (delta, n) = read_prefixed_int(buf, off, 7)
+            .ok_or_else(|| Error::protocol("qpack: truncated base"))?;
+        let mut off = n;
+        let base = if sign {
+            ric.checked_sub(delta)
+                .and_then(|v| v.checked_sub(1))
+                .ok_or_else(|| Error::protocol("qpack: base precedes table start"))?
+        } else {
+            ric + delta
+        };
+        let mut fields = Vec::new();
+        while off < buf.len() {
+            let b = buf[off];
+            if b & 0x80 != 0 {
+                // §4.5.2 indexed field line: 1T + 6-bit index.
+                let is_static = b & 0x40 != 0;
+                let (idx, n) = read_prefixed_int(buf, off, 6)
+                    .ok_or_else(|| Error::protocol("qpack: truncated index"))?;
+                off = n;
+                let (name, value) = if is_static {
+                    let (name, value) = QPACK_STATIC_TABLE
+                        .get(idx as usize)
+                        .ok_or_else(|| {
+                            Error::protocol(format!("qpack: bad static index {idx}"))
+                        })?;
+                    (name.to_string(), value.to_string())
+                } else {
+                    // §3.2.5: relative 0 is the entry at absolute Base-1.
+                    let abs = idx
+                        .checked_add(1)
+                        .and_then(|r| base.checked_sub(r))
+                        .ok_or_else(|| {
+                            Error::protocol("qpack: dynamic reference before table start")
+                        })?;
+                    self.lookup_absolute(abs)?.clone()
+                };
+                fields.push((name, value));
+            } else if b & 0xc0 == 0x40 {
+                // §4.5.4 literal with name reference: 01NT + 4-bit index.
+                // T is bit 4 (0x10); bit 3 belongs to the index prefix —
+                // the old decoder tested 0x08 and misfiled every static
+                // name reference with index < 8 (e.g. `date`, 0x56) as a
+                // dynamic reference.
+                let is_static = b & 0x10 != 0;
+                let (idx, n) = read_prefixed_int(buf, off, 4)
+                    .ok_or_else(|| Error::protocol("qpack: truncated name index"))?;
+                off = n;
+                let name = if is_static {
+                    QPACK_STATIC_TABLE
+                        .get(idx as usize)
+                        .ok_or_else(|| {
+                            Error::protocol(format!("qpack: bad static name index {idx}"))
+                        })?
+                        .0
+                        .to_string()
+                } else {
+                    let abs = idx
+                        .checked_add(1)
+                        .and_then(|r| base.checked_sub(r))
+                        .ok_or_else(|| {
+                            Error::protocol("qpack: dynamic name reference before table start")
+                        })?;
+                    self.lookup_absolute(abs)?.0.clone()
+                };
+                let (value, n) = read_string_literal(buf, off, 7, 0x80)
+                    .ok_or_else(|| Error::protocol("qpack: truncated value"))?;
+                off = n;
+                fields.push((name, String::from_utf8_lossy(&value).into_owned()));
+            } else if b & 0xe0 == 0x20 {
+                // §4.5.6 literal with literal name: 001NH + 3-bit length.
+                let (name, n) = read_string_literal(buf, off, 3, 0x08)
+                    .ok_or_else(|| Error::protocol("qpack: truncated name"))?;
+                off = n;
+                let (value, n) = read_string_literal(buf, off, 7, 0x80)
+                    .ok_or_else(|| Error::protocol("qpack: truncated value"))?;
+                off = n;
+                fields.push((
+                    String::from_utf8_lossy(&name).into_owned(),
+                    String::from_utf8_lossy(&value).into_owned(),
+                ));
+            } else if b & 0xf0 == 0x10 {
+                // §4.5.3 indexed with post-base index: 0001 + 4-bit.
+                let (idx, n) = read_prefixed_int(buf, off, 4)
+                    .ok_or_else(|| Error::protocol("qpack: truncated post-base index"))?;
+                off = n;
+                let (name, value) = self.lookup_absolute(base + idx)?;
+                fields.push((name.clone(), value.clone()));
+            } else {
+                // §4.5.5 literal with post-base name reference: 0000N +
+                // 3-bit index, then the value string literal.
+                let (idx, n) = read_prefixed_int(buf, off, 3)
+                    .ok_or_else(|| Error::protocol("qpack: truncated post-base name index"))?;
+                off = n;
+                let name = self.lookup_absolute(base + idx)?.0.clone();
+                let (value, n) = read_string_literal(buf, off, 7, 0x80)
+                    .ok_or_else(|| Error::protocol("qpack: truncated value"))?;
+                off = n;
+                fields.push((name, String::from_utf8_lossy(&value).into_owned()));
+            }
+        }
+        Ok(Some(DecodedSection {
+            fields,
+            required_insert_count: ric,
+        }))
+    }
+
+    /// Decode the Encoded Required Insert Count (§4.5.1.1) — the module
+    /// `2 * MaxEntries` winding. With MaxTableCapacity 0 (this client's
+    /// advertisement) RFC 9204 leaves no legal nonzero encoding; the
+    /// lenient fallback takes the encoded value as the literal count so
+    /// encoders that use the dynamic table despite a zero-capacity
+    /// advertisement still interoperate.
+    fn decode_required_insert_count(
+        enc: u64,
+        total_inserts: u64,
+        max_capacity: u64,
+    ) -> Result<u64> {
+        if enc == 0 {
+            return Ok(0);
+        }
+        let max_entries = max_capacity / 32;
+        if max_entries == 0 {
+            return Ok(enc); // lenient: see the doc comment
+        }
+        let full_range = 2 * max_entries;
+        if enc > full_range {
+            return Err(Error::protocol("qpack: required insert count out of range"));
+        }
+        let max_value = total_inserts + max_entries;
+        let max_wrapped = (max_value / full_range) * full_range;
+        let mut ric = max_wrapped + enc - 1;
+        if ric > max_value {
+            if ric <= full_range {
+                return Err(Error::protocol("qpack: required insert count out of range"));
+            }
+            ric -= full_range;
+        }
+        if ric == 0 {
+            return Err(Error::protocol("qpack: required insert count encoded as zero"));
+        }
+        Ok(ric)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1149,23 +1594,58 @@ mod tests {
 
     // ---------------------------------------------------- ECH over QUIC
 
-    /// The hysteria2 HTTP/3 auth answer: one HEADERS frame whose QPACK
-    /// block carries the literal `:status 233` (the shape the client's
-    /// `read_auth_response` decodes; see `qpack_decode_static_and_
-    /// literals`).
+    /// The hysteria2 HTTP/3 auth answer shaped exactly like the real
+    /// mihomo server (metacubex/quic-go `response_writer.go` auto-adds
+    /// `Date`; metacubex/qpack emits literal-with-static-name-reference
+    /// lines, Huffman values): `:status 233` (name ref 24, multi-byte
+    /// index 0x5F 0x09) plus `date` (name ref 6 — the single 0x56 byte
+    /// that used to die as "qpack: dynamic name reference").
     fn auth_ok_response() -> Vec<u8> {
         let mut block = vec![0x00, 0x00]; // prefix: ric 0, base 0
-        // Literal with static name idx 24 (:status), value "233" — the
-        // exact construction of `qpack_decode_static_and_literals`
-        // (multi-byte 4-bit index: 0x4f, 24-15).
-        quic::put_prefixed_int(&mut block, 0x40, 4, 24);
-        quic::put_prefixed_int(&mut block, 0x00, 7, 3);
-        block.extend_from_slice(b"233");
+        // :status — literal with static name idx 24 (T bit 0x10 set).
+        quic::put_prefixed_int(&mut block, 0x50, 4, 24);
+        put_test_string(&mut block, b"233", true);
+        // date — literal with static name idx 6 (first byte 0x56).
+        quic::put_prefixed_int(&mut block, 0x50, 4, 6);
+        put_test_string(&mut block, b"Wed, 24 Sep 2026 12:00:00 GMT", true);
         let mut out = Vec::new();
         quic::write_varint(&mut out, 1); // HEADERS
         quic::write_varint(&mut out, block.len() as u64);
         out.extend_from_slice(&block);
         out
+    }
+
+    /// HPACK/QPACK Huffman-encode (RFC 7541 appendix B) with EOS padding.
+    fn huffman_encode_test(data: &[u8]) -> Vec<u8> {
+        let mut bits: Vec<bool> = Vec::new();
+        for &b in data {
+            let (code, len) = HUFFMAN_CODES[b as usize];
+            for i in (0..len).rev() {
+                bits.push(((code >> i) & 1) == 1);
+            }
+        }
+        while !bits.len().is_multiple_of(8) {
+            bits.push(true); // EOS padding
+        }
+        bits.chunks(8)
+            .map(|c| c.iter().fold(0u8, |acc, b| (acc << 1) | *b as u8))
+            .collect()
+    }
+
+    /// One 7-bit-prefix string literal (the field-value form, §4.1.2).
+    fn put_test_string(block: &mut Vec<u8>, data: &[u8], huffman: bool) {
+        let payload = if huffman {
+            huffman_encode_test(data)
+        } else {
+            data.to_vec()
+        };
+        put_prefixed_int(
+            block,
+            if huffman { 0x80 } else { 0x00 },
+            7,
+            payload.len() as u64,
+        );
+        block.extend_from_slice(&payload);
     }
 
     /// `connect_ech`: the dial rides the engine's own TLS 1.3 stack with
@@ -1232,6 +1712,137 @@ mod tests {
             .await
             .expect("ech dial + h3 auth");
         // ALPN negotiated through the ECH inner hello.
+        let data = conn
+            .handshake_data()
+            .unwrap()
+            .downcast::<quinn::crypto::rustls::HandshakeData>()
+            .unwrap();
+        assert_eq!(data.protocol.as_deref(), Some(&b"h3"[..]));
+    }
+
+    /// The QPACK encoder-stream bytes and response HEADERS a hy2 server
+    /// with a dynamic-table encoder produces: a Set Dynamic Table
+    /// Capacity, insert-with-literal-name, insert-with-static-name-ref
+    /// and duplicate instruction on uni stream 0x02, then a HEADERS
+    /// frame mixing a dynamic index reference, the mihomo `date` static
+    /// name reference (0x56), a post-base index reference, a post-base
+    /// literal name reference and a literal name — the exact live-interop
+    /// pattern class the static-only decoder died on. The client must
+    /// authenticate (status 233, udp enabled).
+    fn dynamic_qpack_exchange() -> (Vec<u8>, Vec<u8>) {
+        let mut ins = Vec::new();
+        put_prefixed_int(&mut ins, 0x20, 5, 512); // capacity 512
+        // abs 0: (hysteria-udp, true) — insert with literal name.
+        put_prefixed_int(&mut ins, 0x40, 5, 12);
+        ins.extend_from_slice(b"hysteria-udp");
+        put_prefixed_int(&mut ins, 0x00, 7, 4);
+        ins.extend_from_slice(b"true");
+        // abs 1: (:status, 233) — insert with static name ref 24.
+        put_prefixed_int(&mut ins, 0xC0, 6, 24);
+        put_prefixed_int(&mut ins, 0x00, 7, 3);
+        ins.extend_from_slice(b"233");
+        // abs 2: (hysteria-cc-rx, 0) — insert with literal name.
+        put_prefixed_int(&mut ins, 0x40, 5, 14);
+        ins.extend_from_slice(b"hysteria-cc-rx");
+        put_prefixed_int(&mut ins, 0x00, 7, 1);
+        ins.push(b'0');
+        // abs 3: duplicate of abs 0 (relative index 2).
+        put_prefixed_int(&mut ins, 0x00, 5, 2);
+
+        let mut block = Vec::new();
+        put_prefixed_int(&mut block, 0x00, 8, 4); // ric 4 (lenient)
+        put_prefixed_int(&mut block, 0x80, 7, 1); // S=1 delta 1 -> base 2
+        put_prefixed_int(&mut block, 0x80, 6, 0); // dyn indexed rel 0 -> abs 1 (:status 233)
+        put_prefixed_int(&mut block, 0x50, 4, 6); // date static name ref (0x56)
+        put_test_string(&mut block, b"Wed, 24 Sep 2026 00:00:00 GMT", true);
+        put_prefixed_int(&mut block, 0x80, 6, 1); // dyn indexed rel 1 -> abs 0 (udp true)
+        put_prefixed_int(&mut block, 0x10, 4, 0); // post-base idx 0 -> abs 2 (cc-rx 0)
+        put_prefixed_int(&mut block, 0x00, 3, 1); // post-base name ref 1 -> abs 3 (dup)
+        put_test_string(&mut block, b"true", false);
+        put_qpack_literal(&mut block, b"hysteria-padding", b"pp");
+
+        let mut out = Vec::new();
+        quic::write_varint(&mut out, 1); // HEADERS
+        quic::write_varint(&mut out, block.len() as u64);
+        out.extend_from_slice(&block);
+        (ins, out)
+    }
+
+    /// End-to-end against the in-test hy2 server mimic emitting the
+    /// dynamic QPACK exchange above (encoder instructions on the uni
+    /// QPACK encoder stream, response HEADERS referencing them).
+    #[tokio::test]
+    async fn hy2_server_mimic_dynamic_qpack_authenticates() {
+        let (sk_r, list) = crate::quic::tls13::test_server::ech_server_key(
+            &[21u8; 32],
+            0x71,
+            b"hy2-dyn.example",
+        );
+        let endpoint = crate::quic::tls13::test_server::start_quinn_server(
+            crate::quic::tls13::ServerMode::EchAccept {
+                sk_r,
+                config_list: list.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let response = dynamic_qpack_exchange();
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                let Ok(conn) = incoming.await else { continue };
+                let (instructions, response) = response.clone();
+                tokio::spawn(async move {
+                    // Drain the client's uni control/QPACK streams.
+                    let uni_conn = conn.clone();
+                    tokio::spawn(async move {
+                        while uni_conn.accept_uni().await.is_ok() {}
+                    });
+                    // The server's own critical streams: control with an
+                    // empty SETTINGS, QPACK encoder with the dynamic
+                    // table instructions, and an (idle) QPACK decoder.
+                    if let Ok(mut control) = conn.open_uni().await {
+                        let _ = control
+                            .write_all(&[H3_STREAM_CONTROL, H3_FRAME_SETTINGS as u8, 0])
+                            .await;
+                    }
+                    if let Ok(mut enc) = conn.open_uni().await {
+                        let mut buf = vec![H3_STREAM_QPACK_ENCODER];
+                        buf.extend_from_slice(&instructions);
+                        let _ = enc.write_all(&buf).await;
+                    }
+                    if let Ok(mut dec) = conn.open_uni().await {
+                        let _ = dec.write_all(&[H3_STREAM_QPACK_DECODER]).await;
+                    }
+                    if let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                        let mut buf = [0u8; 1024];
+                        let _ = recv.read(&mut buf).await;
+                        let _ = send.write_all(&response).await;
+                        let _ = send.finish();
+                    }
+                    while conn.accept_bi().await.is_ok() {}
+                });
+            }
+        });
+
+        let cfg = Hysteria2Cfg {
+            server: "127.0.0.1".to_string(),
+            port: addr.port(),
+            password: "dyn-pass".to_string(),
+            sni: "hy2-inner.example".to_string(),
+            skip_verify: true,
+            obfs: None,
+        };
+        use base64::Engine as _;
+        let opts = crate::proto::ech::EchOptions {
+            enable: true,
+            config: base64::engine::general_purpose::STANDARD.encode(&list),
+            query_server_name: String::new(),
+        };
+
+        let conn = crate::proto::hysteria2::connect_ech(&cfg, &opts)
+            .await
+            .expect("hy2 auth over dynamic QPACK");
         let data = conn
             .handshake_data()
             .unwrap()
@@ -1462,7 +2073,11 @@ mod tests {
         let block = &req[quic::varint_len(1) + quic::varint_len(len)..];
         assert_eq!(&block[..2], &[0x00, 0x00]);
 
-        let fields = decode_field_section(block).unwrap();
+        let fields = QpackDecoder::default()
+            .decode_field_section(block)
+            .unwrap()
+            .unwrap()
+            .fields;
         let get = |k: &str| {
             fields
                 .iter()
@@ -1482,35 +2097,39 @@ mod tests {
 
     #[test]
     fn qpack_decode_static_and_literals() {
+        let mut dec = QpackDecoder::default();
         // Indexed static :status 200 (index 25 -> 0xc0|25).
         let mut block = vec![0x00, 0x00, 0xc0 | 25];
-        let fields = decode_field_section(&block).unwrap();
+        let fields = dec.decode_field_section(&block).unwrap().unwrap().fields;
         assert_eq!(fields, vec![(":status".to_string(), "200".to_string())]);
 
         // Indexed static with a multi-byte 6-bit index (:status 500 = 71).
         block = vec![0x00, 0x00, 0xff, (71 - 63) as u8];
-        let fields = decode_field_section(&block).unwrap();
+        let fields = dec.decode_field_section(&block).unwrap().unwrap().fields;
         assert_eq!(fields, vec![(":status".to_string(), "500".to_string())]);
 
         // Literal with static name reference (:status -> "233"), the
-        // shape quic-go emits for the hysteria2 auth response.
+        // shape quic-go emits for the hysteria2 auth response (T is bit
+        // 0x10; multi-byte 4-bit index: 0x5F, 24-15).
         let mut block = vec![0x00, 0x00];
-        put_prefixed_int(&mut block, 0x40, 4, 24); // T=1 static, name idx 24
+        put_prefixed_int(&mut block, 0x50, 4, 24); // T=1 static, name idx 24
         put_prefixed_int(&mut block, 0x00, 7, 3);
         block.extend_from_slice(b"233");
-        let fields = decode_field_section(&block).unwrap();
+        let fields = dec.decode_field_section(&block).unwrap().unwrap().fields;
         assert_eq!(fields, vec![(":status".to_string(), "233".to_string())]);
 
         // Literal with literal name (our own encoder's form).
         let mut block = vec![0x00, 0x00];
         put_qpack_literal(&mut block, b"hysteria-udp", b"true");
-        let fields = decode_field_section(&block).unwrap();
+        let fields = dec.decode_field_section(&block).unwrap().unwrap().fields;
         assert_eq!(fields, vec![("hysteria-udp".to_string(), "true".to_string())]);
 
-        // Dynamic references are rejected.
-        assert!(decode_field_section(&[0x00, 0x00, 0x80]).is_err()); // T=0
-        assert!(decode_field_section(&[0x00, 0x00, 0x1f]).is_err()); // post-base
-        assert!(decode_field_section(&[0x01]).is_err()); // required inserts
+        // Dynamic references against an empty table are errors.
+        assert!(dec.decode_field_section(&[0x00, 0x00, 0x80]).is_err()); // T=0
+        assert!(dec.decode_field_section(&[0x00, 0x00, 0x1f]).is_err()); // post-base
+        // A section requiring inserts the table has not seen is blocked
+        // (RFC 9204 §2.1.2), not decoded.
+        assert!(dec.decode_field_section(&[0x01]).unwrap().is_none());
     }
 
     #[test]
@@ -1534,7 +2153,7 @@ mod tests {
                 bits.push(((code >> i) & 1) == 1);
             }
         }
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits.push(true); // EOS padding
         }
         let packed: Vec<u8> = bits
@@ -1597,5 +2216,278 @@ mod tests {
         assert_eq!(a.to_string(), "example.com:443");
         let b = NetAddr::ip("2001:db8::1".parse::<IpAddr>().unwrap(), 53);
         assert_eq!(b.to_string(), "[2001:db8::1]:53");
+    }
+
+    // --- QPACK dynamic table (RFC 9204) -------------------------------
+
+    /// The live-interop repro (fail-before pin): the real mihomo server's
+    /// auth-ok HEADERS. quic-go's http3 responseWriter (metacubex/quic-go
+    /// aa29579f, response_writer.go "Add Date header") auto-adds `Date`,
+    /// and metacubex/qpack v0.6.0's static-only encoder writes it as a
+    /// literal with STATIC name reference 6 — the single 0x56 byte
+    /// (0101_0110: 01NT, T=1). The old decoder read the T bit at 0x08
+    /// (part of the 4-bit index prefix) and rejected it with exactly
+    /// "qpack: dynamic name reference".
+    #[test]
+    fn qpack_decodes_mihomo_date_static_name_ref() {
+        let mut dec = QpackDecoder::default();
+        let mut block = vec![0x00, 0x00];
+        put_prefixed_int(&mut block, 0x50, 4, 24); // :status (static name)
+        put_test_string(&mut block, b"233", false);
+        put_prefixed_int(&mut block, 0x50, 4, 6); // date (static name) -> 0x56
+        put_test_string(&mut block, b"Wed, 24 Sep 2026 00:00:00 GMT", true);
+        let section = dec.decode_field_section(&block).unwrap().unwrap();
+        assert_eq!(
+            section.fields,
+            vec![
+                (":status".to_string(), "233".to_string()),
+                (
+                    "date".to_string(),
+                    "Wed, 24 Sep 2026 00:00:00 GMT".to_string()
+                ),
+            ]
+        );
+        assert_eq!(section.required_insert_count, 0);
+    }
+
+    /// Encoder-stream instruction handling (§4.3): set-capacity,
+    /// insert-with-literal-name, insert-with-name-ref (static and
+    /// dynamic), duplicate, size accounting, eviction on capacity
+    /// reduction, and partial-instruction buffering.
+    #[test]
+    fn qpack_encoder_instructions_build_dynamic_table() {
+        let mut dec = QpackDecoder::default();
+        let mut ins = Vec::new();
+        put_prefixed_int(&mut ins, 0x20, 5, 512); // set capacity 512
+        // insert with literal name (hysteria-udp, true) -> abs 0
+        put_prefixed_int(&mut ins, 0x40, 5, 12);
+        ins.extend_from_slice(b"hysteria-udp");
+        put_prefixed_int(&mut ins, 0x00, 7, 4);
+        ins.extend_from_slice(b"true");
+        // insert with static name ref (:status idx 24), value 233 -> abs 1
+        put_prefixed_int(&mut ins, 0xC0, 6, 24);
+        put_prefixed_int(&mut ins, 0x00, 7, 3);
+        ins.extend_from_slice(b"233");
+        // duplicate relative 1 (abs 0) -> abs 2
+        put_prefixed_int(&mut ins, 0x00, 5, 1);
+        // insert with DYNAMIC name ref: relative 2 (abs 0), value -> abs 3
+        put_prefixed_int(&mut ins, 0x80, 6, 2);
+        put_prefixed_int(&mut ins, 0x00, 7, 5);
+        ins.extend_from_slice(b"false");
+
+        // A truncated final instruction stays unconsumed.
+        let cut = ins.len() - 1;
+        let consumed = dec.apply_encoder_instructions(&ins[..cut]).unwrap();
+        assert!(consumed < cut, "partial instruction must not be applied");
+        assert_eq!(dec.insert_count, 3);
+
+        let tail = dec.apply_encoder_instructions(&ins[consumed..]).unwrap();
+        assert_eq!(consumed + tail, ins.len());
+        assert_eq!(dec.insert_count, 4);
+        assert_eq!(dec.entries.len(), 4);
+        // Size accounting (§3.2.1: name + value + 32): 48 + 42 + 48 + 49.
+        assert_eq!(dec.size, 187);
+        // Newest entry first.
+        assert_eq!(
+            dec.entries[0],
+            ("hysteria-udp".to_string(), "false".to_string())
+        );
+        assert_eq!(
+            dec.lookup_absolute(0).unwrap(),
+            &("hysteria-udp".to_string(), "true".to_string())
+        );
+        assert_eq!(
+            dec.lookup_absolute(1).unwrap(),
+            &(":status".to_string(), "233".to_string())
+        );
+
+        // Capacity reduction evicts oldest-first (§3.2.2): 49 bytes keeps
+        // only the newest entry (hysteria-udp/false, size 49).
+        let mut shrink = Vec::new();
+        put_prefixed_int(&mut shrink, 0x20, 5, 49);
+        dec.apply_encoder_instructions(&shrink).unwrap();
+        assert_eq!(dec.entries.len(), 1);
+        assert!(dec.lookup_absolute(2).is_err()); // evicted
+        assert!(dec.lookup_absolute(3).is_ok());
+        // insert_count survives eviction (absolute indices never reuse).
+        assert_eq!(dec.insert_count, 4);
+
+        // An insert larger than the capacity is a protocol error.
+        let mut too_big = Vec::new();
+        put_prefixed_int(&mut too_big, 0x40, 5, 30);
+        too_big.extend_from_slice(&[b'x'; 30]);
+        put_prefixed_int(&mut too_big, 0x00, 7, 1);
+        too_big.push(b'y');
+        assert!(dec.apply_encoder_instructions(&too_big).is_err());
+    }
+
+    /// Field sections referencing the dynamic table: relative (pre-base)
+    /// indexed, post-base indexed, literal with dynamic name reference
+    /// and post-base literal name reference, with a negative base
+    /// (S=1) offsetting the Required Insert Count.
+    #[test]
+    fn qpack_decode_dynamic_references() {
+        let mut dec = QpackDecoder::default();
+        let mut ins = Vec::new();
+        // abs 0: (hysteria-udp, true)
+        put_prefixed_int(&mut ins, 0x40, 5, 12);
+        ins.extend_from_slice(b"hysteria-udp");
+        put_prefixed_int(&mut ins, 0x00, 7, 4);
+        ins.extend_from_slice(b"true");
+        // abs 1: (:status, 233) via static name ref
+        put_prefixed_int(&mut ins, 0xC0, 6, 24);
+        put_prefixed_int(&mut ins, 0x00, 7, 3);
+        ins.extend_from_slice(b"233");
+        // abs 2: duplicate of abs 0
+        put_prefixed_int(&mut ins, 0x00, 5, 1);
+        dec.apply_encoder_instructions(&ins).unwrap();
+
+        // ric 3 (lenient absolute), S=1 delta 0 -> base = 3-0-1 = 2.
+        let mut block = Vec::new();
+        put_prefixed_int(&mut block, 0x00, 8, 3);
+        put_prefixed_int(&mut block, 0x80, 7, 0);
+        put_prefixed_int(&mut block, 0x80, 6, 1); // rel 1 -> abs 0
+        put_prefixed_int(&mut block, 0x10, 4, 0); // post-base 0 -> abs 2
+        put_prefixed_int(&mut block, 0x40, 4, 0); // dynamic name ref rel 0 -> abs 1
+        put_test_string(&mut block, b"233", false);
+        put_prefixed_int(&mut block, 0x00, 3, 0); // post-base name ref 0 -> abs 2
+        put_test_string(&mut block, b"false", false);
+        let section = dec.decode_field_section(&block).unwrap().unwrap();
+        assert_eq!(
+            section.fields,
+            vec![
+                ("hysteria-udp".to_string(), "true".to_string()),
+                ("hysteria-udp".to_string(), "true".to_string()),
+                (":status".to_string(), "233".to_string()),
+                ("hysteria-udp".to_string(), "false".to_string()),
+            ]
+        );
+        assert_eq!(section.required_insert_count, 3);
+
+        // A relative reference past the table start is an error.
+        let mut bad = Vec::new();
+        put_prefixed_int(&mut bad, 0x00, 8, 3);
+        put_prefixed_int(&mut bad, 0x80, 7, 0);
+        put_prefixed_int(&mut bad, 0x80, 6, 3); // abs 2-1-3 = before start
+        assert!(dec.decode_field_section(&bad).is_err());
+    }
+
+    /// The requested mixed response: static indexed + dynamic indexed +
+    /// static-name literal + dynamic-name literal in one section (base
+    /// S=0, base = Required Insert Count).
+    #[test]
+    fn qpack_decode_mixed_static_and_dynamic() {
+        let mut dec = QpackDecoder::default();
+        let mut ins = Vec::new();
+        // abs 0: (hysteria-udp, true); abs 1: (:status, 233)
+        put_prefixed_int(&mut ins, 0x40, 5, 12);
+        ins.extend_from_slice(b"hysteria-udp");
+        put_prefixed_int(&mut ins, 0x00, 7, 4);
+        ins.extend_from_slice(b"true");
+        put_prefixed_int(&mut ins, 0xC0, 6, 24);
+        put_prefixed_int(&mut ins, 0x00, 7, 3);
+        ins.extend_from_slice(b"233");
+        dec.apply_encoder_instructions(&ins).unwrap();
+
+        // ric 2, S=0 delta 0 -> base 2.
+        let mut block = Vec::new();
+        put_prefixed_int(&mut block, 0x00, 8, 2);
+        put_prefixed_int(&mut block, 0x00, 7, 0);
+        block.push(0xc0 | 25); // static indexed :status 200
+        put_prefixed_int(&mut block, 0x80, 6, 1); // dynamic rel 1 -> abs 0
+        put_prefixed_int(&mut block, 0x50, 4, 6); // static name ref `date`
+        put_test_string(&mut block, b"Mon, 02 Jan 2006 15:04:05 GMT", false);
+        put_prefixed_int(&mut block, 0x40, 4, 0); // dynamic name ref rel 0 -> abs 1
+        put_test_string(&mut block, b"233", true);
+        let section = dec.decode_field_section(&block).unwrap().unwrap();
+        assert_eq!(
+            section.fields,
+            vec![
+                (":status".to_string(), "200".to_string()),
+                ("hysteria-udp".to_string(), "true".to_string()),
+                (
+                    "date".to_string(),
+                    "Mon, 02 Jan 2006 15:04:05 GMT".to_string()
+                ),
+                (":status".to_string(), "233".to_string()),
+            ]
+        );
+    }
+
+    /// Blocked decoding (§2.1.2): a section whose Required Insert Count
+    /// runs ahead of the applied inserts yields `None` until the
+    /// encoder-stream instructions arrive.
+    #[test]
+    fn qpack_blocked_until_encoder_instructions() {
+        let mut dec = QpackDecoder::default();
+        // ric 2 (lenient), base = 2: rel 0 -> abs 1.
+        let mut block = Vec::new();
+        put_prefixed_int(&mut block, 0x00, 8, 2);
+        put_prefixed_int(&mut block, 0x00, 7, 0);
+        put_prefixed_int(&mut block, 0x80, 6, 0);
+        assert!(dec.decode_field_section(&block).unwrap().is_none());
+
+        let mut ins = Vec::new();
+        put_prefixed_int(&mut ins, 0x40, 5, 12);
+        ins.extend_from_slice(b"hysteria-udp");
+        put_prefixed_int(&mut ins, 0x00, 7, 4);
+        ins.extend_from_slice(b"true");
+        dec.apply_encoder_instructions(&ins).unwrap();
+        assert!(dec.decode_field_section(&block).unwrap().is_none());
+
+        ins.clear();
+        put_prefixed_int(&mut ins, 0x40, 5, 14);
+        ins.extend_from_slice(b"hysteria-cc-rx");
+        put_prefixed_int(&mut ins, 0x00, 7, 1);
+        ins.extend_from_slice(b"0");
+        dec.apply_encoder_instructions(&ins).unwrap();
+        let section = dec.decode_field_section(&block).unwrap().unwrap();
+        assert_eq!(
+            section.fields,
+            vec![("hysteria-cc-rx".to_string(), "0".to_string())]
+        );
+        assert_eq!(section.required_insert_count, 2);
+    }
+
+    /// Required Insert Count winding (§4.5.1.1), including the RFC's own
+    /// example (100-byte table, 10 inserts, encoded 4 -> 9), plus this
+    /// client's lenient zero-capacity mode.
+    #[test]
+    fn qpack_required_insert_count_winding() {
+        let ric = QpackDecoder::decode_required_insert_count;
+        assert_eq!(ric(0, 10, 100).unwrap(), 0);
+        assert_eq!(ric(4, 10, 100).unwrap(), 9); // RFC 9204 §4.5.1.1 example
+        assert!(ric(7, 10, 100).is_err()); // > FullRange (6)
+        assert!(ric(1, 0, 100).is_err()); // would decode to 0
+        assert_eq!(ric(2, 0, 100).unwrap(), 1);
+        // Lenient: no capacity advertised, encoded value taken literally.
+        assert_eq!(ric(3, 0, 0).unwrap(), 3);
+        assert_eq!(ric(0, 0, 0).unwrap(), 0);
+
+        // End-to-end through a decoder that advertised a 100-byte table:
+        // 10 small inserts (only the last two survive the 96-byte
+        // capacity the encoder sets), then a section whose encoded count
+        // 4 winds to a Required Insert Count of 9.
+        let mut dec = QpackDecoder::with_max_capacity(100);
+        let mut ins = Vec::new();
+        put_prefixed_int(&mut ins, 0x20, 5, 96);
+        for i in 0..10u8 {
+            ins.push(0x40 | 2); // insert with literal name, len 2, H=0
+            ins.extend_from_slice(&[b'n', b'a' + i]);
+            ins.push(1); // value len 1
+            ins.push(b'v');
+        }
+        dec.apply_encoder_instructions(&ins).unwrap();
+        assert_eq!(dec.insert_count, 10);
+        let mut block = Vec::new();
+        put_prefixed_int(&mut block, 0x00, 8, 4); // winds to 9
+        put_prefixed_int(&mut block, 0x00, 7, 0); // base 9
+        put_prefixed_int(&mut block, 0x80, 6, 0); // rel 0 -> abs 8 = ("ni","v")
+        let section = dec.decode_field_section(&block).unwrap().unwrap();
+        assert_eq!(
+            section.fields,
+            vec![("ni".to_string(), "v".to_string())] // 9th insert, i=8
+        );
+        assert_eq!(section.required_insert_count, 9);
     }
 }

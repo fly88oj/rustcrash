@@ -198,6 +198,11 @@ pub enum OutboundKind {
     /// EasyTier overlay outbound (config surface + the ported TOML/
     /// overlay helpers; connect fails with the staged first milestone).
     EasyTier(crate::proto::easytier::EasyTierConfig),
+    /// mihomo `type: dns` outbound (adapter/outbound/dns.go): the TCP
+    /// dial returns one end of an in-process pipe whose other end is
+    /// served by the engine's own resolver (RelayDnsConn); UDP answers
+    /// each datagram through the resolver (RelayDnsPacket).
+    Dns,
 }
 
 /// Shared, lazily-dialed QUIC connection for the hysteria2/tuic outbounds
@@ -228,6 +233,9 @@ pub struct Outbound {
     kind: OutboundKind,
     quic: QuicConnCache,
     w7: W7Clients,
+    /// The engine resolver, set by the app after build — the `dns`
+    /// outbound answers through it (mihomo's in-process relay).
+    dns: std::sync::OnceLock<std::sync::Arc<crate::dns::resolver::DnsEngine>>,
 }
 
 impl Outbound {
@@ -238,7 +246,13 @@ impl Outbound {
             kind: cfg.kind.clone(),
             quic: QuicConnCache::default(),
             w7: W7Clients::default(),
+            dns: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Attach the engine resolver (call once after build).
+    pub fn set_dns(&self, dns: std::sync::Arc<crate::dns::resolver::DnsEngine>) {
+        let _ = self.dns.set(dns);
     }
 
     /// The shared QUIC connection for hy2/tuic outbounds, dialed on
@@ -507,6 +521,7 @@ impl Outbound {
             OutboundKind::Tailscale(_) => "Tailscale",
             OutboundKind::ZeroTier(_) => "ZeroTier",
             OutboundKind::EasyTier(_) => "EasyTier",
+            OutboundKind::Dns => "Dns",
         }
     }
 
@@ -1100,12 +1115,47 @@ async fn vless_front(
                 crate::proto::openvpn::connect(cfg, target).await
             }
             OutboundKind::Tailscale(cfg) => {
-                // Always the precise tsnet blocker today (see the module
-                // docs' implementation map).
-                crate::proto::tailscale::connect(cfg).await?;
-                Err(Error::config(
-                    "tailscale: connect returned without a tunnel (unreachable)",
-                ))
+                // The overlay cache handles login/netmap reuse; MagicDNS
+                // names resolve through the netmap (non-tailnet domains
+                // refused — resolve before routing).
+                crate::proto::tailscale::dial_tcp_addr(cfg, target).await
+            }
+            OutboundKind::Dns => {
+                // RelayDnsConn: a duplex whose client side receives DNS
+                // wire messages answered by the engine resolver. Reads
+                // are message-at-a-time (the pipe carries raw queries
+                // back to back; the pump parses boundaries).
+                let dns = self.dns.get().ok_or_else(|| {
+                    Error::config("dns outbound: the engine resolver is not attached")
+                })?;
+                let (client, mut server) = tokio::io::duplex(4096);
+                let dns = dns.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    // Length-prefixed framing: 2-byte BE length + wire
+                    // message (a natural boundary for the pipe; the
+                    // client side is ours too — the inbound hijack uses
+                    // the same convention).
+                    let mut buf = Vec::new();
+                    loop {
+                        let mut hdr = [0u8; 2];
+                        if server.read_exact(&mut hdr).await.is_err() {
+                            break;
+                        }
+                        let len = u16::from_be_bytes(hdr) as usize;
+                        buf.resize(len, 0);
+                        if server.read_exact(&mut buf).await.is_err() {
+                            break;
+                        }
+                        let resp = dns.handle(&buf).await;
+                        let mut out = (resp.len() as u16).to_be_bytes().to_vec();
+                        out.extend_from_slice(&resp);
+                        if server.write_all(&out).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                Ok(Box::new(client) as BoxProxyStream)
             }
             OutboundKind::ZeroTier(cfg) => {
                 crate::proto::zerotier::connect(cfg).await?;
@@ -1114,10 +1164,18 @@ async fn vless_front(
                 ))
             }
             OutboundKind::EasyTier(cfg) => {
-                crate::proto::easytier::connect(cfg).await?;
-                Err(Error::config(
-                    "easytier: connect returned without a tunnel (unreachable)",
-                ))
+                // IPv4 overlay (adapter dials tcp4); domains resolve
+                // before routing — refuse with the reason, like openvpn.
+                match &target.host {
+                    crate::addr::Host::Ip(ip) => {
+                        let addr = std::net::SocketAddr::new(*ip, target.port);
+                        crate::proto::easytier::connect_tcp(cfg, &addr).await
+                    }
+                    crate::addr::Host::Domain(d) => Err(Error::config(format!(
+                        "easytier: target {d} is a domain — resolve it before routing \
+                         (the overlay dials IPv4 addresses)"
+                    ))),
+                }
             }
         }
     }
@@ -1457,11 +1515,25 @@ async fn vless_front(
                 let udp = crate::proto::openvpn::OvpnUdp::bind(cfg).await?;
                 Ok(UdpChannel::OpenVpn(udp))
             }
+            OutboundKind::Tailscale(cfg) => {
+                let sock = crate::proto::tailscale::dial_udp(cfg).await?;
+                Ok(UdpChannel::Tailscale(sock))
+            }
+            OutboundKind::Dns => {
+                // RelayDnsPacket: every datagram answered by the engine
+                // resolver, echoed from the fixed 127.0.0.2:53 source.
+                let dns = self.dns.get().ok_or_else(|| {
+                    Error::config("dns outbound: the engine resolver is not attached")
+                })?;
+                Ok(UdpChannel::Dns(crate::dns::DnsUdpEcho::new(dns.clone())))
+            }
+            OutboundKind::EasyTier(cfg) => {
+                let udp = crate::proto::easytier::EasyTierUdp::bind(cfg).await?;
+                Ok(UdpChannel::EasyTier(udp))
+            }
             OutboundKind::AnyTls(_)
             | OutboundKind::Restls { .. }
-            | OutboundKind::Tailscale(_)
-            | OutboundKind::ZeroTier(_)
-            | OutboundKind::EasyTier(_) => Err(
+            | OutboundKind::ZeroTier(_) => Err(
                 Error::protocol(format!("{} does not support UDP", self.kind_name())),
             ),
             OutboundKind::Reject
@@ -1561,6 +1633,7 @@ fn other_kind_name(kind: &OutboundKind) -> &'static str {
         OutboundKind::Tailscale(_) => "Tailscale",
         OutboundKind::ZeroTier(_) => "ZeroTier",
         OutboundKind::EasyTier(_) => "EasyTier",
+        OutboundKind::Dns => "Dns",
     }
 }
 
@@ -1633,6 +1706,12 @@ pub enum UdpChannel {
     Mieru(crate::proto::mieru::MieruUdp),
     /// openvpn UDP through the smoltcp userspace stack.
     OpenVpn(crate::proto::openvpn::OvpnUdp),
+    /// tailscale overlay UDP (MagicDNS-aware routing per datagram).
+    Tailscale(crate::proto::tailscale::TsUdpSocket),
+    /// easytier overlay UDP.
+    EasyTier(crate::proto::easytier::EasyTierUdp),
+    /// The `dns` outbound's UDP echo (resolver-answered datagrams).
+    Dns(crate::dns::DnsUdpEcho),
 }
 
 impl UdpChannel {
@@ -1762,6 +1841,19 @@ impl UdpChannel {
             UdpChannel::Snell(s) => s.send_to(target, data).await,
             UdpChannel::Mieru(m) => m.send_to(target, data).await,
             UdpChannel::OpenVpn(o) => o.send(target, data).await,
+            UdpChannel::Tailscale(t) => t.send(target, data).await,
+            UdpChannel::Dns(d) => d.send(data).await,
+            UdpChannel::EasyTier(e) => {
+                let addr = match &target.host {
+                    crate::addr::Host::Ip(ip) => std::net::SocketAddr::new(*ip, target.port),
+                    crate::addr::Host::Domain(d) => {
+                        return Err(Error::config(format!(
+                            "easytier udp target {d} is a domain — resolve first"
+                        )))
+                    }
+                };
+                e.send(&addr, data).await
+            }
         }
     }
 
@@ -1858,6 +1950,15 @@ impl UdpChannel {
                 Ok((addr, buf[..n].to_vec()))
             }
             UdpChannel::OpenVpn(o) => o.recv().await,
+            UdpChannel::Tailscale(t) => t.recv().await,
+            UdpChannel::Dns(d) => d.recv().await,
+            UdpChannel::EasyTier(e) => {
+                let (addr, data) = e.recv().await?;
+                Ok((
+                    NetAddr::ip(addr.ip(), addr.port()),
+                    data,
+                ))
+            }
         }
     }
 }
@@ -1898,7 +1999,11 @@ pub struct GroupState {
 }
 
 impl Registry {
-    pub fn build(outbounds: Vec<OutboundConfig>, groups: Vec<GroupConfig>) -> Result<Self> {
+    pub fn build(
+        outbounds: Vec<OutboundConfig>,
+        groups: Vec<GroupConfig>,
+        dns_hint: Option<&std::sync::Arc<crate::dns::resolver::DnsEngine>>,
+    ) -> Result<Self> {
         let mut index = HashMap::new();
         let mut runtime = Vec::with_capacity(outbounds.len());
         for cfg in &outbounds {
@@ -1910,6 +2015,13 @@ impl Registry {
             }
             index.insert(cfg.name.clone(), runtime.len());
             runtime.push(Outbound::from_config(cfg)?);
+        }
+        // Attach the engine resolver to every outbound that wants it
+        // (the `dns` outbound answers through it).
+        if let Some(dns) = dns_hint.as_ref() {
+            for out in &runtime {
+                out.set_dns((*dns).clone());
+            }
         }
         let mut group_index = HashMap::new();
         let mut group_states = Vec::with_capacity(groups.len());
@@ -2181,7 +2293,7 @@ mod tests {
             interval: 0,
             tolerance: 0,
         }];
-        let reg = Registry::build(vec![direct("A"), direct("B"), reject("R")], groups).unwrap();
+        let reg = Registry::build(vec![direct("A"), direct("B"), reject("R")], groups, None).unwrap();
         assert_eq!(reg.resolve("G").await.unwrap().name, "A");
         assert_eq!(reg.resolve("A").await.unwrap().name, "A");
         reg.set_selected("G", "B").await.unwrap();
@@ -2200,7 +2312,7 @@ mod tests {
             interval: 0,
             tolerance: 0,
         }];
-        assert!(Registry::build(vec![direct("A")], groups).is_err());
+        assert!(Registry::build(vec![direct("A")], groups, None).is_err());
 
         let groups = vec![
             GroupConfig {
@@ -2220,7 +2332,7 @@ mod tests {
                 tolerance: 0,
             },
         ];
-        let reg = Registry::build(vec![], groups).unwrap();
+        let reg = Registry::build(vec![], groups, None).unwrap();
         assert!(reg.resolve("G1").await.is_err());
     }
 

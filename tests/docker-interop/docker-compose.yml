@@ -1,0 +1,31 @@
+# Interop e2e: the Rust engine against a REAL mihomo release binary, both
+# directions.
+#
+# One container, everything on internal loopback 127.0.0.1: the fetched
+# mihomo server (one listener per protocol), the mihomo client (reverse
+# direction), the engine (client and server instances), the HTTP/UDP
+# targets and the probes. The image is the SAME engine-full image the
+# tests/docker-engine suite builds (tests/docker-engine/Dockerfile.engine)
+# — this suite adds nothing to it; the real mihomo release binary is
+# fetched at test time inside the container (run.sh marks that step
+# network-dependent) with a host-side cache.
+services:
+  rustcrash:
+    build:
+      context: ../..
+      dockerfile: tests/docker-engine/Dockerfile.engine
+    image: docker-engine-rustcrash
+    networks:
+      - interopnet
+    cap_add:
+      - NET_ADMIN
+    environment:
+      CRASHDIR: /tmp/rustcrash
+    volumes:
+      - ./fixtures:/interop-fixtures:ro
+    entrypoint: bash
+    command: -c "sleep infinity"
+
+networks:
+  interopnet:
+    driver: bridge

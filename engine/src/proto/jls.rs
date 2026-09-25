@@ -72,7 +72,14 @@
 //!   the random before anything is sent.
 //! * The ServerHello is verified by intercepting the first server record
 //!   in the handshake drive loop (the drive-over-records pattern of
-//!   `proto/restls.rs`).
+//!   `proto/restls.rs`). Server records that arrive coalesced with the
+//!   Finished flight — a Go jls-tls server always appends its
+//!   NewSessionTicket to the same flush (`sendServerFinished` →
+//!   `sendSessionTickets`, handshake_server_tls13.go:940-966) — are
+//!   replayed into the session's transport instead of dropped, so the
+//!   client's application-record sequence numbers stay in lockstep with
+//!   the server's (a dropped record would fail every later record's
+//!   GCM nonce).
 //!
 //! ## Scope and deviations
 //!
@@ -390,6 +397,15 @@ thread_local! {
     /// recorded for the next pass.
     static DRAW_SCRIPT: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
     static DRAWN: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+}
+
+// Test-only: the fixed X25519 scalar chosen by the last server stamping
+// window, so hermetic tests can derive the session's traffic secrets
+// from the server's side of the fixed exchange (the byte-faithful
+// Go-flight mimic below). Production never reads it.
+#[cfg(test)]
+thread_local! {
+    static TEST_SERVER_SCALAR: RefCell<Option<[u8; 32]>> = const { RefCell::new(None) };
 }
 
 fn system_random() -> &'static dyn SecureRandom {
@@ -1500,6 +1516,26 @@ async fn connect_plain(
     transport.flush().await?;
     debug!(target: "engine", sni = %cfg.sni, "jls: authenticated tunnel established");
 
+    // Records that arrived coalesced with the server's Finished flight
+    // may still sit unread in the drive loop's buffer. A Go jls-tls
+    // server ALWAYS leaves one there: sendServerFinished precomputes
+    // the client's Finished and calls sendSessionTickets() so the
+    // NewSessionTicket rides in the SAME buffered flush as the Finished
+    // (jls-tls handshake_server_tls13.go:940-966, flushed once at :88-91
+    // — "we can precompute the client finished and roll the transcript
+    // forward to send session tickets in our first flight"). Dropping
+    // such a record would leave rustls one application-traffic sequence
+    // number behind the server and fail every later record with
+    // DecryptError ("cannot decrypt peer's message"), so they are
+    // replayed ahead of the live transport — exactly what the server
+    // half below does for its own drive loop.
+    let leftover: Vec<u8> = rbuf.to_vec();
+    let transport: BoxProxyStream = if leftover.is_empty() {
+        transport
+    } else {
+        Box::new(crate::inbound::PrependStream::new(transport, leftover))
+    };
+
     Ok(Box::new(JlsTlsStream {
         tls,
         io: transport,
@@ -2027,6 +2063,8 @@ fn stamped_server_handshake(
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut scalar);
     let public = curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(scalar).0;
     FIXED_KEY.with(|k| k.set(Some((scalar, public))));
+    #[cfg(test)]
+    TEST_SERVER_SCALAR.with_borrow_mut(|s| *s = Some(scalar));
 
     let stamp = (|| {
         // Pass 1: record the draws, marshal the flight.
@@ -2258,9 +2296,12 @@ mod tests {
 
     use std::time::{Duration, Instant};
 
+    use aes_gcm::{Aes128Gcm, Aes256Gcm};
+    use hkdf::Hkdf;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use rustls::crypto::ring as ring_provider;
     use rustls::ServerConnection;
+    use sha2::{Sha256, Sha384};
     use tokio::io::DuplexStream;
 
     fn hex(b: &[u8]) -> String {
@@ -3518,5 +3559,344 @@ mod tests {
             seen.lock().unwrap().is_empty(),
             "the plain path performs no camouflage round"
         );
+    }
+
+    // ------------------------------------- byte-faithful Go server flight
+    //
+    // jls-tls's server buffers its ENTIRE first flight and flushes it in
+    // ONE write (handshake_server_tls13.go:77-91): ServerHello, the
+    // compatibility ChangeCipherSpec, the encrypted [EE, Certificate,
+    // CertificateVerify, Finished] — and, because sendServerFinished
+    // PRECOMPUTES the client's Finished and rolls the transcript forward
+    // to "send session tickets in our first flight"
+    // (handshake_server_tls13.go:940-966), the NewSessionTicket rides in
+    // the SAME flush, right after the Finished. A Go/mihomo JLS client
+    // therefore always receives — coalesced with the handshake's last
+    // record — at least one more record that consumes a server
+    // application-traffic sequence number.
+    //
+    // The mimic below reproduces that byte shape hermetically: the real
+    // rustls JLS server produces the flight, the mimic derives the
+    // server's OWN application keys from its transcript (a mini RFC 8446
+    // §7.1 schedule over the wire bytes + the ECDHE shared secret), hand
+    // -encrypts one further record (application sequence number 0) and
+    // writes flight + that record in a single write — Go's one
+    // c.flush().
+
+    /// HKDF-Expand-Label (RFC 8446 §7.1); `sha384` selects the suite hash.
+    fn mimic_expand_label(
+        sha384: bool,
+        secret: &[u8],
+        label: &str,
+        context: &[u8],
+        len: usize,
+    ) -> Vec<u8> {
+        let full = format!("tls13 {label}");
+        let mut info = Vec::with_capacity(2 + 1 + full.len() + 1 + context.len());
+        info.extend_from_slice(&(len as u16).to_be_bytes());
+        info.push(full.len() as u8);
+        info.extend_from_slice(full.as_bytes());
+        info.push(context.len() as u8);
+        info.extend_from_slice(context);
+        let mut okm = vec![0u8; len];
+        if sha384 {
+            Hkdf::<Sha384>::from_prk(secret)
+                .expect("hash-length secret")
+                .expand(&info, &mut okm)
+                .expect("in-range okm");
+        } else {
+            Hkdf::<Sha256>::from_prk(secret)
+                .expect("hash-length secret")
+                .expand(&info, &mut okm)
+                .expect("in-range okm");
+        }
+        okm
+    }
+
+    /// HKDF-Extract (RFC 5869).
+    fn mimic_extract(sha384: bool, salt: &[u8], ikm: &[u8]) -> Vec<u8> {
+        if sha384 {
+            Hkdf::<Sha384>::extract(Some(salt), ikm).0.to_vec()
+        } else {
+            Hkdf::<Sha256>::extract(Some(salt), ikm).0.to_vec()
+        }
+    }
+
+    fn mimic_hash(sha384: bool, data: &[u8]) -> Vec<u8> {
+        if sha384 {
+            Sha384::digest(data).to_vec()
+        } else {
+            Sha256::digest(data).to_vec()
+        }
+    }
+
+    /// One direction of the TLS 1.3 record layer (AEAD + nonce
+    /// arithmetic, RFC 8446 §5.2/5.3).
+    struct MimicCrypto {
+        aead: MimicAead,
+        iv: [u8; 12],
+    }
+
+    enum MimicAead {
+        Aes256(Box<Aes256Gcm>),
+        Aes128(Box<Aes128Gcm>),
+    }
+
+    impl MimicCrypto {
+        fn nonce(&self, seq: u64) -> [u8; 12] {
+            let mut nonce = self.iv;
+            let seq = seq.to_be_bytes();
+            for i in 0..8 {
+                nonce[4 + i] ^= seq[i];
+            }
+            nonce
+        }
+
+        /// Encrypt one record: `payload ‖ content_type` sealed under the
+        /// record header as AAD.
+        fn seal_record(&self, seq: u64, content_type: u8, payload: &[u8]) -> Vec<u8> {
+            let mut inner = payload.to_vec();
+            inner.push(content_type);
+            let len = inner.len() + 16;
+            let mut record = Vec::with_capacity(RECORD_HEADER_LEN + len);
+            record.extend_from_slice(&[0x17, 0x03, 0x03, (len >> 8) as u8, len as u8]);
+            let nonce_bytes = self.nonce(seq);
+            let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
+            let sealed = match &self.aead {
+                MimicAead::Aes256(a) => a
+                    .encrypt(nonce, Payload { msg: &inner, aad: &record })
+                    .expect("mimic seal"),
+                MimicAead::Aes128(a) => a
+                    .encrypt(nonce, Payload { msg: &inner, aad: &record })
+                    .expect("mimic seal"),
+            };
+            record.extend_from_slice(&sealed);
+            record
+        }
+
+        /// Decrypt one record, returning the content with the trailing
+        /// content-type byte (and any padding) stripped.
+        fn open_record(&self, seq: u64, record: &[u8]) -> Vec<u8> {
+            let nonce_bytes = self.nonce(seq);
+            let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
+            let inner = match &self.aead {
+                MimicAead::Aes256(a) => a
+                    .decrypt(
+                        nonce,
+                        Payload {
+                            msg: &record[RECORD_HEADER_LEN..],
+                            aad: &record[..RECORD_HEADER_LEN],
+                        },
+                    )
+                    .expect("mimic open"),
+                MimicAead::Aes128(a) => a
+                    .decrypt(
+                        nonce,
+                        Payload {
+                            msg: &record[RECORD_HEADER_LEN..],
+                            aad: &record[..RECORD_HEADER_LEN],
+                        },
+                    )
+                    .expect("mimic open"),
+            };
+            let end = inner
+                .iter()
+                .rposition(|b| *b != 0)
+                .expect("non-empty inner plaintext");
+            inner[..end].to_vec()
+        }
+    }
+
+    /// The server's application-traffic crypto, derived exactly as the
+    /// Go server derives it: the wire transcript (ClientHello ‖ stamped
+    /// ServerHello ‖ the decrypted handshake messages through the server
+    /// Finished) fed through the RFC 8446 §7.1 schedule with the ECDHE
+    /// shared secret the server holds. Panics if the two sides did not
+    /// agree on the handshake keys (the decrypted flight would not
+    /// authenticate).
+    fn mimic_server_app_keys(
+        client_hello_msg: &[u8],
+        flight: &[u8],
+        shared: &[u8],
+    ) -> MimicCrypto {
+        // Record 0 of the flight is the (stamped) ServerHello.
+        let sh_len = usize::from(u16::from_be_bytes([flight[3], flight[4]]));
+        let sh_msg = &flight[RECORD_HEADER_LEN..RECORD_HEADER_LEN + sh_len];
+        // version(2) random(32) session_id(1+n) cipher_suite(2).
+        let sid_end = HELLO_RANDOM_OFFSET + HELLO_RANDOM_LEN;
+        let sid_len = usize::from(sh_msg[sid_end]);
+        let suite_pos = sid_end + 1 + sid_len;
+        let suite = u16::from_be_bytes([sh_msg[suite_pos], sh_msg[suite_pos + 1]]);
+        let (sha384, key_len) = match suite {
+            0x1302 => (true, 32),  // TLS_AES_256_GCM_SHA384
+            0x1301 => (false, 16), // TLS_AES_128_GCM_SHA256
+            other => panic!("mimic: unsupported cipher suite {other:#06x}"),
+        };
+        let hash_len = if sha384 { 48 } else { 32 };
+        let new_aead = |key: &[u8]| -> MimicAead {
+            if sha384 {
+                MimicAead::Aes256(Box::new(
+                    Aes256Gcm::new_from_slice(key).expect("32-byte key"),
+                ))
+            } else {
+                MimicAead::Aes128(Box::new(
+                    Aes128Gcm::new_from_slice(key).expect("16-byte key"),
+                ))
+            }
+        };
+
+        // Transcript through the ServerHello, then the schedule up to
+        // the handshake secrets (RFC 8446 §7.1).
+        let mut transcript = client_hello_msg.to_vec();
+        transcript.extend_from_slice(sh_msg);
+        let zeros = vec![0u8; hash_len];
+        let empty_hash = mimic_hash(sha384, b"");
+        let early = mimic_extract(sha384, &zeros, &zeros);
+        let derived = mimic_expand_label(sha384, &early, "derived", &empty_hash, hash_len);
+        let hs_secret = mimic_extract(sha384, &derived, shared);
+        let s_hs = mimic_expand_label(
+            sha384,
+            &hs_secret,
+            "s hs traffic",
+            &mimic_hash(sha384, &transcript),
+            hash_len,
+        );
+        let hs = MimicCrypto {
+            aead: new_aead(&mimic_expand_label(sha384, &s_hs, "key", &[], key_len)),
+            iv: mimic_expand_label(sha384, &s_hs, "iv", &[], 12)
+                .try_into()
+                .unwrap(),
+        };
+
+        // Decrypt the encrypted flight and roll the transcript forward
+        // through the server Finished (the same plaintext stream the
+        // server hashed).
+        let mut off = RECORD_HEADER_LEN + sh_len;
+        let mut seq = 0u64;
+        while off + RECORD_HEADER_LEN <= flight.len() {
+            let rlen = usize::from(u16::from_be_bytes([flight[off + 3], flight[off + 4]]));
+            if flight[off] == 23 {
+                let plain = hs.open_record(seq, &flight[off..off + RECORD_HEADER_LEN + rlen]);
+                transcript.extend_from_slice(&plain);
+                seq += 1;
+            }
+            off += RECORD_HEADER_LEN + rlen;
+        }
+
+        let derived2 = mimic_expand_label(sha384, &hs_secret, "derived", &empty_hash, hash_len);
+        let master = mimic_extract(sha384, &derived2, &zeros);
+        let s_ap = mimic_expand_label(
+            sha384,
+            &master,
+            "s ap traffic",
+            &mimic_hash(sha384, &transcript),
+            hash_len,
+        );
+        MimicCrypto {
+            aead: new_aead(&mimic_expand_label(sha384, &s_ap, "key", &[], key_len)),
+            iv: mimic_expand_label(sha384, &s_ap, "iv", &[], 12)
+                .try_into()
+                .unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_path_decrypts_records_coalesced_with_the_server_finished_flight() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Fake credentials only (loopback, never a real secret).
+        let cfg = test_cfg("user1", "pass1");
+        let user = JlsUser::new("user1", "pass1").unwrap();
+        let server_config = test_server_cfg(std::slice::from_ref(&user));
+        let (client, server_io) = tokio::io::duplex(256 * 1024);
+        let mut server_io: BoxProxyStream = Box::new(server_io);
+        let client_task = tokio::spawn(tokio::time::timeout(
+            Duration::from_secs(20),
+            async move { connect(&cfg, Box::new(client) as BoxProxyStream).await },
+        ));
+
+        // The production server read/stamp phase, driven by hand so the
+        // final flight is written exactly like Go's single flush.
+        let mut rbuf = BytesMut::new();
+        let mut prefix = Vec::new();
+        let hello = read_client_hello(&mut server_io, &mut rbuf, &mut prefix)
+            .await
+            .expect("a ClientHello");
+        let authed = authenticate_client_hello(&server_config, &hello).expect("JLS auth");
+        let (mut tls_srv, flight) =
+            stamped_server_handshake(&server_config.tls, &prefix, &authed)
+                .expect("stamped server flight");
+        let server_scalar = TEST_SERVER_SCALAR
+            .with_borrow_mut(|s| s.take())
+            .expect("server scalar captured");
+        let client_share =
+            crate::proto::reality::tls13::test_server::parse_client_hello(&hello)
+                .expect("parseable ClientHello")
+                .x25519_share;
+        let shared = curve25519_dalek::montgomery::MontgomeryPoint(client_share)
+            .mul_clamped(server_scalar)
+            .0;
+        let app_keys = mimic_server_app_keys(&hello, &flight, &shared);
+
+        // Go's single c.flush(): the flight AND one further record that
+        // consumes server application sequence number 0 (Go's is the
+        // NewSessionTicket sendSessionTickets folds into the first
+        // flight) leave in ONE write.
+        let coalesced = app_keys.seal_record(0, 23, b"coalesced-with-finished");
+        let mut wire = flight.clone();
+        wire.extend_from_slice(&coalesced);
+        server_io.write_all(&wire).await.unwrap();
+        server_io.flush().await.unwrap();
+
+        // The handshake completes and the client's application writes
+        // relay through the server conn (the live symptom's other half:
+        // mihomo decrypted and relayed the inner request).
+        let mut stream = match client_task.await {
+            Ok(Ok(Ok(stream))) => stream,
+            Ok(Ok(Err(e))) => panic!("jls connect failed: {e}"),
+            Ok(Err(_)) => panic!("jls connect timed out"),
+            Err(e) => panic!("client task: {e}"),
+        };
+        stream.write_all(b"client-ping").await.unwrap();
+
+        let mut plaintext = Vec::new();
+        while plaintext.len() < b"client-ping".len() {
+            let record = read_one_record(&mut server_io, &mut rbuf).await.unwrap();
+            feed_records(&mut tls_srv, &record).unwrap();
+            tls_srv.process_new_packets().unwrap();
+            // The rustls server queues one NewSessionTicket when its
+            // handshake completes; the mimic encrypts the server's
+            // application records itself (the Go-faithful coalesced
+            // record carried the sequence number the ticket would have
+            // used), so the ticket is dropped — the JLS client disables
+            // resumption and never sees one from Go either way.
+            drop(drain_server_tls(&mut tls_srv));
+            let mut tmp = [0u8; 4096];
+            loop {
+                match std::io::Read::read(&mut tls_srv.reader(), &mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => plaintext.extend_from_slice(&tmp[..n]),
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("server conn read: {e}"),
+                }
+            }
+        }
+        assert_eq!(plaintext, b"client-ping");
+
+        // One more server record (application sequence number 1).
+        let followup = app_keys.seal_record(1, 23, b"follow-up-record");
+        server_io.write_all(&followup).await.unwrap();
+        server_io.flush().await.unwrap();
+
+        // The client must read BOTH: the coalesced record first. A client
+        // that dropped it would sit one sequence number behind the
+        // server and fail every later record with rustls' DecryptError
+        // ("cannot decrypt peer's message") — the live-interop symptom.
+        let mut first = [0u8; "coalesced-with-finished".len()];
+        stream.read_exact(&mut first).await.unwrap();
+        assert_eq!(&first, b"coalesced-with-finished");
+        let mut second = [0u8; "follow-up-record".len()];
+        stream.read_exact(&mut second).await.unwrap();
+        assert_eq!(&second, b"follow-up-record");
     }
 }

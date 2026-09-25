@@ -1,0 +1,55 @@
+# REVERSE direction: the REAL mihomo binary as the CLIENT, dialing the Rust
+# engine's listeners (engine-server.yaml.tmpl). Rendered by run.sh from
+# __PLACEHOLDER__ tokens. The negative node (wrong ss password) shares the
+# same engine listener.
+mixed-port: 39500
+mode: rule
+log-level: debug
+external-controller: 127.0.0.1:39590
+
+proxies:
+  - name: m-ss
+    type: ss
+    server: 127.0.0.1
+    port: __PORT_ENG_SS__
+    cipher: aes-256-gcm
+    password: interop-ss-psk-123456
+    udp: true
+
+  - name: m-trojan
+    type: trojan
+    server: 127.0.0.1
+    port: __PORT_ENG_TROJAN__
+    password: interop-trojan-pw-123456
+    sni: tls.test
+    skip-cert-verify: true
+    udp: true
+
+  - name: m-anytls
+    type: anytls
+    server: 127.0.0.1
+    port: __PORT_ENG_ANYTLS__
+    password: interop-anytls-pw-123456
+    sni: tls.test
+    skip-cert-verify: true
+    udp: true
+
+  - name: m-ss-wrongpw
+    type: ss
+    server: 127.0.0.1
+    port: __PORT_ENG_SS__
+    cipher: aes-256-gcm
+    password: wrong-password-000000
+
+proxy-groups:
+  - name: Pick
+    type: select
+    proxies:
+      - m-ss
+      - m-trojan
+      - m-anytls
+      - m-ss-wrongpw
+      - DIRECT
+
+rules:
+  - MATCH,Pick

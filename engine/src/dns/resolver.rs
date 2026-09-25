@@ -39,7 +39,10 @@ pub struct DnsEngine {
 impl DnsEngine {
     pub fn new(cfg: DnsConfig, fakeip_filter: DomainMatcher) -> Result<Arc<Self>> {
         let fakeip = if cfg.enhanced_mode == crate::config::EnhancedMode::FakeIp {
-            Some(FakeIpPool::new(&cfg.fakeip_range)?)
+            Some(match &cfg.fakeip_store {
+                Some(path) => FakeIpPool::load_from(&cfg.fakeip_range, path)?,
+                None => FakeIpPool::new(&cfg.fakeip_range)?,
+            })
         } else {
             None
         };
@@ -320,6 +323,7 @@ mod tests {
 
     fn dns_config() -> DnsConfig {
         DnsConfig {
+            fakeip_store: None,
             enable: true,
             listen: Some("127.0.0.1:0".into()),
             enhanced_mode: crate::config::EnhancedMode::FakeIp,
@@ -358,6 +362,7 @@ mod tests {
         // Filtered domain with a dead upstream → NXDOMAIN, not a fake ip.
         let engine = DnsEngine::new(
             DnsConfig {
+            fakeip_store: None,
                 fakeip_filter: vec!["filtered.test".into()],
                 ..dns_config()
             },
@@ -385,6 +390,7 @@ mod tests {
     async fn hosts_override_wins() {
         let engine = DnsEngine::new(
             DnsConfig {
+            fakeip_store: None,
                 hosts: HashMap::from([(
                     "static.test".to_string(),
                     vec!["9.9.9.9".parse().unwrap()],
@@ -404,6 +410,7 @@ mod tests {
     #[tokio::test]
     async fn dead_upstreams_rejected() {
         let cfg = DnsConfig {
+            fakeip_store: None,
             nameservers: vec![],
             ..dns_config()
         };

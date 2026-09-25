@@ -27,6 +27,44 @@ All notable changes to RustCrash. Format based on
   passthrough (the framing half of the splice; the raw-transport
   rebind is tracked).
 
+### Engine — wave 12: live interop e2e (real mihomo), wireguard stall fix, tailscale/easytier outbounds LIVE, dns outbound, rcode/fakeip/api polish
+
+- **tests/docker-interop — the live-test suite**: a REAL mihomo binary
+  (v1.19.31) serves ss/ss-2022/vmess(tcp+ws)/vless(+REALITY)/trojan/
+  hysteria2/tuic/anytls/snell(+res-tls,+jls) listeners; the engine
+  dials them all (37 checks + UDP echo rounds + wrong-credential
+  negatives), and mihomo dials the engine-as-server for ss/trojan/
+  anytls. It found four real bugs the hermetic suites missed (all
+  fixed this wave).
+- **wireguard multi-segment TCP stall FIXED**: writer-hang on
+  un-graceful close (a full queue pended forever on a dead socket),
+  a single-listener race sending RSTs on concurrent dials, and a
+  missing read-side wake; 9 repro/soak tests, 20 consecutive green
+  runs.
+- **JLS client record-layer FIXED** (live-found): the client dropped
+  the NewSessionTicket coalesced with the server's Finished flight,
+  desynchronizing the rx application-traffic sequence — auth passed
+  but every app record failed to decrypt. The leftover bytes now
+  replay ahead of the transport (the server half already did).
+- **snell fronting dialect FIXED** (live-found): the fronting options
+  live in `obfs-opts:`, not `plugin-opts:`.
+- **tailscale outbound is LIVE**: dial_tcp/dial_udp through the
+  process-global overlay (login + netmap reuse), MagicDNS resolution,
+  subnet-route + exit-node enforcement, map-poll reconnect/backoff,
+  UDP through the overlay.
+- **easytier milestone 2**: the peer RPC subset, two-node route
+  gossip, and the smoltcp attach — the outbound dials a real mesh
+  node, validated against the actual easytier-core v2.6.4 binary
+  (ignored-tagged interop test).
+- **the `type: dns` outbound**: an in-process duplex answered by the
+  engine resolver + the UDP datagram echo (mihomo's RelayDnsConn/
+  RelayDnsPacket).
+- **polish**: all six `rcode://` pseudo-nameservers; fake-ip store
+  persistence (JSON, atomic, `profile.store-fake-ip`); the API
+  surface grows /dns/query (real exchange), /cache/fakeip/flush,
+  /group(+delay), ws-interval /connections, /memory, /providers/*;
+  listener-only configs now load.
+
 ### Engine — wave 11: ECH on QUIC + JLS-in-QUIC (own TLS stack under quinn), tailscale ipn + data plane, snell/anytls frontings, easytier peer tunnel
 
 - **The quinn/rustls blocker is gone**: a `crypto::ClientConfig`

@@ -1,0 +1,53 @@
+# REVERSE direction: the Rust engine AS THE SERVER. One listener per
+# representative protocol (ss / trojan / anytls); the real mihomo binary
+# dials them as a client (see mihomo-client.yaml.tmpl). Rendered by run.sh
+# from __PLACEHOLDER__ tokens. Certs are the in-container test pair.
+#
+# The dummy socks5 proxy and the unused mixed-port exist because the
+# engine currently rejects a mihomo-dialect config without a `proxies:`
+# section ("mihomo config has no proxies") and without a classic inbound
+# ("defines no inbound ports ... and no tun block") even when it only
+# serves listeners — real mihomo accepts listener-only configs fine;
+# noted in the README as a dialect gap.
+mixed-port: 39600
+mode: rule
+log-level: debug
+external-controller: 127.0.0.1:29091
+
+proxies:
+  - name: dummy-unreachable
+    type: socks5
+    server: 127.0.0.1
+    port: 1
+
+listeners:
+  - name: engine-ss-in
+    type: shadowsocks
+    listen: 127.0.0.1
+    port: __PORT_ENG_SS__
+    cipher: aes-256-gcm
+    password: interop-ss-psk-123456
+    udp: true
+
+  - name: engine-trojan-in
+    type: trojan
+    listen: 127.0.0.1
+    port: __PORT_ENG_TROJAN__
+    udp: true
+    users:
+      - password: interop-trojan-pw-123456
+    certificate: /tmp/interop/certs/server.crt
+    private-key: /tmp/interop/certs/server.key
+
+  - name: engine-anytls-in
+    type: anytls
+    listen: 127.0.0.1
+    port: __PORT_ENG_ANYTLS__
+    users:
+      - username: anytls-user
+        password: interop-anytls-pw-123456
+    certificate: /tmp/interop/certs/server.crt
+    private-key: /tmp/interop/certs/server.key
+
+rules:
+  - MATCH,DIRECT
