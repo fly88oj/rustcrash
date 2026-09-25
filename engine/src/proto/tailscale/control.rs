@@ -420,26 +420,35 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ControlSession<S> {
 
     /// `POST <path>` with a JSON body (ts2021.Client.Post, client.go:
     /// 293-311: json.Marshal body, Content-Type: application/json, the
-    /// LB header carrying the node key). Returns the status code; the
-    /// body then streams via [`ControlSession::read_body`].
+    /// LB header carrying the node key). `lb_keys` are the node keys the
+    /// `Ts-Lb` header carries, in order — `AddLBHeader` (client.go:
+    /// 313-318) adds a line per non-zero key; the register path passes
+    /// OldNodeKey then NodeKey (direct.go:821-822), everything else one
+    /// key. Returns the status code; the body then streams via
+    /// [`ControlSession::read_body`].
     pub async fn post_json(
         &mut self,
         path: &str,
         authority: &str,
-        node_key: &NodeKey,
+        lb_keys: &[&NodeKey],
         body: &[u8],
     ) -> Result<u16> {
-        let node_hex: String = node_key.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
-        let req = format!(
+        let mut req = format!(
             "POST {path} HTTP/1.1\r\n\
              Host: {authority}\r\n\
              Content-Type: application/json\r\n\
-             Content-Length: {}\r\n\
-             {LB_HEADER}: nodekey:{node_hex}\r\n\
-             Connection: close\r\n\
-             \r\n",
+             Content-Length: {}\r\n",
             body.len()
         );
+        for key in lb_keys {
+            if key.as_bytes() == &[0u8; 32] {
+                continue; // AddLBHeader skips zero keys (client.go:315)
+            }
+            let node_hex: String =
+                key.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+            req.push_str(&format!("{LB_HEADER}: nodekey:{node_hex}\r\n"));
+        }
+        req.push_str("Connection: close\r\n\r\n");
         let mut wire = req.into_bytes();
         wire.extend_from_slice(body);
         // NoiseConn::send splits at the record boundary (4077-byte
@@ -603,8 +612,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ControlSession<S> {
 // Register (direct.go TryLogin's auth-key leg, 759-860)
 // ---------------------------------------------------------------------------
 
-/// The outcome of one register round: success, or the interactive-URL
-/// branch upstream parks in a `LoginGoal{url}` (auto.go:386-405).
+/// The outcome of one register round: success, the interactive-URL
+/// branch upstream parks in a `LoginGoal{url}` (auto.go:386-405), or
+/// the expired-key branch that triggers rotation.
 #[derive(Debug)]
 pub enum RegisterOutcome {
     /// `resp.AuthURL == "" && resp.Error == ""` — registered; the map
@@ -615,6 +625,13 @@ pub enum RegisterOutcome {
     /// not ported: a headless proxy cannot open the URL. The URL is
     /// carried for the integrator to surface.
     NeedsBrowserAuth(String),
+    /// `resp.NodeKeyExpired` — "if true, the NodeKey needs to be
+    /// replaced" (tailcfg.go:1378-1380). direct.go:861-866 returns
+    /// regen=true so the login re-runs with a freshly generated node
+    /// key (the OldNodeKey rotation, [`super`]'s renewal flow); a
+    /// second expired answer after a rotation is a hard error upstream
+    /// ("weird: regen=true but server says NodeKeyExpired").
+    NodeKeyExpired,
 }
 
 /// Build the RegisterRequest exactly like direct.go:759-804: the node
@@ -657,7 +674,12 @@ pub async fn register(
     let body = serde_json::to_vec(request)
         .map_err(|e| Error::config(format!("register request JSON: {e}")))?;
     let status = session
-        .post_json("/machine/register", authority, &request.node_key, &body)
+        .post_json(
+            "/machine/register",
+            authority,
+            &[&request.old_node_key, &request.node_key],
+            &body,
+        )
         .await?;
     let body = session.read_body_to_end().await?;
     if status != 200 {
@@ -679,9 +701,8 @@ pub async fn register(
         return Ok(RegisterOutcome::NeedsBrowserAuth(resp.auth_url));
     }
     if resp.node_key_expired {
-        return Err(Error::protocol(
-            "register request: node key expired (key rotation is not ported)",
-        ));
+        // direct.go:861-866: the caller must rotate (regen=true).
+        return Ok(RegisterOutcome::NodeKeyExpired);
     }
     Ok(RegisterOutcome::Registered(Box::new(resp)))
 }
@@ -874,6 +895,22 @@ impl NetMap {
         self.peers.iter().find(|p| p.key.as_bytes() == key)
     }
 
+    /// Whether the SELF node's key is expired at `now_unix` —
+    /// `netmap.SelfKeyExpiry().Before(clock.Now())` exactly
+    /// (ipnlocal.go:1906, `b.keyExpired`), with the self node's
+    /// `Expired` flag ORed in the way tailcfg populates it from the same
+    /// timestamp server-side. This is the trigger of the key-expiry
+    /// renewal flow (see [`super`]'s poll task).
+    pub fn self_key_expired(&self, now_unix: u64) -> bool {
+        if self.self_node.expired {
+            return true;
+        }
+        match self.self_node.key_expiry.as_deref().and_then(parse_rfc3339_unix) {
+            Some(expiry) => expiry < now_unix,
+            None => false,
+        }
+    }
+
     /// Port of `netmap.MagicDNSSuffixOfNodeName` (netmap.go:256-262):
     /// the self node's FQDN minus its first label, dots trimmed —
     /// `"host.tail-scale.ts.net."` → `"tail-scale.ts.net"`.
@@ -1032,6 +1069,81 @@ fn normalize_dns_name(name: &str) -> Option<String> {
     let mut out = trimmed.to_ascii_lowercase();
     out.push('.');
     Some(out)
+}
+
+/// Parse an RFC3339 timestamp (`2006-01-02T15:04:05[.frac][Z|±HH:MM]`,
+/// the form Go marshals `time.Time` into JSON) to Unix seconds. `None`
+/// for anything unparseable — an unparseable expiry is treated as "not
+/// expiring" by the caller, matching Go's zero-time semantics (a
+/// `.IsZero()` KeyExpiry means the node does not expire,
+/// tailcfg.go:411-413).
+pub(crate) fn parse_rfc3339_unix(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.len() < "2006-01-02T15:04:05Z".len() {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    if bytes[4] != b'-' || bytes[7] != b'-' || (bytes[10] != b'T' && bytes[10] != b't') {
+        return None;
+    }
+    let num = |a: usize, b: usize| -> Option<u64> { s.get(a..b)?.parse::<u64>().ok() };
+    let year = num(0, 4)?;
+    let month = num(5, 7)?;
+    let day = num(8, 10)?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let hour = num(11, 13)?;
+    let minute = num(14, 16)?;
+    let sec = num(17, 19)?;
+    if hour > 23 || minute > 59 || sec > 60 {
+        return None;
+    }
+    // The remainder: optional fraction, then the zone.
+    let mut rest = &s[19..];
+    if rest.starts_with('.') {
+        let end = rest[1..]
+            .find(['Z', 'z', '+', '-'])
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        rest = &rest[end..];
+    }
+    let offset_secs: i64 = if rest == "Z" || rest == "z" || rest.is_empty() {
+        0
+    } else {
+        let sign = match rest.as_bytes().first() {
+            Some(b'+') => 1i64,
+            Some(b'-') => -1i64,
+            _ => return None,
+        };
+        let (oh, om) = rest.get(1..6).and_then(|z| z.split_once(':'))?;
+        let oh: i64 = oh.parse().ok()?;
+        let om: i64 = om.parse().ok()?;
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        sign * (oh * 3600 + om * 60)
+    };
+    // Days from the civil calendar (Howard Hinnant's algorithm) — the
+    // same math Go's time package does for the date half.
+    let y = year as i64 - if month <= 2 { 1 } else { 0 };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + hour as i64 * 3600 + minute as i64 * 60 + sec as i64 - offset_secs;
+    (secs >= 0).then_some(secs as u64)
+}
+
+/// Unix "now" in seconds (the clock [`NetMap::self_key_expired`]
+/// compares against).
+pub(crate) fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// The stateful session over one long-poll (map.go:52-134 mapSession):
@@ -1207,14 +1319,22 @@ impl MapSession {
 }
 
 /// Build the map request like direct.go:1083-1094 (plus Compress="",
-/// see the module docs).
-pub fn build_map_request(node_key: &NodeKey, hostinfo: Hostinfo, streaming: bool) -> MapRequest {
+/// see the module docs). `disco_key` is our disco public key —
+/// `MapRequest.DiscoKey` (`c.SetDiscoPublicKey`, auto.go:899-905 →
+/// direct.go:1047, 1096), how peers learn which disco key speaks for
+/// our node; pass the zero key when disco is not in play.
+pub fn build_map_request(
+    node_key: &NodeKey,
+    hostinfo: Hostinfo,
+    streaming: bool,
+    disco_key: &super::tailcfg::DiscoKeyText,
+) -> MapRequest {
     MapRequest {
         version: super::tailcfg::CURRENT_CAPABILITY_VERSION,
         compress: String::new(),
         keep_alive: true,
         node_key: node_key.clone(),
-        disco_key: Default::default(),
+        disco_key: disco_key.clone(),
         stream: streaming,
         hostinfo: Some(hostinfo),
         endpoints: Vec::new(),
@@ -1259,7 +1379,7 @@ where
     let body = serde_json::to_vec(request)
         .map_err(|e| Error::config(format!("map request JSON: {e}")))?;
     let status = session
-        .post_json("/machine/map", authority, &request.node_key, &body)
+        .post_json("/machine/map", authority, &[&request.node_key], &body)
         .await?;
     if status != 200 {
         // The error body is small; read it for the message like
@@ -2026,7 +2146,7 @@ mod tests {
         .unwrap();
         let mut session = ControlSession::dial(&dialer).await.unwrap();
         let mut ms = MapSession::new(node_key.clone());
-        let req = build_map_request(&node_key, hostinfo(), true);
+        let req = build_map_request(&node_key, hostinfo(), true, &Default::default());
 
         let maps = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = maps.clone();
@@ -2077,7 +2197,7 @@ mod tests {
         let err = stream_map(
             &mut session,
             "a",
-            &build_map_request(&node_key, hostinfo(), true),
+            &build_map_request(&node_key, hostinfo(), true, &Default::default()),
             &mut ms,
             |_| {},
         )
@@ -2157,6 +2277,68 @@ mod tests {
             ("http".into(), "127.0.0.1".into(), 8080)
         );
         assert!(split_url("control.example").is_err());
+    }
+
+    #[test]
+    fn rfc3339_parsing_covers_go_s_time_json_shapes() {
+        // The exact instants Go's time package would produce.
+        assert_eq!(parse_rfc3339_unix("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_rfc3339_unix("2000-02-29T12:00:00Z"), Some(951825600));
+        // Leap-year-adjacent and month/year boundaries.
+        assert_eq!(parse_rfc3339_unix("2026-09-24T00:00:00Z"), Some(1790208000));
+        assert_eq!(parse_rfc3339_unix("2020-01-01T00:00:00Z"), Some(1577836800));
+        // Fractional seconds are skipped, not parsed.
+        assert_eq!(
+            parse_rfc3339_unix("2020-01-01T00:00:00.123456789Z"),
+            Some(1577836800)
+        );
+        // Zone offsets apply (+02:30 subtracts 2h30m).
+        assert_eq!(
+            parse_rfc3339_unix("2020-01-01T02:30:00+02:30"),
+            Some(1577836800)
+        );
+        assert_eq!(
+            parse_rfc3339_unix("2020-01-01T02:30:00+02:30"),
+            parse_rfc3339_unix("2020-01-01T00:00:00Z")
+        );
+        // Malformed: bad date, bad month, short string, garbage zone.
+        assert_eq!(parse_rfc3339_unix("not-a-time"), None);
+        assert_eq!(parse_rfc3339_unix("2020-13-01T00:00:00Z"), None);
+        assert_eq!(parse_rfc3339_unix("2020-01-32T00:00:00Z"), None);
+        assert_eq!(parse_rfc3339_unix("2020-01-01T25:00:00Z"), None);
+        assert_eq!(parse_rfc3339_unix("2020-01-01T00:00:00~"), None);
+        // Pre-epoch clamps to None (a negative unix time is never a
+        // tailcfg expiry in practice).
+        assert_eq!(parse_rfc3339_unix("1969-12-31T23:59:59Z"), None);
+    }
+
+    #[test]
+    fn self_key_expiry_detection_matches_ipnlocal() {
+        // ipnlocal.go:1906: isExpired = !SelfKeyExpiry().IsZero() &&
+        // SelfKeyExpiry().Before(now). A map with no expiry never
+        // expires; a past one does; a future one does not; the Expired
+        // flag alone does.
+        let mut nm = NetMap::default();
+        assert!(!nm.self_key_expired(unix_now()));
+        nm.self_node.key_expiry = Some("2020-01-01T00:00:00Z".into());
+        assert!(nm.self_key_expired(unix_now()));
+        nm.self_node.key_expiry = Some("2999-01-01T00:00:00Z".into());
+        assert!(!nm.self_key_expired(unix_now()));
+        nm.self_node.key_expiry = None;
+        nm.self_node.expired = true;
+        assert!(nm.self_key_expired(unix_now()));
+    }
+
+    #[test]
+    fn expired_register_response_is_the_rotation_signal() {
+        // direct.go:861-866: resp.NodeKeyExpired becomes regen=true, not
+        // an error — decode the JSON shape straight off the wire parser.
+        let resp: RegisterResponse =
+            serde_json::from_str(r#"{"NodeKeyExpired":true}"#).unwrap();
+        assert!(resp.node_key_expired);
+        assert!(!resp.machine_authorized);
+        // The register outcome is driven in `super`'s e2e renewal test
+        // (the mimic answers 200 with this body).
     }
 
     #[tokio::test]
