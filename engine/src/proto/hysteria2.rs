@@ -18,7 +18,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use rand::rngs::OsRng;
 use rand::{Rng, RngCore};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::addr::NetAddr;
 use crate::error::{Error, Result};
