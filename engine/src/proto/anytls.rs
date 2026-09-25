@@ -58,7 +58,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{ready, Context, Poll};
 use std::time::{Duration, Instant};
@@ -98,7 +98,7 @@ const MAX_FRAME_DATA: usize = 0xFFFF;
 const CHECK_MARK: isize = -1;
 
 /// padding.go:16-25 — the exact default scheme mihomo ships.
-const DEFAULT_PADDING_SCHEME: &[u8] = b"stop=8\n\
+pub const DEFAULT_PADDING_SCHEME: &[u8] = b"stop=8\n\
 0=30-30\n\
 1=100-400\n\
 2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000\n\
@@ -674,7 +674,7 @@ impl AnyTlsSession {
     /// client.go:55-66): a fresh stream id, `cmdSYN` + the first
     /// `cmdPSH(target socksaddr)` flushed together with the buffered
     /// settings as one padded write.
-    async fn open_stream(&self, target: &NetAddr) -> Result<AnyTlsStream> {
+    pub async fn open_stream(&self, target: &NetAddr) -> Result<AnyTlsStream> {
         if self.core.is_dead() {
             return Err(Error::network("anytls: session closed"));
         }
@@ -980,7 +980,7 @@ async fn open_session(cfg: &AnyTlsOut, transport: BoxProxyStream) -> Result<AnyT
         server = %cfg.server, port = %cfg.port, sni = %server_name, skip_verify = cfg.skip_verify,
         "anytls: opening session"
     );
-    let mut tls = if let Some(opts) = cfg.ech.as_ref().filter(|o| o.enable) {
+    let tls = if let Some(opts) = cfg.ech.as_ref().filter(|o| o.enable) {
         // ECH: the engine's own TLS 1.3 stack carries the outer/inner
         // ClientHello pair (ech-opts on anytls). Self-dialing like the
         // jls/jls-quic split upstream: ECH owns the transport.
@@ -1043,10 +1043,26 @@ async fn open_session(cfg: &AnyTlsOut, transport: BoxProxyStream) -> Result<AnyT
         .await?
     };
 
-    // Auth (client.go:77-97): one TLS write before anything else.
+    // Auth (client.go:77-97) + NewClientSession/Run, via
+    // [`start_session`].
+    start_session(tls, &cfg.password).await
+}
+
+/// The post-transport client bring-up: the auth packet (`sha256(pw) ||
+/// be16(pad0) || pad0`, client.go:77-97) then the session loops. Split
+/// out of [`open_session`] so a caller that already owns the transport
+/// layer can join the same wire (tests use plain TCP; embedders can
+/// front their own TLS/JLS exactly like upstream's listener stacking).
+pub async fn start_session(
+    mut tls: BoxProxyStream,
+    password: &str,
+) -> Result<AnyTlsSession> {
+    if password.is_empty() {
+        return Err(Error::config("anytls: password is required"));
+    }
     let auth = auth_packet(
         &PaddingFactory::new(DEFAULT_PADDING_SCHEME).expect("default scheme is well-formed"),
-        &cfg.password,
+        password,
     )?;
     tls.write_all(&auth).await?;
     tls.flush().await?;
@@ -1054,12 +1070,58 @@ async fn open_session(cfg: &AnyTlsOut, transport: BoxProxyStream) -> Result<AnyT
     Ok(AnyTlsSession::start(tls))
 }
 
+/// [`connect`] over a caller-owned transport (no TLS layer): the
+/// hermetic-test / custom-frontend path. Production anytls is TLS by
+/// design — upstream refuses to serve without certificates
+/// (listener/anytls/server.go:159-163) — so integrators front this with
+/// TLS, JLS or shadow-tls exactly like upstream's listener stacking.
+pub async fn connect_plain(
+    cfg: &AnyTlsOut,
+    transport: BoxProxyStream,
+    target: &NetAddr,
+) -> Result<BoxProxyStream> {
+    let session = open_session_plain(cfg, transport).await?;
+    let stream = session.open_stream(target).await?;
+    Ok(Box::new(stream))
+}
+
+/// [`open_session`] over a caller-owned transport. `jls-opts`/`ech-opts`
+/// own the dial, so they cannot combine with an injected transport.
+pub async fn open_session_plain(
+    cfg: &AnyTlsOut,
+    transport: BoxProxyStream,
+) -> Result<AnyTlsSession> {
+    if cfg.password.is_empty() {
+        return Err(Error::config("anytls: password is required"));
+    }
+    if cfg.jls.is_some() || cfg.ech.as_ref().is_some_and(|o| o.enable) {
+        return Err(Error::config(
+            "anytls: plain session start cannot combine jls-opts/ech-opts (they own the transport)",
+        ));
+    }
+    start_session(transport, &cfg.password).await
+}
+
+/// [`udp_stream`] over a caller-owned transport (see [`connect_plain`]).
+pub async fn udp_stream_plain(
+    cfg: &AnyTlsOut,
+    transport: BoxProxyStream,
+) -> Result<AnyTlsUdp> {
+    let session = open_session_plain(cfg, transport).await?;
+    let target = NetAddr::domain(UOT_MAGIC_ADDRESS, 0)?;
+    let stream = session.open_stream(&target).await?;
+    Ok(AnyTlsUdp {
+        stream: Box::new(stream),
+        request_written: false,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // UDP over anytls (sing uot v2)
 // ---------------------------------------------------------------------------
 
 /// The magic uot v2 destination (`uot.MagicAddress`, protocol.go:15).
-const UOT_MAGIC_ADDRESS: &str = "sp.v2.udp-over-tcp.arpa";
+pub const UOT_MAGIC_ADDRESS: &str = "sp.v2.udp-over-tcp.arpa";
 
 /// Append a uot packet address (uot `AddrParser`, protocol.go:19-23):
 /// atyp `0x00`=IPv4, `0x01`=IPv6, `0x02`=Fqdn, then the port be16.
@@ -1454,6 +1516,708 @@ impl AnyTlsSessionPool {
             s.kill("anytls: pool closed");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Server half (listener/anytls/server.go + the server arms of the shared
+// session recvLoop, transport/anytls/session/session.go:166-360)
+// ---------------------------------------------------------------------------
+
+/// `sha256(data)` as a plain 32-byte array (the auth hash form).
+fn sha256_32(data: &[u8]) -> [u8; 32] {
+    let digest = Sha256::digest(data);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+/// The listener's credential set: `sha256(password) → user`
+/// (listener/anytls/server.go:120-125 — `sl.userMap`).
+pub struct AnyTlsUserMap(HashMap<[u8; 32], String>);
+
+impl AnyTlsUserMap {
+    /// The single `password` authenticates as the anonymous user (`""`),
+    /// matching the engine's single-password listener shape; every
+    /// `users` entry maps its own password to its username (mihomo's
+    /// `config.Users`).
+    pub fn new(password: &str, users: &[(String, String)]) -> Self {
+        let mut map: HashMap<[u8; 32], String> = HashMap::new();
+        if !password.is_empty() {
+            map.insert(sha256_32(password.as_bytes()), String::new());
+        }
+        for (user, pw) in users {
+            map.insert(sha256_32(pw.as_bytes()), user.clone());
+        }
+        AnyTlsUserMap(map)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// HandleConn's map hit (server.go:225-229).
+    pub fn authenticate(&self, hash: &[u8; 32]) -> Option<&str> {
+        self.0.get(hash).map(String::as_str)
+    }
+}
+
+/// Read and validate the auth packet — HandleConn's prelude
+/// (listener/anytls/server.go:210-240): `sha256(password) || be16(pad0)
+/// || pad0`. `Ok(None)` = unknown hash: upstream closes without writing
+/// a byte (no oracle), the caller just drops the conn.
+pub async fn read_auth(
+    stream: &mut BoxProxyStream,
+    users: &AnyTlsUserMap,
+) -> Result<Option<String>> {
+    let mut hash = [0u8; 32];
+    stream.read_exact(&mut hash).await?;
+    let Some(user) = users.authenticate(&hash) else {
+        return Ok(None);
+    };
+    let mut plen = [0u8; 2];
+    stream.read_exact(&mut plen).await?;
+    let padding_len = u16::from_be_bytes(plen) as usize;
+    if padding_len > 0 {
+        let mut pad = vec![0u8; padding_len];
+        stream.read_exact(&mut pad).await?;
+    }
+    Ok(Some(user.to_string()))
+}
+
+/// The per-session stream callback — `NewServerSession`'s `onNewStream`
+/// (listener/anytls/server.go:242-260). Called on the session's recv
+/// task for every `cmdSYN`; implementations must spawn their own task.
+pub type AnyTlsOnStream = Arc<dyn Fn(AnyTlsServerStream) + Send + Sync>;
+
+/// One inbound stream event (the server side of `StreamEvent`: SYNACK
+/// errors are client-side receptions only).
+enum ServerStreamEvent {
+    Data(Vec<u8>),
+    Fin,
+}
+
+struct ServerCore {
+    tx: mpsc::UnboundedSender<WriteCmd>,
+    streams: StdMutex<HashMap<u32, mpsc::UnboundedSender<ServerStreamEvent>>>,
+    /// The scheme this server enforces (pushed when the client's md5
+    /// differs, session.go:274-283).
+    padding: Arc<StdMutex<PaddingFactory>>,
+    padding_raw: Vec<u8>,
+    peer_version: AtomicU32,
+    /// The `receivedSettingsFromClient` gate (session.go:170, 207-211).
+    received_settings: AtomicBool,
+    dead: watch::Sender<bool>,
+    dead_rx: watch::Receiver<bool>,
+    die_reason: Arc<StdMutex<String>>,
+    /// The authenticated user (auth.ContextWithUser, server.go:225-228).
+    user: String,
+    on_stream: AnyTlsOnStream,
+}
+
+impl ServerCore {
+    fn is_dead(&self) -> bool {
+        *self.dead_rx.borrow()
+    }
+
+    /// `Session.Close` for the server role: end every stream pipe, shut
+    /// the transport down.
+    fn kill(&self, reason: &str) {
+        if self.is_dead() {
+            return;
+        }
+        *self.die_reason.lock().unwrap() = reason.to_string();
+        self.streams.lock().unwrap().clear();
+        let _ = self.dead.send(true);
+        let _ = self.tx.send(WriteCmd::Shutdown);
+    }
+}
+
+/// The server writer task — `writeControlFrame`/`writeDataFrame` under
+/// `connLock`, server side: `sendPadding` is a client-only flag
+/// (session.go:45-48, 56-66), so the server writes are plain
+/// write+flush sequences.
+async fn server_writer_loop(
+    mut rx: mpsc::UnboundedReceiver<WriteCmd>,
+    mut conn: tokio::io::WriteHalf<BoxProxyStream>,
+    dead: watch::Sender<bool>,
+    die_reason: Arc<StdMutex<String>>,
+) {
+    while let Some(cmd) = rx.recv().await {
+        match cmd {
+            WriteCmd::Bytes(frames) => {
+                if conn.write_all(&frames).await.is_err() || conn.flush().await.is_err() {
+                    *die_reason.lock().unwrap() =
+                        "anytls: server session write error".to_string();
+                    let _ = dead.send(true);
+                    return;
+                }
+            }
+            WriteCmd::Flush(ack) => {
+                let _ = ack.send(conn.flush().await);
+            }
+            WriteCmd::Shutdown => {
+                let _ = conn.shutdown().await;
+                return;
+            }
+            // cmdSettings buffering is a client-only notion.
+            WriteCmd::Open { ack, .. } => {
+                let _ = ack.send(Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "anytls: server streams are opened by the client",
+                )));
+            }
+        }
+    }
+    let _ = conn.shutdown().await;
+}
+
+/// `util.StringMap` — the `k=v\n` settings payload form.
+fn parse_string_map(text: &str) -> HashMap<String, String> {
+    text.split('\n')
+        .filter_map(|line| line.split_once('='))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect()
+}
+
+/// The server recv loop — recvLoop's server arms
+/// (transport/anytls/session/session.go:166-360). Runs to session end.
+async fn server_recv_loop(
+    mut rd: tokio::io::ReadHalf<BoxProxyStream>,
+    core: Arc<ServerCore>,
+    mut dead_rx: watch::Receiver<bool>,
+) {
+    let mut rbuf = BytesMut::with_capacity(16 * 1024);
+    'session: loop {
+        while let Some((cmd, sid, len)) = parse_header(&rbuf) {
+            if rbuf.len() < HEADER_SIZE + len {
+                break;
+            }
+            rbuf.advance(HEADER_SIZE);
+            let data = rbuf[..len].to_vec();
+            rbuf.advance(len);
+            match cmd {
+                CMD_PSH => {
+                    // session.go:190-205 — pipe into the stream if live.
+                    if !data.is_empty() {
+                        let streams = core.streams.lock().unwrap();
+                        if let Some(tx) = streams.get(&sid) {
+                            let _ = tx.send(ServerStreamEvent::Data(data));
+                        }
+                    }
+                }
+                CMD_SYN => {
+                    // session.go:207-225 — settings must precede any SYN.
+                    if !core.received_settings.load(Ordering::Relaxed) {
+                        let mut alert = Vec::with_capacity(HEADER_SIZE + 32);
+                        frame_into(
+                            &mut alert,
+                            CMD_ALERT,
+                            0,
+                            b"client did not send its settings",
+                        );
+                        let _ = core.tx.send(WriteCmd::Bytes(alert));
+                        core.kill("anytls: client did not send its settings");
+                        break 'session;
+                    }
+                    let mut streams = core.streams.lock().unwrap();
+                    if let std::collections::hash_map::Entry::Vacant(entry) = streams.entry(sid)
+                    {
+                        let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+                        entry.insert(ev_tx);
+                        drop(streams);
+                        // go onNewStream(stream) — the callback spawns.
+                        (core.on_stream)(AnyTlsServerStream {
+                            core: core.clone(),
+                            sid,
+                            rx: ev_rx,
+                            out: BytesMut::with_capacity(16 * 1024),
+                            fin: false,
+                            fin_sent: false,
+                            reported: false,
+                        });
+                    }
+                }
+                CMD_FIN => {
+                    // session.go:248-255.
+                    let tx = core.streams.lock().unwrap().remove(&sid);
+                    if let Some(tx) = tx {
+                        let _ = tx.send(ServerStreamEvent::Fin);
+                    }
+                }
+                CMD_WASTE => {}
+                CMD_SETTINGS => {
+                    // session.go:267-296, the !isClient arm: remember the
+                    // gate, push our scheme on an md5 mismatch, answer
+                    // v2 clients with cmdServerSettings.
+                    core.received_settings.store(true, Ordering::Relaxed);
+                    let settings = parse_string_map(&String::from_utf8_lossy(&data));
+                    let our_md5 = core.padding.lock().unwrap().md5.clone();
+                    if settings.get("padding-md5").map(String::as_str) != Some(our_md5.as_str()) {
+                        let mut f = Vec::with_capacity(HEADER_SIZE + core.padding_raw.len());
+                        frame_into(&mut f, CMD_UPDATE_PADDING, 0, &core.padding_raw);
+                        if core.tx.send(WriteCmd::Bytes(f)).is_err() {
+                            break 'session;
+                        }
+                    }
+                    if let Some(v) = settings.get("v").and_then(|v| v.parse::<u32>().ok()) {
+                        if v >= 2 {
+                            core.peer_version.store(v, Ordering::Relaxed);
+                            let mut f = Vec::with_capacity(HEADER_SIZE + 4);
+                            frame_into(&mut f, CMD_SERVER_SETTINGS, 0, b"v=2");
+                            if core.tx.send(WriteCmd::Bytes(f)).is_err() {
+                                break 'session;
+                            }
+                        }
+                    }
+                }
+                CMD_ALERT => {
+                    // session.go:285-301 — the session ends.
+                    error!(
+                        target: "engine",
+                        "anytls: client alert: {}",
+                        String::from_utf8_lossy(&data)
+                    );
+                    core.kill("anytls: client alert");
+                    break 'session;
+                }
+                // cmdUpdatePaddingScheme is applied by clients only
+                // (session.go:297-311); cmdSYNACK/cmdHeartResponse/
+                // cmdServerSettings are client-side receptions. Unknown
+                // commands carry no payload and are ignored.
+                _ => {}
+            }
+        }
+
+        let mut tmp = [0u8; 16 * 1024];
+        tokio::select! {
+            changed = dead_rx.changed() => {
+                if changed.is_ok() && *dead_rx.borrow() {
+                    break 'session;
+                }
+            }
+            r = rd.read(&mut tmp) => match r {
+                Ok(0) => {
+                    core.kill("anytls: client closed the session");
+                    break 'session;
+                }
+                Ok(n) => rbuf.extend_from_slice(&tmp[..n]),
+                Err(e) => {
+                    core.kill(&format!("anytls: server session read error: {e}"));
+                    break 'session;
+                }
+            },
+        }
+    }
+}
+
+/// A server-side anytls stream: one client-opened sid — mihomo `Stream`
+/// over `NewServerSession`. The first PSH carries the target
+/// ([`AnyTlsServerStream::read_target`]); `HandshakeSuccess`/
+/// `HandshakeFailure` send the (single) SYNACK (stream.go:138-163).
+pub struct AnyTlsServerStream {
+    core: Arc<ServerCore>,
+    sid: u32,
+    rx: mpsc::UnboundedReceiver<ServerStreamEvent>,
+    out: BytesMut,
+    fin: bool,
+    fin_sent: bool,
+    /// reportOnce (stream.go:130-131).
+    reported: bool,
+}
+
+impl AnyTlsServerStream {
+    /// The authenticated user for this session (the
+    /// `auth.ContextWithUser` value, listener/anytls/server.go:225-228)
+    /// — "" in single-password mode.
+    pub fn user(&self) -> &str {
+        &self.core.user
+    }
+
+    /// The session's stream id (diagnostics).
+    pub fn sid(&self) -> u32 {
+        self.sid
+    }
+
+    /// Read the stream's target — `M.SocksaddrSerializer.ReadAddrPort`
+    /// (listener/anytls/server.go:245-249): the client's first cmdPSH
+    /// carries exactly the socks address.
+    pub async fn read_target(&mut self) -> Result<NetAddr> {
+        let mut buf = self.read_n(1).await?;
+        let rest = match buf[0] {
+            0x01 => 4 + 2,
+            0x04 => 16 + 2,
+            0x03 => {
+                // The domain length byte is part of the address form —
+                // keep it in the buffer for the decoder.
+                let mut len = self.read_n(1).await?;
+                let rest = len[0] as usize + 2;
+                buf.append(&mut len);
+                rest
+            }
+            other => {
+                return Err(Error::protocol(format!(
+                    "anytls: bad target atyp {other:#x}"
+                )));
+            }
+        };
+        buf.extend(self.read_n(rest).await?);
+        let (target, consumed) = crate::addr::decode_socks_addr(&buf)?;
+        if consumed != buf.len() {
+            return Err(Error::protocol(
+                "anytls: target address has trailing bytes",
+            ));
+        }
+        Ok(target)
+    }
+
+    /// `HandshakeSuccess` (stream.go:153-163): one empty SYNACK, v2
+    /// peers only — "mihomo does not implement a connection error
+    /// reporting mechanism, so we report success directly"
+    /// (listener/anytls/server.go:250-252).
+    pub fn handshake_success(&mut self) {
+        self.report_synack(&[]);
+    }
+
+    /// `HandshakeFailure` (stream.go:138-151): one SYNACK carrying the
+    /// error text, v2 peers only.
+    pub fn handshake_failure(&mut self, err: &str) {
+        self.report_synack(err.as_bytes());
+    }
+
+    fn report_synack(&mut self, payload: &[u8]) {
+        if self.reported {
+            return;
+        }
+        self.reported = true;
+        if self.core.peer_version.load(Ordering::Relaxed) >= 2 {
+            let mut f = Vec::with_capacity(HEADER_SIZE + payload.len());
+            frame_into(&mut f, CMD_SYNACK, self.sid, payload);
+            let _ = self.core.tx.send(WriteCmd::Bytes(f));
+        }
+    }
+
+    /// Buffered exact read over the stream events.
+    async fn read_n(&mut self, n: usize) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; n];
+        let mut filled = 0usize;
+        std::future::poll_fn(|cx| {
+            loop {
+                while filled < n && !self.out.is_empty() {
+                    let take = self.out.len().min(n - filled);
+                    buf[filled..filled + take].copy_from_slice(&self.out[..take]);
+                    self.out.advance(take);
+                    filled += take;
+                }
+                if filled == n {
+                    return Poll::Ready(Ok(()));
+                }
+                match Pin::new(&mut self.rx).poll_recv(cx) {
+                    Poll::Ready(Some(ServerStreamEvent::Data(d))) => {
+                        self.out.extend_from_slice(&d);
+                    }
+                    Poll::Ready(Some(ServerStreamEvent::Fin)) | Poll::Ready(None) => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "anytls: stream closed inside the target address",
+                        )));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        })
+        .await
+        .map_err(Error::from)?;
+        Ok(buf)
+    }
+}
+
+impl AsyncRead for AnyTlsServerStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        loop {
+            if buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            if !this.out.is_empty() {
+                let n = this.out.len().min(buf.remaining());
+                buf.put_slice(&this.out[..n]);
+                this.out.advance(n);
+                return Poll::Ready(Ok(()));
+            }
+            if this.fin {
+                return Poll::Ready(Ok(()));
+            }
+            match Pin::new(&mut this.rx).poll_recv(cx) {
+                Poll::Ready(Some(ServerStreamEvent::Data(d))) => {
+                    this.out.extend_from_slice(&d);
+                }
+                Poll::Ready(Some(ServerStreamEvent::Fin)) => {
+                    this.fin = true;
+                }
+                Poll::Ready(None) => {
+                    // The session ended every stream pipe.
+                    if this.core.is_dead() {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            format!(
+                                "anytls: session closed: {}",
+                                this.core.die_reason.lock().unwrap()
+                            ),
+                        )));
+                    }
+                    this.fin = true;
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl AsyncWrite for AnyTlsServerStream {
+    /// `Stream.Write` → `writeDataFrame` (session.go:379-420): PSH
+    /// frames queued to the session's serialised writer.
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if this.fin_sent {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "anytls: stream closed",
+            )));
+        }
+        if this.core.is_dead() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!(
+                    "anytls: session closed: {}",
+                    this.core.die_reason.lock().unwrap()
+                ),
+            )));
+        }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let mut frames = Vec::with_capacity(buf.len() + HEADER_SIZE);
+        psh_frames_into(&mut frames, this.sid, buf);
+        if this.core.tx.send(WriteCmd::Bytes(frames)).is_err() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "anytls: session closed",
+            )));
+        }
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let (ack_tx, mut ack_rx) = oneshot::channel();
+        if this.core.tx.send(WriteCmd::Flush(ack_tx)).is_err() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "anytls: session closed",
+            )));
+        }
+        match ready!(Pin::new(&mut ack_rx).poll(cx)) {
+            Ok(res) => Poll::Ready(res),
+            Err(_) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "anytls: session closed during flush",
+            ))),
+        }
+    }
+
+    /// `Stream.Close` → `streamClosed` → cmdFIN (session.go:362-371);
+    /// pending reads still drain.
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if !this.fin_sent {
+            this.fin_sent = true;
+            let mut fin = Vec::with_capacity(HEADER_SIZE);
+            frame_into(&mut fin, CMD_FIN, this.sid, &[]);
+            let _ = this.core.tx.send(WriteCmd::Bytes(fin));
+        }
+        this.fin = true;
+        Pin::new(&mut *this).poll_flush(cx)
+    }
+}
+
+impl Drop for AnyTlsServerStream {
+    /// FIN if unsent + deregister (no pool to recycle into — the server
+    /// keeps the session until the client goes away).
+    fn drop(&mut self) {
+        if !self.fin_sent {
+            let mut fin = Vec::with_capacity(HEADER_SIZE);
+            frame_into(&mut fin, CMD_FIN, self.sid, &[]);
+            let _ = self.core.tx.send(WriteCmd::Bytes(fin));
+        }
+        self.core.streams.lock().unwrap().remove(&self.sid);
+    }
+}
+
+/// Run one server session to completion — `NewServerSession` +
+/// `session.Run(); session.Close()` (listener/anytls/server.go:242-262).
+///
+/// * `padding_scheme` is the raw scheme this server enforces
+///   (`listeners[].padding-scheme`, server.go:127-133; the default when
+///   empty or unparseable).
+/// * `user` is the authenticated username carried on every stream
+///   ([`AnyTlsServerStream::user`]).
+/// * `on_stream` receives every client-opened stream (cmdSYN).
+pub async fn run_server_session(
+    stream: BoxProxyStream,
+    padding_scheme: &[u8],
+    user: String,
+    on_stream: AnyTlsOnStream,
+) {
+    let parsed = PaddingFactory::new(padding_scheme);
+    if !padding_scheme.is_empty() && parsed.is_none() {
+        warn!(
+            target: "engine",
+            "anytls: custom padding scheme failed to parse; using the default"
+        );
+    }
+    let padding = parsed
+        .or_else(|| PaddingFactory::new(DEFAULT_PADDING_SCHEME))
+        .expect("the default padding scheme is well-formed");
+    let (r, w) = tokio::io::split(stream);
+    let (tx, rx) = mpsc::unbounded_channel();
+    let (dead, dead_rx) = watch::channel(false);
+    let core = Arc::new(ServerCore {
+        tx,
+        streams: StdMutex::new(HashMap::new()),
+        padding: Arc::new(StdMutex::new(padding)),
+        padding_raw: padding_scheme.to_vec(),
+        peer_version: AtomicU32::new(0),
+        received_settings: AtomicBool::new(false),
+        dead: dead.clone(),
+        dead_rx: dead_rx.clone(),
+        die_reason: Arc::new(StdMutex::new(String::new())),
+        user,
+        on_stream,
+    });
+    tokio::spawn(server_writer_loop(
+        rx,
+        w,
+        dead,
+        core.die_reason.clone(),
+    ));
+    server_recv_loop(r, core, dead_rx).await;
+}
+
+// ---------------------------------------------------------------------------
+// uot server codec (sing udp-over-tcp v2, non-connect mode)
+// ---------------------------------------------------------------------------
+
+/// Parse the lazy uot request prefix — `[isConnect u8][socksaddr]`
+/// (`uot.EncodeRequest` as the server reads it). `None` until the
+/// address is complete; the engine client always sends `isConnect=0`.
+pub fn parse_uot_request(buf: &[u8]) -> Result<Option<(bool, NetAddr, usize)>> {
+    let Some((&is_connect, rest)) = buf.split_first() else {
+        return Ok(None);
+    };
+    let Some((&atyp, addr_rest)) = rest.split_first() else {
+        return Ok(None);
+    };
+    let addr_len = match atyp {
+        0x01 => 4usize,
+        0x04 => 16usize,
+        0x03 => match addr_rest.first() {
+            Some(&len) => 1 + len as usize,
+            None => return Ok(None),
+        },
+        other => {
+            return Err(Error::protocol(format!(
+                "anytls uot: bad request atyp {other:#x}"
+            )));
+        }
+    };
+    let total = 1 + 1 + addr_len + 2;
+    if buf.len() < total {
+        return Ok(None);
+    }
+    let (target, consumed) = crate::addr::decode_socks_addr(&buf[1..])?;
+    if consumed + 1 != total {
+        return Err(Error::protocol(
+            "anytls uot: request address has trailing bytes",
+        ));
+    }
+    Ok(Some((is_connect == 0x01, target, total)))
+}
+
+/// Parse one uot datagram — `uot-addr || be16 len || payload`
+/// (`uot.conn.WritePacket`, read side). `None` until the whole packet
+/// is buffered; returns the origin, payload and consumed length.
+pub fn parse_uot_packet(buf: &[u8]) -> Result<Option<(NetAddr, Vec<u8>, usize)>> {
+    let Some((&atyp, rest)) = buf.split_first() else {
+        return Ok(None);
+    };
+    let addr_len = match atyp {
+        0x00 => 4usize,
+        0x01 => 16usize,
+        0x02 => match rest.first() {
+            Some(&len) => 1 + len as usize,
+            None => return Ok(None),
+        },
+        other => {
+            return Err(Error::protocol(format!(
+                "anytls uot: bad packet atyp {other:#x}"
+            )));
+        }
+    };
+    let fixed = 1 + addr_len + 2 + 2;
+    if buf.len() < fixed {
+        return Ok(None);
+    }
+    let host = match atyp {
+        0x00 => {
+            let mut o = [0u8; 4];
+            o.copy_from_slice(&buf[1..5]);
+            Host::Ip(std::net::IpAddr::V4(o.into()))
+        }
+        0x01 => {
+            let mut o = [0u8; 16];
+            o.copy_from_slice(&buf[1..17]);
+            Host::Ip(std::net::IpAddr::V6(o.into()))
+        }
+        _ => Host::Domain(
+            String::from_utf8_lossy(&buf[2..1 + addr_len]).into_owned(),
+        ),
+    };
+    let port_at = 1 + addr_len;
+    let port = u16::from_be_bytes([buf[port_at], buf[port_at + 1]]);
+    let len = u16::from_be_bytes([buf[port_at + 2], buf[port_at + 3]]) as usize;
+    if buf.len() < fixed + len {
+        return Ok(None);
+    }
+    Ok(Some((
+        NetAddr::new(host, port),
+        buf[fixed..fixed + len].to_vec(),
+        fixed + len,
+    )))
+}
+
+/// Encode one uot datagram for the client — the mirror of
+/// [`AnyTlsUdp::recv_from`]'s wire (`uot-addr || be16 len || payload`).
+pub fn uot_packet_frame(from: &NetAddr, payload: &[u8]) -> Result<Vec<u8>> {
+    let len = u16::try_from(payload.len()).map_err(|_| {
+        Error::protocol("anytls: udp datagram exceeds 65535 bytes")
+    })?;
+    let mut out = Vec::with_capacity(24 + payload.len());
+    uot_addr_into(&mut out, &from.host, from.port);
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(payload);
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -2227,5 +2991,292 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), stream.read(buf))
             .await
             .expect("anytls read timed out")
+    }
+
+    // ------------------------------------------- server half (wave-10)
+
+    /// A server-side stream handler: read the target, SYNACK, echo to
+    /// FIN (the `onNewStream` callback shape, listener server.go:242-260).
+    async fn server_echo_stream(mut stream: AnyTlsServerStream) {
+        let Ok(_target) = stream.read_target().await else {
+            return;
+        };
+        stream.handshake_success();
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if stream.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    let _ = stream.flush().await;
+                }
+            }
+        }
+    }
+
+    async fn spawn_server_session(
+        password: &str,
+        padding_scheme: &[u8],
+    ) -> DuplexStream {
+        let (client, server) = tokio::io::duplex(256 * 1024);
+        let users = AnyTlsUserMap::new(password, &[]);
+        let padding_scheme = padding_scheme.to_vec();
+        tokio::spawn(async move {
+            let mut server = Box::new(server) as BoxProxyStream;
+            let user = match read_auth(&mut server, &users).await {
+                Ok(Some(user)) => user,
+                _ => return, // upstream closes silently on a bad hash
+            };
+            let on_stream: AnyTlsOnStream = Arc::new(|stream| {
+                tokio::spawn(server_echo_stream(stream));
+            });
+            run_server_session(server, &padding_scheme, user, on_stream).await;
+        });
+        client
+    }
+
+    fn plain_cfg(password: &str) -> AnyTlsOut {
+        AnyTlsOut {
+            server: "127.0.0.1".into(),
+            port: 0,
+            password: password.into(),
+            sni: String::new(),
+            skip_verify: true,
+            udp: true,
+            jls: None,
+            ech: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn server_session_echo_loopback() {
+        // The engine's own client (plain transport) through the server
+        // session: auth, settings/SYN/PSH, SYNACK, echo, FIN.
+        let password = test_password();
+        let transport = spawn_server_session(&password, DEFAULT_PADDING_SCHEME).await;
+        let cfg = plain_cfg(&password);
+        let target = NetAddr::domain("echo.example", 443).unwrap();
+        let mut stream = connect_plain(&cfg, Box::new(transport), &target)
+            .await
+            .unwrap();
+        stream.write_all(b"ping-server").await.unwrap();
+        let mut buf = [0u8; 11];
+        read_timeout(&mut stream, &mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping-server");
+        stream.shutdown().await.unwrap();
+        let mut tail = [0u8; 4];
+        let n = read_timeout(&mut stream, &mut tail).await.unwrap();
+        assert_eq!(n, 0, "the server FIN is a clean EOF");
+    }
+
+    #[tokio::test]
+    async fn server_session_pushes_padding_scheme() {
+        // session.go:274-283 — the server's md5 wins: a custom scheme is
+        // pushed via cmdUpdatePaddingScheme and the client adopts it.
+        let password = test_password();
+        let scheme: &[u8] = b"stop=2\n0=10-10\n1=42-42";
+        let transport = spawn_server_session(&password, scheme).await;
+        let cfg = plain_cfg(&password);
+        let session = open_session_plain(&cfg, Box::new(transport))
+            .await
+            .unwrap();
+        let target = NetAddr::domain("echo.example", 443).unwrap();
+        let mut stream = session.open_stream(&target).await.unwrap();
+        stream.write_all(b"hello").await.unwrap();
+        let mut buf = [0u8; 5];
+        read_timeout(&mut stream, &mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+        assert_eq!(
+            stream.padding_md5(),
+            format!("{:x}", Md5::digest(scheme)),
+            "the client adopted the server's scheme"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_session_wrong_password_closes_silently() {
+        // read_auth's None path (server.go:225-229): no alert, no data,
+        // just a close.
+        let password = test_password();
+        let transport = spawn_server_session(&password, DEFAULT_PADDING_SCHEME).await;
+        let cfg = plain_cfg(&format!("wrong-{password}"));
+        let target = NetAddr::domain("echo.example", 443).unwrap();
+        let mut stream = match connect_plain(&cfg, Box::new(transport), &target).await {
+            Ok(s) => s,
+            Err(_) => return, // the open itself may observe the close
+        };
+        let _ = stream.write_all(b"ping").await;
+        let mut buf = [0u8; 8];
+        match read_timeout(&mut stream, &mut buf).await {
+            Ok(0) | Err(_) => {}
+            Ok(n) => panic!("a wrong password must not produce data ({n} bytes)"),
+        }
+    }
+
+    #[tokio::test]
+    async fn server_session_multi_user_surfaces_the_user() {
+        // The users map (server.go:120-125): each password maps to its
+        // user, visible on every stream of the session.
+        let users = vec![
+            ("alice".to_string(), "pw-a".to_string()),
+            ("bob".to_string(), "pw-b".to_string()),
+        ];
+        let map = AnyTlsUserMap::new("", &users);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.authenticate(&sha256_32(b"pw-a")), Some("alice"));
+        assert_eq!(map.authenticate(&sha256_32(b"pw-b")), Some("bob"));
+        assert_eq!(map.authenticate(&sha256_32(b"nope")), None);
+        // End to end: pw-b authenticates as "bob".
+        let (client, server) = tokio::io::duplex(256 * 1024);
+        let seen = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            let mut server = Box::new(server) as BoxProxyStream;
+            let user = match read_auth(&mut server, &map).await {
+                Ok(Some(u)) => u,
+                _ => return,
+            };
+            let on_stream: AnyTlsOnStream = Arc::new(move |stream| {
+                let seen = seen2.clone();
+                tokio::spawn(async move {
+                    seen.lock().unwrap().push(stream.user().to_string());
+                    server_echo_stream(stream).await;
+                });
+            });
+            run_server_session(server, DEFAULT_PADDING_SCHEME, user, on_stream).await;
+        });
+        let cfg = plain_cfg("pw-b");
+        let target = NetAddr::domain("echo.example", 443).unwrap();
+        let mut stream = connect_plain(&cfg, Box::new(client), &target)
+            .await
+            .unwrap();
+        stream.write_all(b"hi").await.unwrap();
+        let mut buf = [0u8; 2];
+        read_timeout(&mut stream, &mut buf).await.unwrap();
+        assert_eq!(&buf, b"hi");
+        assert_eq!(*seen.lock().unwrap(), vec!["bob".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn server_session_sees_uot_magic_target() {
+        // A udp_stream_plain client opens its stream toward the uot v2
+        // magic domain — that is what the listener's uot bridge keys on.
+        let password = test_password();
+        let (client, server) = tokio::io::duplex(256 * 1024);
+        let seen: Arc<StdMutex<Vec<NetAddr>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        let users = AnyTlsUserMap::new(&password, &[]);
+        tokio::spawn(async move {
+            let mut server = Box::new(server) as BoxProxyStream;
+            let user = match read_auth(&mut server, &users).await {
+                Ok(Some(u)) => u,
+                _ => return,
+            };
+            let on_stream: AnyTlsOnStream = Arc::new(move |mut stream| {
+                let seen = seen2.clone();
+                tokio::spawn(async move {
+                    if let Ok(target) = stream.read_target().await {
+                        seen.lock().unwrap().push(target);
+                    }
+                    stream.handshake_success();
+                    // Raw echo so the client side can proceed and finish.
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if stream.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                                let _ = stream.flush().await;
+                            }
+                        }
+                    }
+                });
+            });
+            run_server_session(server, DEFAULT_PADDING_SCHEME, user, on_stream).await;
+        });
+        let cfg = plain_cfg(&password);
+        let mut udp = udp_stream_plain(&cfg, Box::new(client))
+            .await
+            .unwrap();
+        let target = NetAddr::domain("dns.example", 53).unwrap();
+        udp.send_to(&target, b"q").await.unwrap();
+        for _ in 0..100 {
+            if !seen.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].host,
+            Host::Domain("sp.v2.udp-over-tcp.arpa".into()),
+            "the uot stream's target is the magic domain"
+        );
+    }
+
+    #[test]
+    fn uot_server_codec_roundtrip() {
+        // The engine client's exact wire: request prefix + packet form,
+        // parsed by the server codecs and re-encoded for the reply.
+        let target = NetAddr::domain("dns.example", 53).unwrap();
+        let mut wire = vec![0x00u8]; // isConnect = false
+        encode_socks_addr(&mut wire, &target.host, target.port);
+        let (is_connect, parsed, consumed) =
+            parse_uot_request(&wire).unwrap().expect("complete request");
+        assert!(!is_connect);
+        assert_eq!(parsed, target);
+        assert_eq!(consumed, wire.len());
+        // Incomplete prefix → NeedMore.
+        assert!(parse_uot_request(&wire[..wire.len() - 1]).unwrap().is_none());
+        assert!(parse_uot_request(&[]).unwrap().is_none());
+        // Bad atyp.
+        assert!(parse_uot_request(&[0x00, 0x09]).is_err());
+
+        // Packet: uot-addr || be16 || payload, both IP and domain forms.
+        let from = NetAddr::ip("8.8.4.4".parse().unwrap(), 53);
+        let frame = uot_packet_frame(&from, b"resp").unwrap();
+        let (origin, payload, consumed) =
+            parse_uot_packet(&frame).unwrap().expect("complete packet");
+        assert_eq!(origin, from);
+        assert_eq!(payload, b"resp".to_vec());
+        assert_eq!(consumed, frame.len());
+        let domain = NetAddr::domain("peer.example", 443).unwrap();
+        let frame = uot_packet_frame(&domain, b"dd").unwrap();
+        let (origin, payload, _) =
+            parse_uot_packet(&frame).unwrap().expect("complete domain packet");
+        assert_eq!(origin, domain);
+        assert_eq!(payload, b"dd".to_vec());
+        // Truncated at every boundary → NeedMore.
+        for cut in 1..frame.len() {
+            assert!(
+                parse_uot_packet(&frame[..cut]).unwrap().is_none(),
+                "cut {cut} must need more"
+            );
+        }
+        assert!(parse_uot_packet(&[0x07]).is_err());
+        // The client's recv_from wire parses back through
+        // AnyTlsUdp-compatible decoding (same addr/len/payload layout).
+        let v6 = NetAddr::ip("2001:db8::1".parse().unwrap(), 53);
+        let frame = uot_packet_frame(&v6, b"z").unwrap();
+        let (origin, payload, _) = parse_uot_packet(&frame).unwrap().unwrap();
+        assert_eq!(origin, v6);
+        assert_eq!(payload, b"z".to_vec());
+    }
+
+    #[test]
+    fn server_user_map_shapes() {
+        // Single password → anonymous user; users + password coexist.
+        let map = AnyTlsUserMap::new("solo", &[]);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.authenticate(&sha256_32(b"solo")), Some(""));
+        let map = AnyTlsUserMap::new("solo", &[("alice".into(), "pw-a".into())]);
+        assert_eq!(map.len(), 2);
+        assert!(map.authenticate(&sha256_32(b"solo")).is_some());
+        assert!(AnyTlsUserMap::new("", &[]).is_empty());
     }
 }

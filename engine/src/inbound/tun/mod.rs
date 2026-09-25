@@ -1,13 +1,15 @@
 //! TUN inbound: a real TUN device with an in-process smoltcp stack.
 //!
-//! This is the mihomo `tun:` / sing-box `tun` inbound. The device is created
-//! with `IFF_TUN | IFF_NO_PI` (raw IP packets, no PI prefix), given an
-//! address (v4 always; v6 when `inet6_address` is set) and brought up; every
-//! packet the kernel sends out of the interface is fed to a smoltcp stack,
-//! and the TCP connections / UDP associations the stack accepts are handed
-//! to the engine's [`RelayHandler`](crate::inbound::RelayHandler) exactly
-//! like any other inbound. ICMP echo requests ("ping") are answered by the
-//! stack itself on both families, mihomo-style.
+//! This is the mihomo `tun:` / sing-box `tun` inbound. The device is the
+//! platform's native one — `/dev/net/tun` (`IFF_TUN | IFF_NO_PI`) on Linux,
+//! utun on macOS, WinTUN on Windows (see [`device`]) — given an address
+//! (v4 always; v6 when `inet6_address` is set) and brought up; every packet
+//! the kernel sends out of the interface is fed to a smoltcp stack, and the
+//! TCP connections / UDP associations the stack accepts are handed to the
+//! engine's [`RelayHandler`](crate::inbound::RelayHandler) exactly like any
+//! other inbound. ICMP echo requests ("ping") are answered by the stack
+//! itself on both families, mihomo-style; DNS hijack and the IPv6
+//! extension-header walk are platform-independent (see [`netstack`]).
 //!
 //! ```no_run
 //! # async fn example(engine: std::sync::Arc<rustcrash_engine::Engine>) -> rustcrash_engine::Result<()> {
@@ -30,13 +32,15 @@
 //! # }
 //! ```
 //!
-//! Needs CAP_NET_ADMIN (or root) to create and configure the interface, and
-//! `/dev/net/tun` to exist. Failures say which of the two is missing.
+//! Linux needs CAP_NET_ADMIN (or root) plus `/dev/net/tun`; macOS needs root
+//! to open a utun unit; Windows needs `wintun.dll` (shipped with the
+//! official WireGuard clients) and the adapter driver installed once.
+//! Failures say which of these is missing.
 //!
-//! Deferred for this pass, logged at debug rather than dropped silently:
-//! IPv6 extension headers (fragment/routing/hop-by-hop packets are dropped
-//! whole — see `netstack`) and non-Linux hosts (`serve` reports a config
-//! error on anything but Linux).
+//! Known limitation, logged at debug rather than dropped silently: TCP
+//! behind IPv6 extension headers is not relayed — smoltcp does not follow
+//! chains (UDP, DNS hijack and ICMPv6 echo behind chains are handled; see
+//! `netstack`'s docs).
 
 #[cfg(target_os = "linux")]
 mod device_linux;
@@ -48,8 +52,14 @@ mod device_windows;
 /// `/dev/net/tun` backend, WinTUN on Windows and utun on macOS (the latter
 /// two cfg'd out here but compiled and layout-tested on their targets).
 pub mod device;
-#[cfg(target_os = "linux")]
+/// The async device IO surface (`TunIo`) and the reader pump that bridges
+/// the blocking device into the netstack's async loop.
+pub(crate) mod io;
 pub mod netstack;
+/// An in-memory TUN double (`LoopbackTun`): the kernel side of a tunnel for
+/// hermetic full-path netstack tests, no real device or privileges needed.
+#[cfg(test)]
+pub(crate) mod testdev;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
@@ -78,9 +88,11 @@ pub struct TunConfig {
     pub dns_hijack: Vec<IpAddr>,
     /// Optional IPv6 address + prefix for the interface (mihomo's
     /// `inet6-address: fd00::1/64`, an `(addr, prefix)` pair). When set, the
-    /// interface gets the address via the AF_INET6 `SIOCSIFADDR` ioctl and
-    /// the netstack carries IPv6 symmetric to IPv4: TCP, UDP, DNS hijack by
-    /// v6 address, and ICMPv6 echo. `None` keeps the inbound IPv4-only.
+    /// interface gets the address through the platform's v6 assignment path
+    /// (the AF_INET6 `SIOCSIFADDR` ioctl on Linux/macOS, an IP Helper
+    /// unicast-address row on Windows) and the netstack carries IPv6
+    /// symmetric to IPv4: TCP, UDP, DNS hijack by v6 address, and ICMPv6
+    /// echo. `None` keeps the inbound IPv4-only.
     pub inet6_address: Option<(Ipv6Addr, u8)>,
 }
 
@@ -91,14 +103,22 @@ pub struct TunHooks {
     pub dns: Option<Arc<DnsEngine>>,
 }
 
-/// Create the device, configure it, and relay through the stack forever.
+/// Create the platform device, configure it, and relay through the stack
+/// forever.
+///
+/// Platform split: Linux and macOS configure their interface *by name*
+/// (ioctls on an AF_INET/AF_INET6 socket); Windows identifies interfaces by
+/// LUID for its IP Helper calls, so it configures through
+/// [`device::TunDevice::luid`] — and because WinTUN adapters are created and
+/// re-opened *by name*, an empty `name` (which on Linux means "kernel
+/// picks") is a config error there.
 ///
 /// Returns `Err` only for setup failures (missing `/dev/net/tun`, no
-/// CAP_NET_ADMIN, bad prefix length) or when the device dies. Callers
-/// normally `tokio::spawn` this rather than awaiting it, since a live TUN
-/// inbound never returns on its own. Dropping the future closes the fd, which
-/// detaches and removes the interface.
-#[cfg(target_os = "linux")]
+/// CAP_NET_ADMIN/root, missing `wintun.dll`, bad prefix length) or when the
+/// device dies. Callers normally `tokio::spawn` this rather than awaiting
+/// it, since a live TUN inbound never returns on its own. Dropping the
+/// future stops the reader pump and closes the device, which detaches (and
+/// on Linux removes) the interface.
 pub async fn serve(cfg: &TunConfig, relay: SharedRelay, hooks: TunHooks) -> Result<()> {
     if cfg.netmask > 32 {
         return Err(Error::config(format!(
@@ -114,14 +134,41 @@ pub async fn serve(cfg: &TunConfig, relay: SharedRelay, hooks: TunHooks) -> Resu
             )));
         }
     }
-    let dev = Arc::new(device::TunDevice::open(&cfg.name)?);
-    let name = dev.name().to_string();
-    device::configure_interface(&name, cfg.address, cfg.netmask, cfg.mtu)?;
-    // v6 after the v4 bring-up: `ip addr add` normally runs on an up
-    // interface, and the address brings its own prefix route.
-    if let Some((inet6, prefix)) = cfg.inet6_address {
-        device::assign_inet6(&name, inet6, prefix)?;
+    #[cfg(target_os = "windows")]
+    {
+        if cfg.name.is_empty() {
+            return Err(Error::config(
+                "tun: the adapter name must be set on Windows (a WinTUN adapter is \
+                 created and re-opened by name; there is no kernel-assigned default)",
+            ));
+        }
     }
+    let dev = Arc::new(device::TunDevice::open(&cfg.name)?);
+
+    // Address/netmask/MTU/bring-up, then v6: `ip addr add` normally runs on
+    // an up interface, and the address brings its own prefix route.
+    #[cfg(not(target_os = "windows"))]
+    let configured = {
+        let name = dev.name().to_string();
+        device::configure_interface(&name, cfg.address, cfg.netmask, cfg.mtu).and_then(
+            |()| match cfg.inet6_address {
+                Some((inet6, prefix)) => device::assign_inet6(&name, inet6, prefix),
+                None => Ok(()),
+            },
+        )
+    };
+    #[cfg(target_os = "windows")]
+    let configured = {
+        let luid = dev.luid();
+        device::configure_interface(luid, cfg.address, cfg.netmask, cfg.mtu).and_then(|()| {
+            match cfg.inet6_address {
+                Some((inet6, prefix)) => device::assign_inet6(luid, inet6, prefix),
+                None => Ok(()),
+            }
+        })
+    };
+    configured?;
+    let name = dev.name();
     match cfg.inet6_address {
         Some((inet6, prefix)) => tracing::info!(
             target: "engine",
@@ -143,15 +190,6 @@ pub async fn serve(cfg: &TunConfig, relay: SharedRelay, hooks: TunHooks) -> Resu
         ),
     }
     netstack::run(dev, cfg.clone(), relay, hooks).await
-}
-
-/// Non-Linux hosts: the device plumbing is Linux-first (`/dev/net/tun`,
-/// `TUNSETIFF`, `SIOCSIF*`). A clear error beats a half-working interface.
-#[cfg(not(target_os = "linux"))]
-pub async fn serve(_cfg: &TunConfig, _relay: SharedRelay, _hooks: TunHooks) -> Result<()> {
-    Err(Error::config(
-        "the tun inbound is Linux-only for now (Windows wintun and macOS utun are not implemented)",
-    ))
 }
 
 #[cfg(test)]

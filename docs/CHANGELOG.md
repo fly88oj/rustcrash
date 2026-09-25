@@ -27,6 +27,45 @@ All notable changes to RustCrash. Format based on
   passthrough (the framing half of the splice; the raw-transport
   rebind is tracked).
 
+### Engine — wave 10: cross-platform TUN serving, jls/snell/anytls listeners, tlsmirror h2 generator, tailscale wire foundations, overlay config surfaces
+
+- **TUN serves on Windows and macOS**: the netstack was rewritten over a
+  platform-independent device pump (wireguard-go's reader-thread shape —
+  poll(2) on unix, the wintun event on Windows), so the wave-9 device
+  backends now actually SERVE; an in-memory loopback device double runs
+  the full netstack (handshake, DNS hijack, ICMP) in tests with no
+  kernel TUN or privileges.
+- **IPv6 extension headers**: the full chain walker (hop-by-hop,
+  routing, fragment, dest-options, AH, mobility — gvisor semantics),
+  DNS hijack and ICMPv6 echo answers through chains; chained TCP is
+  staged per smoltcp policy instead of dropped whole.
+- **Three new server listeners**: jls (multi-user auth with the
+  camouflage cert, dest fallback relay with upstream's rate-limiter
+  arithmetic), snell (v1-v5 server wire incl. the reuse continuation
+  loop, ping/pong, http-obfs server half, UDP command with the
+  IP-only response frames), and anytls (multi-user auth, the session
+  server with padding-scheme push, uot bridging through the magic
+  domain) — each validated end-to-end against the engine's own
+  clients. Wave-8's "no snell/anytls listeners upstream" correction is
+  retracted (wrong filenames probed).
+- **tlsmirror h2 traffic generator**: generator steps now ride the
+  negotiated-ALPN h2 carrier (prior-knowledge h2c client with credit
+  tracking), including h2-do-not-wait-for-download-finish; the http/1.1
+  arm unchanged.
+- **tailscale wire foundations**: the controlbase Noise
+  IK_25519_ChaChaPoly_BLAKE2s handshake + framed transport, the
+  controlhttp `/ts2021` upgrade client, and a DERP client (frame
+  layer, registration, packet relay) — each proven against in-test
+  Go-parity mimics; connect now reports precisely what the ipn layer
+  still needs.
+- **Overlay outbounds**: zerotier (full config surface + every upstream
+  validation; connect cites the libzt C dependency and the staged
+  milestones) and easytier (the entire mihomo component/easytier
+  ported: TOML rendering/validation, peer URI parsing, overlay
+  DNS/PTR, upstream test vectors; connect cites the not-in-tree Rust
+  mesh core with the first portable milestone). tor: verified absent
+  from both upstreams — nothing to port for 1:1.
+
 ### Engine — wave 9: snell v1-v5 + pools, anytls session mux, jls uTLS, mieru port-ranges/mux, TUN Windows/macOS, WireGuard endpoint, SIP003, .mrs writing
 
 - **snell v1/v2/v5 + connection pool**: the pre-v3 wire formats (v1

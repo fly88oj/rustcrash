@@ -520,10 +520,49 @@ fn parse_proxy_servers(
                         })?,
                 }
             }
+            "jls" => {
+                let users = parse_user_list(entry, "users");
+                if users.is_empty() {
+                    return Err(Error::config(format!(
+                        "listener {tag:?}: jls requires users (username/password pairs)"
+                    )));
+                }
+                ServerProtocol::Jls {
+                    sni: yaml_str(entry, "sni").unwrap_or_default(),
+                    dest: yaml_str(entry, "dest")
+                        .ok_or_else(|| {
+                            Error::config(format!(
+                                "listener {tag:?}: jls requires dest (the fallback target)"
+                            ))
+                        })?,
+                    users,
+                    alpn: yaml_str_list(entry, "alpn"),
+                    rate_limit: yaml_u64(entry, "rate-limit") as u32,
+                }
+            }
+            "snell" => {
+                let raw_version = entry
+                    .get("version")
+                    .and_then(Yaml::as_u64)
+                    .map(|v| v as u8)
+                    .unwrap_or(0);
+                let version = crate::proto::snell::parse_server_version(raw_version)
+                    .map_err(|e| Error::config(format!("listener {tag:?}: {e}")))?;
+                ServerProtocol::Snell {
+                    psk: yaml_str(entry, "psk").unwrap_or_default(),
+                    version,
+                    obfs_mode: yaml_str(entry, "obfs-mode").unwrap_or_default(),
+                    obfs_host: yaml_str(entry, "obfs-host").unwrap_or_default(),
+                }
+            }
+            "anytls" => ServerProtocol::AnyTls {
+                password: yaml_str(entry, "password").unwrap_or_default(),
+                users: parse_user_list(entry, "users"),
+            },
             other => {
                 return Err(Error::config(format!(
                     "listener {tag:?}: type {other:?} is not supported as a server yet \
-                     (supported: shadowsocks, trojan, vmess, vless, hysteria2, tuic, restls, tlsmirror)"
+                     (supported: shadowsocks, trojan, vmess, vless, hysteria2, tuic, restls, tlsmirror, jls, snell, anytls)"
                 )))
             }
         };
@@ -813,6 +852,42 @@ fn plugin_bool_str(entry: &BTreeMap<String, Yaml>, key: &str, default: &str) -> 
         .unwrap_or(default == "true")
 }
 
+/// mihomo listener `users:` — either a list of {username, password}
+/// maps or a name→password map (both accepted like upstream's
+/// structure.RawUsers variants).
+fn parse_user_list(entry: &BTreeMap<String, Yaml>, key: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    match entry.get(key) {
+        Some(Yaml::Sequence(list)) => {
+            for u in list {
+                if let Yaml::Mapping(m) = u {
+                    let user = m
+                        .get(Yaml::String("username".into()))
+                        .or_else(|| m.get(Yaml::String("user".into())))
+                        .and_then(Yaml::as_str)
+                        .unwrap_or("");
+                    let password = m
+                        .get(Yaml::String("password".into()))
+                        .and_then(Yaml::as_str)
+                        .unwrap_or("");
+                    if !user.is_empty() {
+                        out.push((user.to_string(), password.to_string()));
+                    }
+                }
+            }
+        }
+        Some(Yaml::Mapping(m)) => {
+            for (k, v) in m {
+                if let (Yaml::String(user), Yaml::String(pw)) = (k, v) {
+                    out.push((user.clone(), pw.clone()));
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
 /// Scalar yaml helpers for the wave-7 outbound options.
 fn yaml_bool(entry: &BTreeMap<String, Yaml>, key: &str) -> bool {
     entry.get(key).and_then(Yaml::as_bool).unwrap_or(false)
@@ -990,7 +1065,10 @@ fn parse_proxy(
     // Wireguard carries server/port on peers[0], not the entry itself;
     // tailscale dials itself through the tsnet stack (no server field
     // upstream either).
-    let is_wireguard = ptype == "wireguard" || ptype == "tailscale";
+    let is_wireguard = ptype == "wireguard"
+        || ptype == "tailscale"
+        || ptype == "zerotier"
+        || ptype == "easytier";
     let server = if is_wireguard {
         String::new()
     } else {
@@ -1019,7 +1097,13 @@ fn parse_proxy(
         .unwrap_or(false);
 
     let tls = parse_tls(entry);
-    let transport = parse_transport(entry)?;
+    // Overlay outbounds (zerotier) use `network:` for the network id —
+    // their type branches read it themselves; no layered transport.
+    let transport = if ptype == "zerotier" {
+        TransportKind::Tcp
+    } else {
+        parse_transport(entry)?
+    };
 
     let kind = match ptype.as_str() {
         "ss" => {
@@ -1675,8 +1759,77 @@ fn parse_proxy(
                     .and_then(Yaml::as_bool),
             })
         }
+        "zerotier" => {
+            let ip_stack = match yaml_str(entry, "ip-stack") {
+                Some(s) => crate::proto::zerotier::IpStack::parse(&s)
+                    .map_err(|e| Error::config(format!("proxy {name:?}: {e}")))?,
+                None => Default::default(),
+            };
+            let mut cfg = crate::proto::zerotier::ZeroTierConfig {
+                name: name.clone(),
+                network: yaml_str(entry, "network").unwrap_or_default(),
+                state_dir: yaml_str(entry, "state-dir"),
+                identity_secret: yaml_str(entry, "identity-secret"),
+                planet: yaml_str(entry, "planet"),
+                mtu: yaml_i64(entry, "mtu").unwrap_or(0),
+                ip_stack,
+                physical_mtu: yaml_i64(entry, "physical-mtu").unwrap_or(0),
+                udp: yaml_bool(entry, "udp"),
+                remote_dns_resolve: yaml_bool(entry, "remote-dns-resolve"),
+                dns: yaml_str_list(entry, "dns"),
+                low_bandwidth: yaml_bool(entry, "low-bandwidth"),
+                encrypted_hello: yaml_bool(entry, "encrypted-hello"),
+                primary_port: yaml_i64(entry, "primary-port").unwrap_or(0),
+                secondary_port: yaml_i64(entry, "secondary-port").unwrap_or(0),
+                tcp_fallback_mode: yaml_str(entry, "tcp-fallback-mode"),
+                tcp_fallback_relay: yaml_str(entry, "tcp-fallback-relay"),
+                ..Default::default()
+            };
+            if let Some(Yaml::Sequence(list)) = entry.get("orbit") {
+                for o in list.iter().filter_map(Yaml::as_mapping) {
+                    let world = o
+                        .get(Yaml::String("world".into()))
+                        .and_then(Yaml::as_u64)
+                        .unwrap_or(0);
+                    let seed = o
+                        .get(Yaml::String("seed".into()))
+                        .and_then(Yaml::as_str)
+                        .unwrap_or("");
+                    cfg.orbit.push(crate::proto::zerotier::ZeroTierOrbit {
+                        world,
+                        seed: seed.to_string(),
+                    });
+                }
+            }
+            crate::proto::zerotier::parse_network_id(&cfg.network)
+                .map_err(|e| Error::config(format!("proxy {name:?}: {e}")))?;
+            OutboundKind::ZeroTier(cfg)
+        }
+        "easytier" => {
+            let cfg = crate::proto::easytier::EasyTierConfig {
+                name: name.clone(),
+                network_name: yaml_str(entry, "network-name").unwrap_or_default(),
+                network_secret: yaml_str(entry, "network-secret").unwrap_or_default(),
+                hostname: yaml_str(entry, "hostname"),
+                ipv4: yaml_str(entry, "ipv4"),
+                dhcp: yaml_bool(entry, "dhcp"),
+                peers: yaml_str_list(entry, "peers"),
+                listeners: yaml_str_list(entry, "listeners"),
+                no_listener: entry.get("no-listener").and_then(Yaml::as_bool),
+                mapped_listeners: yaml_str_list(entry, "mapped-listeners"),
+                exit_nodes: yaml_str_list(entry, "exit-nodes"),
+                proxy_networks: yaml_str_list(entry, "proxy-networks"),
+                instance_name: yaml_str(entry, "instance-name"),
+                state_dir: yaml_str(entry, "state-dir"),
+                udp: yaml_bool(entry, "udp"),
+                accept_dns: entry.get("accept-dns").and_then(Yaml::as_bool),
+                enable_exit_node: entry.get("enable-exit-node").and_then(Yaml::as_bool),
+                ..Default::default()
+            };
+            OutboundKind::EasyTier(cfg)
+        }
         other => {
-            let supported = "ss, vmess, vless, trojan, socks5, http, hysteria2, tuic, wireguard, snell, anytls, mieru, restls, shadowquic, sudoku, gost-relay, trusttunnel, masque, openvpn, tailscale";
+            let supported = "ss, vmess, vless, trojan, socks5, http, hysteria2, tuic, wireguard, snell, anytls, mieru, restls, shadowquic, sudoku, gost-relay, trusttunnel, masque, openvpn, tailscale, zerotier, easytier";
             return Err(Error::config(format!(
                 "proxy {name:?}: type {other:?} is not supported by the Rust engine yet \
                  (supported: {supported})"
@@ -2258,6 +2411,95 @@ rules:
                 assert!(ech.enable);
                 assert_eq!(ech.config, "aGVsbG8=");
                 assert!(tlsmirror.is_some(), "tlsmirror-opts parsed");
+            }
+            other => panic!("wrong kind: {other:?}"),
+        }
+    }
+
+    /// Wave-10: the jls/snell/anytls listeners parse, and the
+    /// zerotier/easytier overlay outbounds carry their config surface.
+    #[test]
+    fn wave10_listeners_and_overlays_parse() {
+        let cfg = load(
+            r#"mixed-port: 7890
+listeners:
+  - name: jl
+    type: jls
+    listen: 127.0.0.1
+    port: 18445
+    sni: j.example
+    dest: camo.example:443
+    users:
+      - {username: alice, password: pw1}
+      - {username: bob, password: pw2}
+    rate-limit: 1024
+proxies:
+  - {name: d, type: socks5, server: 127.0.0.1, port: 1080}
+rules:
+  - MATCH,d
+"#,
+        )
+        .unwrap();
+        let jl = cfg.proxy_servers.iter().find(|l| l.tag == "jl").unwrap();
+        match &jl.protocol {
+            crate::inbound::proxy_server::ServerProtocol::Jls { users, dest, .. } => {
+                assert_eq!(users.len(), 2);
+                assert_eq!(dest, "camo.example:443");
+            }
+            other => panic!("wrong protocol: {other:?}"),
+        }
+
+        let cfg = load(
+            "mixed-port: 7890\nlisteners:\n  - {name: sn, type: snell, listen: 127.0.0.1, port: 18446, psk: k, version: 4}\nproxies:\n  - {name: d, type: socks5, server: 127.0.0.1, port: 1080}\nrules:\n  - MATCH,d\n",
+        )
+        .unwrap();
+        let sn = cfg.proxy_servers.iter().find(|l| l.tag == "sn").unwrap();
+        match &sn.protocol {
+            crate::inbound::proxy_server::ServerProtocol::Snell { psk, version, .. } => {
+                assert_eq!(psk, "k");
+                assert_eq!(*version, 4);
+            }
+            other => panic!("wrong protocol: {other:?}"),
+        }
+
+        let cfg = load(
+            "mixed-port: 7890\nlisteners:\n  - {name: at, type: anytls, listen: 127.0.0.1, port: 18447, password: pw, users: {alice: pw1, bob: pw2}}\nproxies:\n  - {name: d, type: socks5, server: 127.0.0.1, port: 1080}\nrules:\n  - MATCH,d\n",
+        )
+        .unwrap();
+        let at = cfg.proxy_servers.iter().find(|l| l.tag == "at").unwrap();
+        match &at.protocol {
+            crate::inbound::proxy_server::ServerProtocol::AnyTls { users, .. } => {
+                assert_eq!(users.len(), 2);
+            }
+            other => panic!("wrong protocol: {other:?}"),
+        }
+
+        let cfg = load(
+            "mixed-port: 7890\nproxies:\n  - {name: zt, type: zerotier, network: a84ac5c10a1d86e9, udp: true}\nrules:\n  - MATCH,zt\n",
+        )
+        .unwrap();
+        match &cfg.outbounds.iter().find(|o| o.name == "zt").unwrap().kind {
+            crate::outbound::OutboundKind::ZeroTier(c) => {
+                assert_eq!(c.network, "a84ac5c10a1d86e9");
+            }
+            other => panic!("wrong kind: {other:?}"),
+        }
+        let err = load(
+            "mixed-port: 7890\nproxies:\n  - {name: bad, type: zerotier, network: nothex}\nrules:\n  - MATCH,bad\n",
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(err.contains("network"), "{err}");
+
+        let cfg = load(
+            "mixed-port: 7890\nproxies:\n  - {name: et, type: easytier, network-name: mesh, network-secret: s3cret, peers: [tcp://p.example:11010], hostname: node1}\nrules:\n  - MATCH,et\n",
+        )
+        .unwrap();
+        match &cfg.outbounds.iter().find(|o| o.name == "et").unwrap().kind {
+            crate::outbound::OutboundKind::EasyTier(c) => {
+                assert_eq!(c.network_name, "mesh");
+                assert_eq!(c.peers, vec!["tcp://p.example:11010".to_string()]);
             }
             other => panic!("wrong kind: {other:?}"),
         }

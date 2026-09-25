@@ -70,7 +70,7 @@ use std::time::Instant;
 use bytes::{Buf, BytesMut};
 use rand::Rng;
 use rand::RngCore;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tracing::debug;
 
 use crate::addr::{Host, NetAddr};
@@ -95,7 +95,7 @@ const CMD_ERROR: u8 = 0x02;
 const CMD_UDP_FORWARD: u8 = 0x01;
 
 /// `maxLength` (snell.go:26): largest snell payload / v3 chunk.
-const MAX_LENGTH: usize = 0x3FFF;
+pub const MAX_LENGTH: usize = 0x3FFF;
 /// `DefaultSnellVersion` (snell.go:23) — v1, the backward-compatible
 /// default when the config omits `version`.
 pub const DEFAULT_SNELL_VERSION: u8 = 1;
@@ -2050,9 +2050,9 @@ pub fn parse_snell_udp_response(frame: &[u8]) -> Result<(NetAddr, Vec<u8>)> {
 }
 
 /// Parse an outbound request packet (snell.go `ParseUDPRequest`,
-/// 291-335) — the server-side mirror; exercised by the loopback mimic.
-#[cfg(test)]
-fn parse_snell_udp_request(frame: &[u8]) -> Result<(NetAddr, Vec<u8>)> {
+/// 291-335) — the server-side mirror of [`snell_udp_frame`]; the server
+/// listener decodes every inbound datagram with it.
+pub fn parse_snell_udp_request(frame: &[u8]) -> Result<(NetAddr, Vec<u8>)> {
     if frame.len() < 2 || frame[0] != CMD_UDP_FORWARD {
         return Err(Error::protocol("snell: invalid UDP request"));
     }
@@ -2096,6 +2096,956 @@ fn parse_snell_udp_request(frame: &[u8]) -> Result<(NetAddr, Vec<u8>)> {
     };
     let port = u16::from_be_bytes([frame[3 + addr_len], frame[4 + addr_len]]);
     Ok((NetAddr::ip(ip, port), frame[5 + addr_len..].to_vec()))
+}
+
+/// Encode a server → client UDP response packet (snell.go
+/// `WritePacketResponse`, 246-282): `0x04 || ipv4 || port_be16 || payload`
+/// or `0x06 || ipv6 || port_be16 || payload`. Domains do not occur on
+/// the response wire (upstream converts the reply address with
+/// `socks5.ParseAddrToSocksAddr`, which is IP-only; a domain target must
+/// be resolved by the relay before the reply) — a domain here is an
+/// error, the caller drops the datagram.
+pub fn snell_udp_response_frame(from: &NetAddr, payload: &[u8]) -> Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(3 + 16 + payload.len());
+    match &from.host {
+        Host::Ip(std::net::IpAddr::V4(v4)) => {
+            buf.push(0x04);
+            buf.extend_from_slice(&v4.octets());
+        }
+        Host::Ip(std::net::IpAddr::V6(v6)) => {
+            buf.push(0x06);
+            buf.extend_from_slice(&v6.octets());
+        }
+        Host::Domain(_) => {
+            return Err(Error::protocol(
+                "snell: UDP response address must be an IP (resolve domain targets first)",
+            ));
+        }
+    }
+    buf.extend_from_slice(&from.port.to_be_bytes());
+    buf.extend_from_slice(payload);
+    Ok(buf)
+}
+
+// ---------------------------------------------------------------------------
+// Server half (listener/snell/server.go + transport/snell ServerStreamConn)
+// ---------------------------------------------------------------------------
+//
+// The server inverts the client codecs without duplicating them: the
+// same `Conn` framing ([`Conn::V3`]/[`Conn::V4`], keyed by the same KDF)
+// runs server-role, with the request/reply direction flipped:
+//
+// * `ServerStreamConn` (snell.go:170-174) is `StreamConn` + `reply=true`
+//   — the server never *consumes* a reply byte, it *writes* one: the
+//   first relay write prefixes `CommandTunnel` (tcpRequestConn.Write,
+//   listener/snell/server.go:344-359).
+// * the request header (`handleRequest` + `handleTCP`,
+//   listener/snell/server.go:174-255) is read byte-wise off the
+//   decrypted stream: version, command, clientID, then for connect the
+//   host/port target; `CommandPing` gets a `CommandPong` frame and the
+//   conn closes.
+// * a request that negotiated reuse (`CommandConnectV2`) survives its
+//   relay: on close the server writes the zero-chunk half-close (or a
+//   `CommandError` frame when nothing was ever written —
+//   tcpRequestConn.Close, server.go:327-385) and loops to the next
+//   request header (server.go:166-171).
+// * UDP (`handleUDP`, server.go:257-294): reply `CommandTunnel`, then
+//   one AEAD frame per datagram in each direction (the client's
+//   `ReadPacket`/`WritePacketFrame` mirrors).
+
+/// `CommandPong` (snell.go:37) — the ping reply byte.
+const CMD_PONG: u8 = 0x01;
+/// `CommandPing` (snell.go:35) — numerically `CommandTunnel` (0); the
+/// command byte's position (before the clientID) disambiguates.
+const CMD_PING: u8 = 0x00;
+/// `writeCommandError`'s code for "the remote closed before any reply"
+/// (tcpRequestConn.Close, listener/snell/server.go:372).
+const REMOTE_EOF_CODE: u8 = 0x65;
+
+/// The server-side version default: `New` maps an unset version to
+/// Version4 (listener/snell/server.go:37-39) — note the asymmetry with
+/// the client, whose default is v1 ([`DEFAULT_SNELL_VERSION`]).
+pub const SNELL_SERVER_DEFAULT_VERSION: u8 = 4;
+
+impl Conn {
+    /// Read exactly `buf.len()` decrypted bytes (the byte-stream view the
+    /// server's bufio.Reader sees). A half-close or transport close
+    /// mid-header is `UnexpectedEof`.
+    async fn read_exact_dec(&mut self, buf: &mut [u8]) -> Result<()> {
+        std::future::poll_fn(|cx| {
+            let mut filled = 0usize;
+            loop {
+                {
+                    let out = match self {
+                        Conn::V3(c) => &mut c.out,
+                        Conn::V4(c) => &mut c.out,
+                    };
+                    while filled < buf.len() && !out.is_empty() {
+                        let n = out.len().min(buf.len() - filled);
+                        buf[filled..filled + n].copy_from_slice(&out[..n]);
+                        out.advance(n);
+                        filled += n;
+                    }
+                }
+                if filled == buf.len() {
+                    return Poll::Ready(Ok(()));
+                }
+                match self.poll_fill(cx) {
+                    Poll::Ready(Ok(true)) => continue,
+                    Poll::Ready(Ok(false)) => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "snell: connection closed inside the request header",
+                        )));
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        })
+        .await
+        .map_err(Error::from)
+    }
+
+    /// Frame `payload` and push it fully to the transport (the server's
+    /// plain `Snell.Write`). An empty payload is the zero chunk.
+    async fn write_framed(&mut self, payload: &[u8]) -> Result<()> {
+        let mut wbuf = BytesMut::new();
+        self.frame(payload, &mut wbuf)?;
+        let inner = self.inner_mut();
+        inner.write_all(&wbuf).await?;
+        inner.flush().await?;
+        Ok(())
+    }
+
+    /// Take everything currently decrypted (exactly one frame's payload
+    /// after a successful [`Conn::poll_fill`]).
+    fn take_decrypted(&mut self) -> Option<Vec<u8>> {
+        let out = match self {
+            Conn::V3(c) => &mut c.out,
+            Conn::V4(c) => &mut c.out,
+        };
+        if out.is_empty() {
+            None
+        } else {
+            Some(out.to_vec())
+        }
+    }
+
+    /// Frame `payload` as exactly one AEAD frame (the server's
+    /// `WritePacketFrame` path, snell.go:182-187): v4 seals the whole
+    /// packet through `writeFrame` with the first-frame padding rule,
+    /// v3 rides the plain chunk writer. Used for UDP response packets.
+    fn frame_packet(&mut self, payload: &[u8], wbuf: &mut BytesMut) -> Result<()> {
+        match self {
+            Conn::V3(c) => c.frame(payload, wbuf),
+            Conn::V4(c) => {
+                let padding = c.next_frame_padding_length(payload.len());
+                c.write_frame(payload, padding, wbuf)
+            }
+        }
+    }
+
+    /// The framing half shared by both conn roles.
+    fn frame(&mut self, payload: &[u8], wbuf: &mut BytesMut) -> Result<()> {
+        match self {
+            Conn::V3(c) => c.frame(payload, wbuf),
+            Conn::V4(c) => c.frame(payload, wbuf),
+        }
+    }
+}
+
+/// `writeCommandError` (listener/snell/server.go:315-325):
+/// `CommandError || code || msglen || msg[0..255]`.
+fn command_error_frame(code: u8, message: &str) -> Vec<u8> {
+    let msg = message.as_bytes();
+    let len = msg.len().min(255);
+    let mut buf = Vec::with_capacity(3 + len);
+    buf.push(CMD_ERROR);
+    buf.push(code);
+    buf.push(len as u8);
+    buf.extend_from_slice(&msg[..len]);
+    buf
+}
+
+/// Normalize a listener-configured version exactly like `New`
+/// (listener/snell/server.go:37-44): `0` → Version4; `1..=5` pass (5
+/// rides the v4 codec, like `StreamConn`'s `version >= Version4` route);
+/// anything else is `snell inbound version %d is not supported`.
+pub fn parse_server_version(raw: u8) -> Result<u8> {
+    match raw {
+        0 => Ok(SNELL_SERVER_DEFAULT_VERSION),
+        1..=5 => Ok(raw),
+        other => Err(Error::config(format!(
+            "snell inbound version {other} is not supported"
+        ))),
+    }
+}
+
+/// One parsed request header (handleRequest + handleTCP,
+/// listener/snell/server.go:174-255).
+#[derive(Debug, Clone)]
+pub enum SnellServerRequest {
+    /// `CommandPing` — already answered with a `CommandPong` frame; the
+    /// connection closes (server.go:188-191).
+    Ping,
+    /// `CommandConnect` / `CommandConnectV2` toward `target`;
+    /// `reuse` is the V2 flag, which keeps the conn alive for the next
+    /// request after the relay ends.
+    Connect {
+        target: NetAddr,
+        client_id: String,
+        reuse: bool,
+    },
+    /// `CommandUDP` (server.go:201-205).
+    Udp { client_id: String },
+}
+
+/// Continuation for the request loop: handed back the conn whenever a
+/// reusable request finishes (the listener's `for { handleRequest }`,
+/// server.go:166-171). The listener closes over its relay context.
+pub type SnellServerNext = std::sync::Arc<
+    dyn Fn(SnellServerConn) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// A server-role snell connection over an established (optionally
+/// obfs-wrapped) transport — `ServerStreamConn`
+/// (transport/snell/snell.go:170-174) as driven by
+/// `Listener.HandleConn` (listener/snell/server.go:146-172).
+pub struct SnellServerConn {
+    conn: Conn,
+    psk: Vec<u8>,
+    version: u8,
+}
+
+impl SnellServerConn {
+    /// Wrap a transport with the server framing for `version` (raw
+    /// listener value — [`parse_server_version`] has been applied).
+    pub fn new(stream: BoxProxyStream, psk: &[u8], version: u8) -> Result<Self> {
+        let conn = match version {
+            1..=3 => Conn::V3(V3Conn::new(stream, psk, v3_cipher_kind(version))),
+            4 | 5 => Conn::V4(V4Conn::new(stream, psk)?),
+            other => {
+                return Err(Error::config(format!(
+                    "snell inbound version {other} is not supported"
+                )))
+            }
+        };
+        Ok(SnellServerConn {
+            conn,
+            psk: psk.to_vec(),
+            version,
+        })
+    }
+
+    /// Read one request header (handleRequest, server.go:174-209). Ping
+    /// requests are answered inline with `CommandPong`, exactly like
+    /// `handleRequest`'s first arm.
+    pub async fn read_request(&mut self) -> Result<SnellServerRequest> {
+        let mut b = [0u8; 1];
+        self.conn.read_exact_dec(&mut b).await?;
+        if b[0] != PROTOCOL_VERSION {
+            return Err(Error::protocol(format!(
+                "snell invalid protocol version: {}",
+                b[0]
+            )));
+        }
+        self.conn.read_exact_dec(&mut b).await?;
+        let command = b[0];
+        if command == CMD_PING {
+            // server.go:188-191 — the only command answered before the
+            // clientID is read (CommandPing == CommandTunnel == 0).
+            self.conn.write_framed(&[CMD_PONG]).await?;
+            return Ok(SnellServerRequest::Ping);
+        }
+        // readClientID (server.go:211-224).
+        self.conn.read_exact_dec(&mut b).await?;
+        let id_len = b[0] as usize;
+        let mut id = vec![0u8; id_len];
+        self.conn.read_exact_dec(&mut id).await?;
+        let client_id = String::from_utf8_lossy(&id).into_owned();
+
+        match command {
+            CMD_CONNECT | CMD_CONNECT_V2 => {
+                // handleTCP (server.go:226-255).
+                self.conn.read_exact_dec(&mut b).await?;
+                if b[0] == 0 {
+                    return Err(Error::protocol("snell connect host is empty"));
+                }
+                let mut host = vec![0u8; b[0] as usize];
+                self.conn.read_exact_dec(&mut host).await?;
+                let mut port_bytes = [0u8; 2];
+                self.conn.read_exact_dec(&mut port_bytes).await?;
+                let port = u16::from_be_bytes(port_bytes);
+                let host = String::from_utf8_lossy(&host).into_owned();
+                // metadata() (server.go:296-313): a parseable IP becomes
+                // DstIP, anything else the domain.
+                let target = match host.parse::<std::net::IpAddr>() {
+                    Ok(ip) => NetAddr::ip(ip, port),
+                    Err(_) => NetAddr::new(Host::Domain(host), port),
+                };
+                Ok(SnellServerRequest::Connect {
+                    target,
+                    client_id,
+                    reuse: command == CMD_CONNECT_V2,
+                })
+            }
+            CMD_UDP => Ok(SnellServerRequest::Udp { client_id }),
+            other => Err(Error::protocol(format!("snell unknown command: {other}"))),
+        }
+    }
+
+    /// Write the bare tunnel reply (handleUDP's first write,
+    /// server.go:258-260); UDP only — TCP replies ride the relay's first
+    /// payload frame.
+    pub async fn write_tunnel_reply(&mut self) -> Result<()> {
+        self.conn.write_framed(&[CMD_TUNNEL]).await
+    }
+
+    /// Consume the conn into the relay-facing TCP stream
+    /// (`tcpRequestConn`, server.go:327-385): first write prefixes
+    /// `CommandTunnel`, the peer's zero chunk reads as clean EOF, and
+    /// Drop performs the close semantics — error frame when no reply was
+    /// ever written, zero-chunk half-close on the reuse path, then the
+    /// `next` continuation runs the next request.
+    pub fn into_tcp(self, reuse: bool, next: Option<SnellServerNext>) -> SnellServerTcp {
+        SnellServerTcp {
+            conn: Some(self.conn),
+            psk: Some(self.psk),
+            version: self.version,
+            wbuf: BytesMut::new(),
+            pending_plain: 0,
+            reply_written: false,
+            reuse,
+            failed: false,
+            next,
+        }
+    }
+
+    /// Consume the conn into the UDP datagram IO (after
+    /// [`Self::write_tunnel_reply`]) — one AEAD frame per datagram in
+    /// each direction (`handleUDP` + `udpPacket.WriteBack`,
+    /// server.go:257-294, 399-410).
+    pub fn into_udp(self) -> SnellServerUdp {
+        SnellServerUdp {
+            conn: self.conn,
+            wbuf: BytesMut::new(),
+            pending_plain: 0,
+            failed: false,
+            leftover: BytesMut::new(),
+        }
+    }
+}
+
+/// The relay-facing TCP stream of one snell request —
+/// `tcpRequestConn` (listener/snell/server.go:327-385).
+///
+/// * `Read` maps the peer's zero chunk (and a transport EOF) to a clean
+///   EOF (server.go:336-342).
+/// * `Write` prefixes `CommandTunnel` to the first payload (the reply
+///   byte shares that frame, server.go:344-359).
+/// * Drop is `Close` (server.go:365-385): no reply yet → the
+///   `CommandError`/`Remote EOF` frame; reuse → the zero-chunk
+///   half-close and the `next` continuation (the listener's request
+///   loop); otherwise the transport closes.
+pub struct SnellServerTcp {
+    conn: Option<Conn>,
+    psk: Option<Vec<u8>>,
+    version: u8,
+    wbuf: BytesMut,
+    pending_plain: usize,
+    reply_written: bool,
+    reuse: bool,
+    failed: bool,
+    next: Option<SnellServerNext>,
+}
+
+impl SnellServerTcp {
+    /// Whether the reply byte has been sent (diagnostics/tests).
+    pub fn reply_written(&self) -> bool {
+        self.reply_written
+    }
+}
+
+impl AsyncWrite for SnellServerTcp {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if this.failed {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "snell: server stream failed",
+            )));
+        }
+        let Some(conn) = this.conn.as_mut() else {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "snell: server conn already finished",
+            )));
+        };
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        if this.wbuf.is_empty() {
+            let payload = if this.reply_written {
+                buf.to_vec()
+            } else {
+                // payload[0] = CommandTunnel (server.go:349-355).
+                let mut v = Vec::with_capacity(1 + buf.len());
+                v.push(CMD_TUNNEL);
+                v.extend_from_slice(buf);
+                this.reply_written = true;
+                v
+            };
+            if let Err(e) = conn.frame(&payload, &mut this.wbuf) {
+                this.failed = true;
+                return Poll::Ready(Err(io_invalid(e)));
+            }
+            this.pending_plain = buf.len();
+        }
+        while !this.wbuf.is_empty() {
+            let n = ready!(Pin::new(this.conn.as_mut().expect("checked above").inner_mut())
+                .poll_write(cx, &this.wbuf))?;
+            if n == 0 {
+                this.failed = true;
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "snell: transport accepted zero bytes",
+                )));
+            }
+            this.wbuf.advance(n);
+        }
+        Poll::Ready(Ok(this.pending_plain))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let Some(conn) = this.conn.as_mut() else {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "snell: server conn already finished",
+            )));
+        };
+        while !this.wbuf.is_empty() {
+            let n = ready!(Pin::new(conn.inner_mut()).poll_write(cx, &this.wbuf))?;
+            if n == 0 {
+                this.failed = true;
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "snell: transport accepted zero bytes",
+                )));
+            }
+            this.wbuf.advance(n);
+        }
+        Pin::new(conn.inner_mut()).poll_flush(cx)
+    }
+
+    /// The write half-close is folded into Drop's close semantics (the
+    /// zero chunk is a *request-end* signal here, not a TCP FIN).
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_flush(cx)
+    }
+}
+
+impl AsyncRead for SnellServerTcp {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let Some(conn) = this.conn.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        loop {
+            if buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            if conn.drain_out(buf) {
+                return Poll::Ready(Ok(()));
+            }
+            match conn.poll_fill(cx) {
+                // ErrZeroChunk → io.EOF (server.go:336-342); a clean
+                // transport close reads the same.
+                Poll::Ready(Ok(true)) => continue,
+                Poll::Ready(Ok(false)) => return Poll::Ready(Ok(())),
+                Poll::Ready(Err(e)) => {
+                    this.failed = true;
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl Drop for SnellServerTcp {
+    /// tcpRequestConn.Close (server.go:365-385). The close semantics need
+    /// the wire, so the continuation runs as a task (no runtime → the
+    /// conn is dropped, i.e. closed).
+    fn drop(&mut self) {
+        let Some(conn) = self.conn.take() else { return };
+        let reply_written = self.reply_written;
+        let reuse = self.reuse && !self.failed;
+        let psk = self.psk.take();
+        let version = self.version;
+        let next = self.next.take();
+        if tokio::runtime::Handle::try_current().is_err() {
+            return; // drop(conn) — closed
+        }
+        tokio::spawn(async move {
+            let mut conn = conn;
+            if !reply_written {
+                // writeCommandError(0x65, "Remote EOF") — and unlike the
+                // !reuse arm, the reuse path keeps the conn open.
+                let _ = conn.write_framed(&command_error_frame(REMOTE_EOF_CODE, "Remote EOF")).await;
+            }
+            if reuse {
+                // Conn.Write(nil) — the zero-chunk half-close (only after
+                // a written reply; the error frame above already ended
+                // this request's traffic).
+                if reply_written {
+                    let _ = conn.write_framed(&[]).await;
+                }
+                conn.reset_zero();
+                if let Some(next) = next {
+                    if let Some(psk) = psk {
+                        next(SnellServerConn {
+                            conn,
+                            psk,
+                            version,
+                        })
+                        .await;
+                    }
+                }
+            }
+            // else: dropped — the transport closes.
+        });
+    }
+}
+
+/// The UDP datagram IO of one snell session (`handleUDP` +
+/// `udpPacket.WriteBack`, server.go:257-294, 387-410): each read yields
+/// exactly one decrypted AEAD frame (a `snell_udp_frame` datagram), each
+/// write seals one `snell_udp_response_frame` as one frame — datagram
+/// edges survive the TCP transport exactly like the client's
+/// `ReadPacket`/`WritePacketFrame` pair.
+pub struct SnellServerUdp {
+    conn: Conn,
+    wbuf: BytesMut,
+    pending_plain: usize,
+    failed: bool,
+    /// Remainder of a datagram larger than the caller's buffer.
+    leftover: BytesMut,
+}
+
+impl AsyncRead for SnellServerUdp {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        loop {
+            if buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            if !this.leftover.is_empty() {
+                let n = this.leftover.len().min(buf.remaining());
+                buf.put_slice(&this.leftover[..n]);
+                this.leftover.advance(n);
+                return Poll::Ready(Ok(()));
+            }
+            if this.failed {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "snell: server udp stream failed",
+                )));
+            }
+            match this.conn.poll_fill(cx) {
+                // One frame landed per successful fill; take it whole so
+                // the next read starts a fresh datagram.
+                Poll::Ready(Ok(true)) => {
+                    if let Some(frame) = this.conn.take_decrypted() {
+                        this.leftover.extend_from_slice(&frame);
+                    }
+                }
+                // EOF / zero chunk: the session ended cleanly
+                // (server.go:267-272).
+                Poll::Ready(Ok(false)) => return Poll::Ready(Ok(())),
+                Poll::Ready(Err(e)) => {
+                    this.failed = true;
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl AsyncWrite for SnellServerUdp {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if this.failed {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "snell: server udp stream failed",
+            )));
+        }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        if this.wbuf.is_empty() {
+            if let Err(e) = this.conn.frame_packet(buf, &mut this.wbuf) {
+                this.failed = true;
+                return Poll::Ready(Err(io_invalid(e)));
+            }
+            this.pending_plain = buf.len();
+        }
+        while !this.wbuf.is_empty() {
+            let n = ready!(Pin::new(this.conn.inner_mut()).poll_write(cx, &this.wbuf))?;
+            if n == 0 {
+                this.failed = true;
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "snell: transport accepted zero bytes",
+                )));
+            }
+            this.wbuf.advance(n);
+        }
+        Poll::Ready(Ok(this.pending_plain))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        while !this.wbuf.is_empty() {
+            let n = ready!(Pin::new(this.conn.inner_mut()).poll_write(cx, &this.wbuf))?;
+            if n == 0 {
+                this.failed = true;
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "snell: transport accepted zero bytes",
+                )));
+            }
+            this.wbuf.advance(n);
+        }
+        Pin::new(this.conn.inner_mut()).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        ready!(self.as_mut().poll_flush(cx))?;
+        Pin::new(self.get_mut().conn.inner_mut()).poll_shutdown(cx)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// http obfs, server half (transport/simple-obfs/http_server.go)
+// ---------------------------------------------------------------------------
+
+use base64::Engine as _;
+
+/// Cap while accumulating the fake request head (parity with the client
+/// side's response-head cap).
+const MAX_HTTP_HEAD: usize = 16 * 1024;
+
+/// The mihomo package-level random nginx version (http_server.go:76-77:
+/// `randv2.IntN(11)` / `randv2.IntN(12)`, picked once per process).
+fn nginx_version() -> (u8, u8) {
+    use std::sync::OnceLock;
+    static V: OnceLock<(u8, u8)> = OnceLock::new();
+    *V.get_or_init(|| {
+        let mut rng = rand::rngs::OsRng;
+        (rng.gen_range(0..11), rng.gen_range(0..12))
+    })
+}
+
+/// `time.Now().Format(time.RFC1123)` in GMT (http_server.go:83) — the
+/// fake Date header. Civil-from-days per Hinnant's algorithm.
+fn rfc1123_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86400) as i64;
+    let rem = secs % 86400;
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    const WDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    // 1970-01-01 was a Thursday (index 4).
+    let wday = (days + 4).rem_euclid(7) as usize;
+    format!(
+        "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
+        WDAYS[wday],
+        d,
+        MONTHS[(month - 1) as usize],
+        year,
+        h,
+        m,
+        s
+    )
+}
+
+/// The `101 Switching Protocols` head (http_responseTemplate,
+/// http_server.go:68-92), prefixing the server's first write.
+fn http_response_head() -> String {
+    let mut accept = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut accept);
+    let (major, minor) = nginx_version();
+    format!(
+        "HTTP/1.1 101 Switching Protocols\r\n\
+         Server: nginx/1.{major}.{minor}\r\n\
+         Date: {}\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {}\r\n\
+         \r\n",
+        rfc1123_now(),
+        base64::engine::general_purpose::URL_SAFE.encode(accept),
+    )
+}
+
+/// A parsed fake request head: method + the headers the server gates on.
+struct HttpRequestHead {
+    method: String,
+    connection_upgrade: bool,
+    content_length: usize,
+}
+
+/// Minimal request-head parse: request line + case-insensitive header
+/// scan (Go's `http.ReadRequest` gates on Method and Connection,
+/// http_server.go:41-48; Content-Length bounds the first body).
+fn parse_http_request_head(head: &[u8]) -> Result<HttpRequestHead> {
+    let text = std::str::from_utf8(head)
+        .map_err(|_| Error::protocol("snell obfs http: malformed request head"))?;
+    let text = text.trim_end_matches(['\r', '\n']);
+    let mut lines = text.split("\r\n");
+    let request_line = lines
+        .next()
+        .ok_or_else(|| Error::protocol("snell obfs http: empty request head"))?;
+    let mut parts = request_line.split(' ');
+    let method = parts
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let _uri = parts.next();
+    let version = parts.next().unwrap_or_default();
+    if method.is_empty() || !version.starts_with("HTTP/") {
+        return Err(Error::protocol("snell obfs http: malformed request line"));
+    }
+    let mut connection_upgrade = false;
+    let mut content_length = 0usize;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else { continue };
+        let name = name.trim().to_ascii_lowercase();
+        let value = value.trim();
+        match name.as_str() {
+            "connection" => {
+                connection_upgrade = value
+                    .split(',')
+                    .any(|t| t.trim().eq_ignore_ascii_case("upgrade"));
+            }
+            "content-length" => {
+                content_length = value.parse().map_err(|_| {
+                    Error::protocol("snell obfs http: malformed content-length")
+                })?;
+            }
+            _ => {}
+        }
+    }
+    Ok(HttpRequestHead {
+        method,
+        connection_upgrade,
+        content_length,
+    })
+}
+
+/// Server-side http obfs stream (mihomo `NewHTTPObfsServer`,
+/// transport/simple-obfs/http_server.go:16-103): the first read consumes
+/// the fake `GET … Connection: Upgrade` request and yields its body (the
+/// snell salt + first sealed header); the first write prefixes the
+/// `101` response head; everything after is raw.
+pub struct HttpObfsServerStream {
+    inner: BoxProxyStream,
+    rbuf: BytesMut,
+    /// Bytes of the request body still to surface before raw reads.
+    body_pending: usize,
+    request_done: bool,
+    response_sent: bool,
+}
+
+impl HttpObfsServerStream {
+    /// Read the request head off the transport (http_server.go:40-62).
+    async fn consume_request(&mut self) -> Result<()> {
+        loop {
+            if let Some(pos) = self.rbuf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = self.rbuf[..pos + 4].to_vec();
+                self.rbuf.advance(pos + 4);
+                let parsed = parse_http_request_head(&head)?;
+                // http_server.go:46-47 — non-GET or non-Upgrade is io.EOF.
+                if parsed.method != "GET" || !parsed.connection_upgrade {
+                    return Err(Error::protocol(
+                        "snell obfs http: request is not a websocket upgrade",
+                    ));
+                }
+                self.body_pending = parsed.content_length;
+                self.request_done = true;
+                return Ok(());
+            }
+            if self.rbuf.len() > MAX_HTTP_HEAD {
+                return Err(Error::protocol(
+                    "snell obfs http: request head exceeds 16 KiB without a terminator",
+                ));
+            }
+            let mut tmp = [0u8; 8 * 1024];
+            let n = self.inner.read(&mut tmp).await?;
+            if n == 0 {
+                return Err(Error::protocol(
+                    "snell obfs http: transport closed inside the request head",
+                ));
+            }
+            self.rbuf.extend_from_slice(&tmp[..n]);
+        }
+    }
+}
+
+impl AsyncRead for HttpObfsServerStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        loop {
+            if buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            if this.request_done {
+                if !this.rbuf.is_empty() {
+                    // Buffered bytes first — the request body (up to
+                    // body_pending) then any raw traffic beyond it.
+                    let take = this.rbuf.len().min(buf.remaining());
+                    let from_body = take.min(this.body_pending);
+                    buf.put_slice(&this.rbuf[..take]);
+                    this.body_pending -= from_body;
+                    this.rbuf.advance(take);
+                    return Poll::Ready(Ok(()));
+                }
+                return Pin::new(&mut this.inner).poll_read(cx, buf);
+            }
+            let mut tmp = [0u8; 8 * 1024];
+            let mut rb = ReadBuf::new(&mut tmp);
+            ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
+            if rb.filled().is_empty() {
+                return Poll::Ready(Ok(()));
+            }
+            this.rbuf.extend_from_slice(rb.filled());
+            // Parse synchronously when the head is complete.
+            if let Some(pos) = this.rbuf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = this.rbuf[..pos + 4].to_vec();
+                this.rbuf.advance(pos + 4);
+                match parse_http_request_head(&head) {
+                    Ok(parsed) => {
+                        if parsed.method != "GET" || !parsed.connection_upgrade {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "snell obfs http: request is not a websocket upgrade",
+                            )));
+                        }
+                        this.body_pending = parsed.content_length;
+                        this.request_done = true;
+                    }
+                    Err(e) => return Poll::Ready(Err(io_invalid(e))),
+                }
+            } else if this.rbuf.len() > MAX_HTTP_HEAD {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "snell obfs http: request head exceeds 16 KiB without a terminator",
+                )));
+            }
+        }
+    }
+}
+
+impl AsyncWrite for HttpObfsServerStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if !this.response_sent {
+            // http_server.go:79-92 — the 101 head prefixes the first
+            // write, then raw bytes.
+            let head = http_response_head();
+            let mut out = Vec::with_capacity(head.len() + buf.len());
+            out.extend_from_slice(head.as_bytes());
+            out.extend_from_slice(buf);
+            this.response_sent = true;
+            // Write the head + payload as one unit (retry via inner
+            // writes; the caller sees buf.len() once accepted).
+            let mut wbuf = BytesMut::from(&out[..]);
+            let total = buf.len();
+            drop(out);
+            while !wbuf.is_empty() {
+                let n = ready!(Pin::new(&mut this.inner).poll_write(cx, &wbuf))?;
+                if n == 0 {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "snell obfs http: transport accepted zero bytes",
+                    )));
+                }
+                wbuf.advance(n);
+            }
+            Poll::Ready(Ok(total))
+        } else {
+            Pin::new(&mut this.inner).poll_write(cx, buf)
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// Wrap an accepted transport with the server-side http obfs
+/// (mihomo `obfs.NewHTTPObfsServer`, listener/snell/server.go:156-158).
+pub async fn http_obfs_server(transport: BoxProxyStream) -> Result<BoxProxyStream> {
+    let mut stream = HttpObfsServerStream {
+        inner: transport,
+        rbuf: BytesMut::with_capacity(16 * 1024),
+        body_pending: 0,
+        request_done: false,
+        response_sent: false,
+    };
+    // The snell codec reads immediately (the salt); pull the head now so
+    // a malformed request fails the conn before any crypto work.
+    stream.consume_request().await?;
+    Ok(Box::new(stream))
 }
 
 #[cfg(test)]
@@ -3464,5 +4414,433 @@ mod tests {
 
     fn hex(b: &[u8]) -> String {
         b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    // ------------------------------------------------ server half (wave-10)
+
+    /// A relay-side echo over the server stream (what the listener hands
+    /// to `hand_off`): echo until the client half-closes, then drop —
+    /// Drop runs the close semantics.
+    async fn relay_echo(mut stream: SnellServerTcp) {
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if stream.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    let _ = stream.flush().await;
+                }
+            }
+        }
+    }
+
+    /// Run the server request loop over one duplex conn, mirroring the
+    /// listener's serve_loop (without the relay plumbing). One request
+    /// per entry — reuse re-enters through the continuation.
+    async fn server_loop(conn: SnellServerConn) -> Result<()> {
+        let mut conn = conn;
+        match conn.read_request().await? {
+            SnellServerRequest::Ping => Ok(()),
+            SnellServerRequest::Udp { .. } => {
+                conn.write_tunnel_reply().await?;
+                let mut udp = conn.into_udp();
+                let mut buf = vec![0u8; MAX_LENGTH + 32];
+                loop {
+                    let n = match udp.read(&mut buf).await {
+                        Ok(0) | Err(_) => return Ok(()),
+                        Ok(n) => n,
+                    };
+                    let (target, payload) = parse_snell_udp_request(&buf[..n])?;
+                    let from = NetAddr::ip(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 4, 4)),
+                        target.port,
+                    );
+                    let frame = snell_udp_response_frame(&from, &payload)?;
+                    if udp.write_all(&frame).await.is_err() {
+                        return Ok(());
+                    }
+                    let _ = udp.flush().await;
+                }
+            }
+            SnellServerRequest::Connect { reuse, .. } => {
+                let next: SnellServerNext = std::sync::Arc::new(move |conn| {
+                    // Standalone boxing: an inline async block here
+                    // makes the loop's own generator prove its own
+                    // Send (the same recursion the listener breaks
+                    // with continue_serve_loop).
+                    fn reenter(
+                        conn: SnellServerConn,
+                    ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+                        Box::pin(async move {
+                            let _ = server_loop(conn).await;
+                        })
+                    }
+                    reenter(conn)
+                });
+                let tcp = conn.into_tcp(reuse, Some(next));
+                relay_echo(tcp).await;
+                Ok(())
+            }
+        }
+    }
+
+    async fn spawn_server(version: u8, psk: &str) -> tokio::io::DuplexStream {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let psk = psk.as_bytes().to_vec();
+        tokio::spawn(async move {
+            let conn = SnellServerConn::new(Box::new(server), &psk, version).unwrap();
+            if let Err(e) = server_loop(conn).await {
+                panic!("snell server loop failed: {e}");
+            }
+        });
+        client
+    }
+
+    #[tokio::test]
+    async fn server_tcp_roundtrip_all_versions() {
+        // The engine's own client (each wire version) relays through the
+        // server half: request → tunnel-prefixed echo.
+        for version in [1u8, 2, 3, 4] {
+            let psk = test_psk();
+            let transport = spawn_server(version, &psk).await;
+            let cfg = SnellOut {
+                server: "127.0.0.1".into(),
+                port: 0,
+                psk: psk.clone(),
+                version,
+                udp: false,
+            };
+            let target = NetAddr::domain("echo.example", 443).unwrap();
+            let mut stream = handshake(Box::new(transport), &cfg, &target, false)
+                .await
+                .unwrap();
+            let ping = format!("ping-v{version}");
+            stream.write_all(ping.as_bytes()).await.unwrap();
+            let mut buf = vec![0u8; ping.len()];
+            timeout_read(&mut stream, &mut buf).await.unwrap();
+            assert_eq!(&buf, ping.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn server_v5_accepts_v4_wire() {
+        // A v5 server rides the v4 codec (StreamConn's >= Version4
+        // route); a v4 client interops (listener/snell/server.go:41).
+        let psk = test_psk();
+        let transport = spawn_server(5, &psk).await;
+        let cfg = SnellOut {
+            server: "127.0.0.1".into(),
+            port: 0,
+            psk: psk.clone(),
+            version: 4,
+            udp: false,
+        };
+        let target = NetAddr::domain("echo.example", 443).unwrap();
+        let mut stream = handshake(Box::new(transport), &cfg, &target, false)
+            .await
+            .unwrap();
+        stream.write_all(b"v4-to-v5").await.unwrap();
+        let mut buf = [0u8; 8];
+        timeout_read(&mut stream, &mut buf).await.unwrap();
+        assert_eq!(&buf, b"v4-to-v5");
+    }
+
+    #[tokio::test]
+    async fn server_reuse_loop_serves_second_request() {
+        // The pooled client (CommandConnectV2 + zero-chunk close) gets a
+        // second request served over the SAME server conn — the Drop
+        // continuation back into the request loop
+        // (listener/snell/server.go:166-171).
+        let psk = test_psk();
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let psk2 = psk.clone();
+        tokio::spawn(async move {
+            let conn = SnellServerConn::new(Box::new(server), psk2.as_bytes(), 4).unwrap();
+            if let Err(e) = server_loop(conn).await {
+                panic!("snell server loop failed: {e}");
+            }
+        });
+        let client = std::sync::Mutex::new(Some(client));
+        let pool = SnellPool::with_dialer(
+            SnellOut {
+                server: "127.0.0.1".into(),
+                port: 0,
+                psk,
+                version: 4,
+                udp: false,
+            },
+            move || {
+                let c = client.lock().unwrap().take().expect("only one transport");
+                Box::pin(async move { Ok(Box::new(c) as BoxProxyStream) })
+            },
+        )
+        .unwrap();
+        let target = NetAddr::domain("echo.example", 443).unwrap();
+        {
+            let mut conn = pool.dial(&target).await.unwrap();
+            assert_eq!(pooled_request(&mut conn, b"first").await, b"first");
+            conn.shutdown().await.unwrap();
+            let mut tail = [0u8; 4];
+            let n = pooled_read_timeout(&mut conn, &mut tail).await.unwrap();
+            assert_eq!(n, 0, "the server's zero chunk is a clean EOF");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(pool.idle_len().await, 1, "the conn recycled");
+        {
+            let mut conn = pool.dial(&target).await.unwrap();
+            assert_eq!(pooled_request(&mut conn, b"seco").await, b"seco");
+            conn.shutdown().await.unwrap();
+            let mut tail = [0u8; 4];
+            let _ = pooled_read_timeout(&mut conn, &mut tail).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn server_wrong_psk_rejects_before_reply() {
+        // The server cannot decrypt the request header; the conn dies
+        // with no tunnel data (wrong PSK ⇒ no reply).
+        let psk = test_psk();
+        let transport = spawn_server(4, &psk).await;
+        let cfg = SnellOut {
+            server: "127.0.0.1".into(),
+            port: 0,
+            psk: format!("wrong-{psk}"),
+            version: 4,
+            udp: false,
+        };
+        let target = NetAddr::domain("echo.example", 443).unwrap();
+        let mut stream = handshake(Box::new(transport), &cfg, &target, false)
+            .await
+            .unwrap();
+        let _ = stream.write_all(b"ping").await;
+        let mut buf = [0u8; 8];
+        match timeout_read(&mut stream, &mut buf).await {
+            Ok(0) | Err(_) => {}
+            Ok(n) => panic!("a wrong PSK must not produce tunnel data ({n} bytes)"),
+        }
+    }
+
+    #[tokio::test]
+    async fn server_udp_session_roundtrip_v3_v4() {
+        // The engine's UDP client through the server session: request
+        // packets are parsed, responses sealed one frame per datagram.
+        for version in [3u8, 4] {
+            let psk = test_psk();
+            let transport = spawn_server(version, &psk).await;
+            let cfg = SnellOut {
+                server: "127.0.0.1".into(),
+                port: 0,
+                psk: psk.clone(),
+                version,
+                udp: true,
+            };
+            let mut udp = udp_session(&cfg, Box::new(transport)).await.unwrap();
+            let target = NetAddr::ip("8.8.8.8".parse().unwrap(), 53);
+            udp.send_to(&target, b"query").await.unwrap();
+            let mut buf = [0u8; 1500];
+            let (from, n) =
+                tokio::time::timeout(Duration::from_secs(10), udp.recv_from(&mut buf))
+                    .await
+                    .expect("udp response timeout")
+                    .unwrap();
+            assert_eq!(from.host, Host::Ip("8.8.4.4".parse().unwrap()));
+            assert_eq!(from.port, 53);
+            assert_eq!(&buf[..n], b"query");
+        }
+    }
+
+    #[tokio::test]
+    async fn server_udp_handles_domain_requests() {
+        // A domain request packet parses on the uplink
+        // (ParseUDPRequest's socks-domain form); responses are IP-only
+        // by design (snell_udp_response_frame errors on domains).
+        let psk = test_psk();
+        let transport = spawn_server(4, &psk).await;
+        let cfg = SnellOut {
+            server: "127.0.0.1".into(),
+            port: 0,
+            psk: psk.clone(),
+            version: 4,
+            udp: true,
+        };
+        let mut udp = udp_session(&cfg, Box::new(transport)).await.unwrap();
+        let target = NetAddr::domain("dns.example", 53).unwrap();
+        udp.send_to(&target, b"dom").await.unwrap();
+        let mut buf = [0u8; 1500];
+        let (from, n) =
+            tokio::time::timeout(Duration::from_secs(10), udp.recv_from(&mut buf))
+                .await
+                .expect("udp response timeout")
+                .unwrap();
+        assert_eq!(from.port, 53);
+        assert_eq!(&buf[..n], b"dom");
+        let err = snell_udp_response_frame(&target, b"x").unwrap_err();
+        assert!(err.to_string().contains("must be an IP"), "{err}");
+    }
+
+    #[test]
+    fn server_version_gate_and_error_frames() {
+        // parse_server_version (listener/snell/server.go:37-44).
+        assert_eq!(parse_server_version(0).unwrap(), 4);
+        for v in [1u8, 2, 3, 4, 5] {
+            assert_eq!(parse_server_version(v).unwrap(), v);
+        }
+        let err = parse_server_version(6).unwrap_err();
+        assert!(
+            err.to_string().contains("snell inbound version 6 is not supported"),
+            "{err}"
+        );
+        // writeCommandError layout: CommandError || code || msglen || msg.
+        let frame = command_error_frame(REMOTE_EOF_CODE, "Remote EOF");
+        assert_eq!(&frame[..3], &[CMD_ERROR, 0x65, 10]);
+        assert_eq!(&frame[3..], b"Remote EOF");
+        // Long messages truncate at 255.
+        let long = command_error_frame(1, &"x".repeat(300));
+        assert_eq!(long.len(), 258);
+    }
+
+    #[tokio::test]
+    async fn server_ping_gets_pong() {
+        // CommandPing (0) is answered with a CommandPong frame and the
+        // conn closes (listener/snell/server.go:188-191). Drive the
+        // wire by hand with the v3 mimic.
+        let psk = test_psk();
+        let (mut client, server) = tokio::io::duplex(16 * 1024);
+        let psk2 = psk.clone();
+        tokio::spawn(async move {
+            let mut conn =
+                SnellServerConn::new(Box::new(server), psk2.as_bytes(), 3).unwrap();
+            match conn.read_request().await {
+                Ok(SnellServerRequest::Ping) => {} // answered inline
+                other => panic!("expected Ping, got {other:?}"),
+            }
+        });
+        // Client side: salt + one chunk holding [Version, CommandPing].
+        let mut out_salt = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut out_salt);
+        client.write_all(&out_salt).await.unwrap();
+        let mut enc = V3Mimic::new(AeadKind::Aes128Gcm, psk.as_bytes(), &out_salt);
+        let mut wire = Vec::new();
+        enc.frame_chunk(&[PROTOCOL_VERSION, CMD_PING], &mut wire);
+        client.write_all(&wire).await.unwrap();
+        // Server: fresh salt + one chunk == [CommandPong].
+        let salt = read_n(&mut client, 16).await.unwrap();
+        let mut dec = V3Mimic::new(AeadKind::Aes128Gcm, psk.as_bytes(), &salt);
+        let pong = dec.read_chunk(&mut client).await.unwrap();
+        assert_eq!(pong, vec![CMD_PONG]);
+    }
+
+    #[tokio::test]
+    async fn http_obfs_server_accepts_engine_client() {
+        // The engine's http-obfs client (proto::obfs) through the server
+        // wrapper: request head + body, 101 response head, then raw.
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let settings = crate::proto::obfs::ObfsSettings::new("cdn.example", 443);
+        let client = crate::proto::obfs::http_obfs_client(Box::new(client), &settings)
+            .await
+            .unwrap();
+        let psk = test_psk();
+        let psk2 = psk.clone();
+        tokio::spawn(async move {
+            let wrapped = http_obfs_server(Box::new(server)).await.unwrap();
+            let conn = SnellServerConn::new(wrapped, psk2.as_bytes(), 4).unwrap();
+            if let Err(e) = server_loop(conn).await {
+                panic!("obfs server loop failed: {e}");
+            }
+        });
+        let cfg = SnellOut {
+            server: "127.0.0.1".into(),
+            port: 0,
+            psk,
+            version: 4,
+            udp: false,
+        };
+        let target = NetAddr::domain("echo.example", 443).unwrap();
+        let mut stream = handshake(client, &cfg, &target, false).await.unwrap();
+        stream.write_all(b"obfs-echo").await.unwrap();
+        let mut buf = [0u8; 9];
+        timeout_read(&mut stream, &mut buf).await.unwrap();
+        assert_eq!(&buf, b"obfs-echo");
+    }
+
+    #[tokio::test]
+    async fn http_obfs_server_rejects_plain_http() {
+        // http_server.go:46-47 — a non-upgrade GET is rejected before
+        // any snell work.
+        let (mut client, server) = tokio::io::duplex(4 * 1024);
+        let handle = tokio::spawn(async move { http_obfs_server(Box::new(server)).await });
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let res = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("timeout")
+            .unwrap();
+        let err = res.err().expect("a plain GET must be rejected").to_string();
+        assert!(err.contains("websocket upgrade"), "{err}");
+    }
+
+    #[test]
+    fn http_obfs_server_head_pieces() {
+        // The 101 head shape (http_server.go:68-74).
+        let head = http_response_head();
+        assert!(head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+        assert!(head.contains("Server: nginx/1."));
+        assert!(head.contains("Upgrade: websocket\r\n"));
+        assert!(head.contains("Connection: Upgrade\r\n"));
+        assert!(head.contains("Sec-WebSocket-Accept: "));
+        assert!(head.ends_with("\r\n\r\n"));
+        // nginx versions stay in the upstream ranges.
+        let (major, minor) = nginx_version();
+        assert!(major < 11 && minor < 12);
+        // The Date is an RFC1123 GMT timestamp.
+        let date = rfc1123_now();
+        assert!(date.ends_with("GMT"), "{date}");
+        assert_eq!(date.len(), 29, "RFC1123 length: {date}");
+        // Request-head parsing: method + connection + content-length.
+        let parsed = parse_http_request_head(
+            b"GET / HTTP/1.1\r\nHost: h\r\nContent-Length: 7\r\nConnection: Upgrade\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.method, "GET");
+        assert!(parsed.connection_upgrade);
+        assert_eq!(parsed.content_length, 7);
+        // Malformed request lines are parse errors; a valid non-GET
+        // method parses (the GET gate lives in consume_request).
+        assert!(parse_http_request_head(b"garbage\r\n\r\n").is_err());
+        assert_eq!(
+            parse_http_request_head(b"POST / HTTP/1.1\r\n\r\n")
+                .unwrap()
+                .method,
+            "POST"
+        );
+        let parsed =
+            parse_http_request_head(b"GET / HTTP/1.1\r\nconnection: keep-alive\r\n\r\n").unwrap();
+        assert!(!parsed.connection_upgrade);
+    }
+
+    #[test]
+    fn server_udp_response_frame_layouts() {
+        // WritePacketResponse (snell.go:246-282): 04/06 + ip + port +
+        // payload.
+        let from = NetAddr::ip("1.2.3.4".parse().unwrap(), 53);
+        assert_eq!(
+            snell_udp_response_frame(&from, b"ok").unwrap(),
+            vec![0x04, 1, 2, 3, 4, 0, 53, b'o', b'k']
+        );
+        let from = NetAddr::ip("::1".parse().unwrap(), 53);
+        let frame = snell_udp_response_frame(&from, b"z").unwrap();
+        assert_eq!(frame[0], 0x06);
+        assert_eq!(&frame[1..16], &[0u8; 15]);
+        assert_eq!(frame[16], 1);
+        assert_eq!(u16::from_be_bytes([frame[17], frame[18]]), 53);
+        assert_eq!(&frame[19..], b"z");
+        // The client's response parser round-trips it (ReadPacket).
+        let (addr, payload) = parse_snell_udp_response(&frame).unwrap();
+        assert_eq!(addr.host, Host::Ip("::1".parse().unwrap()));
+        assert_eq!(payload, b"z".to_vec());
     }
 }

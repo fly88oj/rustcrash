@@ -31,3 +31,5 @@ pub mod ech;
 pub mod openvpn;
 pub mod sip003;
 pub mod tailscale;
+pub mod zerotier;
+pub mod easytier;
