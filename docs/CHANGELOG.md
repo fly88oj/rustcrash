@@ -27,6 +27,21 @@ All notable changes to RustCrash. Format based on
   passthrough (the framing half of the splice; the raw-transport
   rebind is tracked).
 
+### Engine — wave 12b: the last live-found bugs — vision response header + hy2 lazy framing
+
+- **Vision splice LIVE-FIX**: the splice path never consumed the VLESS
+  response header (version + addons-length) that precedes the server's
+  first vision frame, so the downlink mis-framed and the relay stalled
+  silently against real Xray. A new `VlessResp` read phase consumes it
+  (the e2e's own test server now models it — live-verified wire fact).
+- **hysteria2 LIVE-FIX**: the TCP response frame is now consumed
+  lazily on the first read — the real sing server writes it together
+  with its first data bytes, so blocking on it up front deadlocked the
+  relay (the target never saw the request).
+- **Interop suite now 42/42** (was 37 + 5 EXPECTED-FAIL): hysteria2
+  TCP+UDP, snell+jls, anytls+jls and the obfs-opts dialect check all
+  pass against the real mihomo binary.
+
 ### Engine — wave 12: live interop e2e (real mihomo), wireguard stall fix, tailscale/easytier outbounds LIVE, dns outbound, rcode/fakeip/api polish
 
 - **tests/docker-interop — the live-test suite**: a REAL mihomo binary
