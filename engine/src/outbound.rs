@@ -192,6 +192,12 @@ pub enum OutboundKind {
     /// Tailscale overlay outbound (config surface + the tsnet
     /// dependency map; connect fails with the precise blocker).
     Tailscale(crate::proto::tailscale::TailscaleConfig),
+    /// ZeroTier overlay outbound (config surface + the libzt C-dep map;
+    /// connect fails with the precise staged blocker).
+    ZeroTier(crate::proto::zerotier::ZeroTierConfig),
+    /// EasyTier overlay outbound (config surface + the ported TOML/
+    /// overlay helpers; connect fails with the staged first milestone).
+    EasyTier(crate::proto::easytier::EasyTierConfig),
 }
 
 /// Shared, lazily-dialed QUIC connection for the hysteria2/tuic outbounds
@@ -499,6 +505,8 @@ impl Outbound {
             OutboundKind::Masque(_) => "Masque",
             OutboundKind::OpenVpn(_) => "OpenVpn",
             OutboundKind::Tailscale(_) => "Tailscale",
+            OutboundKind::ZeroTier(_) => "ZeroTier",
+            OutboundKind::EasyTier(_) => "EasyTier",
         }
     }
 
@@ -1073,6 +1081,18 @@ async fn vless_front(
                     "tailscale: connect returned without a tunnel (unreachable)",
                 ))
             }
+            OutboundKind::ZeroTier(cfg) => {
+                crate::proto::zerotier::connect(cfg).await?;
+                Err(Error::config(
+                    "zerotier: connect returned without a tunnel (unreachable)",
+                ))
+            }
+            OutboundKind::EasyTier(cfg) => {
+                crate::proto::easytier::connect(cfg).await?;
+                Err(Error::config(
+                    "easytier: connect returned without a tunnel (unreachable)",
+                ))
+            }
         }
     }
 
@@ -1409,7 +1429,9 @@ async fn vless_front(
             }
             OutboundKind::AnyTls(_)
             | OutboundKind::Restls { .. }
-            | OutboundKind::Tailscale(_) => Err(
+            | OutboundKind::Tailscale(_)
+            | OutboundKind::ZeroTier(_)
+            | OutboundKind::EasyTier(_) => Err(
                 Error::protocol(format!("{} does not support UDP", self.kind_name())),
             ),
             OutboundKind::Reject
@@ -1507,6 +1529,8 @@ fn other_kind_name(kind: &OutboundKind) -> &'static str {
         OutboundKind::Masque(_) => "Masque",
         OutboundKind::OpenVpn(_) => "OpenVpn",
         OutboundKind::Tailscale(_) => "Tailscale",
+        OutboundKind::ZeroTier(_) => "ZeroTier",
+        OutboundKind::EasyTier(_) => "EasyTier",
     }
 }
 

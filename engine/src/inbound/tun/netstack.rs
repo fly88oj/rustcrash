@@ -32,22 +32,29 @@
 //!   is handed to the stack. That peek is the only packet the netstack
 //!   parses itself; everything else is smoltcp's business.
 //!
-//! # IPv6 caveats
+//! # IPv6 extension headers
 //!
-//! IPv6 *extension headers* are not parsed: a packet whose next-header is a
-//! hop-by-hop/routing/fragment header (or a non-first fragment) is dropped
-//! with a debug log. The kernel fragments before a TUN egress itself, and
-//! TCP negotiates MSS below the interface MTU, so the common paths carry no
-//! extension headers.
+//! The classifier follows the extension-header chain (hop-by-hop, routing,
+//! destination options, fragment, AH, mobility — see [`ipv6_upper_layer`],
+//! the gvisor/Linux walker) so UDP port 53 is hijacked, UDP datagrams are
+//! relayed and ICMPv6 echoes are answered even behind a chain. What is *not*
+//! done is feeding a chained packet to smoltcp: the stack only consumes
+//! hop-by-hop itself (smoltcp `iface/interface/ipv6.rs:204`) and answers
+//! every other unrecognized next-header with an ICMPv6 Parameter Problem
+//! (`ipv6.rs:352-367`), so a staged chain would only earn the client that
+//! error. Locally handled paths (DNS hijack, UDP relay, ICMP echo) are
+//! complete without smoltcp; chained TCP is dropped with a debug log —
+//! upstream sing-tun tolerates it because gvisor parses chains in-stack.
 //!
 //! # Wakeups
 //!
-//! The task sleeps in a `select!` over three things: TUN readability (tokio
-//! `AsyncFd`), a [`tokio::sync::Notify`] pinged by stream writes and UDP
-//! downlinks, and the timer `Interface::poll_delay` asks for (TCP
-//! retransmits, TIME-WAIT, session GC). A stream reader's waker is stored
-//! under the same mutex that guards its queues, so a push can never race the
-//! park and no wakeup is lost.
+//! The task sleeps in a `select!` over three things: packets from the reader
+//! pump ([`io::DeviceReader`] — a dedicated thread blocking on the device,
+//! the wireguard-go `RoutineReadFromTUN` shape), a [`tokio::sync::Notify`]
+//! pinged by stream writes and UDP downlinks, and the timer
+//! `Interface::poll_delay` asks for (TCP retransmits, TIME-WAIT, session
+//! GC). A stream reader's waker is stored under the same mutex that guards
+//! its queues, so a push can never race the park and no wakeup is lost.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -67,7 +74,7 @@ use tokio::sync::{mpsc, Notify};
 use crate::addr::NetAddr;
 use crate::dns::resolver::DnsEngine;
 use crate::error::{Error, Result};
-use crate::inbound::tun::device::TunDevice;
+use crate::inbound::tun::io::{DeviceReader, TunIo};
 use crate::inbound::tun::{TunConfig, TunHooks};
 use crate::inbound::{SharedRelay, TcpMeta};
 
@@ -98,6 +105,10 @@ const MAX_UDP_SESSIONS: usize = 1024;
 const MAX_STAGED_PACKETS: usize = 2048;
 /// Cap on replies waiting to be injected from off-task producers.
 const MAX_PENDING_REPLIES: usize = 1024;
+/// Packets the reader pump may queue between the device thread and this
+/// task. Beyond it the thread parks in `blocking_send` and the kernel's
+/// device queue absorbs the burst — the overload behavior of a NIC.
+const READER_CHANNEL: usize = 1024;
 
 /// Idle UDP sessions are reaped this long after the last datagram, matching
 /// the socks association's lazy teardown.
@@ -126,22 +137,29 @@ pub(crate) enum Classified<'a> {
         dst: SocketAddr,
         /// SYN set — the only trigger that may need a new listener.
         syn: bool,
+        /// The transport header sat behind IPv6 extension headers (true only
+        /// for v6; see [`stage`](Netstack::stage) for what that changes).
+        ext: bool,
     },
     Udp {
         src: SocketAddr,
         dst: SocketAddr,
         payload: &'a [u8],
+        /// Arrived behind IPv6 extension headers.
+        ext: bool,
     },
-    /// ICMP echo request — v4 type 8 / v6 type 128. Answered locally by
-    /// [`icmpv4_echo_reply`] / [`icmpv6_echo_reply`], never staged.
+    /// ICMP echo request — v4 type 8 / v6 type 128 (possibly behind an
+    /// extension-header chain). Answered locally by [`icmpv4_echo_reply`] /
+    /// [`icmpv6_echo_reply`], never staged.
     IcmpEchoRequest {
         src: IpAddr,
         dst: IpAddr,
         v6: bool,
     },
     /// IP but not TCP/UDP/echo-request: every other ICMP type (errors,
-    /// echoes of our own pings, IGMP, ...), and IPv6 packets behind an
-    /// extension header (fragment, routing, hop-by-hop — not parsed).
+    /// echoes of our own pings, IGMP, ...), IPv6 chains that end without a
+    /// parseable transport (non-initial fragments, ESP, "no next header",
+    /// unknown headers), and non-ICMP protocols.
     Other {
         version: u8,
         proto: u8,
@@ -201,6 +219,7 @@ fn classify_v4(pkt: &[u8]) -> Classified<'_> {
                 src: SocketAddr::new(IpAddr::V4(src), src_port),
                 dst: SocketAddr::new(IpAddr::V4(dst), dst_port),
                 syn: flags & FLAG_SYN != 0,
+                ext: false,
             }
         }
         17 => {
@@ -219,6 +238,7 @@ fn classify_v4(pkt: &[u8]) -> Classified<'_> {
                 src: SocketAddr::new(IpAddr::V4(src), src_port),
                 dst: SocketAddr::new(IpAddr::V4(dst), dst_port),
                 payload: &pkt[payload_start..payload_end],
+                ext: false,
             }
         }
         IPPROTO_ICMPV4 => {
@@ -241,42 +261,157 @@ fn classify_v4(pkt: &[u8]) -> Classified<'_> {
     }
 }
 
-/// IPv6 base header (RFC 8200): fixed 40 bytes, no options; the transport
-/// starts at byte 40 unless the next-header field names an extension header,
-/// which this pass does not follow (see the module docs).
+/// IPv6 next-header numbers that continue the extension-header chain
+/// (RFC 8200 §4's table).
+const IPV6_HOPOPTS: u8 = 0;
+const IPV6_ROUTING: u8 = 43;
+const IPV6_FRAGMENT: u8 = 44;
+const IPV6_AUTH_HDR: u8 = 51;
+const IPV6_NO_NEXT_HDR: u8 = 59;
+const IPV6_DEST_OPTS: u8 = 60;
+const IPV6_MOBILITY: u8 = 135;
+
+/// Where an IPv6 extension-header chain ends up.
+#[derive(Debug, PartialEq, Eq)]
+enum UpperLayer {
+    /// A parseable upper-layer header: its protocol and byte offset.
+    Upper(u8, usize),
+    /// The chain ends without one; the value is what the last next-header
+    /// field named (what gvisor's `TryParseTransportProtocol` returns with
+    /// ok=false — the "maybe protocol" it could not confirm).
+    None(u8),
+    /// A header claims more bytes than the packet carries (or is too short
+    /// to even read its length).
+    Malformed,
+}
+
+/// Walk an IPv6 packet's extension-header chain to the upper layer.
+///
+/// Ported from gvisor netstack's `TryParseTransportProtocol`
+/// (pkg/tcpip/header/ipv6.go:234-273, which itself cites Linux
+/// `net/ipv6/exthdrs_core.c:ipv6_skip_exthdr`) with the one addition the
+/// task asked for: mobility (135) is walked too, its length rule identical
+/// to hop-by-hop/routing/destination-options (RFC 6275 §6.1 — 8-octet units
+/// not counting the first 8; gvisor and the kernel stop there instead).
+///
+/// * hop-by-hop/routing/destination-options/mobility skip
+///   `(hdr-ext-len + 1) * 8` bytes;
+/// * fragment is a fixed 8 bytes, and only an offset-0 fragment carries the
+///   upper-layer header — a non-zero offset ends the walk with the
+///   fragment's own next-header value (gvisor ipv6.go:246-254; its
+///   atomic-fragment fast path at network/ipv6/ipv6.go:1610-1618 per
+///   RFC 6946 is exactly the offset-0 case that keeps walking);
+/// * AH skips `(hdr-ext-len + 2) * 4` bytes (RFC 4302 §2.2; gvisor
+///   ipv6.go:261-262) — the walk continues past it;
+/// * ESP, "no next header" and any unrecognized header end the walk with
+///   `None` (gvisor `IsExtensionHeader` ipv6.go:219-227 + the default arm);
+/// * hop-by-hop anywhere but immediately after the IPv6 header is invalid
+///   (RFC 8200 §4.1; gvisor rejects it in
+///   `processIPv6HopByHopOptionsExtHdr`, network/ipv6/ipv6.go:1589-1596).
+///
+/// Offsets strictly grow and every skip is bounds-checked against `limit`,
+/// so the walk always terminates.
+fn ipv6_upper_layer(pkt: &[u8], limit: usize) -> UpperLayer {
+    let mut nh = pkt[6];
+    let mut off = 40usize;
+    loop {
+        if off >= limit {
+            // The chain consumed the whole payload; no upper-layer bytes
+            // remain (gvisor: "if len(data) == 0 ... return ok=false"). For
+            // a transport that was promised but is not present that is a
+            // malformed packet (the pre-ext-header classifier's label for a
+            // truncated TCP/UDP); for anything else it stays `None` — an
+            // unknown protocol is unparseable, not broken.
+            return match nh {
+                6 | 17 | IPPROTO_ICMPV6 => UpperLayer::Malformed,
+                _ => UpperLayer::None(nh),
+            };
+        }
+        let len = match nh {
+            6 | 17 | IPPROTO_ICMPV6 => return UpperLayer::Upper(nh, off),
+            IPV6_HOPOPTS if off != 40 => {
+                return UpperLayer::None(IPV6_HOPOPTS);
+            }
+            IPV6_HOPOPTS | IPV6_ROUTING | IPV6_DEST_OPTS | IPV6_MOBILITY => {
+                if off + 2 > limit {
+                    return UpperLayer::Malformed;
+                }
+                8 * (pkt[off + 1] as usize + 1)
+            }
+            IPV6_FRAGMENT => {
+                if off + 8 > limit {
+                    return UpperLayer::Malformed;
+                }
+                if u16::from_be_bytes([pkt[off + 2], pkt[off + 3]]) >> 3 != 0 {
+                    // Non-initial fragment: the transport is in another
+                    // fragment; report what the fragment header says
+                    // follows it, unconfirmed (gvisor's shape).
+                    return UpperLayer::None(pkt[off]);
+                }
+                8
+            }
+            IPV6_AUTH_HDR => {
+                if off + 2 > limit {
+                    return UpperLayer::Malformed;
+                }
+                4 * (pkt[off + 1] as usize + 2)
+            }
+            // ESP, "no next header" and any unrecognized header: the chain
+            // ends here, unconfirmed (gvisor ipv6.go:265-267).
+            IPV6_NO_NEXT_HDR => return UpperLayer::None(IPV6_NO_NEXT_HDR),
+            other => return UpperLayer::None(other),
+        };
+        if off + len > limit {
+            return UpperLayer::Malformed;
+        }
+        nh = pkt[off];
+        off += len;
+    }
+}
+
+/// IPv6 base header (RFC 8200 §3: fixed 40 bytes) plus, since the ext-header
+/// pass, whatever chain follows it: the transport is found by
+/// [`ipv6_upper_layer`], and packets that arrive through a chain carry
+/// `ext = true` (which keeps them out of smoltcp — see the module docs).
 fn classify_v6(pkt: &[u8]) -> Classified<'_> {
     if pkt.len() < 40 {
         return Classified::Malformed;
     }
     let payload_len = u16::from_be_bytes([pkt[4], pkt[5]]) as usize;
     let end = 40 + payload_len.min(pkt.len() - 40);
-    let next_header = pkt[6];
     let src_bytes: [u8; 16] = pkt[8..24].try_into().expect("24-8 is the address length");
     let dst_bytes: [u8; 16] = pkt[24..40].try_into().expect("40-24 is the address length");
     let src = IpAddr::V6(Ipv6Addr::from(src_bytes));
     let dst = IpAddr::V6(Ipv6Addr::from(dst_bytes));
+    let (next_header, off) = match ipv6_upper_layer(pkt, end) {
+        UpperLayer::Upper(nh, off) => (nh, off),
+        UpperLayer::None(proto) => return Classified::Other { version: 6, proto },
+        UpperLayer::Malformed => return Classified::Malformed,
+    };
+    let ext = off > 40;
     match next_header {
         6 => {
-            if end < 60 {
+            if end < off + 20 {
                 return Classified::Malformed;
             }
-            let src_port = u16::from_be_bytes([pkt[40], pkt[41]]);
-            let dst_port = u16::from_be_bytes([pkt[42], pkt[43]]);
-            let flags = pkt[53];
+            let src_port = u16::from_be_bytes([pkt[off], pkt[off + 1]]);
+            let dst_port = u16::from_be_bytes([pkt[off + 2], pkt[off + 3]]);
+            let flags = pkt[off + 13];
             Classified::Tcp {
                 src: SocketAddr::new(src, src_port),
                 dst: SocketAddr::new(dst, dst_port),
                 syn: flags & FLAG_SYN != 0,
+                ext,
             }
         }
         17 => {
-            if end < 48 {
+            if end < off + 8 {
                 return Classified::Malformed;
             }
-            let src_port = u16::from_be_bytes([pkt[40], pkt[41]]);
-            let dst_port = u16::from_be_bytes([pkt[42], pkt[43]]);
-            let udp_len = u16::from_be_bytes([pkt[44], pkt[45]]) as usize;
-            let payload_start = 48usize;
+            let src_port = u16::from_be_bytes([pkt[off], pkt[off + 1]]);
+            let dst_port = u16::from_be_bytes([pkt[off + 2], pkt[off + 3]]);
+            let udp_len = u16::from_be_bytes([pkt[off + 4], pkt[off + 5]]) as usize;
+            let payload_start = off + 8;
             let payload_end = payload_start
                 .saturating_add(udp_len.saturating_sub(8))
                 .min(end)
@@ -285,10 +420,11 @@ fn classify_v6(pkt: &[u8]) -> Classified<'_> {
                 src: SocketAddr::new(src, src_port),
                 dst: SocketAddr::new(dst, dst_port),
                 payload: &pkt[payload_start..payload_end],
+                ext,
             }
         }
         IPPROTO_ICMPV6 => {
-            if end >= 48 && pkt[40] == ICMPV6_ECHO_REQUEST {
+            if end >= off + 8 && pkt[off] == ICMPV6_ECHO_REQUEST {
                 Classified::IcmpEchoRequest { src, dst, v6: true }
             } else {
                 Classified::Other {
@@ -297,10 +433,7 @@ fn classify_v6(pkt: &[u8]) -> Classified<'_> {
                 }
             }
         }
-        other => Classified::Other {
-            version: 6,
-            proto: other,
-        },
+        _ => unreachable!("ipv6_upper_layer only confirms TCP, UDP or ICMPv6"),
     }
 }
 
@@ -375,16 +508,30 @@ pub(crate) fn icmpv4_echo_reply(pkt: &[u8]) -> Option<Vec<u8>> {
 
 /// Build the echo reply for one IPv6 echo-request packet: type 129, swapped
 /// addresses, id/seq/data verbatim. The ICMPv6 checksum covers the message
-/// *plus* the IPv6 pseudo-header (src, dst, payload length, next header 58),
-/// computed over the reply's own (swapped) addresses — RFC 4443 §2.1 with
-/// RFC 8200 §8.1. `None` when the packet is not a well-formed echo request.
+/// *plus* the IPv6 pseudo-header (src, dst, upper-layer packet length, next
+/// header 58), computed over the reply's own (swapped) addresses — RFC 4443
+/// §2.1 with RFC 8200 §8.1. `None` when the packet is not a well-formed
+/// echo request.
+///
+/// The echo request may sit behind an extension-header chain (found with the
+/// same [`ipv6_upper_layer`] walk the classifier uses); the chain is copied
+/// verbatim into the reply, and per RFC 8200 §8.1 the pseudo-header carries
+/// the *upper-layer* length and protocol — extension headers count in
+/// neither, so the checksum is over the ICMP message alone either way.
 pub(crate) fn icmpv6_echo_reply(pkt: &[u8]) -> Option<Vec<u8>> {
-    if pkt.len() < 48 || pkt[6] != IPPROTO_ICMPV6 {
+    if pkt.len() < 48 {
         return None;
     }
     let payload_len = u16::from_be_bytes([pkt[4], pkt[5]]) as usize;
     let end = 40 + payload_len.clamp(8, pkt.len() - 40);
-    let icmp = &pkt[40..end];
+    let off = match ipv6_upper_layer(pkt, end) {
+        UpperLayer::Upper(IPPROTO_ICMPV6, off) => off,
+        _ => return None,
+    };
+    if end < off + 8 {
+        return None;
+    }
+    let icmp = &pkt[off..end];
     if icmp[0] != ICMPV6_ECHO_REQUEST {
         return None;
     }
@@ -393,12 +540,16 @@ pub(crate) fn icmpv6_echo_reply(pkt: &[u8]) -> Option<Vec<u8>> {
     icmp_out[1] = 0;
     icmp_out[2..4].copy_from_slice(&[0, 0]);
 
-    let mut out = pkt[..40].to_vec();
+    // Base header + any extension chain, copied verbatim up to the message.
+    let mut out = pkt[..off].to_vec();
     out[7] = 64; // hop limit of a locally generated reply
     out[8..24].copy_from_slice(&pkt[24..40]); // src <- request dst
     out[24..40].copy_from_slice(&pkt[8..24]); // dst <- request src
 
-    // Pseudo-header over the reply's addresses (RFC 8200 §8.1).
+    // Pseudo-header over the reply's addresses (RFC 8200 §8.1): the length
+    // is the upper-layer packet length (payload minus extension headers),
+    // so `icmp_out.len()` — not the on-wire payload length — and next header
+    // 58, never the chain's first header type.
     let mut pseudo = [0u8; 40];
     pseudo[..16].copy_from_slice(&out[8..24]);
     pseudo[16..32].copy_from_slice(&out[24..40]);
@@ -598,15 +749,21 @@ impl AsyncWrite for TunStream {
 // Packet sink + smoltcp device shim
 // ---------------------------------------------------------------------------
 
-/// Where the stack's egress goes. Production is the TUN fd; tests capture the
-/// packets so the identical path runs without privileges.
+/// Where the stack's egress goes. Production is the device (through
+/// [`TunIoSink`]); tests capture the packets so the identical path runs
+/// without privileges.
 pub(crate) trait PacketSink: Send + Sync + 'static {
     fn send(&self, pkt: &[u8]) -> io::Result<()>;
 }
 
-impl PacketSink for TunDevice {
+/// The device as the stack's egress sink: one nonblocking write per packet
+/// (`WouldBlock` drops — see `TxTok::consume`), exactly the write half every
+/// platform backend already provides.
+struct TunIoSink(Arc<dyn TunIo>);
+
+impl PacketSink for TunIoSink {
     fn send(&self, pkt: &[u8]) -> io::Result<()> {
-        TunDevice::send(self, pkt)
+        self.0.send(pkt)
     }
 }
 
@@ -857,19 +1014,35 @@ impl Netstack {
     /// addressed to the interface would make smoltcp answer it too).
     fn stage(&mut self, pkt: &[u8]) {
         match classify_packet(pkt) {
-            Classified::Tcp { src, dst, syn } => {
+            Classified::Tcp { src, dst, syn, ext } => {
+                if ext {
+                    // The classifier followed the chain, but smoltcp does
+                    // not: only hop-by-hop is consumed before dispatch
+                    // (smoltcp iface/interface/ipv6.rs:204-210) and any other
+                    // chain reaches process_nxt_hdr as an unrecognized
+                    // next-header, which it answers with an ICMPv6 Parameter
+                    // Problem (ipv6.rs:352-367). Staging the SYN would only
+                    // earn the client that error, so it is dropped here —
+                    // upstream sing-tun tolerates chains because gvisor
+                    // parses them in-stack before demux.
+                    tracing::debug!(target: "engine",
+                        "tun: dropping IPv6 TCP behind extension headers ({src} -> {dst})");
+                    return;
+                }
                 if syn && needs_new_listener(&self.socket_facts(), src, dst) {
                     self.add_listener(dst.port());
                 }
                 self.shim.stage(pkt);
             }
-            Classified::Udp { src, dst, payload } => {
+            Classified::Udp { src, dst, payload, ext } => {
                 // The stack needs a UDP socket bound to this port even though
                 // the payload is handled here: without one smoltcp answers
                 // every relayed datagram with an ICMP port-unreachable, which
                 // would tell the client the destination is dead. At the
                 // socket cap the datagram is dropped instead — a silent drop
-                // is the honest failure, a false ICMP is not.
+                // is the honest failure, a false ICMP is not. The socket is
+                // also the reply path for hijacked answers and relay
+                // downlinks, so it is bound for ext-headered datagrams too.
                 if self.ensure_udp_socket(dst.port()).is_none() {
                     return;
                 }
@@ -878,6 +1051,13 @@ impl Netstack {
                     self.spawn_dns(payload.to_vec(), src, dst);
                 } else {
                     self.udp_uplink(src, dst, payload.to_vec());
+                }
+                if ext {
+                    // Same smoltcp limitation as the TCP arm: the datagram
+                    // itself is fully handled above (resolver or relay), and
+                    // only the redundant staging copy — which would draw an
+                    // ICMPv6 Parameter Problem — is skipped.
+                    return;
                 }
                 self.shim.stage(pkt);
             }
@@ -1304,43 +1484,63 @@ impl Netstack {
 
 /// Drive the stack until the device dies. One task owns everything; the relay
 /// only ever sees `TunStream`s and UDP sessions.
+///
+/// Ingress is the reader pump ([`io::DeviceReader`], a dedicated thread
+/// blocking on the device — the wireguard-go `RoutineReadFromTUN` shape);
+/// this task consumes its channel, stages each packet after the peeks above,
+/// and never touches device readiness itself. Egress is the same device
+/// through [`TunIoSink`]: a nonblocking write per transmitted packet.
 pub(crate) async fn run(
-    dev: Arc<TunDevice>,
+    dev: Arc<dyn TunIo>,
     cfg: TunConfig,
     relay: SharedRelay,
     hooks: TunHooks,
 ) -> Result<()> {
-    let afd = tokio::io::unix::AsyncFd::new(dev.clone())
-        .map_err(|e| Error::network(format!("tun: AsyncFd registration: {e}")))?;
-    let mut net = Netstack::new(dev.clone(), &cfg, relay, hooks)?;
+    // Room for the largest packet the interface can deliver, plus headroom
+    // for the utun 4-byte family header macOS recv strips in place.
+    let mut reader = DeviceReader::spawn(dev.clone(), cfg.mtu.max(576) as usize + 64, READER_CHANNEL)
+        .map_err(|e| Error::network(e.to_string()))?;
+    let mut rx = reader
+        .take_receiver()
+        .expect("the receiver is taken exactly once");
+    let mut net = Netstack::new(Arc::new(TunIoSink(dev)), &cfg, relay, hooks)?;
     let wake = net.wake.clone();
-    // Room for the largest packet the interface can deliver.
-    let mut rx = vec![0u8; cfg.mtu.max(576) as usize + 64];
 
     loop {
         net.step();
         let delay = net.poll_delay();
         tokio::select! {
             biased;
-            r = afd.readable() => {
-                let mut guard =
-                    r.map_err(|e| Error::network(format!("tun: readable: {e}")))?;
-                // Drain until EAGAIN: readiness is edge-driven, so stopping
-                // early would park the loop with packets still queued.
-                loop {
-                    match guard.try_io(|_| dev.recv(&mut rx)) {
-                        // A TUN read only returns 0 if no packet was consumed;
-                        // nothing more to drain right now.
-                        Ok(Ok(0)) => break,
-                        Ok(Ok(n)) => net.stage(&rx[..n]),
-                        Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
-                        Ok(Err(e)) => {
-                            return Err(Error::network(format!("tun: read: {e}")));
-                        }
-                        Err(_would_block) => break,
+            pkt = rx.recv() => match pkt {
+                Some(pkt) => {
+                    net.stage(&pkt);
+                    // Drain what arrived behind it: the reader thread batches
+                    // (it keeps reading while packets are there), and one
+                    // step per burst is the old AsyncFd drain loop's
+                    // discipline.
+                    while let Ok(pkt) = rx.try_recv() {
+                        net.stage(&pkt);
                     }
                 }
-            }
+                None => {
+                    // The reader stopped. The channel only closes when the
+                    // thread exits, so the liveness query must agree (the
+                    // unconditional read also keeps it out of dead-code
+                    // pruning in release builds).
+                    let finished = reader.is_finished();
+                    debug_assert!(
+                        finished,
+                        "reader channel closed before the thread exited"
+                    );
+                    // Either the device died — surface the error the thread
+                    // recorded — or the pump was dropped, which cannot
+                    // happen while this future lives.
+                    return match reader.take_error() {
+                        Some(e) => Err(Error::network(format!("tun: device read: {e}"))),
+                        None => Ok(()),
+                    };
+                }
+            },
             _ = wake.notified() => {}
             _ = tokio::time::sleep(delay) => {}
         }
@@ -1602,6 +1802,164 @@ mod tests {
         ipv6_packet(58, src, dst, &msg)
     }
 
+    // -- IPv6 extension-header builders --------------------------------------
+    //
+    // Hand-built chains, byte for byte: every length rule the walker
+    // implements is pinned by these constructors (and the assertions below).
+
+    /// One 8-octet-unit extension header (hop-by-hop / routing /
+    /// destination options / mobility): `[next header, hdr ext len, data..]`
+    /// padded so the *total* is `8 * (hdr ext len + 1)` (RFC 8200 §4.3;
+    /// mobility RFC 6275 §6.1) — with the 2 fixed bytes, `data` lands on
+    /// `6 mod 8` bytes.
+    fn ext8(next: u8, data: &[u8]) -> Vec<u8> {
+        let mut d = data.to_vec();
+        while d.len() < 6 || !(d.len() + 2).is_multiple_of(8) {
+            d.push(0);
+        }
+        let hdrlen = (d.len() + 2) / 8 - 1;
+        let mut h = Vec::with_capacity(d.len() + 2);
+        h.push(next);
+        h.push(hdrlen as u8);
+        h.extend_from_slice(&d);
+        h
+    }
+
+    /// Fragment header (fixed 8 bytes, RFC 8200 §4.5): the 13-bit offset in
+    /// 8-octet units occupies the high bits of bytes 2..4; the low bit is M.
+    fn frag_hdr(next: u8, offset_units: u16, more: bool) -> Vec<u8> {
+        let v = (offset_units << 3) | u16::from(more);
+        let mut h = vec![next, 0];
+        h.extend_from_slice(&v.to_be_bytes());
+        h.extend_from_slice(&[0x2a, 0, 0, 1]); // identification (arbitrary)
+        h
+    }
+
+    /// Authentication Header (RFC 4302 §2.2): the *total* is
+    /// `4 * (hdr ext len + 2)` — 4-octet units, unlike everything else.
+    fn ah_hdr(next: u8, data: &[u8]) -> Vec<u8> {
+        let mut d = data.to_vec();
+        while d.len() < 6 || !(d.len() + 2).is_multiple_of(4) {
+            d.push(0);
+        }
+        let hdrlen = (d.len() + 2) / 4 - 2;
+        let mut h = Vec::with_capacity(d.len() + 2);
+        h.push(next);
+        h.push(hdrlen as u8);
+        h.extend_from_slice(&d);
+        h
+    }
+
+    /// An IPv6 packet whose payload starts with an extension-header chain.
+    /// `first_nh` is the *type* of the first extension header (0/43/44/51/
+    /// 60/135) — the type itself is not written inside the header, only in
+    /// the preceding next-header field, so it cannot be derived from `chain`.
+    fn ipv6_chained(
+        first_nh: u8,
+        chain: &[&[u8]],
+        src: Ipv6Addr,
+        dst: Ipv6Addr,
+        transport: &[u8],
+    ) -> Vec<u8> {
+        let plen = chain.iter().map(|c| c.len()).sum::<usize>() + transport.len();
+        let mut pkt = Vec::with_capacity(40 + plen);
+        pkt.extend_from_slice(&[0x60, 0, 0, 0]);
+        pkt.extend_from_slice(&(plen as u16).to_be_bytes());
+        pkt.push(first_nh);
+        pkt.push(64);
+        pkt.extend_from_slice(&src.octets());
+        pkt.extend_from_slice(&dst.octets());
+        for c in chain {
+            pkt.extend_from_slice(c);
+        }
+        pkt.extend_from_slice(transport);
+        pkt
+    }
+
+    /// UDP over a chain: the checksum's pseudo-header carries the
+    /// *upper-layer* length (RFC 8200 §8.1 — extension headers are excluded),
+    /// which is why the segment is checksummed before the chain is prepended.
+    fn udp6_chained(
+        first_nh: u8,
+        chain: &[&[u8]],
+        src: SocketAddr,
+        dst: SocketAddr,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let (IpAddr::V6(src_ip), IpAddr::V6(dst_ip)) = (src.ip(), dst.ip()) else {
+            panic!("udp6_chained wants v6 addresses");
+        };
+        let len = 8 + payload.len();
+        let mut seg = vec![
+            (src.port() >> 8) as u8,
+            src.port() as u8,
+            (dst.port() >> 8) as u8,
+            dst.port() as u8,
+            (len >> 8) as u8,
+            len as u8,
+            0,
+            0,
+        ];
+        seg.extend_from_slice(payload);
+        let pseudo = pseudo_header_v6(src_ip, dst_ip, 17, len);
+        let ck = checksum(&[&pseudo, &seg]);
+        seg[6..8].copy_from_slice(&ck.to_be_bytes());
+        ipv6_chained(first_nh, chain, src_ip, dst_ip, &seg)
+    }
+
+    /// TCP over a chain (`ack` = None means a bare SYN).
+    #[allow(clippy::too_many_arguments)]
+    fn tcp6_chained(
+        first_nh: u8,
+        chain: &[&[u8]],
+        src: SocketAddr,
+        dst: SocketAddr,
+        seq: u32,
+        ack: Option<u32>,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let (IpAddr::V6(src_ip), IpAddr::V6(dst_ip)) = (src.ip(), dst.ip()) else {
+            panic!("tcp6_chained wants v6 addresses");
+        };
+        let mut seg = Vec::with_capacity(20 + payload.len());
+        seg.extend_from_slice(&src.port().to_be_bytes());
+        seg.extend_from_slice(&dst.port().to_be_bytes());
+        seg.extend_from_slice(&seq.to_be_bytes());
+        seg.extend_from_slice(&ack.unwrap_or(0).to_be_bytes());
+        seg.push(5 << 4);
+        let flags = if ack.is_some() { flags | 0x10 } else { flags };
+        seg.push(flags);
+        seg.extend_from_slice(&65535u16.to_be_bytes());
+        seg.extend_from_slice(&[0, 0, 0, 0]);
+        seg.extend_from_slice(payload);
+        let pseudo = pseudo_header_v6(src_ip, dst_ip, 6, seg.len());
+        let ck = checksum(&[&pseudo, &seg]);
+        seg[16..18].copy_from_slice(&ck.to_be_bytes());
+        ipv6_chained(first_nh, chain, src_ip, dst_ip, &seg)
+    }
+
+    /// ICMPv6 echo request over a chain; the pseudo-header length is the
+    /// ICMP message length (RFC 8200 §8.1 again).
+    fn icmpv6_echo_request_chained(
+        first_nh: u8,
+        chain: &[&[u8]],
+        src: Ipv6Addr,
+        dst: Ipv6Addr,
+        id: u16,
+        seq: u16,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let mut msg = vec![128, 0, 0, 0];
+        msg.extend_from_slice(&id.to_be_bytes());
+        msg.extend_from_slice(&seq.to_be_bytes());
+        msg.extend_from_slice(data);
+        let pseudo = pseudo_header_v6(src, dst, 58, msg.len());
+        let ck = checksum(&[&pseudo, &msg]);
+        msg[2..4].copy_from_slice(&ck.to_be_bytes());
+        ipv6_chained(first_nh, chain, src, dst, &msg)
+    }
+
     /// ICMP message bytes from a raw IPv4 packet.
     fn icmpv4_msg(pkt: &[u8]) -> &[u8] {
         let ihl = (pkt[0] & 0x0f) as usize * 4;
@@ -1771,7 +2129,8 @@ mod tests {
             Classified::Tcp {
                 src: SocketAddr::V4(src),
                 dst: SocketAddr::V4(dst),
-                syn: true
+                syn: true,
+                ext: false
             }
         );
         // ACK-only: same tuple, no SYN.
@@ -1781,7 +2140,8 @@ mod tests {
             Classified::Tcp {
                 src: SocketAddr::V4(src),
                 dst: SocketAddr::V4(dst),
-                syn: false
+                syn: false,
+                ext: false
             }
         );
 
@@ -1791,6 +2151,7 @@ mod tests {
                 src: s,
                 dst: d,
                 payload,
+                ..
             } => {
                 assert_eq!((s, d), (SocketAddr::V4(src), SocketAddr::V4(dst)));
                 assert_eq!(payload, b"payload");
@@ -1812,7 +2173,8 @@ mod tests {
             Classified::Tcp {
                 src,
                 dst,
-                syn: true
+                syn: true,
+                ext: false
             }
         );
 
@@ -1822,6 +2184,7 @@ mod tests {
                 src: s,
                 dst: d,
                 payload,
+                ..
             } => {
                 assert_eq!((s, d), (src, dst));
                 assert_eq!(payload, b"v6-payload");
@@ -1853,13 +2216,15 @@ mod tests {
             }
         );
 
-        // An extension header (fragment) is not followed.
-        let frag = ipv6_packet(44, src_ip, dst_ip, &[0u8; 8]);
+        // A non-initial fragment (offset 8 units, M set) carries no
+        // upper-layer header: gvisor's walker returns ok=false with the
+        // fragment's own next-header value as the maybe-proto.
+        let frag = ipv6_packet(44, src_ip, dst_ip, &[6, 0, 0, 8, 0, 0, 0, 0]);
         assert_eq!(
             classify_packet(&frag),
             Classified::Other {
                 version: 6,
-                proto: 44
+                proto: 6
             }
         );
 
@@ -2610,5 +2975,629 @@ mod tests {
         assert!(payload.ends_with(&answer_v6.octets()), "AAAA record answer");
         assert!(relay.udp.lock().unwrap().is_empty(), "nothing relayed");
         assert!(relay.tcp.lock().unwrap().is_empty());
+    }
+
+    // -- IPv6 extension-header classification ----------------------------------
+
+    /// The chains the classifier must see through, per gvisor's
+    /// `TryParseTransportProtocol` (header/ipv6.go:234) — the walker this
+    /// port follows.
+    #[test]
+    fn classify_ipv6_ext_header_chains_to_the_transport() {
+        let src_ip = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2);
+        let dst_ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x443);
+        let client = SocketAddr::new(IpAddr::V6(src_ip), 40000);
+        let dns = SocketAddr::new(IpAddr::V6(dst_ip), 53);
+        let https = SocketAddr::new(IpAddr::V6(dst_ip), 443);
+
+        // hop-by-hop -> UDP: as classify-able as a bare UDP datagram.
+        let hbh = ext8(17, &[0x05, 0x02, 0, 0, 0, 0]); // a PadN option, content irrelevant
+        let pkt = udp6_chained(0, &[&hbh], client, dns, b"q");
+        assert_eq!(
+            classify_packet(&pkt),
+            Classified::Udp {
+                src: client,
+                dst: dns,
+                payload: b"q",
+                ext: true
+            }
+        );
+
+        // hop-by-hop + routing -> UDP (the headline chain).
+        let hbh_r = ext8(43, &[0x05, 0x02, 0, 0, 0, 0]);
+        let routing = ext8(17, &[0u8; 8]); // type 0, segments-left 0
+        let pkt = udp6_chained(0, &[&hbh_r, &routing], client, dns, b"chain");
+        assert_eq!(
+            classify_packet(&pkt),
+            Classified::Udp {
+                src: client,
+                dst: dns,
+                payload: b"chain",
+                ext: true
+            }
+        );
+
+        // destination options -> TCP SYN.
+        let dst_opts = ext8(6, &[]);
+        let pkt = tcp6_chained(60, &[&dst_opts], client, https, 1000, None, FLAG_SYN, &[]);
+        assert_eq!(
+            classify_packet(&pkt),
+            Classified::Tcp {
+                src: client,
+                dst: https,
+                syn: true,
+                ext: true
+            }
+        );
+
+        // A fragment at offset 0 (atomic, RFC 6946) carries the transport.
+        let frag0 = frag_hdr(17, 0, false);
+        let pkt = udp6_chained(44, &[&frag0], client, dns, b"atomic");
+        assert_eq!(
+            classify_packet(&pkt),
+            Classified::Udp {
+                src: client,
+                dst: dns,
+                payload: b"atomic",
+                ext: true
+            }
+        );
+
+        // AH (4-octet units, RFC 4302) and mobility (RFC 6275) are walked
+        // with their own length rules.
+        let ah = ah_hdr(6, &[0u8; 8]);
+        let pkt = tcp6_chained(51, &[&ah], client, https, 7, None, FLAG_SYN, &[]);
+        assert_eq!(
+            classify_packet(&pkt),
+            Classified::Tcp {
+                src: client,
+                dst: https,
+                syn: true,
+                ext: true
+            }
+        );
+        let mob = ext8(17, &[0u8; 8]);
+        let pkt = udp6_chained(135, &[&mob], client, dns, b"mipv6");
+        assert_eq!(
+            classify_packet(&pkt),
+            Classified::Udp {
+                src: client,
+                dst: dns,
+                payload: b"mipv6",
+                ext: true
+            }
+        );
+    }
+
+    /// Chains that end without a transport, and chains that are broken.
+    #[test]
+    fn classify_ipv6_ext_header_terminators_and_bounds() {
+        let src_ip = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2);
+        let dst_ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x443);
+
+        // ESP (50): opaque, ends the walk.
+        let pkt = ipv6_packet(50, src_ip, dst_ip, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            classify_packet(&pkt),
+            Classified::Other {
+                version: 6,
+                proto: 50
+            }
+        );
+        // No next header (59): nothing follows.
+        let pkt = ipv6_packet(59, src_ip, dst_ip, &[0u8; 4]);
+        assert_eq!(
+            classify_packet(&pkt),
+            Classified::Other {
+                version: 6,
+                proto: 59
+            }
+        );
+        // Unrecognized (139 = Host Identity Protocol): same shape.
+        let pkt = ipv6_packet(139, src_ip, dst_ip, &[0u8; 4]);
+        assert_eq!(
+            classify_packet(&pkt),
+            Classified::Other {
+                version: 6,
+                proto: 139
+            }
+        );
+
+        // Hop-by-hop must be first (RFC 8200 §4.1): routing -> hbh is a
+        // malformed chain per gvisor; it reports the hbh value.
+        let hbh = ext8(17, &[0x05, 0x02, 0, 0, 0, 0]);
+        let routing = ext8(0, &[0u8; 8]);
+        let client = SocketAddr::new(IpAddr::V6(src_ip), 40000);
+        let dns = SocketAddr::new(IpAddr::V6(dst_ip), 53);
+        let pkt = udp6_chained(43, &[&routing, &hbh], client, dns, b"late-hbh");
+        assert_eq!(
+            classify_packet(&pkt),
+            Classified::Other {
+                version: 6,
+                proto: 0
+            }
+        );
+
+        // A header claiming more bytes than the packet carries is malformed.
+        let mut pkt = udp6_chained(0, &[&ext8(17, &[0u8; 8])], client, dns, b"cut");
+        pkt.truncate(pkt.len() - 12);
+        assert_eq!(classify_packet(&pkt), Classified::Malformed);
+
+        // A chain that consumes the whole payload while promising a
+        // transport: the transport is absent, so the packet is malformed
+        // (the pre-ext-header label for a truncated TCP/UDP).
+        let pkt = ipv6_chained(0, &[&ext8(17, &[0u8; 8])], src_ip, dst_ip, &[]);
+        assert_eq!(classify_packet(&pkt), Classified::Malformed);
+    }
+
+    /// The echo responder answers a request that arrived through a chain,
+    /// carrying the chain verbatim and checksumming only the ICMP message
+    /// (RFC 8200 §8.1: the pseudo-header excludes extension headers).
+    #[test]
+    fn icmpv6_echo_reply_behind_ext_headers_keeps_chain_and_checksum() {
+        let client = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2);
+        let gateway = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
+        let hbh = ext8(58, &[0x05, 0x02, 0, 0, 0, 0]);
+        let req = icmpv6_echo_request_chained(0, &[&hbh], client, gateway, 0xcafe, 3, b"ext-ping");
+        assert_eq!(
+            classify_packet(&req),
+            Classified::IcmpEchoRequest {
+                src: IpAddr::V6(client),
+                dst: IpAddr::V6(gateway),
+                v6: true
+            }
+        );
+
+        let reply = icmpv6_echo_reply(&req).expect("chained echo request is answered");
+        assert_eq!(reply[6], 0, "the chain is still the first next header");
+        assert_eq!(reply[40], 58, "the chain's last header names ICMPv6");
+        assert_eq!(&reply[40..48], &hbh[..], "chain bytes carried verbatim");
+        assert_eq!(&reply[8..24], &gateway.octets()[..], "src = pinged address");
+        assert_eq!(&reply[24..40], &client.octets()[..], "dst = pinger");
+        let icmp = &reply[48..];
+        assert_eq!(icmp[0], 129, "echo reply type");
+        assert_eq!(&icmp[4..6], &0xcafeu16.to_be_bytes(), "id kept");
+        assert_eq!(&icmp[6..8], &3u16.to_be_bytes(), "seq kept");
+        assert_eq!(&icmp[8..], b"ext-ping");
+        // The pseudo-header checksum verifies over the upper-layer length
+        // (the ICMP message, not chain+message).
+        let pseudo = pseudo_header_v6(gateway, client, 58, icmp.len());
+        assert_eq!(checksum(&[&pseudo, icmp]), 0, "pseudo-header checksum");
+    }
+
+    /// The whole classification stage() policy for chained packets: handled
+    /// locally, never handed to smoltcp (which cannot follow a chain and
+    /// would answer with an ICMPv6 Parameter Problem instead).
+    #[tokio::test]
+    async fn ipv6_dns_hijack_survives_extension_headers() {
+        let mut cfg = test_cfg_v6();
+        let gateway = IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1));
+        cfg.dns_hijack = vec![gateway];
+        let mut dns_cfg = crate::config::DnsConfig::default();
+        let answer_v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x55);
+        dns_cfg
+            .hosts
+            .insert("probe-xh.test".to_string(), vec![answer_v6.into()]);
+        let dns = DnsEngine::new(dns_cfg, crate::rule::DomainMatcher::default()).unwrap();
+
+        let relay = Arc::new(CaptureRelay::default());
+        let (mut net, sink) = stack(&cfg, relay.clone(), Some(dns));
+
+        let client = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2)),
+            40000,
+        );
+        let hijack = SocketAddr::new(gateway, 53);
+        let hbh = ext8(43, &[0x05, 0x02, 0, 0, 0, 0]); // -> routing follows
+        let routing = ext8(17, &[0u8; 8]); // -> UDP follows
+        // AAAA query so the hosts entry's v6 address answers it.
+        let mut q = dns_query("probe-xh.test", 0x0a0b);
+        let q_len = q.len();
+        q[q_len - 4] = 0x00;
+        q[q_len - 3] = 0x1c;
+        net.stage(&udp6_chained(0, &[&hbh, &routing], client, hijack, &q));
+        net.step();
+
+        let client_ip = match client.ip() {
+            IpAddr::V6(ip) => ip,
+            _ => unreachable!(),
+        };
+        let is_answer =
+            |p: &[u8]| p[0] >> 4 == 6 && p[6] == 17 && p[24..40] == client_ip.octets();
+        let mut answer_pkt = None;
+        for _ in 0..200 {
+            net.step();
+            answer_pkt = sink.0.lock().unwrap().iter().find(|p| is_answer(p)).cloned();
+            if answer_pkt.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let answer = answer_pkt.expect("hijacked chained query must be answered");
+        let (src, dst, payload) = udp6_fields(&answer);
+        assert_eq!(src, hijack, "answer must come from the hijacked v6 address");
+        assert_eq!(dst, client);
+        assert_eq!(&payload[..2], &0x0a0bu16.to_be_bytes(), "transaction id");
+        assert!(payload.ends_with(&answer_v6.octets()), "AAAA record answer");
+        // Nothing relayed, and nothing entered smoltcp.
+        assert!(relay.udp.lock().unwrap().is_empty(), "nothing relayed");
+        assert!(relay.tcp.lock().unwrap().is_empty());
+        assert!(
+            net.shim.ingress.is_empty(),
+            "chained packets must not be handed to smoltcp"
+        );
+    }
+
+    /// A chained UDP datagram to a non-hijacked destination is relayed like
+    /// a bare one; only the staging copy into smoltcp is skipped.
+    #[tokio::test]
+    async fn ipv6_udp_behind_ext_headers_is_relayed_not_staged() {
+        let cfg = test_cfg_v6();
+        let relay = Arc::new(CaptureRelay::default());
+        let (mut net, sink) = stack(&cfg, relay.clone(), None);
+
+        let client = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2)),
+            40000,
+        );
+        let server = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)),
+            53,
+        );
+        let hbh = ext8(17, &[0x05, 0x02, 0, 0, 0, 0]);
+        net.stage(&udp6_chained(0, &[&hbh], client, server, b"ext-query"));
+        net.step();
+
+        for _ in 0..100 {
+            if !relay.udp.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        {
+            let up = relay.udp.lock().unwrap();
+            assert_eq!(up.len(), 1, "the chained datagram is relayed");
+            assert_eq!(up[0].0, client);
+            assert_eq!(up[0].1.to_string(), "[2001:4860:4860::8888]:53");
+            assert_eq!(up[0].2, b"ext-query");
+        }
+        assert!(
+            net.shim.ingress.is_empty(),
+            "the chained packet is not staged for smoltcp"
+        );
+        assert!(
+            net.udp_sockets.contains_key(&53),
+            "the reply socket is bound despite the chain"
+        );
+
+        // The relay's echo reply still comes back through the bound socket.
+        let client_ip = match client.ip() {
+            IpAddr::V6(ip) => ip,
+            _ => unreachable!(),
+        };
+        let is_reply = |p: &[u8]| p[0] >> 4 == 6 && p[6] == 17 && p[24..40] == client_ip.octets();
+        for _ in 0..100 {
+            if sink.0.lock().unwrap().iter().any(|p| is_reply(p)) {
+                break;
+            }
+            net.step();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let reply = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|p| is_reply(p))
+            .cloned()
+            .expect("the reply rides the bound smoltcp socket");
+        let (src, dst, payload) = udp6_fields(&reply);
+        assert_eq!(src, server);
+        assert_eq!(dst, client);
+        assert_eq!(payload, b"ext-query");
+    }
+
+    /// Chained ICMPv6 echoes are answered on the device, chain preserved.
+    #[tokio::test]
+    async fn ipv6_icmp_echo_behind_ext_headers_is_answered() {
+        let cfg = test_cfg_v6();
+        let relay = Arc::new(CaptureRelay::default());
+        let (mut net, sink) = stack(&cfg, relay.clone(), None);
+
+        let client = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2);
+        let gateway = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
+        let hbh = ext8(58, &[0x05, 0x02, 0, 0, 0, 0]);
+        net.stage(&icmpv6_echo_request_chained(
+            0,
+            &[&hbh],
+            client,
+            gateway,
+            9,
+            9,
+            b"ping6-xh",
+        ));
+        net.step();
+
+        let out = sink.0.lock().unwrap().clone();
+        assert_eq!(out.len(), 1, "exactly the chained echo reply");
+        let reply = &out[0];
+        assert_eq!(reply[6], 0, "chain still first");
+        assert_eq!(&reply[40..48], &hbh[..], "chain carried verbatim");
+        assert_eq!(reply[48], 129, "echo reply type");
+        let icmp = &reply[48..];
+        let pseudo = pseudo_header_v6(gateway, client, 58, icmp.len());
+        assert_eq!(checksum(&[&pseudo, icmp]), 0, "checksum verifies");
+        assert!(relay.tcp.lock().unwrap().is_empty());
+        assert!(relay.udp.lock().unwrap().is_empty());
+    }
+
+    // -- the full inbound over the in-memory device -----------------------------
+
+    use crate::inbound::tun::testdev::LoopbackTun;
+    use std::time::Instant;
+
+    /// Wait for `cond` (polled on a fresh clone of the closure's captures
+    /// each round) up to 10s, tokio-yielding between rounds. Returns the
+    /// value or panics with `what`.
+    async fn wait_until<T>(what: &str, mut cond: impl FnMut() -> Option<T>) -> T {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(v) = cond() {
+                return v;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// The same discipline for the device's egress: tokio yields between
+    /// rounds so the spawned netstack task keeps being polled — a
+    /// `std::thread::sleep` loop would starve a current-thread runtime and
+    /// the packets this waits for would never be produced.
+    async fn wait_egress(
+        dev: &LoopbackTun,
+        what: &str,
+        mut pred: impl FnMut(&[u8]) -> bool,
+        spill: &mut Vec<Vec<u8>>,
+    ) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            for pkt in dev.take_egress() {
+                if pred(&pkt) {
+                    return pkt;
+                }
+                spill.push(pkt);
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// UDP relay + ICMP echo through the real `run()` loop: in-memory device
+    /// -> reader pump thread -> select loop -> classifier -> relay/ICMP
+    /// responder -> sink -> device egress. No kernel TUN anywhere.
+    #[tokio::test]
+    async fn run_serves_udp_and_icmp_over_the_in_memory_device() {
+        let dev = LoopbackTun::new();
+        let relay = Arc::new(CaptureRelay::default());
+        let cfg = test_cfg_v6();
+        let io_dev: Arc<dyn TunIo> = dev.clone();
+        let task = tokio::spawn(run(
+            io_dev,
+            cfg,
+            relay.clone(),
+            TunHooks { dns: None },
+        ));
+
+        let client = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2)),
+            40000,
+        );
+        let server = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)),
+            53,
+        );
+        dev.inject(&udp6_packet(client, server, b"pumpme"));
+        let up = wait_until("relay uplink", || relay.udp.lock().unwrap().first().cloned()).await;
+        assert_eq!(up.0, client, "session keyed by the v6 source");
+        assert_eq!(up.1.to_string(), "[2001:4860:4860::8888]:53");
+        assert_eq!(up.2, b"pumpme");
+
+        let client_ip = match client.ip() {
+            IpAddr::V6(ip) => ip,
+            _ => unreachable!(),
+        };
+        let mut spill = Vec::new();
+        let reply = wait_egress(
+            &dev,
+            "the relay echo must come back out of the device",
+            |p| p[0] >> 4 == 6 && p[6] == 17 && p[24..40] == client_ip.octets(),
+            &mut spill,
+        )
+        .await;
+        let (src, dst, payload) = udp6_fields(&reply);
+        assert_eq!(src, server, "reply sourced from the dialled peer");
+        assert_eq!(dst, client);
+        assert_eq!(payload, b"pumpme");
+
+        // ICMPv4 echo through the same pump (the stack answers it itself).
+        let ping = icmpv4_echo_request(
+            Ipv4Addr::new(10, 7, 0, 2),
+            Ipv4Addr::new(10, 7, 0, 1),
+            5,
+            5,
+            b"via-pump",
+        );
+        dev.inject(&ping);
+        let pong = wait_egress(
+            &dev,
+            "the echo reply must come back out of the device",
+            |p| p.len() > 28 && p[0] >> 4 == 4 && p[9] == 1 && icmpv4_msg(p)[0] == 0,
+            &mut spill,
+        )
+        .await;
+        assert_eq!(icmpv4_msg(&pong)[0], 0, "echo reply type");
+        assert_eq!(&icmpv4_msg(&pong)[8..], b"via-pump", "data carried");
+
+        task.abort();
+    }
+
+    /// A full TCP handshake + data over the in-memory device: proves the
+    /// SYN-peek/listener path and the stream bridge ride the pump too.
+    #[tokio::test]
+    async fn run_relays_a_tcp_handshake_over_the_in_memory_device() {
+        let dev = LoopbackTun::new();
+        let relay = Arc::new(CaptureRelay::default());
+        let cfg = test_cfg_v6();
+        let io_dev: Arc<dyn TunIo> = dev.clone();
+        let task = tokio::spawn(run(
+            io_dev,
+            cfg,
+            relay.clone(),
+            TunHooks { dns: None },
+        ));
+
+        let client = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2)),
+            40000,
+        );
+        let server = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111)),
+            443,
+        );
+        dev.inject(&tcp6_packet(client, server, 1000, None, FLAG_SYN, &[]));
+        let mut spill = Vec::new();
+        let synack = wait_egress(
+            &dev,
+            "SYN-ACK through the pump",
+            |p| p[0] >> 4 == 6 && p[6] == 6 && tcp6_fields(p).4 & 0x12 == 0x12,
+            &mut spill,
+        )
+        .await;
+        let (_sp, _dp, stack_seq, ack_no, _f) = tcp6_fields(&synack);
+        assert_eq!(ack_no, 1001, "SYN-ACK acknowledges the SYN");
+
+        dev.inject(&tcp6_packet(
+            client,
+            server,
+            ack_no,
+            Some(stack_seq + 1),
+            0,
+            &[],
+        ));
+        let _meta = wait_until("relay accept", || {
+            relay.tcp.lock().unwrap().first().cloned()
+        })
+        .await;
+        let mut stream = relay.take_stream().expect("stream handed to the relay");
+
+        use tokio::io::AsyncWriteExt;
+        stream.write_all(b"over-the-pump").await.unwrap();
+        let data = wait_egress(
+            &dev,
+            "stream bytes must reach the wire",
+            |p| p[0] >> 4 == 6 && p[6] == 6 && p.len() > 60 && p[60..].ends_with(b"over-the-pump"),
+            &mut spill,
+        )
+        .await;
+        assert!(data.len() >= 60 + b"over-the-pump".len());
+
+        drop(stream);
+        task.abort();
+    }
+
+    /// DNS hijack end to end over the in-memory device, including a chained
+    /// query: the reader pump, classifier, resolver and reply socket in one
+    /// path — the platform-independence proof for the whole inbound.
+    #[tokio::test]
+    async fn run_hijacks_dns_over_the_in_memory_device() {
+        let dev = LoopbackTun::new();
+        let relay = Arc::new(CaptureRelay::default());
+        let mut cfg = test_cfg_v6();
+        let gateway = IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1));
+        cfg.dns_hijack = vec![gateway];
+        let mut dns_cfg = crate::config::DnsConfig::default();
+        let answer_v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x66);
+        dns_cfg
+            .hosts
+            .insert("pump-dns.test".to_string(), vec![answer_v6.into()]);
+        let dns = DnsEngine::new(dns_cfg, crate::rule::DomainMatcher::default()).unwrap();
+
+        let io_dev: Arc<dyn TunIo> = dev.clone();
+        let task = tokio::spawn(run(
+            io_dev,
+            cfg,
+            relay.clone(),
+            TunHooks { dns: Some(dns) },
+        ));
+
+        let client = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2)),
+            40000,
+        );
+        let hijack = SocketAddr::new(gateway, 53);
+        // A chained query: hop-by-hop -> routing -> UDP 53 to the hijack
+        // address.
+        let hbh_then_routing = ext8(43, &[0x05, 0x02, 0, 0, 0, 0]);
+        let routing = ext8(17, &[0u8; 8]);
+        let mut q = dns_query("pump-dns.test", 0x0c0d);
+        let q_len = q.len();
+        q[q_len - 4] = 0x00;
+        q[q_len - 3] = 0x1c; // AAAA
+        dev.inject(&udp6_chained(
+            0,
+            &[&hbh_then_routing, &routing],
+            client,
+            hijack,
+            &q,
+        ));
+
+        let client_ip = match client.ip() {
+            IpAddr::V6(ip) => ip,
+            _ => unreachable!(),
+        };
+        let mut spill = Vec::new();
+        let answer = wait_egress(
+            &dev,
+            "the resolver's answer must come back out of the device",
+            |p| p[0] >> 4 == 6 && p[6] == 17 && p[24..40] == client_ip.octets(),
+            &mut spill,
+        )
+        .await;
+        let (src, dst, payload) = udp6_fields(&answer);
+        assert_eq!(src, hijack, "answer from the hijacked address");
+        assert_eq!(dst, client);
+        assert_eq!(&payload[..2], &0x0c0du16.to_be_bytes(), "transaction id");
+        assert!(payload.ends_with(&answer_v6.octets()), "AAAA answer");
+        assert!(relay.udp.lock().unwrap().is_empty(), "nothing relayed");
+
+        task.abort();
+    }
+
+    /// A device that dies takes `run()` down with the reader's error — the
+    /// pump's error slot reaches the caller.
+    #[tokio::test]
+    async fn run_returns_the_device_error() {
+        let dev = LoopbackTun::new();
+        let relay = Arc::new(CaptureRelay::default());
+        let io_dev: Arc<dyn TunIo> = dev.clone();
+        let task = tokio::spawn(run(
+            io_dev,
+            test_cfg(),
+            relay,
+            TunHooks { dns: None },
+        ));
+        dev.kill("device vanished");
+        let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("run must return when the device dies")
+            .expect("task must not panic");
+        let err = outcome.expect_err("the device error must surface");
+        let text = err.to_string();
+        assert!(text.contains("device read"), "{text}");
+        assert!(text.contains("device vanished"), "{text}");
     }
 }

@@ -31,8 +31,12 @@
 //!   random/cipher-suite parsers.
 //! * `transport/tlsmirror/padding.go` — `payload ‖ pad ‖ len_be32`.
 //! * `transport/tlsmirror/traffic.go` — the embedded HTTP traffic
-//!   generator with weighted step transitions (HTTP/1.1 here; see
-//!   below for h2).
+//!   generator with weighted step transitions; the carrier transport is
+//!   picked from the NEGOTIATED ALPN (`newTrafficHTTPTransport`,
+//!   traffic.go:52): `http/1.1`/none drive plain HTTP/1.1 requests, `h2`
+//!   multiplexes the steps over a prior-knowledge h2c connection
+//!   (`newTrafficHTTP2Transport`, traffic.go:60-73 — the in-module h2
+//!   client below).
 //! * `transport/tlsmirror/enrollment.go` — connection enrolment: the
 //!   server-identifier host derived from the primary key, the h2c
 //!   confirmation protocol on TCP :80, the client verification pass
@@ -53,9 +57,14 @@
 //!   (the engine's routing) — `connect` rejects it precisely until
 //!   `connect_with` supplies one; the h2c control connection itself is
 //!   implemented in-module (a minimal RFC 9113 prior-knowledge client
-//!   and server — no HTTP/2 dependency). Generator steps over an `h2`
-//!   carrier are rejected precisely; `http/1.1` and no-ALPN carriers
-//!   are implemented.
+//!   and server — no HTTP/2 dependency). The generator's h2 carrier
+//!   rides that same in-module h2 machinery (see the carrier transport
+//!   below): `http/1.1`/no-ALPN carriers run HTTP/1.1 steps, an `h2`
+//!   carrier runs h2 steps. One deviation: upstream closes the whole
+//!   carrier conn when `newTrafficHTTPTransport` rejects the negotiated
+//!   ALPN (traffic.go:78-82); this port stops the generator and leaves
+//!   the carrier open (the misconfigured-ALPN-only path — see the note
+//!   on [`new_traffic_transport`]).
 //! * Enrolment loopback prevention (upstream's ctx markers
 //!   `WithLoopbackProtection` / `WithSecondaryLoopbackProtection`) is
 //!   router plumbing this port does not have: the integrator's dialer
@@ -69,10 +78,12 @@
 //!   the explicit-nonce path engages exactly when the negotiated
 //!   suite is in the configured list (the TLS 1.2 AEAD case).
 
+use std::collections::HashMap;
 use std::io;
 use std::io::{Read as _, Write as _};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -826,6 +837,9 @@ async fn pump(
     ready_notify: Arc<tokio::sync::Notify>,
     defer_write: Duration,
     mut carrier_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    // The negotiated carrier ALPN, handed to the traffic generator
+    // (`carrierALPN := NegotiatedProtocol`, client.go:96-105).
+    mut carrier_alpn: Option<tokio::sync::oneshot::Sender<String>>,
     randoms_tx: tokio::sync::watch::Sender<Option<([u8; 32], [u8; 32])>>,
 ) {
     let mut rbuf = BytesMut::with_capacity(16 * 1024);
@@ -892,6 +906,13 @@ async fn pump(
             announced_handshake = true;
             if let Some(tx) = carrier_ready.take() {
                 let _ = tx.send(());
+            }
+            if let Some(tx) = carrier_alpn.take() {
+                let alpn = tls
+                    .alpn_protocol()
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .unwrap_or_default();
+                let _ = tx.send(alpn);
             }
         }
 
@@ -1154,13 +1175,363 @@ async fn run_http1_step(
     Ok(())
 }
 
-/// `runTrafficGenerator` (traffic.go:75) for the HTTP/1.1 arm.
+// ---------------------------------------------------------------------------
+// The traffic generator (traffic.go), h2 carrier arm
+// ---------------------------------------------------------------------------
+
+/// Events one generator h2 stream receives from the connection reader —
+/// the demux `http.ClientConn.RoundTrip` provides upstream
+/// (`trafficHTTP2Transport`, traffic.go:37-49). The connection reader is
+/// modeled on `proto/trusttunnel.rs`'s `h2_reader_task` (private to that
+/// module, so duplicated here with this cross-ref) and reuses the
+/// in-module RFC 9113 frame/HPACK helpers the enrolment control
+/// connection (`h2c_post`) already uses.
+enum CarrierH2Event {
+    /// Response HEADERS complete (the decoded `:status`).
+    Headers(u16),
+    /// Response DATA (the payload is discarded at the reader — the
+    /// generator drains bodies into `io.Discard`, traffic.go:170-176).
+    Data,
+    /// END_STREAM on DATA/HEADERS, or RST_STREAM.
+    End,
+    GoAway,
+}
+
+/// One prior-knowledge h2 connection over the carrier duplex
+/// (`newTrafficHTTP2Transport`: `SetUnencryptedHTTP2(true)` +
+/// `transport.NewClientConn`, traffic.go:60-73): a reader task
+/// demultiplexing frames to per-stream channels, plus a serialized
+/// writer. Requests carry no body, so only the receive path needs
+/// flow-control credit handling.
+struct CarrierH2 {
+    writer: Arc<tokio::sync::Mutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>>,
+    next_stream: AtomicU32,
+    streams: Arc<Mutex<HashMap<u32, tokio::sync::mpsc::UnboundedSender<CarrierH2Event>>>>,
+    dead: Arc<AtomicBool>,
+}
+
+impl CarrierH2 {
+    /// Client preface + a generous initial window (mirrors `h2c_post`'s
+    /// settings; Go's transport advertises the same large windows).
+    async fn handshake(carrier: tokio::io::DuplexStream) -> Result<Arc<Self>> {
+        let (read_half, write_half) = tokio::io::split(carrier);
+        let conn = Arc::new(CarrierH2 {
+            writer: Arc::new(tokio::sync::Mutex::new(write_half)),
+            next_stream: AtomicU32::new(1),
+            streams: Arc::new(Mutex::new(HashMap::new())),
+            dead: Arc::new(AtomicBool::new(false)),
+        });
+        {
+            let mut w = conn.writer.lock().await;
+            w.write_all(H2_PREFACE).await?;
+            let mut settings = Vec::with_capacity(6);
+            // SETTINGS_INITIAL_WINDOW_SIZE (0x4) = 1 MiB.
+            settings.extend_from_slice(&0x4u16.to_be_bytes());
+            settings.extend_from_slice(&(1u32 << 20).to_be_bytes());
+            w.write_all(&h2_frame(H2_SETTINGS, 0, 0, &settings)).await?;
+            w.flush().await?;
+        }
+        let reader = tokio::spawn(carrier_h2_reader(
+            read_half,
+            conn.streams.clone(),
+            conn.writer.clone(),
+            conn.dead.clone(),
+        ));
+        // The reader task owns the demux loop for the connection
+        // lifetime; its JoinHandle is deliberately dropped.
+        drop(reader);
+        Ok(conn)
+    }
+
+    /// `ClientConn.RoundTrip` for a bodyless request: HEADERS with
+    /// END_STREAM on a fresh odd stream. Returns the stream id and its
+    /// event channel.
+    async fn open_request(
+        self: &Arc<Self>,
+        block: &[u8],
+    ) -> Result<(
+        u32,
+        tokio::sync::mpsc::UnboundedReceiver<CarrierH2Event>,
+    )> {
+        let id = self.next_stream.fetch_add(2, Ordering::SeqCst);
+        if id == 0 || id > 0x7FFF_F000 {
+            return Err(Error::network("tlsmirror: h2 stream ids exhausted"));
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.streams.lock().unwrap().insert(id, tx);
+        // END_HEADERS | END_STREAM: the generator's requests have no
+        // body (traffic.go builds GET/HEAD-style requests only).
+        let out = h2_frame(H2_HEADERS, 0x4 | 0x1, id, block);
+        {
+            let mut w = self.writer.lock().await;
+            w.write_all(&out).await?;
+            w.flush().await?;
+        }
+        Ok((id, rx))
+    }
+
+    fn remove_stream(&self, id: u32) {
+        self.streams.lock().unwrap().remove(&id);
+    }
+}
+
+/// The connection reader: dispatch frames to stream channels, answer
+/// SETTINGS/PING, return receive credit on DATA (the pattern of
+/// trusttunnel's `h2_reader_task`, over the in-module frame codec).
+async fn carrier_h2_reader(
+    mut read_half: tokio::io::ReadHalf<tokio::io::DuplexStream>,
+    streams: Arc<Mutex<HashMap<u32, tokio::sync::mpsc::UnboundedSender<CarrierH2Event>>>>,
+    writer: Arc<tokio::sync::Mutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>>,
+    dead: Arc<AtomicBool>,
+) {
+    let mut rbuf = BytesMut::with_capacity(16 * 1024);
+    let mut tmp = [0u8; 16 * 1024];
+    // Per-stream header-block assembly across CONTINUATION frames.
+    let mut header_blocks: HashMap<u32, Vec<u8>> = HashMap::new();
+    'conn: loop {
+        while rbuf.len() >= 9 {
+            let len =
+                ((rbuf[0] as usize) << 16) | ((rbuf[1] as usize) << 8) | rbuf[2] as usize;
+            if rbuf.len() < 9 + len {
+                break;
+            }
+            let kind = rbuf[3];
+            let flags = rbuf[4];
+            let stream_id =
+                u32::from_be_bytes([rbuf[5], rbuf[6], rbuf[7], rbuf[8]]) & 0x7FFF_FFFF;
+            let payload = rbuf[9..9 + len].to_vec();
+            rbuf.advance(9 + len);
+            match kind {
+                H2_SETTINGS => {
+                    if flags & 0x1 == 0 {
+                        // SETTINGS ACK.
+                        let out = h2_frame(H2_SETTINGS, 0x1, 0, &[]);
+                        let mut w = writer.lock().await;
+                        if w.write_all(&out).await.is_err() {
+                            break 'conn;
+                        }
+                    }
+                }
+                H2_PING => {
+                    if flags & 0x1 == 0 {
+                        let out = h2_frame(H2_PING, 0x1, 0, &payload);
+                        let mut w = writer.lock().await;
+                        if w.write_all(&out).await.is_err() {
+                            break 'conn;
+                        }
+                    }
+                }
+                H2_WINDOW_UPDATE => {} // requests are bodyless; send-side flow control never binds
+                H2_HEADERS | H2_CONTINUATION => {
+                    let block = header_blocks.entry(stream_id).or_default();
+                    block.extend_from_slice(&payload);
+                    if flags & 0x4 != 0 {
+                        // END_HEADERS: the response header block is whole.
+                        let block = header_blocks.remove(&stream_id).unwrap_or_default();
+                        let handle = streams.lock().unwrap().get(&stream_id).cloned();
+                        if let Some(tx) = handle {
+                            let status = hpack_decode_status(&block).unwrap_or(0);
+                            let _ = tx.send(CarrierH2Event::Headers(status));
+                            if flags & 0x1 != 0 {
+                                let _ = tx.send(CarrierH2Event::End);
+                            }
+                        }
+                    }
+                }
+                H2_DATA => {
+                    let handle = streams.lock().unwrap().get(&stream_id).cloned();
+                    if let Some(tx) = handle {
+                        if !payload.is_empty() {
+                            let _ = tx.send(CarrierH2Event::Data);
+                            // Return the flow-control credit (stream and
+                            // connection windows).
+                            let inc = (payload.len() as u32).to_be_bytes();
+                            let mut out = h2_frame(H2_WINDOW_UPDATE, 0, stream_id, &inc);
+                            out.extend_from_slice(&h2_frame(H2_WINDOW_UPDATE, 0, 0, &inc));
+                            let mut w = writer.lock().await;
+                            if w.write_all(&out).await.is_err() {
+                                break 'conn;
+                            }
+                        }
+                        if flags & 0x1 != 0 {
+                            let _ = tx.send(CarrierH2Event::End);
+                        }
+                    }
+                }
+                H2_GOAWAY => {
+                    let handles: Vec<_> = streams.lock().unwrap().values().cloned().collect();
+                    for tx in handles {
+                        let _ = tx.send(CarrierH2Event::GoAway);
+                    }
+                    break 'conn;
+                }
+                H2_RST_STREAM => {
+                    let handle = streams.lock().unwrap().remove(&stream_id);
+                    if let Some(tx) = handle {
+                        let _ = tx.send(CarrierH2Event::End);
+                    }
+                }
+                _ => {} // RFC 9113: unknown frames are ignored
+            }
+        }
+        match read_half.read(&mut tmp).await {
+            Ok(0) | Err(_) => break 'conn,
+            Ok(n) => rbuf.extend_from_slice(&tmp[..n]),
+        }
+    }
+    dead.store(true, Ordering::SeqCst);
+    streams.lock().unwrap().clear();
+}
+
+/// `newTrafficHTTPTransport` (traffic.go:52-73): pick the carrier
+/// transport from the NEGOTIATED ALPN (client.go:96-105 passes
+/// `NegotiatedProtocol`; an empty negotiation is the HTTP/1.1 arm).
+///
+/// Upstream closes the whole conn on an unknown ALPN (traffic.go:78-82);
+/// this port stops the generator instead and leaves the carrier to the
+/// mirror pump (the hidden channel then hangs rather than erroring) —
+/// reachable only with a carrier ALPN that is neither `h2`, `http/1.1`
+/// nor empty, i.e. a misconfigured `alpn` list.
+async fn new_traffic_transport(
+    carrier: tokio::io::DuplexStream,
+    alpn: &str,
+) -> Result<TrafficCarrier> {
+    match alpn {
+        "h2" => Ok(TrafficCarrier::H2(CarrierH2::handshake(carrier).await?)),
+        "http/1.1" | "" => Ok(TrafficCarrier::Http1(carrier)),
+        other => Err(Error::config(format!(
+            "tlsmirror: unknown carrier ALPN {other:?}"
+        ))),
+    }
+}
+
+/// The `trafficHTTPTransport` interface (traffic.go:26-50): whichever
+/// carrier protocol the generator's `RoundTrip` runs over.
+enum TrafficCarrier {
+    Http1(tokio::io::DuplexStream),
+    H2(Arc<CarrierH2>),
+}
+
+/// `runTrafficStep` for the h2 arm (traffic.go:146-199): the request is
+/// `:method`/`:scheme https`/`:authority`/`:path` plus the step headers;
+/// `finishRequest` drains the body — unless
+/// `h2-do-not-wait-for-download-finish` is set, when the drain continues
+/// in the background (traffic.go:179-181) and the generator moves on.
+async fn run_h2_step(
+    transport: &Arc<CarrierH2>,
+    step: &TrafficStep,
+    do_not_wait: bool,
+) -> Result<()> {
+    let host = if step.host.is_empty() {
+        "localhost".to_string()
+    } else {
+        step.host.clone()
+    };
+    let path = if step.path.is_empty() { "/".to_string() } else { step.path.clone() };
+    let method = if step.method.is_empty() { "GET".to_string() } else { step.method.to_uppercase() };
+    // Go's http2 client maps the URL onto the pseudo-headers and sends
+    // `Host` as `:authority`; header names are lowercased on the wire.
+    let mut block = Vec::with_capacity(128);
+    hpack_literal_header(&mut block, ":method", &method);
+    hpack_literal_header(&mut block, ":scheme", "https");
+    hpack_literal_header(&mut block, ":authority", &host);
+    hpack_literal_header(&mut block, ":path", &path);
+    let mut has_ua = false;
+    for (name, value) in &step.headers {
+        if name.is_empty() {
+            continue;
+        }
+        let name = name.to_ascii_lowercase();
+        if name == "user-agent" {
+            has_ua = true;
+        }
+        hpack_literal_header(&mut block, &name, value);
+    }
+    if !has_ua {
+        // Go's http2 transport default.
+        hpack_literal_header(&mut block, "user-agent", "Go-http-client/2.0");
+    }
+
+    let (id, mut rx) = transport.open_request(&block).await?;
+    // RoundTrip resolves on the response HEADERS; a block with no
+    // decodable :status is a protocol error (Go's RoundTrip fails the
+    // same way).
+    let status = loop {
+        let event = rx
+            .recv()
+            .await
+            .ok_or_else(|| Error::network("tlsmirror: h2 stream closed before response"))?;
+        match event {
+            CarrierH2Event::Headers(code) => break code,
+            // DATA before HEADERS is out of order; keep draining.
+            CarrierH2Event::Data => {}
+            CarrierH2Event::End => {
+                transport.remove_stream(id);
+                return Err(Error::network(
+                    "tlsmirror: h2 stream closed before response",
+                ));
+            }
+            CarrierH2Event::GoAway => {
+                transport.remove_stream(id);
+                return Err(Error::network("tlsmirror: h2 connection gone"));
+            }
+        }
+    };
+    if status == 0 {
+        transport.remove_stream(id);
+        return Err(Error::protocol("tlsmirror: h2 response missing :status"));
+    }
+    if do_not_wait {
+        // `go func() { _ = finishRequest() }()` (traffic.go:179-181): the
+        // body drains in the background; errors are dropped.
+        let transport = transport.clone();
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if matches!(event, CarrierH2Event::End | CarrierH2Event::GoAway) {
+                    break;
+                }
+            }
+            transport.remove_stream(id);
+        });
+        return Ok(());
+    }
+    // finishRequest: io.Copy(io.Discard, resp.Body) + Close — consume to
+    // END_STREAM (RST/GOAWAY count as ends).
+    while let Some(event) = rx.recv().await {
+        if matches!(event, CarrierH2Event::End | CarrierH2Event::GoAway) {
+            break;
+        }
+    }
+    transport.remove_stream(id);
+    Ok(())
+}
+
+/// `runTrafficGenerator` (traffic.go:75): the transport is built AFTER
+/// the carrier handshake from the negotiated ALPN (client.go:96-105),
+/// then the weighted step loop runs over it. HTTP/1.1 steps share this
+/// loop with h2 steps — only the per-step transport differs.
 async fn run_traffic_generator(
-    mut carrier: tokio::io::DuplexStream,
+    carrier: tokio::io::DuplexStream,
     steps: Vec<TrafficStep>,
     mut ready: Option<tokio::sync::oneshot::Sender<()>>,
     recall: Arc<tokio::sync::Notify>,
+    alpn_rx: tokio::sync::oneshot::Receiver<String>,
 ) {
+    // The pump reports the negotiated protocol once the carrier
+    // handshake completes; an error means the carrier died first.
+    let alpn = match alpn_rx.await {
+        Ok(alpn) => alpn,
+        Err(_) => return,
+    };
+    let mut transport = match new_traffic_transport(carrier, &alpn).await {
+        Ok(transport) => transport,
+        Err(e) => {
+            // Upstream closes the conn here (traffic.go:78-82); see the
+            // note on new_traffic_transport for this port's deviation.
+            debug!(target: "engine", "tlsmirror: carrier transport ended: {e}");
+            return;
+        }
+    };
     let waits = traffic_generator_waits_for_ready(&steps);
     let mut current = 0usize;
     loop {
@@ -1168,7 +1539,13 @@ async fn run_traffic_generator(
             return;
         }
         let step = &steps[current];
-        if let Err(e) = run_http1_step(&mut carrier, step).await {
+        let step_result = match &mut transport {
+            TrafficCarrier::Http1(carrier) => run_http1_step(carrier, step).await,
+            TrafficCarrier::H2(h2) => {
+                run_h2_step(h2, step, step.h2_do_not_wait_for_download_finish).await
+            }
+        };
+        if let Err(e) = step_result {
             debug!(target: "engine", "tlsmirror: traffic step ended: {e}");
             return;
         }
@@ -1312,24 +1689,6 @@ pub async fn connect_with(
         ));
     }
     let has_generator = !cfg.traffic_generator.is_empty();
-    if has_generator {
-        let h2_only = cfg.alpn.iter().any(|a| a == "h2");
-        if h2_only {
-            return Err(Error::config(
-                "tlsmirror: embedded-traffic-generator over an h2 carrier is not implemented: \
-                 upstream multiplexes the generator steps over HTTP/2 \
-                 (transport/tlsmirror/traffic.go newTrafficHTTP2Transport, unencrypted-h2 prior \
-                 knowledge) and this engine has no HTTP/2 client; use an http/1.1 (or empty) \
-                 ALPN carrier",
-            ));
-        }
-        for step in &cfg.traffic_generator {
-            if step.h2_do_not_wait_for_download_finish {
-                // Only meaningful on the h2 arm; carried.
-                debug!(target: "engine", "tlsmirror: h2-do-not-wait-for-download-finish applies to the h2 carrier only");
-            }
-        }
-    }
     let server_name = if cfg.server_name.is_empty() {
         return Err(Error::config(
             "tlsmirror: server-name is required when certificate verification is enabled",
@@ -1362,6 +1721,7 @@ pub async fn connect_with(
         (None, None)
     };
     let (carrier_ready_tx, carrier_ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let (carrier_alpn_tx, carrier_alpn_rx) = tokio::sync::oneshot::channel::<String>();
 
     let mirror = Mirror::new(cfg, primary_key, false);
     let pump_ready = ready.clone();
@@ -1381,6 +1741,7 @@ pub async fn connect_with(
             pump_ready_notify,
             defer,
             Some(carrier_ready_tx),
+            Some(carrier_alpn_tx),
             randoms_tx,
         )
         .await;
@@ -1393,7 +1754,14 @@ pub async fn connect_with(
         let steps = cfg.traffic_generator.clone();
         let gen_recall = recall.clone();
         tokio::spawn(async move {
-            run_traffic_generator(carrier, steps, Some(gen_ready_tx), gen_recall).await;
+            run_traffic_generator(
+                carrier,
+                steps,
+                Some(gen_ready_tx),
+                gen_recall,
+                carrier_alpn_rx,
+            )
+            .await;
         });
         if waits {
             // Wait until the carrier handshake completed AND a
@@ -1772,6 +2140,7 @@ const H2_PING: u8 = 0x6;
 const H2_GOAWAY: u8 = 0x7;
 const H2_WINDOW_UPDATE: u8 = 0x8;
 const H2_CONTINUATION: u8 = 0x9;
+const H2_RST_STREAM: u8 = 0x3;
 
 fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(9 + payload.len());
@@ -2437,6 +2806,9 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::time::{Duration, Instant};
 
+    /// The h2 carrier server's request log: `(stream id, HPACK block)`.
+    type H2Requests = Arc<StdMutex<Vec<(u32, Vec<u8>)>>>;
+
     /// RFC 8439 §2.3.2/§A.1: ChaCha20 block for key 0..31, nonce
     /// 000000000000004a00000000, counter 1.
     #[test]
@@ -3061,6 +3433,305 @@ mod tests {
         echo_roundtrip(&mut stream, b"over-generator").await;
     }
 
+    // ------------------------------------------------- h2 carrier generator
+
+    fn h2_carrier_server_config(alpn: &str) -> Arc<rustls::ServerConfig> {
+        let certified = rcgen::generate_simple_self_signed(vec!["carrier.example".to_string()])
+            .expect("rcgen self-signed cert");
+        let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let provider = Arc::new(ring_provider::default_provider());
+        let mut config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .expect("server config");
+        config.alpn_protocols = vec![alpn.as_bytes().to_vec()];
+        Arc::new(config)
+    }
+
+    /// The camouflage carrier speaking h2 after the TLS handshake: the
+    /// in-test h2 server answering every complete request stream with
+    /// `:status 200` + a small body. Logs `(stream id, header block)` per
+    /// request. `hang_first` leaves stream 1's download dangling (HEADERS
+    /// only, no END_STREAM) — the `h2-do-not-wait-for-download-finish`
+    /// scenario.
+    fn spawn_forward_server_h2(
+        alpn: &str,
+        hang_first: bool,
+        requests: H2Requests,
+    ) -> BoxProxyStream {
+        let (mirror_side, server_side) = tokio::io::duplex(64 * 1024);
+        let config = h2_carrier_server_config(alpn);
+        tokio::spawn(async move {
+            let mut tls = match rustls::ServerConnection::new(config) {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            let mut io = server_side;
+            let mut tls_out = Vec::new();
+            // TLS handshake (same drive loop as spawn_forward_server).
+            loop {
+                while tls.wants_write() {
+                    if tls.write_tls(&mut tls_out).unwrap_or(0) == 0 {
+                        break;
+                    }
+                }
+                if !tls_out.is_empty() && io.write_all(&tls_out).await.is_err() {
+                    return;
+                }
+                tls_out.clear();
+                if !tls.is_handshaking() {
+                    break;
+                }
+                let mut tmp = [0u8; 16 * 1024];
+                let n = match io.read(&mut tmp).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                let mut cursor = &tmp[..n];
+                if tls.read_tls(&mut cursor).is_err() || tls.process_new_packets().is_err() {
+                    return;
+                }
+            }
+
+            let mut plain = BytesMut::new();
+            let mut tmp = [0u8; 16 * 1024];
+            let mut header_blocks: HashMap<u32, Vec<u8>> = HashMap::new();
+            let mut preface_done = false;
+            loop {
+                // Pull decrypted h2 plaintext.
+                {
+                    use std::io::Read as _;
+                    let mut buf = [0u8; 16 * 1024];
+                    loop {
+                        let n = tls.reader().read(&mut buf).unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        plain.extend_from_slice(&buf[..n]);
+                    }
+                }
+                // The client preface precedes every frame.
+                if !preface_done {
+                    if plain.len() < H2_PREFACE.len() {
+                        // Need more bytes; fall through to the socket read.
+                    } else if &plain[..H2_PREFACE.len()] == H2_PREFACE {
+                        plain.advance(H2_PREFACE.len());
+                        preface_done = true;
+                        // Our own SETTINGS, like any real h2 server.
+                        let _ = tls.writer().write_all(&h2_frame(H2_SETTINGS, 0, 0, &[]));
+                    } else {
+                        return; // not an h2c client
+                    }
+                }
+                while plain.len() >= 9 {
+                    let len = ((plain[0] as usize) << 16)
+                        | ((plain[1] as usize) << 8)
+                        | plain[2] as usize;
+                    if plain.len() < 9 + len {
+                        break;
+                    }
+                    let kind = plain[3];
+                    let flags = plain[4];
+                    let stream =
+                        u32::from_be_bytes([plain[5], plain[6], plain[7], plain[8]]) & 0x7FFF_FFFF;
+                    let payload = plain[9..9 + len].to_vec();
+                    plain.advance(9 + len);
+                    match kind {
+                        H2_SETTINGS => {
+                            if flags & 0x1 == 0 {
+                                let _ = tls.writer().write_all(&h2_frame(H2_SETTINGS, 0x1, 0, &[]));
+                            }
+                        }
+                        H2_PING => {
+                            if flags & 0x1 == 0 {
+                                let _ = tls.writer().write_all(&h2_frame(H2_PING, 0x1, 0, &payload));
+                            }
+                        }
+                        H2_HEADERS | H2_CONTINUATION => {
+                            let block = header_blocks.entry(stream).or_default();
+                            block.extend_from_slice(&payload);
+                            if flags & 0x4 != 0 {
+                                let block = header_blocks.remove(&stream).unwrap_or_default();
+                                requests.lock().unwrap().push((stream, block));
+                                // :status 200 (static 0x88); hang_first
+                                // leaves stream 1's BODY dangling (no
+                                // DATA/END_STREAM) — the download that
+                                // never finishes.
+                                let _ = tls
+                                    .writer()
+                                    .write_all(&h2_frame(H2_HEADERS, 0x4, stream, &[0x88]));
+                                if !(hang_first && stream == 1) {
+                                    let _ = tls
+                                        .writer()
+                                        .write_all(&h2_frame(H2_DATA, 0x1, stream, b"h2-ok"));
+                                }
+                            }
+                        }
+                        _ => {} // DATA (never sent), WINDOW_UPDATE, …: ignored
+                    }
+                }
+                // Flush anything the responses queued.
+                while tls.wants_write() {
+                    if tls.write_tls(&mut tls_out).unwrap_or(0) == 0 {
+                        break;
+                    }
+                }
+                if !tls_out.is_empty() {
+                    if io.write_all(&tls_out).await.is_err() {
+                        return;
+                    }
+                    tls_out.clear();
+                    continue;
+                }
+                let n = match io.read(&mut tmp).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                let mut cursor = &tmp[..n];
+                if tls.read_tls(&mut cursor).is_err() || tls.process_new_packets().is_err() {
+                    return;
+                }
+            }
+        });
+        Box::new(mirror_side)
+    }
+
+    /// `run_client` against an h2-speaking carrier.
+    async fn run_client_h2(
+        cfg: &TlsMirrorOut,
+        alpn: &str,
+        hang_first: bool,
+        requests: H2Requests,
+    ) -> Result<BoxProxyStream> {
+        let primary_key = decode_primary_key(&cfg.primary_key)?;
+        let (client_duplex, server_duplex) = tokio::io::duplex(256 * 1024);
+        let forward = spawn_forward_server_h2(alpn, hang_first, requests);
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
+        let cfg2 = cfg.clone();
+        tokio::spawn(async move {
+            mirror_server_mimic(Box::new(server_duplex), forward, &cfg2, primary_key, close_rx).await;
+        });
+        std::mem::forget(close_tx);
+        connect(cfg, Box::new(client_duplex)).await
+    }
+
+    #[tokio::test]
+    async fn traffic_generator_carries_h2_and_signals_ready() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut cfg = base_cfg();
+        cfg.alpn = vec!["h2".to_string()];
+        cfg.traffic_generator = vec![TrafficStep {
+            host: "carrier.example".into(),
+            path: "/h2carrier".into(),
+            method: "GET".into(),
+            headers: vec![("User-Agent".into(), "tlsmirror-h2-test".into())],
+            connection_ready: true,
+            connection_recall_exit: true,
+            wait_time: TimeSpec {
+                base_nanoseconds: 10_000_000,
+                uniform_random_multiplier_nanoseconds: 0,
+            },
+            next_step: vec![TrafficTransferCandidate { weight: 1, goto_location: 0 }],
+            ..http_step("step", "/h2carrier")
+        }];
+        let mut stream = run_client_h2(&cfg, "h2", false, requests.clone())
+            .await
+            .unwrap();
+        // Dial returned only after the ConnectionReady step ran, so at
+        // least one h2 request reached the carrier.
+        let reqs = requests.lock().unwrap().clone();
+        assert!(!reqs.is_empty(), "generator produced no h2 requests");
+        // The steps ride one connection: odd stream ids ascending (1, 3, …).
+        // The goto-self loop re-runs step 0 every wait_time — wait for the
+        // second round before asserting the ids.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let reqs = loop {
+            let reqs = requests.lock().unwrap().clone();
+            if reqs.len() >= 2 || Instant::now() > deadline {
+                break reqs;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(reqs[0].0, 1, "{reqs:?}");
+        assert!(reqs.len() >= 2, "the goto-self loop produced one request only: {reqs:?}");
+        assert!(reqs.iter().all(|(id, _)| id % 2 == 1), "{reqs:?}");
+        // The request is h2-shaped: literal-encoded pseudo-headers plus
+        // the step header, lowercased on the wire (run_h2_step).
+        let block = &reqs[0].1;
+        let contains = |needle: &[u8]| block.windows(needle.len()).any(|w| w == needle);
+        assert!(contains(b":method") && contains(b"GET"), "{block:?}");
+        assert!(contains(b":scheme") && contains(b"https"), "{block:?}");
+        assert!(contains(b":authority") && contains(b"carrier.example"), "{block:?}");
+        assert!(contains(b":path") && contains(b"/h2carrier"), "{block:?}");
+        assert!(contains(b"user-agent") && contains(b"tlsmirror-h2-test"), "{block:?}");
+        // The hidden channel still works over the h2-generating carrier.
+        echo_roundtrip(&mut stream, b"over-h2-generator").await;
+    }
+
+    #[tokio::test]
+    async fn h2_do_not_wait_for_download_finish_moves_on() {
+        // Stream 1's download hangs (HEADERS, no END_STREAM); the
+        // do-not-wait step hands the drain to the background and the
+        // generator proceeds to the next step on stream 3.
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut cfg = base_cfg();
+        cfg.alpn = vec!["h2".to_string()];
+        cfg.traffic_generator = vec![
+            TrafficStep {
+                path: "/slow".into(),
+                connection_ready: true,
+                h2_do_not_wait_for_download_finish: true,
+                ..http_step("slow", "/slow")
+            },
+            http_step("next", "/next"),
+        ];
+        let mut stream = run_client_h2(&cfg, "h2", true, requests.clone())
+            .await
+            .unwrap();
+        // The ready step's round trip resolved on HEADERS (the body still
+        // dangling) and the generator moved to step two.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let reqs = requests.lock().unwrap().clone();
+            let next_ran = reqs.iter().any(|(id, block)| {
+                *id == 3 && block.windows(5).any(|w| w == b"/next")
+            });
+            if next_ran {
+                break;
+            }
+            assert!(Instant::now() < deadline, "step two never ran: {reqs:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The hidden channel is unaffected by the dangling download.
+        echo_roundtrip(&mut stream, b"not-waiting").await;
+    }
+
+    #[tokio::test]
+    async fn unknown_carrier_alpn_fails_the_generator_before_ready() {
+        // A negotiated ALPN that is neither h2 nor http/1.1 kills the
+        // generator (newTrafficHTTPTransport's default arm,
+        // traffic.go:74-77); with a ConnectionReady step the dial then
+        // fails instead of hanging.
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut cfg = base_cfg();
+        cfg.alpn = vec!["weird/9".to_string()];
+        cfg.traffic_generator = vec![TrafficStep {
+            connection_ready: true,
+            ..http_step("s", "/x")
+        }];
+        let err = match run_client_h2(&cfg, "weird/9", false, requests).await {
+            Ok(_) => panic!("an unknown carrier ALPN must fail the generator"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("generator exited before ready"),
+            "{err}"
+        );
+    }
+
     #[tokio::test]
     async fn tls12_explicit_nonce_roundtrip() {
         let mut cfg = base_cfg();
@@ -3095,12 +3766,9 @@ mod tests {
         let err = connect(&cfg, Box::new(tokio::io::duplex(16).0)).await.err().map(|e| e.to_string()).unwrap_or_default();
         assert!(err.contains("connection-enrolment"), "{err}");
         assert!(err.contains("enrollment.go"), "{err}");
-        let mut cfg = base_cfg();
-        cfg.alpn = vec!["h2".to_string()];
-        cfg.traffic_generator = vec![http_step("s", "/x")];
-        let err = connect(&cfg, Box::new(tokio::io::duplex(16).0)).await.err().map(|e| e.to_string()).unwrap_or_default();
-        assert!(err.contains("h2 carrier"), "{err}");
-        assert!(err.contains("HTTP/2"), "{err}");
+        // (The h2-carrier generator is no longer rejected at config time:
+        // the transport is chosen from the negotiated ALPN — see the
+        // traffic_generator_carries_h2_* tests.)
         let mut cfg = base_cfg();
         cfg.server_name.clear();
         assert!(connect(&cfg, Box::new(tokio::io::duplex(16).0)).await.is_err());

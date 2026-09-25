@@ -18,6 +18,11 @@
 //! `recv` reports an empty queue as `WouldBlock` on every platform, matching
 //! the Linux backend's `O_NONBLOCK` reads.
 //!
+//! The netstack does not drive these backends directly — `io.rs` wraps them
+//! in the [`TunIo`](super::io::TunIo) surface (nonblocking `recv`/`send` plus
+//! a blocking `wait_readable`) and the reader pump that bridges them into
+//! the async loop, so the same netstack serves all three platforms.
+//!
 //! The [`abi`] module holds the platform-independent facts of the two new
 //! backends — the utun 4-byte address-family header codec, the WinTUN ring
 //! capacity rules, and the `#[repr(C)]` layouts of every structure handed to
