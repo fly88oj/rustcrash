@@ -28,3 +28,4 @@ pub mod tlsmirror;
 pub mod trusttunnel;
 pub mod masque;
 pub mod ech;
+pub mod openvpn;

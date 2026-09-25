@@ -33,8 +33,15 @@
 //! * `transport/tlsmirror/traffic.go` — the embedded HTTP traffic
 //!   generator with weighted step transitions (HTTP/1.1 here; see
 //!   below for h2).
-//! * `transport/tlsmirror/enrollment.go` — connection enrolment /
-//!   loopback protection (scoped out; see `connect`).
+//! * `transport/tlsmirror/enrollment.go` — connection enrolment: the
+//!   server-identifier host derived from the primary key, the h2c
+//!   confirmation protocol on TCP :80, the client verification pass
+//!   (needs a dialer — `connect_with`) and the server-side active
+//!   table that `ServeConnReady` populates.
+//! * `transport/tlsmirror/server.go` — `ServeConnReady`: the server
+//!   mirror between a client conn and the pre-dialed forward conn,
+//!   activation on the first decrypted hidden record, enrolment
+//!   registration on the forward's first handshake record.
 //!
 //! ## Wire-visible vs config-carried
 //!
@@ -42,11 +49,18 @@
 //!   nonce + GCM-sealed payload, optionally length-suffixed padding),
 //!   the 16-byte ChaCha20 watermark over app-data/alert records, and
 //!   the carrier HTTP/1.1 requests the generator issues.
-//! * Config-carried: `connection-enrolment` needs the engine's proxy
-//!   dialer plus an h2 enrolment control connection — enabling it is
-//!   config-rejected precisely. Generator steps over an `h2` carrier
-//!   are rejected precisely (no HTTP/2 client in-tree); `http/1.1`
-//!   and no-ALPN carriers are implemented.
+//! * Config-carried: `connection-enrolment` needs an enrolment dialer
+//!   (the engine's routing) — `connect` rejects it precisely until
+//!   `connect_with` supplies one; the h2c control connection itself is
+//!   implemented in-module (a minimal RFC 9113 prior-knowledge client
+//!   and server — no HTTP/2 dependency). Generator steps over an `h2`
+//!   carrier are rejected precisely; `http/1.1` and no-ALPN carriers
+//!   are implemented.
+//! * Enrolment loopback prevention (upstream's ctx markers
+//!   `WithLoopbackProtection` / `WithSecondaryLoopbackProtection`) is
+//!   router plumbing this port does not have: the integrator's dialer
+//!   can consult [`is_enrollment_control_target`] to refuse dialing
+//!   its own control endpoint.
 //! * `client-fingerprint` (uTLS), `fingerprint` (server-cert pinning)
 //!   and client certificates are carried but not applied: the plain
 //!   rustls hello with standard verification is offered, like the
@@ -812,6 +826,7 @@ async fn pump(
     ready_notify: Arc<tokio::sync::Notify>,
     defer_write: Duration,
     mut carrier_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    randoms_tx: tokio::sync::watch::Sender<Option<([u8; 32], [u8; 32])>>,
 ) {
     let mut rbuf = BytesMut::with_capacity(16 * 1024);
     let mut first_flight = true;
@@ -897,6 +912,9 @@ async fn pump(
                     mirror.tls12_explicit = mirror.explicit_suites.contains(&suite);
                 }
                 first_inbound = false;
+            }
+            if let (Some(cr), Some(sr)) = (mirror.client_random, mirror.server_random) {
+                let _ = randoms_tx.send(Some((cr, sr)));
             }
             mirror.apply_watermark_rx(&mut record[RECORD_HEADER_LEN..], rec_type);
             if let Some(payload) = mirror.handle_inbound_record(&record[RECORD_HEADER_LEN..], rec_type) {
@@ -1261,14 +1279,36 @@ fn tls_config(cfg: &TlsMirrorOut) -> Result<Arc<ClientConfig>> {
 /// `Dial` (client.go:15): establish the mirrored carrier TLS and
 /// return the hidden stream.
 pub async fn connect(cfg: &TlsMirrorOut, transport: BoxProxyStream) -> Result<BoxProxyStream> {
+    connect_with(cfg, transport, None).await
+}
+
+/// The enrolment control-connection dialer
+/// (`ClientConfig.EnrollmentDialer`): routes `controlHost:80` through
+/// the primary ingress/egress outbounds. The address is the derived
+/// `.tlsmirror-controlconnection.v2fly.arpa` host on port 80.
+pub type EnrollmentDialer = std::sync::Arc<
+    dyn Fn(
+            crate::addr::NetAddr,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<BoxProxyStream>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// `Dial` with connection enrolment (client.go:136-141 →
+/// `verifyConnectionEnrollment`, enrollment.go:119): after the carrier
+/// is ready, confirm this (clientRandom, serverRandom) pair against the
+/// server's enrolment control endpoint over h2c.
+pub async fn connect_with(
+    cfg: &TlsMirrorOut,
+    transport: BoxProxyStream,
+    enrollment_dialer: Option<EnrollmentDialer>,
+) -> Result<BoxProxyStream> {
     let primary_key = decode_primary_key(&cfg.primary_key)?;
-    if cfg.connection_enrolment.is_some() {
+    if cfg.connection_enrolment.is_some() && enrollment_dialer.is_none() {
         return Err(Error::config(
-            "tlsmirror: connection-enrolment is not implemented: it requires the engine proxy \
-             dialer (primary-ingress/egress-outbound) and the h2 enrolment control connection \
-             (transport/tlsmirror/enrollment.go: deriveEnrollmentRequestKey, \
-             marshalEnrollmentConfirmationReq, ServeEnrollmentControlConnection); configure it \
-             away for this port",
+            "tlsmirror: connection-enrolment requires an enrollment dialer \
+             (primary-ingress-outbound / primary-egress-outbound routing); pass one to \
+             connect_with (transport/tlsmirror/enrollment.go:119 verifyConnectionEnrollment)",
         ));
     }
     let has_generator = !cfg.traffic_generator.is_empty();
@@ -1327,6 +1367,8 @@ pub async fn connect(cfg: &TlsMirrorOut, transport: BoxProxyStream) -> Result<Bo
     let pump_ready = ready.clone();
     let pump_ready_notify = ready_notify.clone();
     let defer = cfg.defer_instance_derived_write.duration();
+    let (randoms_tx, randoms_rx) =
+        tokio::sync::watch::channel(None::<([u8; 32], [u8; 32])>);
     tokio::spawn(async move {
         pump(
             transport,
@@ -1339,6 +1381,7 @@ pub async fn connect(cfg: &TlsMirrorOut, transport: BoxProxyStream) -> Result<Bo
             pump_ready_notify,
             defer,
             Some(carrier_ready_tx),
+            randoms_tx,
         )
         .await;
     });
@@ -1374,6 +1417,12 @@ pub async fn connect(cfg: &TlsMirrorOut, transport: BoxProxyStream) -> Result<Bo
         }
     }
 
+    if cfg.connection_enrolment.is_some() {
+        // verifyConnectionEnrollment (client.go:136 → enrollment.go:119).
+        let dialer = enrollment_dialer.expect("checked above");
+        verify_connection_enrollment(&primary_key, &randoms_rx, &dialer).await?;
+    }
+
     debug!(target: "engine", "tlsmirror: hidden conn established over carrier {server_name}");
     Ok(Box::new(TlsMirrorStream {
         hidden_rx,
@@ -1384,6 +1433,999 @@ pub async fn connect(cfg: &TlsMirrorOut, transport: BoxProxyStream) -> Result<Bo
         alive,
     }))
 }
+
+
+// ---------------------------------------------------------------------------
+// Connection enrolment (enrollment.go)
+// ---------------------------------------------------------------------------
+
+/// `enrollmentControlConnectionPostfix` (enrollment.go:21).
+const ENROLLMENT_CONTROL_POSTFIX: &str = ".tlsmirror-controlconnection.v2fly.arpa";
+
+/// `enrollmentBase32` (enrollment.go:23): RFC 4648 lower alphabet with
+/// digits first, no padding.
+const ENROLLMENT_BASE32: &[u8; 32] = b"0123456789abcdefghijklmnopqrstuv";
+
+fn enrollment_base32_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity((data.len() * 8).div_ceil(5));
+    let mut buffer: u32 = 0;
+    let mut bits: u32 = 0;
+    for byte in data {
+        buffer = (buffer << 8) | u32::from(*byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(ENROLLMENT_BASE32[((buffer >> bits) & 0x1f) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        out.push(ENROLLMENT_BASE32[((buffer << (5 - bits)) & 0x1f) as usize] as char);
+    }
+    out
+}
+
+/// `deriveSecondaryKey` (enrollment.go:187): HKDF-SHA256 with the
+/// primary key as PRK under the v2ray secondary-key namespace.
+fn derive_secondary_key(primary_key: &[u8; 32], tag: &str) -> Result<[u8; 16]> {
+    let hk = Hkdf::<Sha256>::from_prk(primary_key)
+        .map_err(|_| Error::crypto("tlsmirror: prk"))?;
+    let mut key = [0u8; 16];
+    hk.expand(
+        format!("v2ray-sv77RCEY-e8AhYsbD-BmFC7XRK:tlsmirror-secondary{tag}").as_bytes(),
+        &mut key,
+    )
+    .map_err(|_| Error::crypto("tlsmirror: hkdf expand secondary"))?;
+    Ok(key)
+}
+
+/// `deriveEnrollmentServerIdentifier` (enrollment.go:183).
+fn derive_enrollment_server_identifier(primary_key: &[u8; 32]) -> Result<[u8; 16]> {
+    derive_secondary_key(
+        primary_key,
+        ":connection-enrollment-server-identifier-av38NNGF-TJvRw7C3-p8KM8yKd",
+    )
+}
+
+/// `deriveEnrollmentRequestKey` (enrollment.go:198): the 16-byte
+/// encryption key half of `deriveEncryptionKey` under the enrolment tag.
+fn derive_enrollment_request_key(
+    primary_key: &[u8; 32],
+    client_random: &[u8; 32],
+    server_random: &[u8; 32],
+) -> Result<[u8; 16]> {
+    let (key, _mask) = derive_encryption_key(
+        primary_key,
+        client_random,
+        server_random,
+        ":connection-enrollment-re78HQNM-CmpRnPbr-PNJVRMhu",
+    )?;
+    Ok(key)
+}
+
+/// `ServerIdentifierHost` (enrollment.go:61): the control-connection
+/// host the client dials on TCP :80 and the server intercepts.
+pub fn server_identifier_host(primary_key: &str) -> Result<String> {
+    let key = decode_primary_key(primary_key)?;
+    let id = derive_enrollment_server_identifier(&key)?;
+    Ok(format!(
+        "{}{ENROLLMENT_CONTROL_POSTFIX}",
+        enrollment_base32_encode(&id)
+    ))
+}
+
+/// The active-enrolment table (`enrollmentProcessors`, enrollment.go:203):
+/// request keys of served mirrors, per primary key.
+fn enrollment_active() -> &'static std::sync::Mutex<std::collections::HashSet<Vec<u8>>> {
+    static ACTIVE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<Vec<u8>>>> =
+        std::sync::OnceLock::new();
+    ACTIVE.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// `enrollmentProcessor.add` (enrollment.go:220): register a served
+/// mirror's handshake randoms; errors on duplicates (replay). Returns a
+/// guard that removes the entry (`remove`).
+fn enrollment_add(
+    primary_key: &[u8; 32],
+    client_random: &[u8; 32],
+    server_random: &[u8; 32],
+) -> Result<EnrollmentGuard> {
+    let request_key =
+        derive_enrollment_request_key(primary_key, client_random, server_random)?;
+    let mut active = enrollment_active().lock().unwrap_or_else(|e| e.into_inner());
+    if !active.insert(request_key.to_vec()) {
+        return Err(Error::protocol(
+            "tlsmirror: enrollment connection already exists",
+        ));
+    }
+    drop(active);
+    Ok(EnrollmentGuard { request_key: Some(request_key.to_vec()) })
+}
+
+/// Removes the entry on drop (`hidden.setEnrollmentRemove`, server.go:63).
+struct EnrollmentGuard {
+    request_key: Option<Vec<u8>>,
+}
+
+impl Drop for EnrollmentGuard {
+    fn drop(&mut self) {
+        if let Some(key) = self.request_key.take() {
+            enrollment_active()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+        }
+    }
+}
+
+/// `enrollmentProcessor.verify` (enrollment.go:233).
+fn enrollment_verify(
+    primary_key: &[u8; 32],
+    client_random: &[u8; 32],
+    server_random: &[u8; 32],
+) -> bool {
+    match derive_enrollment_request_key(primary_key, client_random, server_random) {
+        Ok(request_key) => enrollment_active()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&request_key.to_vec()),
+        Err(_) => false,
+    }
+}
+
+// -- the enrollment protobuf (enrollment.go:248-432) --------------------------
+
+/// `enrollmentConfirmationReq` (enrollment.go:31). Fields 1-5 are bytes;
+/// only 1-3 are populated by either side today.
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+pub struct EnrollmentConfirmationReq {
+    pub server_identifier: Vec<u8>,
+    pub client_random: Vec<u8>,
+    pub server_random: Vec<u8>,
+    pub client_identifier: Vec<u8>,
+    pub reply_address_tag: Vec<u8>,
+}
+
+/// `marshalEnrollmentConfirmationReq` (enrollment.go:248).
+pub(crate) fn marshal_enrollment_req(req: &EnrollmentConfirmationReq) -> Vec<u8> {
+    let mut out = Vec::new();
+    append_proto_bytes(&mut out, 1, &req.server_identifier);
+    append_proto_bytes(&mut out, 2, &req.client_random);
+    append_proto_bytes(&mut out, 3, &req.server_random);
+    append_proto_bytes(&mut out, 4, &req.client_identifier);
+    append_proto_bytes(&mut out, 5, &req.reply_address_tag);
+    out
+}
+
+/// `unmarshalEnrollmentConfirmationReq` (enrollment.go:258).
+fn unmarshal_enrollment_req(data: &[u8]) -> Result<EnrollmentConfirmationReq> {
+    let mut req = EnrollmentConfirmationReq::default();
+    let mut data = data;
+    while !data.is_empty() {
+        let (key, n) = consume_proto_varint(data)?;
+        data = &data[n..];
+        let field = usize::try_from(key >> 3)
+            .map_err(|_| Error::protocol("tlsmirror: invalid protobuf field number"))?;
+        let wire_type = key & 0x7;
+        if field == 0 {
+            return Err(Error::protocol("tlsmirror: invalid protobuf field number"));
+        }
+        if wire_type == 2 {
+            let (size, n) = consume_proto_varint(data)?;
+            data = &data[n..];
+            let size = usize::try_from(size)
+                .map_err(|_| Error::protocol("tlsmirror: protobuf length overflow"))?;
+            if data.len() < size {
+                return Err(Error::network("tlsmirror: unexpected EOF"));
+            }
+            let value = data[..size].to_vec();
+            data = &data[size..];
+            match field {
+                1 => req.server_identifier = value,
+                2 => req.client_random = value,
+                3 => req.server_random = value,
+                4 => req.client_identifier = value,
+                5 => req.reply_address_tag = value,
+                _ => {}
+            }
+            continue;
+        }
+        let n = skip_proto_value(data, field, wire_type)?;
+        data = &data[n..];
+    }
+    Ok(req)
+}
+
+/// `marshalEnrollmentConfirmationResp` (enrollment.go:305).
+fn marshal_enrollment_resp(enrolled: bool) -> Vec<u8> {
+    if !enrolled {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    append_proto_varint(&mut out, (1 << 3) as u64);
+    append_proto_varint(&mut out, 1);
+    out
+}
+
+/// `unmarshalEnrollmentConfirmationResp` (enrollment.go:313).
+fn unmarshal_enrollment_resp(data: &[u8]) -> Result<bool> {
+    let mut enrolled = false;
+    let mut data = data;
+    while !data.is_empty() {
+        let (key, n) = consume_proto_varint(data)?;
+        data = &data[n..];
+        let field = usize::try_from(key >> 3)
+            .map_err(|_| Error::protocol("tlsmirror: invalid protobuf field number"))?;
+        let wire_type = key & 0x7;
+        if field == 0 {
+            return Err(Error::protocol("tlsmirror: invalid protobuf field number"));
+        }
+        if field == 1 && wire_type == 0 {
+            let (value, n) = consume_proto_varint(data)?;
+            data = &data[n..];
+            enrolled = value != 0;
+            continue;
+        }
+        let n = skip_proto_value(data, field, wire_type)?;
+        data = &data[n..];
+    }
+    Ok(enrolled)
+}
+
+fn append_proto_bytes(out: &mut Vec<u8>, field: usize, value: &[u8]) {
+    if value.is_empty() {
+        return;
+    }
+    append_proto_varint(out, ((field << 3) | 2) as u64);
+    append_proto_varint(out, value.len() as u64);
+    out.extend_from_slice(value);
+}
+
+fn append_proto_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push(value as u8 | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn consume_proto_varint(data: &[u8]) -> Result<(u64, usize)> {
+    let mut value: u64 = 0;
+    for (i, b) in data.iter().enumerate() {
+        if i == 10 {
+            return Err(Error::protocol("tlsmirror: invalid protobuf varint"));
+        }
+        value |= u64::from(b & 0x7f) << (7 * i);
+        if b < &0x80 {
+            return Ok((value, i + 1));
+        }
+    }
+    Err(Error::network("tlsmirror: unexpected EOF"))
+}
+
+fn skip_proto_value(data: &[u8], start_field: usize, wire_type: u64) -> Result<usize> {
+    match wire_type {
+        0 => Ok(consume_proto_varint(data)?.1),
+        1 => {
+            if data.len() < 8 {
+                return Err(Error::network("tlsmirror: unexpected EOF"));
+            }
+            Ok(8)
+        }
+        2 => {
+            let (size, n) = consume_proto_varint(data)?;
+            let size = usize::try_from(size)
+                .map_err(|_| Error::protocol("tlsmirror: protobuf length overflow"))?;
+            if data.len() < n + size {
+                return Err(Error::network("tlsmirror: unexpected EOF"));
+            }
+            Ok(n + size)
+        }
+        3 => {
+            // Deprecated group: skip until the matching end-group.
+            let mut data = data;
+            let mut consumed = 0usize;
+            loop {
+                let (key, n) = consume_proto_varint(data)?;
+                data = &data[n..];
+                consumed += n;
+                let nested_field = usize::try_from(key >> 3)
+                    .map_err(|_| Error::protocol("tlsmirror: invalid protobuf field number"))?;
+                let nested_wire = key & 0x7;
+                if nested_field == 0 {
+                    return Err(Error::protocol("tlsmirror: invalid protobuf field number"));
+                }
+                if nested_wire == 4 {
+                    if nested_field != start_field {
+                        return Err(Error::protocol(
+                            "tlsmirror: mismatched protobuf end group",
+                        ));
+                    }
+                    return Ok(consumed);
+                }
+                let n = skip_proto_value(data, nested_field, nested_wire)?;
+                data = &data[n..];
+                consumed += n;
+            }
+        }
+        4 => Err(Error::protocol("tlsmirror: unexpected protobuf end group")),
+        5 => {
+            if data.len() < 4 {
+                return Err(Error::network("tlsmirror: unexpected EOF"));
+            }
+            Ok(4)
+        }
+        other => Err(Error::protocol(format!(
+            "tlsmirror: unsupported enrollment protobuf wire type {other}"
+        ))),
+    }
+}
+
+// -- minimal h2c (unencrypted HTTP/2 prior knowledge, RFC 9113) ---------------
+
+/// The connection preface every h2c client sends first.
+const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+const H2_DATA: u8 = 0x0;
+const H2_HEADERS: u8 = 0x1;
+const H2_SETTINGS: u8 = 0x4;
+const H2_PING: u8 = 0x6;
+const H2_GOAWAY: u8 = 0x7;
+const H2_WINDOW_UPDATE: u8 = 0x8;
+const H2_CONTINUATION: u8 = 0x9;
+
+fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(9 + payload.len());
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes()[1..]);
+    out.push(kind);
+    out.push(flags);
+    out.extend_from_slice(&stream.to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+async fn h2_read_frame(
+    io: &mut BoxProxyStream,
+) -> Result<(u8, u8, u32, Vec<u8>)> {
+    let mut head = [0u8; 9];
+    io.read_exact(&mut head).await?;
+    let len = (u32::from(head[0]) << 16 | u32::from(head[1]) << 8 | u32::from(head[2])) as usize;
+    let kind = head[3];
+    let flags = head[4];
+    let stream = u32::from_be_bytes([head[5], head[6], head[7], head[8]]);
+    let mut payload = vec![0u8; len];
+    io.read_exact(&mut payload).await?;
+    Ok((kind, flags, stream, payload))
+}
+
+/// HPACK literal-without-indexing string (RFC 7541 §6.2.2, no Huffman).
+fn hpack_string(out: &mut Vec<u8>, value: &[u8]) {
+    hpack_integer(out, value.len() as u64, 7, 0x00);
+    out.extend_from_slice(value);
+}
+
+/// HPACK integer encoding with an N-bit prefix (RFC 7541 §5.1).
+fn hpack_integer(out: &mut Vec<u8>, value: u64, prefix_bits: u32, first_byte: u8) {
+    let max = (1u64 << prefix_bits) - 1;
+    if value < max {
+        out.push(first_byte | value as u8);
+        return;
+    }
+    out.push(first_byte | max as u8);
+    let mut rest = value - max;
+    while rest >= 0x80 {
+        out.push(rest as u8 | 0x80);
+        rest >>= 7;
+    }
+    out.push(rest as u8);
+}
+
+/// One HPACK header field, literal without indexing, new name.
+fn hpack_literal_header(out: &mut Vec<u8>, name: &str, value: &str) {
+    out.push(0x00);
+    hpack_string(out, name.as_bytes());
+    hpack_string(out, value.as_bytes());
+}
+
+/// Decode `:status` from a header block wedge: indexed static entries
+/// and plain literals decode; Huffman literals are refused (the Go h2
+/// server emits the standard statuses as static-indexed).
+fn hpack_decode_status(block: &[u8]) -> Result<u16> {
+    let mut pos = 0usize;
+    let mut status: Option<u16> = None;
+    while pos < block.len() {
+        let b0 = block[pos];
+        if b0 & 0x80 != 0 {
+            // Indexed header field (static table only here).
+            let (idx, n) = hpack_integer_read(block, pos, 7)?;
+            pos += n;
+            let code = match idx {
+                8 => Some(200),
+                9 => Some(204),
+                10 => Some(206),
+                11 => Some(304),
+                12 => Some(400),
+                13 => Some(404),
+                14 => Some(500),
+                _ => None,
+            };
+            if let Some(code) = code {
+                status = Some(code);
+            }
+            continue;
+        }
+        if b0 & 0xc0 == 0x40 || b0 & 0xf0 == 0x00 || b0 & 0xf0 == 0x10 {
+            // Literal (with/without indexing / never indexed): the
+            // 6- or 4-bit prefix name index, 0 = literal name.
+            let literal_prefix = if b0 & 0xc0 == 0x40 { 6 } else { 4 };
+            let (name_idx, n) = hpack_integer_read(block, pos, literal_prefix)?;
+            pos += n;
+            let name = if name_idx == 0 {
+                let (v, n) = hpack_string_read(block, pos)?;
+                pos += n;
+                v
+            } else {
+                // Indexed name: never :status in the static table.
+                Vec::new()
+            };
+            let (value, n) = hpack_string_read(block, pos)?;
+            pos += n;
+            if name_idx == 0 && name == b":status" {
+                let text = std::str::from_utf8(&value)
+                    .map_err(|_| Error::protocol("tlsmirror: h2 :status not utf-8"))?;
+                status = Some(
+                    text.parse()
+                        .map_err(|_| Error::protocol("tlsmirror: h2 :status not numeric"))?,
+                );
+            }
+            continue;
+        }
+        if b0 & 0xe0 == 0x20 {
+            // Dynamic table size update: skip the integer.
+            let (_size, n) = hpack_integer_read(block, pos, 5)?;
+            pos += n;
+            continue;
+        }
+        return Err(Error::protocol("tlsmirror: unsupported HPACK entry"));
+    }
+    status.ok_or_else(|| Error::protocol("tlsmirror: h2 response missing :status"))
+}
+
+fn hpack_integer_read(block: &[u8], pos: usize, prefix_bits: u32) -> Result<(u64, usize)> {
+    let Some(&first) = block.get(pos) else {
+        return Err(Error::network("tlsmirror: hpack truncated"));
+    };
+    let max = (1u64 << prefix_bits) - 1;
+    let mut value = u64::from(first) & max;
+    if value < max {
+        return Ok((value, 1));
+    }
+    let mut shift = 0u32;
+    let mut n = 1usize;
+    loop {
+        let Some(&b) = block.get(pos + n) else {
+            return Err(Error::network("tlsmirror: hpack truncated"));
+        };
+        n += 1;
+        value += u64::from(b & 0x7f) << shift;
+        if b & 0x80 == 0 {
+            return Ok((value, n));
+        }
+        shift += 7;
+        if shift > 42 {
+            return Err(Error::protocol("tlsmirror: hpack integer overflow"));
+        }
+    }
+}
+
+fn hpack_string_read(block: &[u8], pos: usize) -> Result<(Vec<u8>, usize)> {
+    let Some(&first) = block.get(pos) else {
+        return Err(Error::network("tlsmirror: hpack truncated"));
+    };
+    let huffman = first & 0x80 != 0;
+    let (len, n) = hpack_integer_read(block, pos, 7)?;
+    let len = usize::try_from(len)
+        .map_err(|_| Error::protocol("tlsmirror: hpack length overflow"))?;
+    let start = pos + n;
+    let end = start + len;
+    if block.len() < end {
+        return Err(Error::network("tlsmirror: hpack truncated"));
+    }
+    if huffman {
+        return Err(Error::protocol(
+            "tlsmirror: huffman-coded HPACK string is not supported",
+        ));
+    }
+    Ok((block[start..end].to_vec(), n + len))
+}
+
+/// `newTrafficHTTPTransport(conn, "h2")` + `RoundTrip` for the one POST
+/// the enrolment handshake issues (enrollment.go:151-165): h2c with
+/// prior knowledge over the dialed control connection.
+pub(crate) async fn h2c_post(
+    mut io: BoxProxyStream,
+    host: &str,
+    body: &[u8],
+) -> Result<(u16, Vec<u8>)> {
+    // Preface + a large initial window (the request is small but be
+    // generous with the response path).
+    io.write_all(H2_PREFACE).await?;
+    let mut settings = Vec::new();
+    // SETTINGS_INITIAL_WINDOW_SIZE (0x4) = 1 MiB.
+    settings.extend_from_slice(&0x4u16.to_be_bytes());
+    settings.extend_from_slice(&(1u32 << 20).to_be_bytes());
+    io.write_all(&h2_frame(H2_SETTINGS, 0, 0, &settings)).await?;
+
+    // HEADERS on stream 1: literal-without-indexing, no Huffman.
+    let mut block = Vec::new();
+    hpack_literal_header(&mut block, ":method", "POST");
+    hpack_literal_header(&mut block, ":scheme", "http");
+    hpack_literal_header(&mut block, ":authority", host);
+    hpack_literal_header(&mut block, ":path", "/");
+    hpack_literal_header(&mut block, "content-type", "application/octet-stream");
+    hpack_literal_header(&mut block, "content-length", &body.len().to_string());
+    io.write_all(&h2_frame(H2_HEADERS, 0x4 /* END_HEADERS */, 1, &block))
+        .await?;
+    io.write_all(&h2_frame(H2_DATA, 0x1 /* END_STREAM */, 1, body))
+        .await?;
+
+    let mut status: Option<u16> = None;
+    let mut resp_body = Vec::new();
+    let mut header_block: Vec<u8> = Vec::new();
+    let mut headers_done = false;
+    let mut stream_done = false;
+    while !stream_done || !headers_done {
+        let (kind, flags, stream, payload) = h2_read_frame(&mut io).await?;
+        match kind {
+            H2_SETTINGS => {
+                if flags & 0x1 == 0 {
+                    // Best-effort ACK: the one-shot control peer may
+                    // return as soon as its response is flushed.
+                    let _ = io.write_all(&h2_frame(H2_SETTINGS, 0x1, 0, &[])).await;
+                }
+            }
+            H2_WINDOW_UPDATE => {}
+            H2_HEADERS | H2_CONTINUATION => {
+                if stream != 1 {
+                    continue;
+                }
+                header_block.extend_from_slice(&payload);
+                if flags & 0x4 != 0 {
+                    // END_HEADERS
+                    status = Some(hpack_decode_status(&header_block)?);
+                    headers_done = true;
+                }
+                if flags & 0x1 != 0 {
+                    stream_done = true;
+                }
+            }
+            H2_DATA => {
+                if stream != 1 {
+                    continue;
+                }
+                if !payload.is_empty() {
+                    resp_body.extend_from_slice(&payload);
+                    // Keep the peer's flow-control window healthy
+                    // (best-effort, see SETTINGS above).
+                    let inc = h2_frame(H2_WINDOW_UPDATE, 0, 0, &payload.len().to_be_bytes());
+                    let _ = io.write_all(&inc).await;
+                }
+                if flags & 0x1 != 0 {
+                    stream_done = true;
+                }
+            }
+            H2_PING => {
+                if flags & 0x1 == 0 {
+                    let _ = io.write_all(&h2_frame(H2_PING, 0x1, 0, &payload)).await;
+                }
+            }
+            H2_GOAWAY => {
+                return Err(Error::network("tlsmirror: h2c GOAWAY"));
+            }
+            _ => {} // unknown frame types are ignored per RFC 9113
+        }
+    }
+    let status = status.ok_or_else(|| Error::protocol("tlsmirror: h2c no :status"))?;
+    Ok((status, resp_body))
+}
+
+/// `ServeEnrollmentControlConnection` (enrollment.go:69): serve the
+/// h2c confirmation endpoint on ONE intercepted TCP connection. The
+/// listener (or the integrator's intercept hook) hands the control
+/// connection here; it answers exactly the enrollment confirmation.
+pub async fn serve_enrollment_control_connection(
+    mut io: BoxProxyStream,
+    primary_key: &str,
+) -> Result<()> {
+    let key = decode_primary_key(primary_key)?;
+    // Preface, then one request.
+    let mut preface = vec![0u8; H2_PREFACE.len()];
+    io.read_exact(&mut preface).await?;
+    if preface != H2_PREFACE {
+        return Err(Error::protocol(
+            "tlsmirror: enrollment control connection: not an h2c preface",
+        ));
+    }
+    io.write_all(&h2_frame(H2_SETTINGS, 0, 0, &[])).await?;
+    let mut body = Vec::new();
+    let mut stream_done = false;
+    let mut request_stream: Option<u32> = None;
+    while !stream_done {
+        let (kind, flags, stream, payload) = h2_read_frame(&mut io).await?;
+        match kind {
+            H2_SETTINGS => {
+                if flags & 0x1 == 0 {
+                    let _ = io.write_all(&h2_frame(H2_SETTINGS, 0x1, 0, &[])).await;
+                }
+            }
+            H2_WINDOW_UPDATE | H2_CONTINUATION | H2_HEADERS => {
+                // The request headers are not inspected upstream either
+                // (the handler reads only the body).
+            }
+            H2_DATA => {
+                if Some(stream) != request_stream && request_stream.is_none() {
+                    request_stream = Some(stream);
+                }
+                if !payload.is_empty() {
+                    body.extend_from_slice(&payload);
+                    let inc = h2_frame(H2_WINDOW_UPDATE, 0, 0, &payload.len().to_be_bytes());
+                    let _ = io.write_all(&inc).await;
+                }
+                if flags & 0x1 != 0 {
+                    stream_done = true;
+                }
+            }
+            H2_PING => {
+                if flags & 0x1 == 0 {
+                    let _ = io.write_all(&h2_frame(H2_PING, 0x1, 0, &payload)).await;
+                }
+            }
+            H2_GOAWAY => return Ok(()),
+            _ => {}
+        }
+    }
+    let stream = request_stream.unwrap_or(1);
+    // verify (enrollment.go:233): membership in the active table.
+    let req = unmarshal_enrollment_req(&body)?;
+    let enrolled = if req.client_random.len() == 32 && req.server_random.len() == 32 {
+        let mut cr = [0u8; 32];
+        cr.copy_from_slice(&req.client_random);
+        let mut sr = [0u8; 32];
+        sr.copy_from_slice(&req.server_random);
+        enrollment_verify(&key, &cr, &sr)
+    } else {
+        false
+    };
+    let resp_body = marshal_enrollment_resp(enrolled);
+    let mut block = Vec::new();
+    hpack_literal_header(&mut block, ":status", "200");
+    hpack_literal_header(&mut block, "content-type", "application/octet-stream");
+    hpack_literal_header(&mut block, "content-length", &resp_body.len().to_string());
+    io.write_all(&h2_frame(H2_HEADERS, 0x4, stream, &block)).await?;
+    io.write_all(&h2_frame(H2_DATA, 0x1, stream, &resp_body)).await?;
+    let _ = io.flush().await;
+    Ok(())
+}
+
+/// `verifyConnectionEnrollment` (enrollment.go:119): the client side of
+/// the control protocol — dial `controlHost:80`, POST the confirmation
+/// request over h2c, require `enrolled`.
+async fn verify_connection_enrollment(
+    primary_key: &[u8; 32],
+    randoms_rx: &tokio::sync::watch::Receiver<Option<([u8; 32], [u8; 32])>>,
+    dialer: &EnrollmentDialer,
+) -> Result<()> {
+    let mut rx = randoms_rx.clone();
+    let (client_random, server_random) = match tokio::time::timeout(
+        Duration::from_secs(30),
+        rx.wait_for(|r| r.is_some()),
+    )
+    .await
+    {
+        Ok(Ok(value)) => value.ok_or_else(|| Error::network("tlsmirror: handshake randoms lost")),
+        _ => Err(Error::network(
+            "tlsmirror: carrier handshake randoms never became available",
+        )),
+    }?;
+    let server_id = derive_enrollment_server_identifier(primary_key)?;
+    let host = format!(
+        "{}{ENROLLMENT_CONTROL_POSTFIX}",
+        enrollment_base32_encode(&server_id)
+    );
+    let target = crate::addr::NetAddr::domain(&host, 80)?;
+    let control = dialer(target).await?;
+    let req = marshal_enrollment_req(&EnrollmentConfirmationReq {
+        server_identifier: server_id.to_vec(),
+        client_random: client_random.to_vec(),
+        server_random: server_random.to_vec(),
+        client_identifier: Vec::new(),
+        reply_address_tag: Vec::new(),
+    });
+    let (status, resp_body) = h2c_post(control, &host, &req).await?;
+    if status != 200 {
+        return Err(Error::protocol(format!(
+            "tlsmirror: unexpected enrollment response status {status}"
+        )));
+    }
+    let enrolled = unmarshal_enrollment_resp(&resp_body)?;
+    if !enrolled {
+        return Err(Error::protocol("tlsmirror: connection enrollment failed"));
+    }
+    Ok(())
+}
+
+/// Is the target the enrolment control endpoint for this primary key?
+/// The integrator's intercept hook (upstream `enrollmentTunnel`,
+/// listener/tlsmirror/tlsmirror.go:73) matches exactly this: TCP, port
+/// 80, host equal to the derived control host (case-insensitive).
+pub fn is_enrollment_control_target(target: &crate::addr::NetAddr, primary_key: &str) -> bool {
+    if target.port != 80 {
+        return false;
+    }
+    let Some(host) = target.host.as_domain() else {
+        return false;
+    };
+    match server_identifier_host(primary_key) {
+        Ok(control_host) => host.eq_ignore_ascii_case(&control_host),
+        Err(_) => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The server half (server.go ServeConnReady + serveConn + mirror.go)
+// ---------------------------------------------------------------------------
+
+/// `ServerConfig` = `Config` (tlsmirror config.go:53): what the server
+/// mirror needs. Built from the listener config.
+#[derive(Debug, Clone)]
+pub struct TlsMirrorServerConfig {
+    pub primary_key: String,
+    pub explicit_nonce_cipher_suites: Vec<u16>,
+    pub defer_instance_derived_write: TimeSpec,
+    pub transport_layer_padding: bool,
+    pub connection_enrolment: Option<(String, String)>,
+    pub sequence_watermarking_enabled: bool,
+}
+
+impl TlsMirrorServerConfig {
+    /// The same shape as a client `TlsMirrorOut` minus the carrier knobs.
+    pub fn as_out(&self) -> TlsMirrorOut {
+        TlsMirrorOut {
+            primary_key: self.primary_key.clone(),
+            explicit_nonce_cipher_suites: self.explicit_nonce_cipher_suites.clone(),
+            defer_instance_derived_write: self.defer_instance_derived_write,
+            transport_layer_padding: self.transport_layer_padding,
+            connection_enrolment: self.connection_enrolment.clone(),
+            traffic_generator: Vec::new(),
+            sequence_watermarking_enabled: self.sequence_watermarking_enabled,
+            server_name: "tlsmirror-server".to_string(),
+            skip_cert_verify: true,
+            alpn: Vec::new(),
+            client_fingerprint: String::new(),
+            fingerprint: String::new(),
+            certificate: String::new(),
+            private_key: String::new(),
+        }
+    }
+}
+
+/// `ServeConnReady` (server.go:8): the server mirror between the client
+/// conn and the pre-dialed forward conn; returns the hidden stream once
+/// the FIRST hidden record from the client decrypts (the `activated`
+/// transition). Carrier records pass through in both directions; hidden
+/// records the server writes are inserted into its s2c flow.
+///
+/// When the client never activates the hidden channel (a plain TLS
+/// client hitting the port — `peekFirstHandshakeRecord` fallback,
+/// mirror.go:303) the mirror degenerates into a bidirectional
+/// passthrough and this future resolves to an error when either side
+/// closes; the camouflage relay has already happened by then.
+pub async fn serve_conn_ready(
+    client_io: BoxProxyStream,
+    forward_io: BoxProxyStream,
+    cfg: &TlsMirrorServerConfig,
+) -> Result<BoxProxyStream> {
+    let key = decode_primary_key(&cfg.primary_key)?;
+    let out_cfg = cfg.as_out();
+    let mirror = Arc::new(tokio::sync::Mutex::new(Mirror::new(&out_cfg, key, true)));
+    let (hidden_tx, hidden_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (insert_tx, insert_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<BoxProxyStream>();
+    let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let recall = Arc::new(tokio::sync::Notify::new());
+
+    let (client_rd, mut client_wr) = tokio::io::split(client_io);
+    let (mut forward_rd, mut forward_wr) = tokio::io::split(forward_io);
+
+    // The hidden stream exists up front; the c2s task holds it until the
+    // first hidden record decrypts, then hands it over (serveConn's
+    // `activated` → onReady, server.go:41-52).
+    let hidden_stream = Box::new(TlsMirrorStream {
+        hidden_rx,
+        insert_tx: insert_tx.clone(),
+        recall: recall.clone(),
+        pending: BytesMut::new(),
+        closed: false,
+        alive: alive.clone(),
+    });
+
+    // c2s relay (mirror.go c2sWorker + serveConn's onC2SMessage):
+    // extract hidden records, forward the rest, signal ready on the
+    // first extraction.
+    let c2s_mirror = mirror.clone();
+    let c2s_hidden = hidden_tx.clone();
+    let c2s = tokio::spawn(async move {
+        let mut rd = client_rd;
+        let mut first = true;
+        let mut rbuf = BytesMut::with_capacity(16 * 1024);
+        let mut tmp = [0u8; 16 * 1024];
+        let mut hidden_stream = Some(hidden_stream);
+        let mut ready_tx = Some(ready_tx);
+        loop {
+            while rbuf.len() >= RECORD_HEADER_LEN {
+                let rlen = u16::from_be_bytes([rbuf[3], rbuf[4]]) as usize;
+                if rbuf.len() < RECORD_HEADER_LEN + rlen {
+                    break;
+                }
+                let mut record = rbuf.split_to(RECORD_HEADER_LEN + rlen).to_vec();
+                let rec_type = record[0];
+                if first && rec_type == REC_HANDSHAKE {
+                    if let Some(random) = parse_client_random(&record[RECORD_HEADER_LEN..]) {
+                        c2s_mirror.lock().await.client_random = Some(random);
+                    }
+                    first = false;
+                }
+                let mut m = c2s_mirror.lock().await;
+                m.apply_watermark_rx(&mut record[RECORD_HEADER_LEN..], rec_type);
+                let extracted =
+                    m.handle_inbound_record(&record[RECORD_HEADER_LEN..], rec_type);
+                drop(m);
+                match extracted {
+                    Some(payload) => {
+                        if !payload.is_empty() {
+                            let _ = c2s_hidden.send(payload);
+                        }
+                        if let (Some(tx), Some(stream)) = (ready_tx.take(), hidden_stream.take())
+                        {
+                            let _ = tx.send(stream);
+                        }
+                    }
+                    None => {
+                        if forward_wr.write_all(&record).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            match rd.read(&mut tmp).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => rbuf.extend_from_slice(&tmp[..n]),
+            }
+        }
+    });
+
+    // s2c relay (mirror.go s2cWorker + recordWriter): forward carrier
+    // records (watermarked), insert the server's hidden records, enrol
+    // on the forward's first handshake record (server.go:53-66). The
+    // enrolment guard lives here: when this task ends the entry is
+    // removed (`mirror.onClose = hidden.removeEnrollment`, server.go:77).
+    let s2c_mirror = mirror.clone();
+    let s2c_cfg_enrol = cfg.connection_enrolment.is_some();
+    let mut defer = cfg.defer_instance_derived_write.duration();
+    let mut insert_rx = insert_rx;
+    let s2c = tokio::spawn(async move {
+        let mut first = true;
+        let mut rbuf = BytesMut::with_capacity(16 * 1024);
+        let mut tmp = [0u8; 16 * 1024];
+        let mut pending: Vec<Vec<u8>> = Vec::new();
+        let mut enrolment: Option<EnrollmentGuard> = None;
+        loop {
+            while rbuf.len() >= RECORD_HEADER_LEN {
+                let rlen = u16::from_be_bytes([rbuf[3], rbuf[4]]) as usize;
+                if rbuf.len() < RECORD_HEADER_LEN + rlen {
+                    break;
+                }
+                let mut record = rbuf.split_to(RECORD_HEADER_LEN + rlen).to_vec();
+                let rec_type = record[0];
+                let mut m = s2c_mirror.lock().await;
+                if first && rec_type == REC_HANDSHAKE {
+                    if let Some((random, suite)) = parse_server_hello(&record[RECORD_HEADER_LEN..])
+                    {
+                        m.server_random = Some(random);
+                        m.tls12_explicit = m.explicit_suites.contains(&suite);
+                    }
+                    first = false;
+                }
+                if s2c_cfg_enrol && rec_type == REC_HANDSHAKE && enrolment.is_none() {
+                    if let (Some(cr), Some(sr)) = (m.client_random, m.server_random) {
+                        if let Ok(guard) = enrollment_add(&key, &cr, &sr) {
+                            enrolment = Some(guard);
+                        }
+                    }
+                }
+                m.apply_watermark_tx(&mut record[RECORD_HEADER_LEN..], rec_type, false);
+                drop(m);
+                if client_wr.write_all(&record).await.is_err() {
+                    return;
+                }
+            }
+            // Server hidden inserts (Conn.Write server side, with the
+            // deferred first write — firstWriteDelay, conn.go:178-195).
+            while let Ok(chunk) = insert_rx.try_recv() {
+                pending.push(chunk);
+            }
+            for chunk in pending.drain(..) {
+                let mut plain: &[u8] = &chunk;
+                while !plain.is_empty() {
+                    let (rec, take) = {
+                        let mut m = s2c_mirror.lock().await;
+                        match m.build_inserted_record(plain, false) {
+                            Ok((fragment, take)) => {
+                                let mut rec =
+                                    Vec::with_capacity(RECORD_HEADER_LEN + fragment.len());
+                                rec.push(REC_APP_DATA);
+                                rec.extend_from_slice(&[0x03, 0x03]);
+                                rec.extend_from_slice(&(fragment.len() as u16).to_be_bytes());
+                                let mut frag = fragment;
+                                m.apply_watermark_tx(&mut frag, REC_APP_DATA, true);
+                                rec.extend_from_slice(&frag);
+                                (rec, take)
+                            }
+                            Err(_) => return,
+                        }
+                    };
+                    if !defer.is_zero() {
+                        tokio::time::sleep(defer).await;
+                        defer = Duration::ZERO;
+                    }
+                    if client_wr.write_all(&rec).await.is_err() {
+                        return;
+                    }
+                    plain = &plain[take..];
+                }
+            }
+            let read = tokio::select! {
+                r = forward_rd.read(&mut tmp) => r,
+                chunk = insert_rx.recv() => {
+                    match chunk {
+                        Some(chunk) => pending.push(chunk),
+                        // The hidden stream is gone: teardown (the guard
+                        // above drops with this task's return).
+                        None => return,
+                    }
+                    continue;
+                }
+            };
+            match read {
+                Ok(0) | Err(_) => return,
+                Ok(n) => rbuf.extend_from_slice(&tmp[..n]),
+            }
+        }
+    });
+
+    // Wait for activation (server.go:19-27). The unused sender half of
+    // the hidden channel stays here: when serve_conn_ready returns, the
+    // extraction sender that remains (c2s task's) keeps it alive.
+    let _ = hidden_tx;
+    // A finished task means its side of the carrier closed; the select
+    // moves the handles (on the ready path the surviving tasks detach
+    // and keep serving the mirror).
+    let hidden = match tokio::select! {
+        ready = ready_rx => ready.map_err(|_| {
+            Error::protocol("tlsmirror: mirror ended before the hidden channel activated")
+        }),
+        _ = c2s => Err(Error::protocol(
+            "tlsmirror: client carrier closed before the hidden channel activated",
+        )),
+        _ = s2c => Err(Error::protocol(
+            "tlsmirror: forward carrier closed before the hidden channel activated",
+        )),
+    } {
+        Ok(hidden) => hidden,
+        Err(e) => return Err(e),
+    };
+    Ok(hidden)
+}
+
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -2066,4 +3108,351 @@ mod tests {
         assert!(RECOMMENDED_EXPLICIT_NONCE_CIPHER_SUITES.contains(&49195));
         assert_eq!(RECOMMENDED_EXPLICIT_NONCE_CIPHER_SUITES.len(), 48);
     }
+    // ------------------------------------------------ connection enrolment
+
+    #[test]
+    fn server_identifier_host_shape() {
+        let key = generate_primary_key();
+        let host = server_identifier_host(&key).unwrap();
+        assert!(
+            host.ends_with(".tlsmirror-controlconnection.v2fly.arpa"),
+            "{host}"
+        );
+        let label = host.strip_suffix(".tlsmirror-controlconnection.v2fly.arpa").unwrap();
+        assert!(!label.is_empty());
+        assert!(
+            label
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'v').contains(&b)),
+            "the base32 lower alphabet: {label}"
+        );
+        // Deterministic for the same key.
+        assert_eq!(host, server_identifier_host(&key).unwrap());
+        assert_ne!(host, server_identifier_host(&generate_primary_key()).unwrap());
+        // The intercept predicate (listener/tlsmirror/tlsmirror.go:82).
+        let target = crate::addr::NetAddr::domain(&host, 80).unwrap();
+        assert!(is_enrollment_control_target(&target, &key));
+        // Case-insensitive host, wrong port, wrong host.
+        let upper = crate::addr::NetAddr::domain(&host.to_uppercase(), 80).unwrap();
+        assert!(is_enrollment_control_target(&upper, &key));
+        let wrong_port = crate::addr::NetAddr::domain(&host, 443).unwrap();
+        assert!(!is_enrollment_control_target(&wrong_port, &key));
+        let wrong_host = crate::addr::NetAddr::domain("other.example", 80).unwrap();
+        assert!(!is_enrollment_control_target(&wrong_host, &key));
+        // Bad keys do not derive.
+        assert!(server_identifier_host("").is_err());
+    }
+
+    #[test]
+    fn enrollment_base32_vectors() {
+        // RFC 4648 lower alphabet with digits first: encodings of
+        // 0x00..: 5-bit groups of 00000 → '0', 00001 → '1' … 11111 → 'v'.
+        assert_eq!(enrollment_base32_encode(&[0x00]), "00");
+        assert_eq!(enrollment_base32_encode(&[0xff]), "vs");
+        assert_eq!(enrollment_base32_encode(&[0xAB, 0xCD]), "lf6g");
+        let range: Vec<u8> = (0..16u8).collect();
+        assert_eq!(enrollment_base32_encode(&range), "000g40o40k30e209185go38e1s");
+        // 16-byte identifiers give 26 chars (80 bits), no padding.
+        assert_eq!(enrollment_base32_encode(&[0u8; 16]).len(), 26);
+    }
+
+    #[test]
+    fn enrollment_protobuf_roundtrip() {
+        let req = EnrollmentConfirmationReq {
+            server_identifier: vec![1, 2, 3],
+            client_random: vec![9; 32],
+            server_random: vec![8; 32],
+            client_identifier: vec![],
+            reply_address_tag: vec![7],
+        };
+        let bytes = marshal_enrollment_req(&req);
+        assert_eq!(unmarshal_enrollment_req(&bytes).unwrap(), req);
+        // Empty fields are omitted (marshalEnrollmentConfirmationReq).
+        assert!(!bytes.windows(2).any(|w| w == [0x22, 0x00]), "{bytes:?}");
+        // Unknown fields are skipped (field 9 varint + field 10 bytes).
+        let mut extended = marshal_enrollment_req(&req);
+        extended.extend_from_slice(&[0x48, 0x2a]); // field 9, varint 42
+        extended.extend_from_slice(&[0x52, 0x02, 0x03, 0x04]); // field 10, bytes
+        assert_eq!(unmarshal_enrollment_req(&extended).unwrap(), req);
+        // Response forms (enrollment.go:305/313).
+        assert_eq!(marshal_enrollment_resp(true), vec![0x08, 0x01]);
+        assert!(marshal_enrollment_resp(false).is_empty());
+        assert!(unmarshal_enrollment_resp(&[0x08, 0x01]).unwrap());
+        assert!(!unmarshal_enrollment_resp(&[]).unwrap());
+        // Field-number zero is refused.
+        assert!(unmarshal_enrollment_req(&[0x00]).is_err());
+        assert!(unmarshal_enrollment_resp(&[0x00]).is_err());
+    }
+
+    #[test]
+    fn enrollment_request_key_is_directionless_and_random_dependent() {
+        let key = [7u8; 32];
+        let cr = [1u8; 32];
+        let sr = [2u8; 32];
+        let k1 = derive_enrollment_request_key(&key, &cr, &sr).unwrap();
+        assert_eq!(k1.len(), 16);
+        assert_eq!(k1, derive_enrollment_request_key(&key, &cr, &sr).unwrap());
+        assert_ne!(k1, derive_enrollment_request_key(&key, &sr, &cr).unwrap());
+        assert_ne!(k1, derive_enrollment_request_key(&[8u8; 32], &cr, &sr).unwrap());
+        // The server identifier derivation (secondary key namespace).
+        let id = derive_enrollment_server_identifier(&key).unwrap();
+        assert_eq!(id.len(), 16);
+        assert_ne!(id, derive_enrollment_server_identifier(&[8u8; 32]).unwrap());
+    }
+
+    #[tokio::test]
+    async fn enrollment_active_lifecycle() {
+        let key = [3u8; 32];
+        let cr = [1u8; 32];
+        let sr = [2u8; 32];
+        assert!(!enrollment_verify(&key, &cr, &sr));
+        let guard = enrollment_add(&key, &cr, &sr).unwrap();
+        assert!(enrollment_verify(&key, &cr, &sr));
+        // Duplicate registration is a replay error (enrollment.go:225).
+        assert!(enrollment_add(&key, &cr, &sr).is_err());
+        // A different key has its own table.
+        assert!(!enrollment_verify(&[4u8; 32], &cr, &sr));
+        drop(guard);
+        assert!(!enrollment_verify(&key, &cr, &sr), "guard removal");
+    }
+
+    #[test]
+    fn hpack_status_decoding() {
+        // Indexed static :status 200 → 0x88 (RFC 7541 App. A).
+        assert_eq!(hpack_decode_status(&[0x88]).unwrap(), 200);
+        assert_eq!(hpack_decode_status(&[0x8c]).unwrap(), 400);
+        assert_eq!(hpack_decode_status(&[0x8e]).unwrap(), 500);
+        // Literal :status (no huffman).
+        let mut block = vec![0x00, 0x07];
+        block.extend_from_slice(b":status");
+        block.extend_from_slice(&[0x03]);
+        block.extend_from_slice(b"404");
+        assert_eq!(hpack_decode_status(&block).unwrap(), 404);
+        // A dynamic-table size update then an indexed status.
+        assert_eq!(hpack_decode_status(&[0x20, 0x88]).unwrap(), 200);
+        // Huffman-coded literals are refused.
+        let mut huff = vec![0x00, 0x87];
+        huff.extend_from_slice(b":status");
+        huff.push(0x83);
+        huff.extend_from_slice(&[0x1f, 0x9e, 0x9d]);
+        assert!(hpack_decode_status(&huff).is_err());
+        // Missing :status.
+        assert!(hpack_decode_status(&[0x61, 0x02, b'a', b'b', 0x03, b'x', b'y', b'z']).is_err());
+    }
+
+    #[tokio::test]
+    async fn h2c_enrollment_confirmation_roundtrip() {
+        // The control server over one duplex against the h2c client.
+        let key = [5u8; 32];
+        let key_b64 = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(key)
+        };
+        let cr = [1u8; 32];
+        let sr = [2u8; 32];
+        let host = server_identifier_host(&key_b64).unwrap();
+        let req = marshal_enrollment_req(&EnrollmentConfirmationReq {
+            server_identifier: derive_enrollment_server_identifier(&key).unwrap().to_vec(),
+            client_random: cr.to_vec(),
+            server_random: sr.to_vec(),
+            ..EnrollmentConfirmationReq::default()
+        });
+
+        // Unregistered: enrolled=false (empty response body).
+        {
+            let (client, server) = tokio::io::duplex(16 * 1024);
+            let key_b64 = key_b64.clone();
+            let server_task = tokio::spawn(async move {
+                serve_enrollment_control_connection(Box::new(server), &key_b64).await
+            });
+            let (status, body) = h2c_post(Box::new(client), &host, &req).await.unwrap();
+            assert_eq!(status, 200);
+            assert!(!unmarshal_enrollment_resp(&body).unwrap());
+            server_task.await.unwrap().unwrap();
+        }
+        // Registered: enrolled=true.
+        {
+            let _guard = enrollment_add(&key, &cr, &sr).unwrap();
+            let (client, server) = tokio::io::duplex(16 * 1024);
+            let key_b64 = key_b64.clone();
+            let server_task = tokio::spawn(async move {
+                serve_enrollment_control_connection(Box::new(server), &key_b64).await
+            });
+            let (status, body) = h2c_post(Box::new(client), &host, &req).await.unwrap();
+            assert_eq!(status, 200);
+            assert!(unmarshal_enrollment_resp(&body).unwrap());
+            server_task.await.unwrap().unwrap();
+        }
+        // Not an h2c preface: refused precisely.
+        {
+            let (mut client, server) = tokio::io::duplex(16 * 1024);
+            // 28 junk bytes (>= the 24-byte preface) from the client end.
+            client
+                .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+                .await
+                .unwrap();
+            let err = serve_enrollment_control_connection(Box::new(server), &key_b64)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("not an h2c preface"), "{err}");
+        }
+    }
+
+    // ------------------------------------------------ the server half
+
+    fn server_cfg_from(out: &TlsMirrorOut) -> TlsMirrorServerConfig {
+        TlsMirrorServerConfig {
+            primary_key: out.primary_key.clone(),
+            explicit_nonce_cipher_suites: out.explicit_nonce_cipher_suites.clone(),
+            defer_instance_derived_write: out.defer_instance_derived_write,
+            transport_layer_padding: out.transport_layer_padding,
+            connection_enrolment: out.connection_enrolment.clone(),
+            sequence_watermarking_enabled: out.sequence_watermarking_enabled,
+        }
+    }
+
+    /// The engine client ↔ `serve_conn_ready` ↔ a real TLS dest. The
+    /// hidden stream echoes inside the server task.
+    async fn run_ready_client(
+        cfg: &TlsMirrorOut,
+        server_cfg: TlsMirrorServerConfig,
+    ) -> Result<BoxProxyStream> {
+        let (client_duplex, server_duplex) = tokio::io::duplex(256 * 1024);
+        let forward = spawn_forward_server(false, Arc::new(StdMutex::new(Vec::new())));
+        tokio::spawn(async move {
+            if let Ok(mut hidden) =
+                serve_conn_ready(Box::new(server_duplex), forward, &server_cfg).await
+            {
+                // The relay stand-in: echo the hidden plaintext.
+                let mut buf = vec![0u8; 16 * 1024];
+                loop {
+                    match hidden.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if hidden.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        connect(cfg, Box::new(client_duplex)).await
+    }
+
+    #[tokio::test]
+    async fn serve_conn_ready_hidden_echo() {
+        let cfg = base_cfg();
+        let mut stream = run_ready_client(&cfg, server_cfg_from(&cfg)).await.unwrap();
+        echo_roundtrip(&mut stream, b"ready-mirror").await;
+        let payload: Vec<u8> = (0..60_000u32).map(|i| (i % 251) as u8).collect();
+        echo_roundtrip(&mut stream, &payload).await;
+    }
+
+    #[tokio::test]
+    async fn serve_conn_ready_padding_and_watermarking() {
+        let mut cfg = base_cfg();
+        cfg.transport_layer_padding = true;
+        cfg.sequence_watermarking_enabled = true;
+        let mut stream = run_ready_client(&cfg, server_cfg_from(&cfg)).await.unwrap();
+        echo_roundtrip(&mut stream, b"padded-watermarked").await;
+    }
+
+    #[tokio::test]
+    async fn serve_conn_ready_never_activates_on_wrong_key() {
+        let real = base_cfg();
+        let mut bad = real.clone();
+        bad.primary_key = generate_primary_key();
+        // The client connects against a server configured with another
+        // key: its inserts are carrier junk; serve_conn_ready must not
+        // return a hidden stream (the camouflage carrier TLS eventually
+        // dies because the dest server cannot parse the junk records).
+        let mut stream = match tokio::time::timeout(
+            Duration::from_secs(15),
+            run_ready_client(&bad, server_cfg_from(&real)),
+        )
+        .await
+        {
+            // connect() itself can succeed (the carrier handshake is
+            // legitimate TLS); the hidden channel must stay dead.
+            Ok(Ok(stream)) => stream,
+            Ok(Err(_)) => return,
+            Err(_) => panic!("connect timed out"),
+        };
+        stream.write_all(b"secret").await.unwrap();
+        let mut buf = [0u8; 6];
+        match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf)).await {
+            Err(_) => {}
+            Ok(Err(_)) => {}
+            Ok(Ok(n)) => panic!("a wrong primary key must never echo hidden data ({n} bytes)"),
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_conn_ready_registers_enrolment() {
+        // Client WITHOUT enrolment config against a server WITH it: the
+        // mirror registers the randoms; an in-test control server (fed
+        // by the client-side verify over its own dialer) confirms.
+        let cfg = base_cfg();
+        let mut server_cfg = server_cfg_from(&cfg);
+        server_cfg.connection_enrolment = Some(("ingress".to_string(), "egress".to_string()));
+
+        // The control-connection endpoint: the dialer creates a duplex,
+        // serves the control protocol on one end, hands over the other.
+        let key_b64 = cfg.primary_key.clone();
+        let dialer: EnrollmentDialer = Arc::new(move |_target| {
+            let key_b64 = key_b64.clone();
+            Box::pin(async move {
+                let (client, server) = tokio::io::duplex(16 * 1024);
+                tokio::spawn(async move {
+                    let _ = serve_enrollment_control_connection(Box::new(server), &key_b64).await;
+                });
+                Ok(Box::new(client) as BoxProxyStream)
+            })
+        });
+
+        let (client_duplex, server_duplex) = tokio::io::duplex(256 * 1024);
+        let forward = spawn_forward_server(false, Arc::new(StdMutex::new(Vec::new())));
+        let server_cfg2 = server_cfg.clone();
+        tokio::spawn(async move {
+            if let Ok(mut hidden) =
+                serve_conn_ready(Box::new(server_duplex), forward, &server_cfg2).await
+            {
+                let mut buf = vec![0u8; 16 * 1024];
+                loop {
+                    match hidden.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if hidden.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut client_cfg = cfg.clone();
+        client_cfg.connection_enrolment = Some(("ingress".to_string(), "egress".to_string()));
+        let mut stream =
+            connect_with(&client_cfg, Box::new(client_duplex), Some(dialer)).await
+                .expect("enrolled connect");
+        echo_roundtrip(&mut stream, b"enrol-echo").await;
+    }
+
+    #[tokio::test]
+    async fn enrolment_without_dialer_is_precisely_rejected() {
+        let mut cfg = base_cfg();
+        cfg.connection_enrolment = Some(("a".into(), "b".into()));
+        let err = connect(&cfg, Box::new(tokio::io::duplex(16).0))
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("enrollment dialer"), "{err}");
+        assert!(err.contains("connect_with"), "{err}");
+        assert!(err.contains("enrollment.go"), "{err}");
+    }
+
 }

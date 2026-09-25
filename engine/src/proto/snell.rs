@@ -38,11 +38,17 @@
 //!   zero-chunks, `CommandConnectV2` and idle pooling are the outbound
 //!   layer's job; this module always sends `CommandConnect` (mihomo's
 //!   default without `reuse: true`).
-//! * **UDP relay glue**: [`snell_udp_frame`] /
-//!   [`parse_snell_udp_response`] implement the packet codecs (snell.go
-//!   `writePacket` / `ReadPacket`); muxing datagrams over one session is
-//!   the integrator's UDP path (`handshake(_, _, _, true)` opens the UDP
-//!   session).
+//! * **UDP relay**: one TCP transport carries every datagram
+//!   (adapter/outbound/snell.go `ListenPacketContext` →
+//!   `snell.PacketConn(c)`). The session opens with
+//!   `handshake(_, _, _, true)` (v4 additionally awaits the tunnel reply
+//!   there, adapter/outbound/snell.go:88-95); each datagram then rides its
+//!   own AEAD frame — [`SnellStream::read_packet`] returns exactly one
+//!   decrypted frame per call (snell.go `ReadPacket` does one `Read`, and
+//!   one `Read` = one frame), and v4 writes each datagram as a single
+//!   frame via the `WritePacketFrame` path (v4.go:81-96) instead of the
+//!   stream chunk ramp. [`udp_session`] / [`SnellUdp`] wrap that into a
+//!   `send_to`/`recv_from` channel shaped like `anytls::AnyTlsUdp`.
 //! * **obfs plugins** (`obfs-opts`: http/tls/shadow-tls/restls/jls):
 //!   `handshake` takes the post-dial stream, so the integrator wraps
 //!   before calling, exactly like mihomo's `streamConnContext`.
@@ -1226,6 +1232,91 @@ impl SnellStream {
             }
         }
     }
+
+    /// Frame one datagram as exactly one AEAD frame (the UDP write path,
+    /// snell.go `writePacket` → `WritePacketFrame`, v4.go:81-96): v4 seals
+    /// the whole packet with `nextFramePaddingLength` and skips the stream
+    /// chunk ramp; v3 uses the plain stream write (its payload is already
+    /// capped at one chunk by [`snell_udp_frame`]).
+    fn frame_packet(&mut self, packet: &[u8]) -> Result<()> {
+        match &mut self.conn {
+            Conn::V3(c) => c.frame(packet, &mut self.wbuf),
+            Conn::V4(c) => {
+                let padding = c.next_frame_padding_length(packet.len());
+                c.write_frame(packet, padding, &mut self.wbuf)
+            }
+        }
+    }
+
+    /// Write one whole datagram frame and flush it to the transport.
+    async fn write_packet(&mut self, packet: &[u8]) -> Result<()> {
+        if self.failed {
+            return Err(Error::network("snell: stream failed"));
+        }
+        if !self.wbuf.is_empty() {
+            return Err(Error::protocol(
+                "snell: previous packet still in flight during UDP write",
+            ));
+        }
+        self.frame_packet(packet)?;
+        AsyncWriteExt::flush(self).await.map_err(Error::from)?;
+        Ok(())
+    }
+
+    /// Read exactly one decrypted AEAD frame payload — the packet view of
+    /// the session (snell.go `ReadPacket` performs a single `Read`, and
+    /// one `Read` on the snell conn yields exactly one frame's payload;
+    /// v4Reader.Read keeps its own leftover, v3 chunks one `Write` per
+    /// frame). This is what preserves datagram edges: consecutive frames
+    /// are never merged. The server reply is consumed here if it has not
+    /// been yet (v3 UDP; `packetConn.ReadFrom` → `Snell.Read` →
+    /// `ReadReply`).
+    pub async fn read_packet(&mut self) -> Result<Vec<u8>> {
+        let packet = std::future::poll_fn(|cx| {
+            loop {
+                if self.failed {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "snell: stream failed",
+                    )));
+                }
+                if let Err(e) = self.conn.feed_reply(&mut self.reply) {
+                    self.failed = true;
+                    return Poll::Ready(Err(io_invalid(e)));
+                }
+                if self.reply.resolved() {
+                    let out = match &mut self.conn {
+                        Conn::V3(c) => &mut c.out,
+                        Conn::V4(c) => &mut c.out,
+                    };
+                    if !out.is_empty() {
+                        // Bytes left after the reply are the first packet.
+                        let packet = out.to_vec();
+                        out.clear();
+                        return Poll::Ready(Ok(packet));
+                    }
+                }
+                match self.conn.poll_fill(cx) {
+                    Poll::Ready(Ok(true)) => continue, // a chunk landed; loop
+                    Poll::Ready(Ok(false)) => {
+                        self.failed = true;
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "snell: session closed before a packet arrived",
+                        )));
+                    }
+                    Poll::Ready(Err(e)) => {
+                        self.failed = true;
+                        return Poll::Ready(Err(e));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        })
+        .await
+        .map_err(Error::from)?;
+        Ok(packet)
+    }
 }
 
 impl AsyncWrite for SnellStream {
@@ -1371,6 +1462,81 @@ pub async fn handshake(
     }
     debug!(target: "engine", "snell: request sent");
     Ok(Box::new(snell))
+}
+
+// ---------------------------------------------------------------------------
+// UDP session (adapter/outbound/snell.go:132-153 `ListenPacketContext`
+// → snell.PacketConn(c), snell.go:411-443)
+// ---------------------------------------------------------------------------
+
+/// A snell UDP session: datagrams muxed over one framed TCP transport,
+/// shaped like `anytls::AnyTlsUdp` for the integrator's UDP channel.
+///
+/// * [`SnellUdp::send_to`] frames each datagram with its target address
+///   (snell.go `WritePacket`, 189-244) and seals it as exactly one AEAD
+///   frame — v4 through the `WritePacketFrame` path (v4.go:81-96), v3 as
+///   a single chunk.
+/// * [`SnellUdp::recv_from`] reads one AEAD frame per call (snell.go
+///   `ReadPacket`, 356-409: `0x04/0x06 || ip || port || payload`), so
+///   packet edges survive the TCP transport.
+pub struct SnellUdp {
+    stream: SnellStream,
+}
+
+impl SnellUdp {
+    /// Send one datagram toward `target` through the snell session.
+    pub async fn send_to(&mut self, target: &NetAddr, payload: &[u8]) -> Result<()> {
+        let frame = snell_udp_frame(target, payload)?;
+        self.stream.write_packet(&frame).await
+    }
+
+    /// Receive one datagram; returns its origin address and the length
+    /// written to `buf`. A buffer shorter than the datagram is an error
+    /// (upstream `ReadPacket` would silently truncate; refusing is safer
+    /// and matches `anytls::AnyTlsUdp`).
+    pub async fn recv_from(&mut self, buf: &mut [u8]) -> Result<(NetAddr, usize)> {
+        let frame = self.stream.read_packet().await?;
+        let (addr, payload) = parse_snell_udp_response(&frame)?;
+        if buf.len() < payload.len() {
+            return Err(Error::protocol(format!(
+                "snell: udp read: {} byte datagram exceeds the {} byte buffer",
+                payload.len(),
+                buf.len()
+            )));
+        }
+        buf[..payload.len()].copy_from_slice(&payload);
+        Ok((addr, payload.len()))
+    }
+}
+
+/// Open a snell UDP session over an established (optionally obfs-wrapped)
+/// transport: writes the UDP command header (`0x01 0x06 0x00`,
+/// snell.go:128-136) and, for v4, awaits the server's tunnel reply
+/// eagerly (adapter/outbound/snell.go:88-95 — v3 keeps the lazy
+/// first-read consumption of [`SnellStream::read_packet`]).
+pub async fn udp_session(cfg: &SnellOut, transport: BoxProxyStream) -> Result<SnellUdp> {
+    if cfg.psk.is_empty() {
+        return Err(Error::config("snell: psk is required"));
+    }
+    if !matches!(cfg.version, 3 | 4) {
+        return Err(Error::config(format!(
+            "snell: UDP requires version 3 or 4, got {} (WriteUDPHeader refuses < v3)",
+            cfg.version
+        )));
+    }
+    debug!(
+        target: "engine",
+        server = %cfg.server, port = cfg.port, version = cfg.version,
+        "snell: starting UDP session"
+    );
+    let mut snell = SnellStream::new(transport, cfg)?;
+    snell.write_all(&udp_header()).await?;
+    snell.flush().await?;
+    if cfg.version >= 4 {
+        snell.wait_reply().await?;
+    }
+    debug!(target: "engine", "snell: UDP session open");
+    Ok(SnellUdp { stream: snell })
 }
 
 // ---------------------------------------------------------------------------
@@ -2070,6 +2236,214 @@ mod tests {
             }
             assert!(raw.len() < 64, "no response packet within 64 bytes");
         }
+    }
+
+    /// UDP echo mimic shared by v3/v4: verifies the UDP command header,
+    /// replies tunnel, then echoes every request packet back as a
+    /// response frame (server-side `WritePacketResponse` layout).
+    async fn udp_echo_mimic(
+        io: DuplexStream,
+        psk: Vec<u8>,
+        version: u8,
+        packets_per_request: usize,
+    ) -> Result<()> {
+        let (mut rd, mut wr) = tokio::io::split(io);
+        match version {
+            3 => {
+                let salt = read_n(&mut rd, 16).await.map_err(Error::from)?;
+                let mut dec = V3Mimic::new(&psk, &salt);
+                let header = dec.read_chunk(&mut rd).await.map_err(Error::from)?;
+                assert_eq!(header, vec![PROTOCOL_VERSION, CMD_UDP, 0x00]);
+                let mut out_salt = [0u8; 16];
+                rand::rngs::OsRng.fill_bytes(&mut out_salt);
+                let mut enc = V3Mimic::new(&psk, &out_salt);
+                let mut wire = out_salt.to_vec();
+                enc.frame_chunk(&[CMD_TUNNEL], &mut wire);
+                wr.write_all(&wire).await.map_err(Error::from)?;
+                loop {
+                    let packet = match dec.read_chunk(&mut rd).await {
+                        Ok(p) => p,
+                        Err(_) => return Ok(()),
+                    };
+                    let (_, payload) = parse_snell_udp_request(&packet)?;
+                    for _ in 0..packets_per_request {
+                        let resp = udp_response_frame(&payload);
+                        let mut wire = Vec::new();
+                        enc.frame_chunk(&resp, &mut wire);
+                        wr.write_all(&wire).await.map_err(Error::from)?;
+                    }
+                    wr.flush().await.map_err(Error::from)?;
+                }
+            }
+            4 => {
+                let salt = read_n(&mut rd, V4_SALT_SIZE).await.map_err(Error::from)?;
+                let mut dec = V4Mimic::new(&psk, &salt);
+                let header = dec.read_frame(&mut rd).await.map_err(Error::from)?;
+                assert_eq!(header, vec![PROTOCOL_VERSION, CMD_UDP, 0x00]);
+                let mut out_salt = [0u8; V4_SALT_SIZE];
+                rand::rngs::OsRng.fill_bytes(&mut out_salt);
+                let mut enc = V4Mimic::new(&psk, &out_salt);
+                let mut wire = out_salt.to_vec();
+                enc.frame(&[CMD_TUNNEL], &mut wire);
+                wr.write_all(&wire).await.map_err(Error::from)?;
+                loop {
+                    let packet = match dec.read_frame(&mut rd).await {
+                        Ok(p) => p,
+                        Err(_) => return Ok(()),
+                    };
+                    let (target, payload) = parse_snell_udp_request(&packet)?;
+                    assert_eq!(target.host, Host::Domain("dns.example".into()));
+                    assert_eq!(target.port, 53);
+                    for i in 0..packets_per_request {
+                        let mut resp = udp_response_frame(&payload);
+                        // Distinguish the copies in the edge test.
+                        if packets_per_request > 1 {
+                            let last = resp.len() - 1;
+                            resp[last] = i as u8;
+                        }
+                        let mut wire = Vec::new();
+                        enc.frame(&resp, &mut wire);
+                        wr.write_all(&wire).await.map_err(Error::from)?;
+                    }
+                    wr.flush().await.map_err(Error::from)?;
+                }
+            }
+            other => panic!("unsupported mimic version {other}"),
+        }
+    }
+
+    /// Server-side `WritePacketResponse` (snell.go:246-282):
+    /// `0x04 || ipv4 || port || payload`.
+    fn udp_response_frame(payload: &[u8]) -> Vec<u8> {
+        let mut resp = vec![0x04u8, 8, 8, 4, 4];
+        resp.extend_from_slice(&53u16.to_be_bytes());
+        resp.extend_from_slice(payload);
+        resp
+    }
+
+    async fn connect_udp_mimic(
+        cfg: &SnellOut,
+        psk: &str,
+        packets_per_request: usize,
+    ) -> Result<SnellUdp> {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let psk = psk.to_string();
+        let version = cfg.version;
+        tokio::spawn(async move {
+            if let Err(e) =
+                udp_echo_mimic(server, psk.as_bytes().to_vec(), version, packets_per_request).await
+            {
+                panic!("udp mimic failed: {e}");
+            }
+        });
+        udp_session(cfg, Box::new(client)).await
+    }
+
+    #[tokio::test]
+    async fn v4_udp_session_roundtrip_and_edges() {
+        let psk = test_psk();
+        let cfg = SnellOut {
+            server: "127.0.0.1".into(),
+            port: 0,
+            psk: psk.clone(),
+            version: 4,
+            udp: true,
+        };
+        // Three response frames ride back-to-back on one transport; each
+        // recv_from must return exactly one frame's payload — the frame
+        // edges survive because read_packet never merges chunks.
+        let mut udp = connect_udp_mimic(&cfg, &psk, 3).await.unwrap();
+        let target = NetAddr::domain("dns.example", 53).unwrap();
+        udp.send_to(&target, b"q1").await.unwrap();
+        let mut buf = [0u8; 1500];
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            let (addr, n) = tokio::time::timeout(Duration::from_secs(10), udp.recv_from(&mut buf))
+                .await
+                .expect("recv timed out")
+                .unwrap();
+            assert_eq!(addr.host, Host::Ip("8.8.4.4".parse().unwrap()));
+            assert_eq!(addr.port, 53);
+            assert_eq!(n, 2, "one snell frame per datagram");
+            got.push(buf[..n].to_vec());
+        }
+        assert_eq!(
+            got,
+            vec![b"q\x00".to_vec(), b"q\x01".to_vec(), b"q\x02".to_vec()]
+        );
+
+        // Multiple client datagrams in flight keep their edges too: the
+        // mimic stamps the copy index into the last byte, so the six
+        // responses must arrive as first0..first2 then secon0..secon2 —
+        // any frame merging would corrupt or glue them.
+        udp.send_to(&target, b"first!").await.unwrap();
+        udp.send_to(&target, b"second").await.unwrap();
+        let mut frames = Vec::new();
+        for _ in 0..6 {
+            let (_, n) = tokio::time::timeout(Duration::from_secs(10), udp.recv_from(&mut buf))
+                .await
+                .expect("recv timed out")
+                .unwrap();
+            assert_eq!(n, 6, "each datagram keeps its own frame");
+            frames.push(buf[..n].to_vec());
+        }
+        for (i, frame) in frames.iter().take(3).enumerate() {
+            assert_eq!(&frame[..5], b"first");
+            assert_eq!(frame[5], i as u8);
+        }
+        for (i, frame) in frames.iter().skip(3).enumerate() {
+            assert_eq!(&frame[..5], b"secon");
+            assert_eq!(frame[5], i as u8);
+        }
+    }
+
+    #[tokio::test]
+    async fn v3_udp_session_lazy_reply_roundtrip() {
+        let psk = test_psk();
+        let cfg = SnellOut {
+            server: "127.0.0.1".into(),
+            port: 0,
+            psk: psk.clone(),
+            version: 3,
+            udp: true,
+        };
+        // v3 does not await the reply in udp_session; the tunnel byte is
+        // consumed lazily by the first recv_from, like packetConn.ReadFrom
+        // → Snell.Read → ReadReply (adapter/outbound/snell.go:88-95).
+        let mut udp = connect_udp_mimic(&cfg, &psk, 1).await.unwrap();
+        let target = NetAddr::domain("dns.example", 53).unwrap();
+        udp.send_to(&target, b"v3-query").await.unwrap();
+        let mut buf = [0u8; 1500];
+        let (addr, n) = tokio::time::timeout(Duration::from_secs(10), udp.recv_from(&mut buf))
+            .await
+            .expect("recv timed out")
+            .unwrap();
+        assert_eq!(addr.host, Host::Ip("8.8.4.4".parse().unwrap()));
+        assert_eq!(addr.port, 53);
+        assert_eq!(&buf[..n], b"v3-query");
+    }
+
+    #[tokio::test]
+    async fn udp_session_rejects_bad_version_and_empty_psk() {
+        let mut cfg = SnellOut {
+            server: "127.0.0.1".into(),
+            port: 0,
+            psk: String::new(),
+            version: 3,
+            udp: true,
+        };
+        let err = match udp_session(&cfg, Box::new(tokio::io::duplex(16).0)).await {
+            Ok(_) => panic!("empty psk must be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("psk"), "{err}");
+        cfg.psk = "p".into();
+        cfg.version = 2;
+        let err = match udp_session(&cfg, Box::new(tokio::io::duplex(16).0)).await {
+            Ok(_) => panic!("version 2 must be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("version"), "{err}");
     }
 
     #[tokio::test]

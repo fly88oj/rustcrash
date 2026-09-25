@@ -43,7 +43,10 @@ impl UtlsCfg {
 /// the bundled webpki roots for containers without one. (Same policy as
 /// `crate::transport::tls_client_config`; kept local because this module is
 /// the only place that needs the store itself rather than a rustls config.)
-fn root_store() -> Result<RootCertStore> {
+/// The trust anchors for WebPki verification of our own TLS 1.3 stack:
+/// the system store when present, plus the webpki-roots bundle. Shared
+/// with the ECH dial path (outbound wiring).
+pub fn root_store() -> Result<RootCertStore> {
     let mut roots = RootCertStore::empty();
     let mut loaded = 0usize;
     for cert in rustls_native_certs::load_native_certs()

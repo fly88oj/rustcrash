@@ -38,6 +38,19 @@
 //!   `addrLen be16 || payloadLen be16 || addr || payload`.
 //! * `transport/sudoku/obfs/httpmask/masker.go` — the legacy HTTP
 //!   camouflage request header written before the obfuscated stream.
+//! * `transport/sudoku/obfs/httpmask/{tunnel_dial,tunnel_api,
+//!   tunnel_conn_stream,tunnel_conn_poll,tunnel_ws,ws_stream_conn,
+//!   tunnel_conn_queue,tunnel_ready,tunnel_retry,ws_auth}.go` + the
+//!   client half of `transport/sudoku/early_handshake.go` — the
+//!   HTTP-camouflage tunnels that carry the KIP session: `stream`
+//!   (split long-pull + sequenced POST uploads), `poll` (base64-line
+//!   pulls/pushes), `auto` (stream probe with poll fallback) and `ws`
+//!   (WebSocket upgrade with HMAC anti-probe auth), all with the
+//!   optional `http-mask-tls` layer, Host/SNI override and path-root
+//!   namespacing. The KIP exchange rides the tunnels as the *early
+//!   handshake*: the obfuscated client hello in the `ed` query param,
+//!   the obfuscated server hello in the authorize `ed=` field (ws: the
+//!   `X-Sudoku-Early` response header).
 //! * `transport/sudoku/multiplex{.go,/session.go}` + `multiplex_dialer.go`
 //!   — `multiplex: on`: `KIPTypeStartMux` then a self-contained
 //!   session mux (`open/data/close/reset` frames, 128 KiB data chunks,
@@ -53,17 +66,25 @@
 //!
 //! ## Scope / deviations
 //!
-//! * **httpmask modes `stream`, `poll`, `auto`, `ws`** (`tunnel_conn_*
-//!   .go`, ~3500 lines of HTTP/1.1+2/WebSocket tunnel machinery with
-//!   preconnect pools) are config-rejected with a precise reason;
-//!   `legacy` (the default) is implemented.
+//! * All httpmask modes are implemented: `legacy` (the default: one
+//!   header before the raw stream) and the HTTP tunnels `stream`,
+//!   `poll`, `auto`, `ws` (see `connect_tunnel*`).
+//! * The tunnel HTTP client is hand-rolled HTTP/1.1 over one fresh
+//!   connection per request: upstream pools keep-alive connections and
+//!   preconnects three sockets per session (`tunnel_preconnect.go`,
+//!   `http.Transport`); the per-request wire form is identical, the
+//!   port just opens more TCP connections. Likewise upstream's https
+//!   arm negotiates h2 (`ForceAttemptHTTP2`); this port offers ALPN
+//!   `http/1.1` only.
+//! * `multiplex: on` is implemented (the session mux is
+//!   self-contained); `connect_tunnel_mux` awaits the tunnel readiness
+//!   (`WaitTunnelReady`). The persistent `MultiplexDialer` warm-keeping
+//!   loop is the integrator's job — `connect_tunnel_mux` returns the
+//!   live session.
 //! * **`multiplex: auto`** only enables HTTPMask transport reuse
-//!   upstream, which without the tunnel modes is inert; it is accepted
-//!   and treated as `off` (documented, no wire difference over raw TCP).
-//! * **`multiplex: on`** is implemented (the session mux is
-//!   self-contained); the persistent `MultiplexDialer` warm-keeping
-//!   loop is the integrator's job — `connect_mux` returns the live
-//!   session.
+//!   upstream (config.go:67); this port has no shared transport, so
+//!   `auto` is accepted and treated as `off` (documented; no wire
+//!   difference per request).
 //! * `handshake-timeout` (server-side) and the server's replay filter
 //!   are server concerns; the client never sends them.
 //! * `ClientAEADSeed` uses curve25519-dalek's edwards25519 point
@@ -2441,11 +2462,16 @@ pub struct SudokuOut {
     pub enable_pure_downlink: Option<bool>,
     /// `http-mask` (default enabled).
     pub http_mask: Option<bool>,
-    /// `http-mask-mode`: legacy (implemented) | stream/poll/auto/ws
-    /// (rejected with a precise error).
+    /// `http-mask-mode`: legacy (default) | stream | poll | auto | ws.
     pub http_mask_mode: String,
-    /// `http-mask-tls` — only meaningful for the tunnel modes.
+    /// `http-mask-tls` — TLS carrier for the stream/poll/auto modes
+    /// (and `wss` for `ws`).
     pub http_mask_tls: bool,
+    /// Engine-local knob (no mihomo field): accept any certificate on
+    /// the `http-mask-tls` carrier. Upstream always verifies against
+    /// the system store (tunnel_dial.go `ca.GetTLSConfig`); hermetic
+    /// tests and private-CA deployments need this.
+    pub http_mask_tls_insecure: bool,
     /// `http-mask-host` — Host/SNI override.
     pub http_mask_host: String,
     /// `path-root` — single-segment path prefix.
@@ -2473,6 +2499,7 @@ impl SudokuOut {
             http_mask: None,
             http_mask_mode: String::new(),
             http_mask_tls: false,
+            http_mask_tls_insecure: false,
             http_mask_host: String::new(),
             path_root: String::new(),
             multiplex: String::new(),
@@ -2492,10 +2519,24 @@ struct ResolvedConfig {
     padding_max: i64,
     enable_pure_downlink: bool,
     disable_http_mask: bool,
+    http_mask_mode: String,
+    http_mask_tls: bool,
+    http_mask_tls_insecure: bool,
     http_mask_host: String,
     path_root: String,
     multiplex: String,
     tables: Vec<Arc<Table>>,
+}
+
+impl ResolvedConfig {
+    /// `httpTunnelModeEnabled` (mihomo_sudoku.go): the HTTP tunnel
+    /// modes (everything but the legacy mask).
+    fn tunnel_mode(&self) -> bool {
+        matches!(
+            self.http_mask_mode.as_str(),
+            "stream" | "poll" | "auto" | "ws"
+        ) && !self.disable_http_mask
+    }
 }
 
 /// `ResolvePadding` (config.go:220).
@@ -2583,38 +2624,7 @@ fn resolve_config(cfg: &SudokuOut) -> Result<ResolvedConfig> {
         cfg.http_mask_mode.trim().to_ascii_lowercase()
     };
     match http_mask_mode.as_str() {
-        "" | "legacy" => {}
-        "stream" => {
-            return Err(Error::config(
-                "sudoku: http-mask-mode \"stream\" is not implemented: the CDN split-stream \
-                 HTTP tunnel (transport/sudoku/obfs/httpmask/tunnel_conn_stream.go, with \
-                 request/response queueing and preconnect warming) is out of scope for this \
-                 port; use the default \"legacy\" mode",
-            ))
-        }
-        "poll" => {
-            return Err(Error::config(
-                "sudoku: http-mask-mode \"poll\" is not implemented: the authorize/push/pull \
-                 HTTP polling tunnel (transport/sudoku/obfs/httpmask/tunnel_conn_poll.go) is \
-                 out of scope for this port; use the default \"legacy\" mode",
-            ))
-        }
-        "auto" => {
-            return Err(Error::config(
-                "sudoku: http-mask-mode \"auto\" is not implemented: it requires the stream \
-                 and poll tunnel modes with fallback probing \
-                 (transport/sudoku/obfs/httpmask/tunnel_dial.go); use the default \"legacy\" \
-                 mode",
-            ))
-        }
-        "ws" => {
-            return Err(Error::config(
-                "sudoku: http-mask-mode \"ws\" is not implemented: the WebSocket upgrade \
-                 tunnel with masked-frame streaming \
-                 (transport/sudoku/obfs/httpmask/tunnel_ws.go + ws_stream_conn.go) is out of \
-                 scope for this port; use the default \"legacy\" mode",
-            ))
-        }
+        "" | "legacy" | "stream" | "poll" | "auto" | "ws" => {}
         other => {
             return Err(Error::config(format!(
                 "sudoku: invalid http-mask-mode {other:?}, must be one of: legacy, stream, \
@@ -2622,9 +2632,11 @@ fn resolve_config(cfg: &SudokuOut) -> Result<ResolvedConfig> {
             )))
         }
     }
-    if cfg.http_mask_tls {
+    if cfg.http_mask_tls && matches!(http_mask_mode.as_str(), "legacy" | "") {
         // `http-mask-tls` only applies to the stream/poll/auto tunnel
-        // modes (adapter/outbound/sudoku.go:42); carried, inert here.
+        // modes (adapter/outbound/sudoku.go:42); upstream rejects it
+        // for ws in `normalizeWSSchemeFromAddress` terms — carried,
+        // inert for legacy.
         debug!(target: "engine", "sudoku: http-mask-tls only applies to the stream/poll/auto tunnel modes");
     }
     validate_path_root(&cfg.path_root)?;
@@ -2652,6 +2664,9 @@ fn resolve_config(cfg: &SudokuOut) -> Result<ResolvedConfig> {
         padding_max,
         enable_pure_downlink: cfg.enable_pure_downlink.unwrap_or(true),
         disable_http_mask,
+        http_mask_mode,
+        http_mask_tls: cfg.http_mask_tls,
+        http_mask_tls_insecure: cfg.http_mask_tls_insecure,
         http_mask_host: cfg.http_mask_host.clone(),
         path_root: cfg.path_root.clone(),
         multiplex,
@@ -2679,8 +2694,10 @@ async fn client_handshake(transport: BoxProxyStream, rc: &ResolvedConfig) -> Res
     let (choice, hint) = pick_client_table(&rc.tables)?;
     let mut transport = transport;
     if !rc.disable_http_mask {
-        // resolve_config only admits the legacy mode (the default), so
-        // an enabled mask always writes the legacy header.
+        // Only reachable for the legacy mode: the tunnel modes route
+        // through `dial_http_mask_tunnel` (which runs the KIP exchange
+        // as the early handshake) instead of this raw path.
+        debug_assert!(matches!(rc.http_mask_mode.as_str(), "" | "legacy"));
         let host = if rc.http_mask_host.is_empty() {
             rc.server_address.clone()
         } else {
@@ -2758,6 +2775,13 @@ pub async fn connect(
             "sudoku: multiplex \"on\" requires the session dialer — use connect_mux",
         ));
     }
+    if rc.tunnel_mode() {
+        return Err(Error::config(format!(
+            "sudoku: http-mask-mode {:?} dials its own HTTP connections (authorize, pull, \
+             push) — pass a dialer to connect_tunnel instead of one transport",
+            rc.http_mask_mode
+        )));
+    }
     let mut conn = client_handshake(transport, &rc).await?;
     let addr_buf = encode_address(target);
     write_kip_message(&mut conn, KIP_TYPE_OPEN_TCP, &addr_buf).await?;
@@ -2770,6 +2794,12 @@ pub async fn connect(
 /// [`read_uot_datagram`] (`NewUoTPacketConn` semantics).
 pub async fn connect_udp(cfg: &SudokuOut, transport: BoxProxyStream) -> Result<BoxProxyStream> {
     let rc = resolve_config(cfg)?;
+    if rc.tunnel_mode() {
+        return Err(Error::config(format!(
+            "sudoku: http-mask-mode {:?} dials its own HTTP connections — use connect_tunnel_udp",
+            rc.http_mask_mode
+        )));
+    }
     let mut conn = client_handshake(transport, &rc).await?;
     write_kip_message(&mut conn, KIP_TYPE_START_UOT, &[]).await?;
     debug!(target: "engine", "sudoku: UoT session started");
@@ -3214,8 +3244,2568 @@ impl AsyncWrite for MuxStream {
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// HTTPMask tunnel modes (obfs/httpmask: tunnel_dial.go, tunnel_api.go,
+// tunnel_conn_stream.go, tunnel_conn_poll.go, tunnel_ws.go,
+// ws_stream_conn.go, tunnel_conn_queue.go, tunnel_ready.go,
+// tunnel_retry.go, ws_auth.go; client half of early_handshake.go)
 // ---------------------------------------------------------------------------
+
+/// `TunnelDialOptions.DialContext` — a fresh transport to the mask
+/// server; the embedder keeps its routing/proxy behavior here.
+pub type TunnelDialer = std::sync::Arc<
+    dyn Fn() -> Pin<Box<dyn std::future::Future<Output = Result<BoxProxyStream>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// `TunnelMode` (tunnel_api.go:16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelMode {
+    Stream,
+    Poll,
+    Auto,
+    Ws,
+}
+
+impl TunnelMode {
+    /// The `X-Sudoku-Tunnel` value (applyTunnelHeaders, tunnel_api.go:198).
+    fn as_str(&self) -> &'static str {
+        match self {
+            TunnelMode::Stream => "stream",
+            TunnelMode::Poll => "poll",
+            TunnelMode::Auto => "auto",
+            TunnelMode::Ws => "ws",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The early KIP handshake (early_handshake.go) — the whole KIP exchange
+// marshalled through the tunnel's early-data channel: the obfuscated
+// client hello as the `ed` query param, the obfuscated server hello in
+// the authorize response.
+// ---------------------------------------------------------------------------
+
+/// `earlyMemoryConn` (early_handshake.go:51): an in-memory duplex whose
+/// writes are captured and whose reads drain a fixed buffer then EOF.
+struct MemIo {
+    read: Vec<u8>,
+    read_off: usize,
+    write: MemWrite,
+}
+
+/// The MemIo write destination: a shared capture buffer or /dev/null.
+enum MemWrite {
+    Sink(Arc<Mutex<Vec<u8>>>),
+    Discard,
+}
+
+impl MemIo {
+    /// A write-only sink capturing into `written` (the request side).
+    fn sink(written: Arc<Mutex<Vec<u8>>>) -> BoxProxyStream {
+        Box::new(MemIo {
+            read: Vec::new(),
+            read_off: 0,
+            write: MemWrite::Sink(written),
+        })
+    }
+
+    /// A read-only source (the response-processing side).
+    fn source(bytes: Vec<u8>) -> BoxProxyStream {
+        Box::new(MemIo {
+            read: bytes,
+            read_off: 0,
+            write: MemWrite::Discard,
+        })
+    }
+}
+
+impl AsyncRead for MemIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.read_off < this.read.len() {
+            let n = (this.read.len() - this.read_off).min(buf.remaining());
+            buf.put_slice(&this.read[this.read_off..this.read_off + n]);
+            this.read_off += n;
+        }
+        // Drained (or empty): EOF, like `bytes.Reader`.
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for MemIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match &self.write {
+            // A live capture buffer.
+            MemWrite::Sink(shared) => shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buf),
+            MemWrite::Discard => {}
+        }
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// `EarlyClientState` (early_handshake.go:27): builds the obfuscated,
+/// PSK-encrypted KIP client hello offline; processes the obfuscated
+/// server hello; wraps the tunnel conn with the session keys.
+struct EarlyClientState {
+    request_payload: Vec<u8>,
+    table: Arc<Table>,
+    nonce: [u8; 16],
+    scalar: [u8; 32],
+    seed: String,
+    method: RecordMethod,
+    padding: (i64, i64),
+    pure_downlink: bool,
+    session_c2s: [u8; 32],
+    session_s2c: [u8; 32],
+    response_set: bool,
+}
+
+impl EarlyClientState {
+    /// `NewEarlyClientState` (early_handshake.go:102): the client hello
+    /// written through a fresh obfs+record stack into memory.
+    async fn new(rc: &ResolvedConfig, table: Arc<Table>, table_hint: Option<u32>) -> Result<Self> {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let obfs = ObfsStream::new(
+            MemIo::sink(written.clone()),
+            table.clone(),
+            rc.padding_min,
+            rc.padding_max,
+            rc.enable_pure_downlink,
+        );
+        let seed = client_aead_seed(&rc.seed);
+        let (psk_c2s, psk_s2c) = derive_psk_directional_bases(&seed);
+        let mut conn = RecordConn::new(obfs, rc.method, psk_c2s, psk_s2c);
+        let mut scalar = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut scalar);
+        let client_pub = curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(scalar).0;
+        let mut nonce = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let user_hash = kip_user_hash_from_key(&rc.seed);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let hello = kip_client_hello_payload(
+            timestamp,
+            &user_hash,
+            &nonce,
+            &client_pub,
+            KIP_FEAT_ALL,
+            table_hint,
+        );
+        write_kip_message(&mut conn, KIP_TYPE_CLIENT_HELLO, &hello).await?;
+        let request_payload = written.lock().unwrap().clone();
+        Ok(EarlyClientState {
+            request_payload,
+            table,
+            nonce,
+            scalar,
+            seed,
+            method: rc.method,
+            padding: (rc.padding_min, rc.padding_max),
+            pure_downlink: rc.enable_pure_downlink,
+            session_c2s: [0u8; 32],
+            session_s2c: [0u8; 32],
+            response_set: false,
+        })
+    }
+
+    /// `ProcessResponse` (early_handshake.go:142): the obfuscated server
+    /// hello read back through a fresh stack; derives the session keys.
+    async fn process_response(&mut self, payload: Vec<u8>) -> Result<()> {
+        let obfs = ObfsStream::new(
+            MemIo::source(payload),
+            self.table.clone(),
+            self.padding.0,
+            self.padding.1,
+            self.pure_downlink,
+        );
+        let (psk_c2s, psk_s2c) = derive_psk_directional_bases(&self.seed);
+        let mut conn = RecordConn::new(obfs, self.method, psk_c2s, psk_s2c);
+        let (typ, payload) = read_kip_message(&mut conn).await?;
+        if typ != KIP_TYPE_SERVER_HELLO {
+            return Err(Error::protocol(format!(
+                "sudoku: unexpected early handshake message: {typ:#x}"
+            )));
+        }
+        let (echo_nonce, server_pub, _feats) = decode_kip_server_hello_payload(&payload)?;
+        if echo_nonce != self.nonce {
+            return Err(Error::protocol("sudoku: early handshake nonce mismatch"));
+        }
+        let shared = x25519_shared_secret(&self.scalar, &server_pub)?;
+        let (c2s, s2c) = derive_session_directional_bases(&self.seed, &shared, &self.nonce)?;
+        self.session_c2s = c2s;
+        self.session_s2c = s2c;
+        self.response_set = true;
+        Ok(())
+    }
+
+    /// `WrapConn` (early_handshake.go:182): the live tunnel conn with
+    /// the session-key record layer (no in-band handshake remains).
+    fn wrap_conn(self, raw: BoxProxyStream) -> Result<RecordConn<ObfsStream>> {
+        if !self.response_set {
+            return Err(Error::protocol("sudoku: early handshake not completed"));
+        }
+        let obfs = ObfsStream::new(
+            raw,
+            self.table,
+            self.padding.0,
+            self.padding.1,
+            self.pure_downlink,
+        );
+        Ok(RecordConn::new(obfs, self.method, self.session_c2s, self.session_s2c))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Minimal HTTP/1.1 client (one request per fresh connection)
+// ---------------------------------------------------------------------------
+
+/// `net.SplitHostPort` for `host:port` / `[v6]:port`; `None` when the
+/// string carries no port.
+fn split_host_port(s: &str) -> Option<(String, String)> {
+    if let Some(rest) = s.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']')?;
+        let port = tail.strip_prefix(':')?;
+        return Some((host.to_string(), port.to_string()));
+    }
+    let (host, port) = s.rsplit_once(':')?;
+    if host.is_empty() || port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((host.to_string(), port.to_string()))
+}
+
+/// `canonicalHeaderHost` (tunnel_dial.go:35): strip the default port,
+/// keeping IPv6 literals bracketed.
+fn canonical_header_host(url_host: &str, scheme: &str) -> String {
+    let Some((host, port)) = split_host_port(url_host) else {
+        return url_host.to_string();
+    };
+    let default_port = match scheme {
+        "https" | "wss" => "443",
+        "http" | "ws" => "80",
+        _ => "",
+    };
+    if default_port.is_empty() || port != default_port {
+        return url_host.to_string();
+    }
+    if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host
+    }
+}
+
+/// `normalizeHTTPDialTarget` (tunnel_dial.go:439).
+#[derive(Clone)]
+struct HttpTarget {
+    scheme: &'static str,
+    /// Canonical Host header value (from the `host:port` URL host).
+    header_host: String,
+    /// SNI for the TLS carrier.
+    server_name: String,
+}
+
+fn normalize_http_dial_target(
+    server_address: &str,
+    tls_enabled: bool,
+    host_override: &str,
+) -> Result<HttpTarget> {
+    let (mut host, mut port) = split_host_port(server_address)
+        .ok_or_else(|| Error::config(format!("sudoku: invalid server address {server_address:?}")))?;
+    let mut server_name;
+    let url_host;
+    if !host_override.is_empty() {
+        // Allow "example.com" or "example.com:443".
+        if let Some((h, p)) = split_host_port(host_override) {
+            host = h;
+            port = p;
+        } else {
+            host = host_override.to_string();
+        }
+        server_name = host.clone();
+        url_host = format!("{host}:{port}");
+    } else {
+        server_name = host.clone();
+        url_host = format!("{host}:{port}");
+    }
+    let scheme = if tls_enabled { "https" } else { "http" };
+    server_name = trim_port_for_host(&server_name);
+    Ok(HttpTarget {
+        scheme,
+        header_host: canonical_header_host(&url_host, scheme),
+        server_name,
+    })
+}
+
+/// `normalizeWSDialTarget` (tunnel_ws.go:38) — the engine always dials
+/// `server:port`, so the ws/wss scheme follows the TLS flag and a
+/// missing port defaults to 80/443.
+fn normalize_ws_dial_target(
+    server_address: &str,
+    tls_enabled: bool,
+    host_override: &str,
+) -> Result<HttpTarget> {
+    let (mut host, mut port) = match split_host_port(server_address) {
+        Some((h, p)) => (h, p),
+        None => {
+            if server_address.contains(':') && !server_address.starts_with('[') {
+                return Err(Error::config(format!(
+                    "sudoku: invalid server address {server_address:?}"
+                )));
+            }
+            let scheme = if tls_enabled { "wss" } else { "ws" };
+            (
+                server_address.to_string(),
+                if scheme == "wss" { "443" } else { "80" }.to_string(),
+            )
+        }
+    };
+    if !host_override.is_empty() {
+        if let Some((h, p)) = split_host_port(host_override) {
+            host = h;
+            port = p;
+        } else {
+            host = host_override.to_string();
+        }
+    }
+    let server_name = trim_port_for_host(&host);
+    let url_host = format!("{host}:{port}");
+    let scheme = if tls_enabled { "wss" } else { "ws" };
+    Ok(HttpTarget {
+        scheme,
+        header_host: canonical_header_host(&url_host, if tls_enabled { "https" } else { "http" }),
+        server_name,
+    })
+}
+
+// -- request/response plumbing ------------------------------------------------
+
+/// One HTTP/1.1 request over a fresh connection.
+struct HttpRequest<'a> {
+    method: &'a str,
+    /// Origin-form path with query.
+    path_query: &'a str,
+    /// Extra headers (after Host).
+    headers: Vec<(String, String)>,
+    body: Option<&'a [u8]>,
+}
+
+struct HttpResp {
+    status: u16,
+    body: HttpBody,
+}
+
+enum BodyKind {
+    Length(u64),
+    Chunked,
+    UntilClose,
+}
+
+/// A response body reader supporting Content-Length, chunked framing
+/// (with trailers) and read-to-EOF.
+struct HttpBody {
+    conn: BoxProxyStream,
+    kind: BodyKind,
+    /// Set once the body fully ended (chunked: after trailers).
+    done: bool,
+    /// Chunked: bytes remaining in the current chunk.
+    chunk_rem: usize,
+    pub trailers: Vec<(String, String)>,
+}
+
+impl HttpBody {
+    /// Append some body bytes to `out`; `Ok(false)` when the body ended.
+    async fn read_some(&mut self, out: &mut Vec<u8>) -> Result<bool> {
+        if self.done {
+            return Ok(false);
+        }
+        match self.kind {
+            BodyKind::Length(rem) => {
+                if rem == 0 {
+                    self.done = true;
+                    return Ok(false);
+                }
+                let want = (rem.min(32 * 1024)) as usize;
+                let mut tmp = vec![0u8; want];
+                let n = self.conn.read(&mut tmp).await?;
+                if n == 0 {
+                    return Err(Error::network("sudoku: http body ended early"));
+                }
+                out.extend_from_slice(&tmp[..n]);
+                self.kind = BodyKind::Length(rem - n as u64);
+                Ok(true)
+            }
+            BodyKind::UntilClose => {
+                let mut tmp = vec![0u8; 32 * 1024];
+                let n = self.conn.read(&mut tmp).await?;
+                if n == 0 {
+                    self.done = true;
+                    return Ok(false);
+                }
+                out.extend_from_slice(&tmp[..n]);
+                Ok(true)
+            }
+            BodyKind::Chunked => {
+                if self.chunk_rem == 0 {
+                    // Start the next chunk (the previous one consumed its CRLF).
+                    let line = read_crlf_line(&mut self.conn, 128).await?;
+                    let size_str = String::from_utf8_lossy(&line);
+                    let size_hex = size_str.trim().split(';').next().unwrap_or("").trim();
+                    let size = usize::from_str_radix(size_hex, 16)
+                        .map_err(|_| Error::protocol("sudoku: bad chunk size"))?;
+                    if size == 0 {
+                        self.read_trailers().await?;
+                        self.done = true;
+                        return Ok(false);
+                    }
+                    self.chunk_rem = size;
+                }
+                let want = self.chunk_rem.min(32 * 1024);
+                let mut tmp = vec![0u8; want];
+                let n = self.conn.read(&mut tmp).await?;
+                if n == 0 {
+                    return Err(Error::network("sudoku: chunked body ended early"));
+                }
+                out.extend_from_slice(&tmp[..n]);
+                self.chunk_rem -= n;
+                if self.chunk_rem == 0 {
+                    let mut crlf = [0u8; 2];
+                    self.conn.read_exact(&mut crlf).await?;
+                    if &crlf != b"\r\n" {
+                        return Err(Error::protocol("sudoku: bad chunk terminator"));
+                    }
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    /// The chunked trailer section (`Trailer:`-declared headers after the
+    /// terminating zero chunk).
+    async fn read_trailers(&mut self) -> Result<()> {
+        loop {
+            let line = read_crlf_line(&mut self.conn, 8 * 1024).await?;
+            if line.is_empty() {
+                return Ok(());
+            }
+            let text = String::from_utf8_lossy(&line).into_owned();
+            if let Some((name, value)) = text.split_once(':') {
+                self.trailers
+                    .push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
+            }
+        }
+    }
+
+    fn trailer(&self, name: &str) -> Option<&str> {
+        self.trailers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Read the whole body, bounded (authorize bodies, drain limits).
+    async fn read_all_limited(&mut self, limit: usize) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        while out.len() <= limit {
+            let mut chunk = Vec::new();
+            if !self.read_some(&mut chunk).await? {
+                break;
+            }
+            if chunk.is_empty() {
+                continue;
+            }
+            out.extend_from_slice(&chunk);
+            if out.len() > limit {
+                return Err(Error::protocol("sudoku: http response body too large"));
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Read one CRLF-terminated line (without the terminator). Byte-wise so
+/// nothing past the line is ever consumed from the transport.
+async fn read_crlf_line(conn: &mut BoxProxyStream, cap: usize) -> Result<Vec<u8>> {
+    let mut line = Vec::with_capacity(128);
+    let mut byte = [0u8; 1];
+    loop {
+        let n = conn.read(&mut byte).await?;
+        if n == 0 {
+            if line.is_empty() {
+                return Err(Error::network("sudoku: http response ended mid-header"));
+            }
+            return Err(Error::network("sudoku: http response header missing CRLF"));
+        }
+        if byte[0] == b'\n' {
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            return Ok(line);
+        }
+        line.push(byte[0]);
+        if line.len() > cap {
+            return Err(Error::protocol("sudoku: http response line too long"));
+        }
+    }
+}
+
+/// `applyTunnelHeaders` (tunnel_api.go:182) minus Host (written on the
+/// request line block) — one random camouflage set + the mode marker.
+fn apply_tunnel_headers(mode: TunnelMode) -> Vec<(String, String)> {
+    vec![
+        ("User-Agent".into(), mask_pick(&MASK_USER_AGENTS).to_string()),
+        ("Accept".into(), mask_pick(&MASK_ACCEPTS).to_string()),
+        ("Accept-Language".into(), mask_pick(&MASK_ACCEPT_LANGUAGES).to_string()),
+        ("Cache-Control".into(), "no-cache".into()),
+        ("Pragma".into(), "no-cache".into()),
+        ("Connection".into(), "keep-alive".into()),
+        ("X-Sudoku-Tunnel".into(), mode.as_str().to_string()),
+    ]
+}
+
+/// `applyWSHeaders` (tunnel_ws.go:77).
+fn apply_ws_headers() -> Vec<(String, String)> {
+    vec![
+        ("User-Agent".into(), mask_pick(&MASK_USER_AGENTS).to_string()),
+        ("Accept".into(), mask_pick(&MASK_ACCEPTS).to_string()),
+        ("Accept-Language".into(), mask_pick(&MASK_ACCEPT_LANGUAGES).to_string()),
+        ("Accept-Encoding".into(), mask_pick(&MASK_ACCEPT_ENCODINGS).to_string()),
+        ("Cache-Control".into(), "no-cache".into()),
+        ("Pragma".into(), "no-cache".into()),
+        ("X-Sudoku-Tunnel".into(), "ws".into()),
+        ("X-Sudoku-Version".into(), "1".into()),
+    ]
+}
+
+// -- transport context --------------------------------------------------------
+
+/// Everything the HTTP client needs to open one request connection
+/// (the per-request equivalent of upstream's pooled transport).
+#[derive(Clone)]
+struct HttpCtx {
+    dialer: TunnelDialer,
+    target: HttpTarget,
+    tls: Option<Arc<rustls::ClientConfig>>,
+    path_root: String,
+}
+
+/// A concrete duplex wrapper so tokio-rustls can terminate TLS on the
+/// boxed transport.
+struct TlsIo(BoxProxyStream);
+impl AsyncRead for TlsIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+impl AsyncWrite for TlsIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+/// Accept-anything verifier for the engine-local insecure knob.
+#[derive(Debug)]
+struct MaskNoVerify(Arc<rustls::crypto::CryptoProvider>);
+impl rustls::client::danger::ServerCertVerifier for MaskNoVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// The http-mask TLS carrier config (`ca.GetTLSConfig` upstream always
+/// verifies; the engine-local knob admits any cert for tests/private
+/// CAs). ALPN is pinned to http/1.1 — this port has no h2 client.
+fn mask_tls_config(insecure: bool) -> Result<Arc<rustls::ClientConfig>> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| Error::config(format!("sudoku: http-mask tls: {e}")))?;
+    let mut config = if insecure {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(MaskNoVerify(provider)))
+            .with_no_client_auth()
+    } else {
+        let mut roots = rustls::RootCertStore::empty();
+        let certs = rustls_native_certs::load_native_certs()
+            .map_err(|e| Error::config(format!("sudoku: native cert store: {e}")))?;
+        for cert in certs {
+            roots
+                .add(cert)
+                .map_err(|e| Error::config(format!("sudoku: bad native cert: {e}")))?;
+        }
+        if roots.is_empty() {
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        }
+        builder.with_root_certificates(roots).with_no_client_auth()
+    };
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
+}
+
+impl HttpCtx {
+    fn new(rc: &ResolvedConfig, dialer: TunnelDialer, ws: bool) -> Result<Self> {
+        let target = if ws {
+            normalize_ws_dial_target(&rc.server_address, rc.http_mask_tls, &rc.http_mask_host)?
+        } else {
+            normalize_http_dial_target(&rc.server_address, rc.http_mask_tls, &rc.http_mask_host)?
+        };
+        let tls = if target.scheme == "https" || target.scheme == "wss" {
+            Some(mask_tls_config(rc.http_mask_tls_insecure)?)
+        } else {
+            None
+        };
+        Ok(HttpCtx {
+            dialer,
+            target,
+            tls,
+            path_root: rc.path_root.clone(),
+        })
+    }
+
+    /// One fresh request connection (DialContext [+ TLS]).
+    async fn open(&self) -> Result<BoxProxyStream> {
+        let raw = (self.dialer)().await?;
+        match &self.tls {
+            None => Ok(raw),
+            Some(config) => {
+                let connector = tokio_rustls::TlsConnector::from(config.clone());
+                let name = rustls::pki_types::ServerName::try_from(self.target.server_name.clone())
+                    .map_err(|_| {
+                        Error::config(format!(
+                            "sudoku: invalid SNI {:?}",
+                            self.target.server_name
+                        ))
+                    })?;
+                let tls = connector
+                    .connect(name, TlsIo(raw))
+                    .await
+                    .map_err(|e| Error::network(format!("sudoku: http-mask tls: {e}")))?;
+                Ok(Box::new(tls))
+            }
+        }
+    }
+
+    /// One full request/response exchange over a fresh connection.
+    async fn exchange(&self, req: HttpRequest<'_>) -> Result<HttpResp> {
+        let mut conn = self.open().await?;
+        let mut head = Vec::with_capacity(512);
+        head.extend_from_slice(
+            format!("{} {} HTTP/1.1\r\n", req.method, req.path_query).as_bytes(),
+        );
+        head.extend_from_slice(format!("Host: {}\r\n", self.target.header_host).as_bytes());
+        for (name, value) in &req.headers {
+            head.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+        }
+        if let Some(body) = req.body {
+            head.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+        }
+        head.extend_from_slice(b"\r\n");
+        conn.write_all(&head).await?;
+        if let Some(body) = req.body {
+            conn.write_all(body).await?;
+        }
+        let status_line = read_crlf_line(&mut conn, 8 * 1024).await?;
+        let status_text = String::from_utf8_lossy(&status_line).into_owned();
+        let mut parts = status_text.splitn(3, ' ');
+        let version = parts.next().unwrap_or_default();
+        if !version.starts_with("HTTP/1.") {
+            return Err(Error::protocol(format!(
+                "sudoku: bad http status line {status_text:?}"
+            )));
+        }
+        let status: u16 = parts
+            .next()
+            .and_then(|c| c.parse().ok())
+            .ok_or_else(|| Error::protocol(format!("sudoku: bad http status {status_text:?}")))?;
+        let mut headers = Vec::new();
+        loop {
+            let line = read_crlf_line(&mut conn, 16 * 1024).await?;
+            if line.is_empty() {
+                break;
+            }
+            let text = String::from_utf8_lossy(&line).into_owned();
+            if let Some((name, value)) = text.split_once(':') {
+                headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
+            }
+        }
+        let header = |name: &str| -> Option<String> {
+            headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.trim().to_string())
+        };
+        let kind = if header("transfer-encoding")
+            .map(|v| v.to_ascii_lowercase().contains("chunked"))
+            .unwrap_or(false)
+        {
+            BodyKind::Chunked
+        } else if let Some(v) = header("content-length") {
+            BodyKind::Length(
+                v.parse::<u64>()
+                    .map_err(|_| Error::protocol("sudoku: bad content-length"))?,
+            )
+        } else {
+            BodyKind::UntilClose
+        };
+        Ok(HttpResp {
+            status,
+            body: HttpBody {
+                conn,
+                kind,
+                done: false,
+                chunk_rem: 0,
+                trailers: Vec::new(),
+            },
+        })
+    }
+}
+
+// -- retry classification (tunnel_retry.go) -----------------------------------
+
+/// `isRetryableStatusCode` (tunnel_retry.go:27).
+fn is_retryable_status(code: u16) -> bool {
+    code == 408 || code == 429 || code >= 500
+}
+
+/// `isRetryableHTTPTransportError`: transport failures and the retryable
+/// statuses (encoded as `network` errors) retry; hard protocol errors do
+/// not.
+fn is_retryable_err(e: &Error) -> bool {
+    matches!(e, Error::Network(_) | Error::Io(_))
+}
+
+/// `statusError` as a network error so `is_retryable_err` can see the
+/// code through the message (`bad status: NNN`).
+fn retryable_status_err(code: u16) -> Error {
+    Error::network(format!("bad status: {code}"))
+}
+
+fn hard_status_err(code: u16) -> Error {
+    Error::protocol(format!("bad status: {code}"))
+}
+
+/// `nextBackoff` (tunnel_retry.go:149).
+fn next_backoff(current: std::time::Duration, min: std::time::Duration, max: std::time::Duration) -> std::time::Duration {
+    let mut current = current;
+    if current < min {
+        current = min;
+    }
+    if current >= max / 2 {
+        return max;
+    }
+    current * 2
+}
+
+// -- the queued tunnel conn (tunnel_conn_queue.go) ----------------------------
+
+/// A poll-friendly one-shot flag with an optional reason — upstream's
+/// `closed`/`readEOF`/`writeDone` channels (tunnel_conn_queue.go) as a
+/// value the AsyncRead/AsyncWrite impls can poll directly.
+#[derive(Default)]
+struct OnceFlag {
+    state: Mutex<Option<String>>,
+    wakers: Mutex<Vec<std::task::Waker>>,
+}
+
+impl OnceFlag {
+    fn shared() -> Arc<Self> {
+        Arc::new(OnceFlag::default())
+    }
+
+    /// Set once; wakes every registered poller. An empty reason means
+    /// "signalled without a diagnostic" (the plain bool channels).
+    fn set(&self, reason: impl Into<String>) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.is_none() {
+            *state = Some(reason.into());
+            drop(state);
+            let mut wakers = self.wakers.lock().unwrap_or_else(|e| e.into_inner());
+            for w in wakers.drain(..) {
+                w.wake();
+            }
+        }
+    }
+
+    fn is_set(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    fn reason(&self) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn poll_set(&self, cx: &mut Context<'_>) -> Poll<Option<String>> {
+        if let Some(reason) = self.reason() {
+            return Poll::Ready(Some(reason));
+        }
+        self.wakers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(cx.waker().clone());
+        Poll::Pending
+    }
+
+    /// Cancel-safe wait for the signal.
+    async fn wait(&self) -> Option<String> {
+        std::future::poll_fn(|cx| self.poll_set(cx)).await
+    }
+}
+
+/// The shared control plane of one stream/poll tunnel connection
+/// (`queuedConn`'s channels + the loops' stop signals).
+#[derive(Clone)]
+struct QueueState {
+    /// `closed` + closeWithError's reason.
+    closed: Arc<OnceFlag>,
+    /// `writeClosed`.
+    write_closed: Arc<OnceFlag>,
+    /// `writeDone` + completeWrite's error.
+    write_done: Arc<OnceFlag>,
+}
+
+impl QueueState {
+    fn new() -> Self {
+        QueueState {
+            closed: OnceFlag::shared(),
+            write_closed: OnceFlag::shared(),
+            write_done: OnceFlag::shared(),
+        }
+    }
+
+    fn close_with(&self, err: &str) {
+        self.closed.set(err);
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.is_set()
+    }
+
+    /// Wait until closed (returns the reason). Cancel-safe.
+    async fn wait_closed(&self) -> String {
+        self.closed
+            .wait()
+            .await
+            .filter(|r| !r.is_empty())
+            .unwrap_or_else(|| "sudoku: tunnel closed".to_string())
+    }
+}
+
+/// `tunnelReadiness` (tunnel_ready.go:9): pull and push readiness.
+#[derive(Clone)]
+struct TunnelReadiness {
+    pull: Arc<OnceFlag>,
+    push: Arc<OnceFlag>,
+}
+
+impl TunnelReadiness {
+    fn new() -> Self {
+        TunnelReadiness {
+            pull: OnceFlag::shared(),
+            push: OnceFlag::shared(),
+        }
+    }
+
+    fn mark_pull_ready(&self) {
+        self.pull.set("");
+    }
+
+    fn mark_push_ready(&self) {
+        self.push.set("");
+    }
+
+    /// `wait` (tunnel_ready.go:35): both directions once, racing the
+    /// closed channel.
+    async fn wait(&self, st: &QueueState) -> Result<()> {
+        for flag in [&self.pull, &self.push] {
+            loop {
+                if flag.is_set() {
+                    break;
+                }
+                tokio::select! {
+                    _ = flag.wait() => {}
+                    reason = st.wait_closed() => return Err(Error::network(reason)),
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The stream/poll tunnel conn (queuedConn + streamSplitConn/pollConn's
+/// session-control drop hook).
+struct TunnelConn {
+    rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    read_buf: Vec<u8>,
+    /// `readEOF` observed.
+    read_eof_seen: bool,
+    read_eof: Arc<OnceFlag>,
+    /// The payload channel's sender end died.
+    dead: bool,
+    closed: Arc<OnceFlag>,
+    write_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    write_closed: bool,
+    write_closed_flag: Arc<OnceFlag>,
+    write_done: Arc<OnceFlag>,
+    /// `bestEffortCloseSession` on drop (stream/poll only); never
+    /// read — holding it keeps the Drop hook alive.
+    _close_hook: Option<CloseOnDrop>,
+}
+
+impl AsyncRead for TunnelConn {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        loop {
+            if !self.read_buf.is_empty() {
+                let n = self.read_buf.len().min(buf.remaining());
+                buf.put_slice(&self.read_buf[..n]);
+                self.read_buf.drain(..n);
+                return Poll::Ready(Ok(()));
+            }
+            if buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            if let Some(err) = self.closed.reason() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    err,
+                )));
+            }
+            if self.dead {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "sudoku: tunnel closed",
+                )));
+            }
+            match self.rx.poll_recv(cx) {
+                Poll::Ready(Some(v)) => {
+                    if v.is_empty() {
+                        continue;
+                    }
+                    self.read_buf = v;
+                }
+                Poll::Ready(None) => {
+                    self.dead = true;
+                }
+                Poll::Pending => {
+                    // Race with readEOF and closed (queuedConn.Read's
+                    // select); on readEOF one more non-blocking drain
+                    // happens before reporting EOF.
+                    match self.read_eof.poll_set(cx) {
+                        Poll::Ready(_) => {
+                            self.read_eof_seen = true;
+                            continue;
+                        }
+                        Poll::Pending => {}
+                    }
+                    if self.read_eof_seen {
+                        return match self.rx.try_recv() {
+                            Ok(v) if !v.is_empty() => {
+                                self.read_buf = v;
+                                continue;
+                            }
+                            _ => Poll::Ready(Ok(())),
+                        };
+                    }
+                    return Poll::Pending;
+                }
+            }
+        }
+    }
+}
+
+impl AsyncWrite for TunnelConn {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        if self.closed.is_set() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "sudoku: tunnel closed",
+            )));
+        }
+        if self.write_closed {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "sudoku: tunnel write closed",
+            )));
+        }
+        match self.write_tx.send(buf.to_vec()) {
+            Ok(()) => Poll::Ready(Ok(buf.len())),
+            Err(_) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "sudoku: tunnel closed",
+            ))),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    /// `CloseWrite` (tunnel_conn_queue.go:52): stop accepting writes,
+    /// then wait for the push loop's drain + FIN.
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if !self.write_closed {
+            self.write_closed = true;
+            self.write_closed_flag.set("");
+        }
+        match self.write_done.poll_set(cx) {
+            Poll::Ready(Some(err)) if !err.is_empty() => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                err,
+            ))),
+            Poll::Ready(_) => Poll::Ready(Ok(())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// `bestEffortCloseSession` fired from Drop (streamSplitConn.Close →
+/// closeWithError → close=1 POST).
+struct CloseOnDrop {
+    ctx: HttpCtx,
+    close_q: String,
+}
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        let ctx = self.ctx.clone();
+        let close_q = self.close_q.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = send_session_control(&ctx, &close_q).await;
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session dial + control (tunnel_dial.go)
+// ---------------------------------------------------------------------------
+
+/// `parseAuthorizeResponse` (tunnel_dial.go:65): `token=…` line, optional
+/// `ed=…` line (base64 RawURL), mandatory `cap=upload-seq`.
+fn parse_authorize_response(body: &[u8]) -> Result<(String, Option<Vec<u8>>)> {
+    let text = String::from_utf8_lossy(body);
+    let text = text.trim();
+    let token_line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("token="))
+        .ok_or_else(|| Error::protocol("sudoku: authorize: missing token"))?;
+    let token: String = token_line["token=".len()..]
+        .bytes()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == b'-' || *c == b'_')
+        .map(|c| c as char)
+        .collect();
+    if token.is_empty() {
+        return Err(Error::protocol("sudoku: authorize: empty token"));
+    }
+    let early = text
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("ed="))
+        .map(|l| &l["ed=".len()..])
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| {
+            use base64::Engine;
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(v.trim())
+                .map_err(|_| Error::protocol("sudoku: authorize: decode early payload failed"))
+        })
+        .transpose()?;
+    if !text.lines().map(str::trim).any(|l| l == "cap=upload-seq") {
+        return Err(Error::protocol(
+            "sudoku: server does not support HTTPMask v0.5 upload sequencing",
+        ));
+    }
+    Ok((token, early))
+}
+
+/// `findAuthorizeField` — the `ed` value rides the body, covered above.
+const _: () = {};
+
+/// The per-session endpoint set (`sessionDialInfo`).
+struct SessionEndpoints {
+    push_q: String,
+    pull_q: String,
+    fin_q: String,
+    close_q: String,
+}
+
+/// `dialSessionWithClient` (tunnel_dial.go:276): the authorize exchange.
+/// Returns the endpoints; `early.process_response` runs on the `ed=`
+/// field when the server answered the early handshake.
+async fn dial_session(ctx: &HttpCtx, mode: TunnelMode, early: &mut EarlyClientState) -> Result<SessionEndpoints> {
+    let mut auth_q = join_path_root(&ctx.path_root, "/session");
+    if !early.request_payload.is_empty() {
+        use base64::Engine;
+        auth_q = format!(
+            "{auth_q}?ed={}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&early.request_payload)
+        );
+    }
+    // Three attempts with a fixed 50ms backoff (dialSession's retry loop).
+    let mut resp = None;
+    let mut last_err = None;
+    for _ in 0..3 {
+        let req = HttpRequest {
+            method: "GET",
+            path_query: &auth_q,
+            headers: apply_tunnel_headers(mode),
+            body: None,
+        };
+        match ctx.exchange(req).await {
+            Ok(r) => {
+                resp = Some(r);
+                break;
+            }
+            Err(e) => {
+                let retryable = is_retryable_err(&e);
+                last_err = Some(e);
+                if !retryable {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+    let mut resp = match resp {
+        Some(r) => r,
+        None => {
+            return Err(last_err.unwrap_or_else(|| Error::network("sudoku: authorize failed")));
+        }
+    };
+    let body = resp.body.read_all_limited(4 * 1024).await?;
+    if resp.status != 200 {
+        let text = String::from_utf8_lossy(&body).trim().to_string();
+        return Err(Error::network(format!(
+            "sudoku: {} authorize bad status: {} ({})",
+            mode.as_str(),
+            resp.status,
+            text
+        )));
+    }
+    let (token, early_payload) = parse_authorize_response(&body)?;
+    if let Some(payload) = early_payload {
+        early.process_response(payload).await?;
+    }
+    let base = join_path_root(&ctx.path_root, "/api/v1/upload");
+    Ok(SessionEndpoints {
+        push_q: format!("{base}?token={token}"),
+        pull_q: format!("{}?token={token}", join_path_root(&ctx.path_root, "/stream")),
+        fin_q: format!("{base}?token={token}&fin=1"),
+        close_q: format!("{base}?token={token}&close=1"),
+    })
+}
+
+/// `sendSessionControl` (tunnel_dial.go:370): POST a control URL (fin /
+/// close), ≤3 attempts inside 5s; 403/404/410 count as done.
+async fn send_session_control(ctx: &HttpCtx, ctl_q: &str) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut backoff = std::time::Duration::from_millis(50);
+    for attempt in 0..3 {
+        let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if budget.is_zero() {
+            return Err(Error::network("sudoku: session control timed out"));
+        }
+        let post = async {
+            let req = HttpRequest {
+                method: "POST",
+                path_query: ctl_q,
+                headers: apply_tunnel_headers(TunnelMode::Stream),
+                body: None,
+            };
+            let mut resp = ctx.exchange(req).await?;
+            let _ = resp.body.read_all_limited(4 * 1024).await;
+            if resp.status == 200 {
+                return Ok(());
+            }
+            if resp.status == 403 || resp.status == 404 || resp.status == 410 {
+                return Ok(());
+            }
+            if is_retryable_status(resp.status) {
+                return Err(retryable_status_err(resp.status));
+            }
+            Err(hard_status_err(resp.status))
+        };
+        match tokio::time::timeout(budget, post).await {
+            Err(_) => return Err(Error::network("sudoku: session control timed out")),
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(e)) => {
+                if attempt == 2 || !is_retryable_err(&e) {
+                    return Err(e);
+                }
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+        }
+    }
+    Err(Error::network("sudoku: session control failed"))
+}
+
+// ---------------------------------------------------------------------------
+// stream mode (tunnel_conn_stream.go)
+// ---------------------------------------------------------------------------
+
+/// `dialStreamSplit` (tunnel_conn_stream.go:55): authorize, then the
+/// pull/push loops over the queued conn.
+async fn dial_stream(
+    ctx: &HttpCtx,
+    early: &mut EarlyClientState,
+) -> Result<(BoxProxyStream, TunnelWait)> {
+    let endpoints = dial_session(ctx, TunnelMode::Stream, early).await?;
+    let st = QueueState::new();
+    let readiness = TunnelReadiness::new();
+    let (payload_tx, payload_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let (write_tx, write_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let read_eof = OnceFlag::shared();
+    tokio::spawn(stream_pull_loop(
+        ctx.clone(),
+        endpoints.pull_q.clone(),
+        st.clone(),
+        readiness.clone(),
+        payload_tx,
+        read_eof.clone(),
+    ));
+    tokio::spawn(stream_push_loop(
+        ctx.clone(),
+        endpoints.push_q.clone(),
+        endpoints.fin_q.clone(),
+        st.clone(),
+        readiness.clone(),
+        write_rx,
+    ));
+    let conn = TunnelConn {
+        rx: payload_rx,
+        read_buf: Vec::new(),
+        read_eof_seen: false,
+        read_eof,
+        dead: false,
+        closed: st.closed.clone(),
+        write_tx,
+        write_closed: false,
+        write_closed_flag: st.write_closed.clone(),
+        write_done: st.write_done.clone(),
+        _close_hook: Some(CloseOnDrop {
+            ctx: ctx.clone(),
+            close_q: endpoints.close_q.clone(),
+        }),
+    };
+    Ok((Box::new(conn), TunnelWait { readiness, st }))
+}
+
+/// `wrapReadyTunnelConn` + `WaitTunnelReady` inputs: the readiness flags
+/// plus the queue state they race against.
+struct TunnelWait {
+    readiness: TunnelReadiness,
+    st: QueueState,
+}
+
+impl TunnelWait {
+    /// `WaitTunnelReady` (tunnel_ready.go:91).
+    async fn wait(&self) -> Result<()> {
+        self.readiness.wait(&self.st).await
+    }
+}
+
+/// `pullLoop` (tunnel_conn_stream.go:125): long-poll GETs whose chunked
+/// bodies stream the downlink; `X-Sudoku-Stream-EOF` ends the read side.
+#[allow(clippy::too_many_arguments)]
+async fn stream_pull_loop(
+    ctx: HttpCtx,
+    pull_q: String,
+    st: QueueState,
+    readiness: TunnelReadiness,
+    payload_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    read_eof: Arc<OnceFlag>,
+) {
+    const READ_CHUNK: usize = 32 * 1024;
+    const IDLE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(25);
+    const MIN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+
+    let mut backoff = MIN_BACKOFF;
+    loop {
+        if st.is_closed() {
+            return;
+        }
+        let req = HttpRequest {
+            method: "GET",
+            path_query: &pull_q,
+            headers: apply_tunnel_headers(TunnelMode::Stream),
+            body: None,
+        };
+        let mut resp = match ctx.exchange(req).await {
+            Ok(r) => r,
+            Err(e) => {
+                if !is_retryable_err(&e) {
+                    st.close_with(&format!("stream pull failed: {e}"));
+                    return;
+                }
+                let closed = st.wait_closed();
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    reason = closed => {
+                        st.close_with(&reason);
+                        return;
+                    }
+                }
+                backoff = next_backoff(backoff, MIN_BACKOFF, MAX_BACKOFF);
+                continue;
+            }
+        };
+        backoff = MIN_BACKOFF;
+        if resp.status != 200 {
+            if is_retryable_status(resp.status) {
+                let _ = resp.body.read_all_limited(4 * 1024).await;
+                let closed = st.wait_closed();
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    reason = closed => {
+                        st.close_with(&reason);
+                        return;
+                    }
+                }
+                backoff = next_backoff(backoff, MIN_BACKOFF, MAX_BACKOFF);
+                continue;
+            }
+            st.close_with(&format!("stream pull bad status: {}", resp.status));
+            return;
+        }
+        readiness.mark_pull_ready();
+
+        let mut read_any = false;
+        let mut body_retry = false;
+        loop {
+            let mut chunk = Vec::with_capacity(READ_CHUNK);
+            match resp.body.read_some(&mut chunk).await {
+                Ok(true) => {
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    read_any = true;
+                    let closed = st.wait_closed();
+                    tokio::select! {
+                        res = payload_tx.send(chunk) => {
+                            if res.is_err() {
+                                return;
+                            }
+                        }
+                        reason = closed => {
+                            st.close_with(&reason);
+                            return;
+                        }
+                    }
+                }
+                Ok(false) => {
+                    // Body ended: a trailer EOF ends the read side, any
+                    // other end is just a long-poll boundary.
+                    if resp.body.trailer("X-Sudoku-Stream-EOF") == Some("1") {
+                        read_eof.set("");
+                        return;
+                    }
+                    break;
+                }
+                Err(e) => {
+                    if is_retryable_err(&e) {
+                        body_retry = true;
+                        break;
+                    }
+                    st.close_with(&format!("stream pull body failed: {e}"));
+                    return;
+                }
+            }
+        }
+        if body_retry {
+            let closed = st.wait_closed();
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                reason = closed => {
+                    st.close_with(&reason);
+                    return;
+                }
+            }
+            backoff = next_backoff(backoff, MIN_BACKOFF, MAX_BACKOFF);
+            continue;
+        }
+        backoff = MIN_BACKOFF;
+        if !read_any {
+            let closed = st.wait_closed();
+            tokio::select! {
+                _ = tokio::time::sleep(IDLE_BACKOFF) => {}
+                reason = closed => {
+                    st.close_with(&reason);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// `pushLoop` (tunnel_conn_stream.go:247): batch writes into sequenced
+/// POST uploads; FIN (fin=1) on CloseWrite.
+async fn stream_push_loop(
+    ctx: HttpCtx,
+    push_q: String,
+    fin_q: String,
+    st: QueueState,
+    readiness: TunnelReadiness,
+    mut write_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+) {
+    const MAX_BATCH_BYTES: usize = 256 * 1024;
+    const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+    const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+    const MIN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+
+    let upload_seq = std::sync::atomic::AtomicU64::new(0);
+    let mut buf: Vec<u8> = Vec::with_capacity(MAX_BATCH_BYTES);
+    let ctx_flush = ctx.clone();
+
+    // flush() (tunnel_conn_stream.go:269): one sequenced POST, retried
+    // until it lands or the tunnel closes.
+    macro_rules! flush {
+        () => {
+            if buf.is_empty() {
+                Ok(())
+            } else {
+                let sequence = 1 + upload_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let url = format!("{push_q}&seq={sequence}");
+                let payload = std::mem::take(&mut buf);
+                let ctx = &ctx_flush;
+                retry_persistent(&st, MIN_BACKOFF, MAX_BACKOFF, || async {
+                    // Per-attempt 20s request timeout
+                    // (requestTimeout, tunnel_conn_stream.go:251).
+                    let req = HttpRequest {
+                        method: "POST",
+                        path_query: &url,
+                        headers: {
+                            let mut h = apply_tunnel_headers(TunnelMode::Stream);
+                            h.push(("Content-Type".into(), "application/octet-stream".into()));
+                            h
+                        },
+                        body: Some(&payload),
+                    };
+                    let mut resp = tokio::time::timeout(REQUEST_TIMEOUT, ctx.exchange(req))
+                        .await
+                        .map_err(|_| Error::network("sudoku: stream push timed out"))??;
+                    let _ = resp.body.read_all_limited(4 * 1024).await;
+                    if resp.status == 200 {
+                        return Ok(());
+                    }
+                    if is_retryable_status(resp.status) {
+                        return Err(retryable_status_err(resp.status));
+                    }
+                    Err(hard_status_err(resp.status))
+                })
+                .await
+                .map(|()| readiness.mark_push_ready())
+            }
+        };
+    }
+
+    let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let write_closed_flag = st.write_closed.clone();
+    let mut write_err: Option<String> = None;
+    loop {
+        let mut fin_phase = false;
+        tokio::select! {
+            maybe = write_rx.recv() => {
+                match maybe {
+                    Some(b) => {
+                        if b.is_empty() {
+                            continue;
+                        }
+                        if buf.len() + b.len() > MAX_BATCH_BYTES {
+                            if let Err(e) = flush!() {
+                                write_err = Some(format!("stream push flush failed: {e}"));
+                                break;
+                            }
+                            ticker.reset();
+                        }
+                        buf.extend_from_slice(&b);
+                        if buf.len() >= MAX_BATCH_BYTES {
+                            if let Err(e) = flush!() {
+                                write_err = Some(format!("stream push flush failed: {e}"));
+                                break;
+                            }
+                            ticker.reset();
+                        }
+                    }
+                    None => {
+                        // The tunnel conn is gone.
+                        let e = st.wait_closed().await;
+                        write_err = Some(e);
+                        break;
+                    }
+                }
+            }
+            _ = ticker.tick() => {
+                if let Err(e) = flush!() {
+                    write_err = Some(format!("stream push flush failed: {e}"));
+                    break;
+                }
+            }
+            _ = write_closed_flag.wait() => {
+                fin_phase = true;
+            }
+        }
+        if fin_phase {
+            // Drain everything already accepted, flush, then FIN.
+            while let Ok(b) = write_rx.try_recv() {
+                if b.is_empty() {
+                    continue;
+                }
+                if buf.len() + b.len() > MAX_BATCH_BYTES {
+                    if let Err(e) = flush!() {
+                        write_err = Some(format!("stream push flush failed: {e}"));
+                        break;
+                    }
+                }
+                buf.extend_from_slice(&b);
+            }
+            if write_err.is_none() {
+                if let Err(e) = flush!() {
+                    write_err = Some(format!("stream push flush failed: {e}"));
+                }
+            }
+            if write_err.is_none() {
+                if let Err(e) = send_session_control(&ctx, &fin_q).await {
+                    write_err = Some(format!("stream FIN failed: {e}"));
+                }
+            }
+            break;
+        }
+    }
+    if let Some(err) = &write_err {
+        st.close_with(err);
+    }
+    st.write_done.set(write_err.unwrap_or_default());
+}
+
+/// `retryPersistent` (tunnel_retry.go:101).
+async fn retry_persistent<F, Fut>(
+    st: &QueueState,
+    min_backoff: std::time::Duration,
+    max_backoff: std::time::Duration,
+    mut f: F,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut backoff = min_backoff;
+    loop {
+        match f().await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if !is_retryable_err(&e) {
+                    return Err(e);
+                }
+                let closed = st.wait_closed();
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    reason = closed => return Err(Error::network(reason)),
+                }
+                backoff = (backoff * 2).min(max_backoff);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// poll mode (tunnel_conn_poll.go)
+// ---------------------------------------------------------------------------
+
+/// `dialPoll` (tunnel_conn_poll.go:49).
+async fn dial_poll(
+    ctx: &HttpCtx,
+    early: &mut EarlyClientState,
+) -> Result<(BoxProxyStream, TunnelWait)> {
+    let endpoints = dial_session(ctx, TunnelMode::Poll, early).await?;
+    let st = QueueState::new();
+    let readiness = TunnelReadiness::new();
+    let (payload_tx, payload_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let (write_tx, write_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let read_eof = OnceFlag::shared();
+    tokio::spawn(poll_pull_loop(
+        ctx.clone(),
+        endpoints.pull_q.clone(),
+        st.clone(),
+        readiness.clone(),
+        payload_tx,
+        read_eof.clone(),
+    ));
+    tokio::spawn(poll_push_loop(
+        ctx.clone(),
+        endpoints.push_q.clone(),
+        endpoints.fin_q.clone(),
+        st.clone(),
+        readiness.clone(),
+        write_rx,
+    ));
+    let conn = TunnelConn {
+        rx: payload_rx,
+        read_buf: Vec::new(),
+        read_eof_seen: false,
+        read_eof,
+        dead: false,
+        closed: st.closed.clone(),
+        write_tx,
+        write_closed: false,
+        write_closed_flag: st.write_closed.clone(),
+        write_done: st.write_done.clone(),
+        _close_hook: Some(CloseOnDrop {
+            ctx: ctx.clone(),
+            close_q: endpoints.close_q.clone(),
+        }),
+    };
+    Ok((Box::new(conn), TunnelWait { readiness, st }))
+}
+
+/// `pullLoop` (tunnel_conn_poll.go:119): each response is a set of
+/// base64 lines, one decoded payload per line.
+async fn poll_pull_loop(
+    ctx: HttpCtx,
+    pull_q: String,
+    st: QueueState,
+    readiness: TunnelReadiness,
+    payload_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    read_eof: Arc<OnceFlag>,
+) {
+    const MIN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+
+    let mut backoff = MIN_BACKOFF;
+    loop {
+        if st.is_closed() {
+            return;
+        }
+        let req = HttpRequest {
+            method: "GET",
+            path_query: &pull_q,
+            headers: apply_tunnel_headers(TunnelMode::Poll),
+            body: None,
+        };
+        let mut resp = match ctx.exchange(req).await {
+            Ok(r) => r,
+            Err(e) => {
+                if !is_retryable_err(&e) {
+                    st.close_with(&format!("poll pull request failed: {e}"));
+                    return;
+                }
+                let closed = st.wait_closed();
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    reason = closed => {
+                        st.close_with(&reason);
+                        return;
+                    }
+                }
+                backoff = next_backoff(backoff, MIN_BACKOFF, MAX_BACKOFF);
+                continue;
+            }
+        };
+        if resp.status != 200 {
+            if is_retryable_status(resp.status) {
+                let _ = resp.body.read_all_limited(4 * 1024).await;
+                let closed = st.wait_closed();
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    reason = closed => {
+                        st.close_with(&reason);
+                        return;
+                    }
+                }
+                backoff = next_backoff(backoff, MIN_BACKOFF, MAX_BACKOFF);
+                continue;
+            }
+            st.close_with(&format!("poll pull bad status: {}", resp.status));
+            return;
+        }
+        readiness.mark_pull_ready();
+
+        // bufio.Scanner over the body: one base64 line per payload.
+        use base64::Engine;
+        let mut carry: Vec<u8> = Vec::new();
+        let mut failure: Option<Error> = None;
+        loop {
+            let mut chunk = Vec::new();
+            match resp.body.read_some(&mut chunk).await {
+                Ok(true) => carry.extend_from_slice(&chunk),
+                Ok(false) => break,
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+            while let Some(pos) = carry.iter().position(|&b| b == b'\n') {
+                let mut line: Vec<u8> = carry.drain(..=pos).collect();
+                line.pop(); // '\n'
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                if line.is_empty() {
+                    continue;
+                }
+                let payload = base64::engine::general_purpose::STANDARD
+                    .decode(&line)
+                    .map_err(|_| Error::protocol("sudoku: poll pull decode failed"));
+                let payload = match payload {
+                    Ok(p) => p,
+                    Err(_) => {
+                        // closeWithError (tunnel_conn_poll.go:181).
+                        let mut dead = resp.body;
+                        let _ = dead.read_all_limited(4 * 1024).await;
+                        st.close_with("poll pull decode failed");
+                        return;
+                    }
+                };
+                let closed = st.wait_closed();
+                tokio::select! {
+                    res = payload_tx.send(payload) => {
+                        if res.is_err() {
+                            return;
+                        }
+                    }
+                    reason = closed => {
+                        st.close_with(&reason);
+                        return;
+                    }
+                }
+            }
+        }
+        if let Some(e) = failure {
+            if is_retryable_err(&e) {
+                let closed = st.wait_closed();
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    reason = closed => {
+                        st.close_with(&reason);
+                        return;
+                    }
+                }
+                backoff = next_backoff(backoff, MIN_BACKOFF, MAX_BACKOFF);
+                continue;
+            }
+            st.close_with(&format!("poll pull scan failed: {e}"));
+            return;
+        }
+        // The final line may lack its newline (Scanner still yields it).
+        if !carry.is_empty() {
+            let payload = base64::engine::general_purpose::STANDARD
+                .decode(&carry)
+                .map_err(|_| Error::protocol("sudoku: poll pull decode failed"));
+            if let Ok(payload) = payload {
+                let closed = st.wait_closed();
+                tokio::select! {
+                    res = payload_tx.send(payload) => {
+                        if res.is_err() {
+                            return;
+                        }
+                    }
+                    reason = closed => {
+                        st.close_with(&reason);
+                        return;
+                    }
+                }
+            }
+        }
+        if resp.body.trailer("X-Sudoku-Stream-EOF") == Some("1") {
+            read_eof.set("");
+            return;
+        }
+        backoff = MIN_BACKOFF;
+    }
+}
+
+/// `pushLoop` (tunnel_conn_poll.go:212).
+async fn poll_push_loop(
+    ctx: HttpCtx,
+    push_q: String,
+    fin_q: String,
+    st: QueueState,
+    readiness: TunnelReadiness,
+    mut write_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+) {
+    const MAX_BATCH_BYTES: usize = 64 * 1024;
+    const MAX_LINE_RAW_BYTES: usize = 16 * 1024;
+    const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+    const MIN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+
+    let upload_seq = std::sync::atomic::AtomicU64::new(0);
+    let mut buf: Vec<u8> = Vec::with_capacity(MAX_BATCH_BYTES * 2);
+    let mut pending_raw: usize = 0;
+
+    macro_rules! flush {
+        () => {
+            if buf.is_empty() {
+                Ok(())
+            } else {
+                let sequence = 1 + upload_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let url = format!("{push_q}&seq={sequence}");
+                let payload = std::mem::take(&mut buf);
+                let result = retry_persistent(&st, MIN_BACKOFF, MAX_BACKOFF, || async {
+                    let req = HttpRequest {
+                        method: "POST",
+                        path_query: &url,
+                        headers: {
+                            let mut h = apply_tunnel_headers(TunnelMode::Poll);
+                            h.push(("Content-Type".into(), "text/plain".into()));
+                            h
+                        },
+                        body: Some(&payload),
+                    };
+                    let mut resp = ctx.exchange(req).await?;
+                    let _ = resp.body.read_all_limited(4 * 1024).await;
+                    if resp.status == 200 {
+                        return Ok(());
+                    }
+                    if is_retryable_status(resp.status) {
+                        return Err(retryable_status_err(resp.status));
+                    }
+                    Err(hard_status_err(resp.status))
+                })
+                .await;
+                match result {
+                    Ok(()) => {
+                        readiness.mark_push_ready();
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        };
+    }
+
+    // enqueue (tunnel_conn_poll.go:285): base64 lines of ≤16KiB raw; the
+    // caller flushes when the batch would overflow.
+    fn enqueue(buf: &mut Vec<u8>, pending_raw: &mut usize, mut b: &[u8]) {
+        use base64::Engine;
+        while !b.is_empty() {
+            let chunk = &b[..b.len().min(MAX_LINE_RAW_BYTES)];
+            b = &b[chunk.len()..];
+            buf.extend_from_slice(
+                base64::engine::general_purpose::STANDARD.encode(chunk).as_bytes(),
+            );
+            buf.push(b'\n');
+            *pending_raw += chunk.len();
+        }
+    }
+
+    let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let write_closed_flag = st.write_closed.clone();
+    let mut write_err: Option<String> = None;
+    loop {
+        let mut fin_phase = false;
+        tokio::select! {
+            maybe = write_rx.recv() => {
+                match maybe {
+                    Some(b) => {
+                        if b.is_empty() {
+                            continue;
+                        }
+                        // Split into lines, flushing when the batch fills.
+                        let mut rest: &[u8] = &b;
+                        while !rest.is_empty() {
+                            let take = rest.len().min(MAX_LINE_RAW_BYTES);
+                            if pending_raw + take > MAX_BATCH_BYTES {
+                                if let Err(e) = flush!() {
+                                    write_err = Some(format!("poll push flush failed: {e}"));
+                                    break;
+                                }
+                                // buf.Reset(); pendingRaw = 0
+                                // (tunnel_conn_poll.go:277).
+                                pending_raw = 0;
+                                ticker.reset();
+                            }
+                            enqueue(&mut buf, &mut pending_raw, &rest[..take]);
+                            rest = &rest[take..];
+                        }
+                        if write_err.is_some() {
+                            break;
+                        }
+                        if pending_raw >= MAX_BATCH_BYTES {
+                            if let Err(e) = flush!() {
+                                write_err = Some(format!("poll push flush failed: {e}"));
+                                break;
+                            }
+                            pending_raw = 0;
+                            ticker.reset();
+                        }
+                    }
+                    None => {
+                        let e = st.wait_closed().await;
+                        write_err = Some(e);
+                        break;
+                    }
+                }
+            }
+            _ = ticker.tick() => {
+                if let Err(e) = flush!() {
+                    write_err = Some(format!("poll push flush failed: {e}"));
+                    break;
+                }
+                pending_raw = 0;
+            }
+            _ = write_closed_flag.wait() => {
+                fin_phase = true;
+            }
+        }
+        if fin_phase {
+            while let Ok(b) = write_rx.try_recv() {
+                if b.is_empty() {
+                    continue;
+                }
+                enqueue(&mut buf, &mut pending_raw, &b);
+            }
+            if let Err(e) = flush!() {
+                write_err = Some(format!("poll push flush failed: {e}"));
+            }
+            if write_err.is_none() {
+                if let Err(e) = send_session_control(&ctx, &fin_q).await {
+                    write_err = Some(format!("poll FIN failed: {e}"));
+                }
+            }
+            break;
+        }
+    }
+    if let Some(err) = &write_err {
+        st.close_with(err);
+    }
+    st.write_done.set(write_err.unwrap_or_default());
+}
+
+// ---------------------------------------------------------------------------
+// ws mode (tunnel_ws.go + ws_stream_conn.go + ws_auth.go)
+// ---------------------------------------------------------------------------
+
+/// `tunnelAuth` (ws_auth.go): token = `ts_be64 || HMAC-SHA256_trunc16`
+/// base64 RawURL, HMAC key = `sha256("sudoku-httpmask-auth-v1:" || key)`.
+fn tunnel_auth_token(auth_key: &str, mode: &str, method: &str, path: &str) -> String {
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    let key_material = Sha256::new_with_prefix(b"sudoku-httpmask-auth-v1:")
+        .chain_update(auth_key.as_bytes())
+        .finalize();
+    let key: [u8; 32] = key_material.into();
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let method = if method.is_empty() { "GET".to_string() } else { method.to_uppercase() };
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key).expect("hmac accepts any key");
+    mac.update(mode.as_bytes());
+    mac.update(&[0]);
+    mac.update(method.as_bytes());
+    mac.update(&[0]);
+    mac.update(path.as_bytes());
+    mac.update(&[0]);
+    mac.update(&ts.to_be_bytes());
+    let sig = mac.finalize().into_bytes();
+    let mut raw = [0u8; 24];
+    raw[..8].copy_from_slice(&ts.to_be_bytes());
+    raw[8..].copy_from_slice(&sig[..16]);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
+}
+
+/// The WebSocket event/command channels between the frame tasks and the
+/// stream (`wsStreamConn` over a duplex).
+enum WsEvent {
+    Data(Vec<u8>),
+    Eof,
+}
+
+enum WsCmd {
+    Data(Vec<u8>),
+    Pong(Vec<u8>),
+    Close,
+}
+
+/// RFC 6455 client frame (always masked).
+fn ws_build_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(payload.len() + 14);
+    frame.push(0x80 | opcode); // FIN + opcode
+    let mask_bit = 0x80u8;
+    if payload.len() < 126 {
+        frame.push(mask_bit | payload.len() as u8);
+    } else if payload.len() <= u16::MAX as usize {
+        frame.push(mask_bit | 126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        frame.push(mask_bit | 127);
+        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+    let mut mask = [0u8; 4];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut mask);
+    frame.extend_from_slice(&mask);
+    for (i, b) in payload.iter().enumerate() {
+        frame.push(b ^ mask[i % 4]);
+    }
+    frame
+}
+
+/// One parsed server frame.
+struct WsFrame {
+    fin: bool,
+    opcode: u8,
+    payload: Vec<u8>,
+}
+
+async fn ws_read_frame<R: AsyncRead + Unpin>(conn: &mut R) -> Result<WsFrame> {
+    let mut hdr = [0u8; 2];
+    conn.read_exact(&mut hdr).await?;
+    let fin = hdr[0] & 0x80 != 0;
+    let opcode = hdr[0] & 0x0f;
+    if hdr[0] & 0x70 != 0 {
+        return Err(Error::protocol("sudoku: ws frame with RSV bits"));
+    }
+    let masked = hdr[1] & 0x80 != 0;
+    let len = (hdr[1] & 0x7f) as u64;
+    let len = match len {
+        126 => {
+            let mut ext = [0u8; 2];
+            conn.read_exact(&mut ext).await?;
+            u16::from_be_bytes(ext) as u64
+        }
+        127 => {
+            let mut ext = [0u8; 8];
+            conn.read_exact(&mut ext).await?;
+            u64::from_be_bytes(ext)
+        }
+        n => n,
+    };
+    let mut mask = [0u8; 4];
+    if masked {
+        conn.read_exact(&mut mask).await?;
+    }
+    let mut payload = vec![0u8; len as usize];
+    conn.read_exact(&mut payload).await?;
+    if masked {
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b ^= mask[i % 4];
+        }
+    }
+    Ok(WsFrame { fin, opcode, payload })
+}
+
+/// `newWSStreamConn` (ws_stream_conn.go): the frame tasks feeding a
+/// duplex the tunnel conn reads/writes.
+struct WsConn {
+    event_rx: tokio::sync::mpsc::Receiver<WsEvent>,
+    cmd_tx: tokio::sync::mpsc::UnboundedSender<WsCmd>,
+    pending: Vec<u8>,
+    eof: bool,
+}
+
+impl AsyncRead for WsConn {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        loop {
+            if !self.pending.is_empty() {
+                let n = self.pending.len().min(buf.remaining());
+                buf.put_slice(&self.pending[..n]);
+                self.pending.drain(..n);
+                return Poll::Ready(Ok(()));
+            }
+            if buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            if self.eof {
+                return Poll::Ready(Ok(()));
+            }
+            match self.event_rx.poll_recv(cx) {
+                Poll::Ready(Some(WsEvent::Data(mut d))) => {
+                    if d.is_empty() {
+                        continue;
+                    }
+                    if d.len() > buf.remaining() {
+                        let take = buf.remaining();
+                        buf.put_slice(&d[..take]);
+                        self.pending = d.split_off(take);
+                    } else {
+                        buf.put_slice(&d);
+                    }
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Ready(Some(WsEvent::Eof)) => {
+                    self.eof = true;
+                }
+                Poll::Ready(None) => {
+                    self.eof = true;
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl AsyncWrite for WsConn {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.eof {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "sudoku: ws tunnel closed",
+            )));
+        }
+        match self.cmd_tx.send(WsCmd::Data(buf.to_vec())) {
+            Ok(()) => Poll::Ready(Ok(buf.len())),
+            Err(_) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "sudoku: ws tunnel closed",
+            ))),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    /// `wsStreamConn.Close` (ws_stream_conn.go:75): close frame then TCP.
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let _ = self.cmd_tx.send(WsCmd::Close);
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl Drop for WsConn {
+    fn drop(&mut self) {
+        let _ = self.cmd_tx.send(WsCmd::Close);
+    }
+}
+
+/// `dialWS` (tunnel_ws.go:98): the upgrade handshake, the early
+/// handshake riding the `ed` query param and the `X-Sudoku-Early`
+/// response header.
+async fn dial_ws(ctx: &HttpCtx, auth_key: &str, early: &mut EarlyClientState) -> Result<BoxProxyStream> {
+    let mut path = join_path_root(&ctx.path_root, "/ws");
+    let mut query = Vec::new();
+    if !early.request_payload.is_empty() {
+        use base64::Engine;
+        query.push(format!(
+            "ed={}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&early.request_payload)
+        ));
+    }
+    let token = tunnel_auth_token(auth_key, "ws", "GET", "/ws");
+    if !auth_key.trim().is_empty() {
+        query.push(format!("auth={token}"));
+    }
+    if !query.is_empty() {
+        path = format!("{path}?{}", query.join("&"));
+    }
+    let mut headers = apply_ws_headers();
+    if !auth_key.trim().is_empty() {
+        headers.push(("Authorization".into(), format!("Bearer {token}")));
+    }
+    headers.push(("Connection".into(), "Upgrade".into()));
+    headers.push(("Upgrade".into(), "websocket".into()));
+    headers.push(("Sec-WebSocket-Version".into(), "13".into()));
+    use base64::Engine;
+    let mut key_bytes = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key_bytes);
+    headers.push((
+        "Sec-WebSocket-Key".into(),
+        base64::engine::general_purpose::STANDARD.encode(key_bytes),
+    ));
+
+    let mut conn = ctx.open().await?;
+    let mut head = Vec::with_capacity(512);
+    head.extend_from_slice(format!("GET {path} HTTP/1.1\r\n").as_bytes());
+    head.extend_from_slice(format!("Host: {}\r\n", ctx.target.header_host).as_bytes());
+    for (name, value) in &headers {
+        head.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+    }
+    head.extend_from_slice(b"\r\n");
+    conn.write_all(&head).await?;
+
+    // The 101 response head.
+    let status_line = read_crlf_line(&mut conn, 8 * 1024).await?;
+    let status_text = String::from_utf8_lossy(&status_line).into_owned();
+    let status: u16 = status_text
+        .split(' ')
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .ok_or_else(|| Error::protocol(format!("sudoku: bad ws status line {status_text:?}")))?;
+    let mut resp_headers = Vec::new();
+    loop {
+        let line = read_crlf_line(&mut conn, 16 * 1024).await?;
+        if line.is_empty() {
+            break;
+        }
+        let text = String::from_utf8_lossy(&line).into_owned();
+        if let Some((name, value)) = text.split_once(':') {
+            resp_headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
+        }
+    }
+    if status != 101 {
+        return Err(Error::network(format!("sudoku: ws upgrade bad status: {status}")));
+    }
+    let early_header = resp_headers
+        .iter()
+        .find(|(k, _)| k == "x-sudoku-early")
+        .map(|(_, v)| v.clone());
+    if let Some(value) = early_header {
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(value.trim())
+            .map_err(|_| Error::protocol("sudoku: ws early payload decode failed"))?;
+        early.process_response(decoded).await?;
+    }
+
+    // The frame tasks (wsStreamConn's reader/writer).
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel::<WsEvent>(64);
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WsCmd>();
+    let (mut reader_conn, mut writer_conn) = tokio::io::split(conn);
+    let reader_cmd_tx = cmd_tx.clone();
+    tokio::spawn(async move {
+        // Assemble fragmented messages; answer pings; EOF on close.
+        let mut assembled: Option<(u8, Vec<u8>)> = None;
+        loop {
+            let frame = match ws_read_frame(&mut reader_conn).await {
+                Ok(f) => f,
+                Err(_) => {
+                    let _ = event_tx.send(WsEvent::Eof).await;
+                    return;
+                }
+            };
+            match frame.opcode {
+                8 => {
+                    // Close: reply with a close frame, then EOF.
+                    let _ = reader_cmd_tx.send(WsCmd::Close);
+                    let _ = event_tx.send(WsEvent::Eof).await;
+                    return;
+                }
+                9 => {
+                    // Ping → pong with the same payload.
+                    let _ = reader_cmd_tx.send(WsCmd::Pong(frame.payload));
+                    continue;
+                }
+                10 => continue, // pong
+                1 | 2 => {
+                    if frame.fin {
+                        let _ = event_tx.send(WsEvent::Data(frame.payload)).await;
+                    } else {
+                        assembled = Some((frame.opcode, frame.payload));
+                    }
+                }
+                0 => {
+                    // Continuation.
+                    match assembled.as_mut() {
+                        Some((_, buf)) => buf.extend_from_slice(&frame.payload),
+                        None => continue, // stray continuation
+                    }
+                    if frame.fin {
+                        if let Some((_, buf)) = assembled.take() {
+                            let _ = event_tx.send(WsEvent::Data(buf)).await;
+                        }
+                    }
+                }
+                _ => {
+                    let _ = event_tx.send(WsEvent::Eof).await;
+                    return;
+                }
+            }
+        }
+    });
+    tokio::spawn(async move {
+        while let Some(cmd) = cmd_rx.recv().await {
+            match cmd {
+                WsCmd::Data(payload) => {
+                    if writer_conn.write_all(&ws_build_frame(2, &payload)).await.is_err() {
+                        return;
+                    }
+                }
+                WsCmd::Pong(payload) => {
+                    if writer_conn.write_all(&ws_build_frame(10, &payload)).await.is_err() {
+                        return;
+                    }
+                }
+                WsCmd::Close => {
+                    let body = 1000u16.to_be_bytes().to_vec();
+                    let _ = writer_conn.write_all(&ws_build_frame(8, &body)).await;
+                    let _ = writer_conn.shutdown().await;
+                    return;
+                }
+            }
+        }
+    });
+    Ok(Box::new(WsConn {
+        event_rx,
+        cmd_tx,
+        pending: Vec::new(),
+        eof: false,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// DialTunnel (tunnel_api.go) + the public entry points
+// ---------------------------------------------------------------------------
+
+/// `autoProbeTimeout` (tunnel_api.go:168).
+const AUTO_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// `DialTunnel` (tunnel_api.go:138) for every mode, always with the
+/// early handshake armed (the client path passes `Upgrade`, which
+/// upstream turns into the early handshake). Falls back to the in-band
+/// handshake when the server ignored the early data.
+async fn dial_http_mask_tunnel(
+    rc: &ResolvedConfig,
+    dialer: TunnelDialer,
+) -> Result<(RecordConn<ObfsStream>, Option<TunnelWait>)> {
+    let mode = rc.http_mask_mode.as_str();
+    let (choice, hint) = pick_client_table(&rc.tables)?;
+    let mut early = EarlyClientState::new(rc, choice.clone(), hint).await?;
+    let raw: BoxProxyStream;
+    let readiness: Option<TunnelWait>;
+    match mode {
+        "ws" => {
+            let ctx = HttpCtx::new(rc, dialer, true)?;
+            let auth_key = client_aead_seed(&rc.seed);
+            raw = dial_ws(&ctx, &auth_key, &mut early).await?;
+            readiness = None;
+        }
+        "poll" => {
+            let ctx = HttpCtx::new(rc, dialer, false)?;
+            let (conn, ready) = dial_poll(&ctx, &mut early).await?;
+            raw = conn;
+            readiness = Some(ready);
+        }
+        _ => {
+            // stream + auto (auto: 20s stream probe, then poll).
+            let ctx = HttpCtx::new(rc, dialer.clone(), false)?;
+            let attempt = async {
+                if mode == "auto" {
+                    match tokio::time::timeout(AUTO_PROBE_TIMEOUT, dial_stream(&ctx, &mut early)).await {
+                        Ok(r) => r,
+                        Err(_) => Err(Error::network("sudoku: stream probe timed out")),
+                    }
+                } else {
+                    dial_stream(&ctx, &mut early).await
+                }
+            };
+            match attempt.await {
+                Ok((conn, ready)) => {
+                    raw = conn;
+                    readiness = Some(ready);
+                }
+                Err(stream_err) if mode == "auto" => {
+                    // The stream attempt consumed the early state's
+                    // payload; rebuild it for the poll attempt.
+                    let mut early2 = EarlyClientState::new(rc, choice.clone(), hint).await?;
+                    match dial_poll(&ctx, &mut early2).await {
+                        Ok((conn, ready)) => {
+                            early = early2;
+                            raw = conn;
+                            readiness = Some(ready);
+                        }
+                        Err(poll_err) => {
+                            return Err(Error::network(format!(
+                                "sudoku: auto tunnel failed: stream: {stream_err}; poll: {poll_err}"
+                            )));
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    // applyEarlyHandshakeOrUpgrade (early_handshake.go:78): the early
+    // branch when Ready(), else the in-band Upgrade.
+    if early.response_set {
+        let conn = early.wrap_conn(raw)?;
+        Ok((conn, readiness))
+    } else {
+        let obfs = ObfsStream::new(
+            raw,
+            choice,
+            rc.padding_min,
+            rc.padding_max,
+            rc.enable_pure_downlink,
+        );
+        let conn = kip_handshake_client(
+            RecordConn::new(obfs, rc.method, [0u8; 32], [0u8; 32]),
+            rc,
+            hint,
+        )
+        .await?;
+        Ok((conn, readiness))
+    }
+}
+
+/// Whether the config's http-mask mode is a tunnel mode (stream/poll/
+/// auto/ws): the integrator picks `connect_tunnel*` (which take a
+/// dialer) instead of `connect`/`connect_udp` for these.
+pub fn uses_http_mask_tunnel(cfg: &SudokuOut) -> bool {
+    resolve_config(cfg).map(|rc| rc.tunnel_mode()).unwrap_or(false)
+}
+
+/// `DialContext` over an HTTPMask tunnel (mihomo dialAndHandshake's
+/// tunnel branch): early-handshake KIP exchange, then `KIPTypeOpenTCP`.
+pub async fn connect_tunnel(
+    cfg: &SudokuOut,
+    dialer: TunnelDialer,
+    target: &NetAddr,
+) -> Result<BoxProxyStream> {
+    let rc = resolve_config(cfg)?;
+    if !rc.tunnel_mode() {
+        return Err(Error::config(format!(
+            "sudoku: http-mask-mode {:?} does not use the http tunnel — use connect",
+            if rc.http_mask_mode.is_empty() { "legacy" } else { &rc.http_mask_mode }
+        )));
+    }
+    if rc.multiplex == "on" {
+        return Err(Error::config(
+            "sudoku: multiplex \"on\" requires the session dialer — use connect_tunnel_mux",
+        ));
+    }
+    let (mut conn, _readiness) = dial_http_mask_tunnel(&rc, dialer).await?;
+    let addr_buf = encode_address(target);
+    write_kip_message(&mut conn, KIP_TYPE_OPEN_TCP, &addr_buf).await?;
+    debug!(target: "engine", "sudoku: tunnel TCP open sent for {target}");
+    Ok(Box::new(conn))
+}
+
+/// `ListenPacketContext` over an HTTPMask tunnel.
+pub async fn connect_tunnel_udp(
+    cfg: &SudokuOut,
+    dialer: TunnelDialer,
+) -> Result<BoxProxyStream> {
+    let rc = resolve_config(cfg)?;
+    if !rc.tunnel_mode() {
+        return Err(Error::config(format!(
+            "sudoku: http-mask-mode {:?} does not use the http tunnel — use connect_udp",
+            if rc.http_mask_mode.is_empty() { "legacy" } else { &rc.http_mask_mode }
+        )));
+    }
+    let (mut conn, _readiness) = dial_http_mask_tunnel(&rc, dialer).await?;
+    write_kip_message(&mut conn, KIP_TYPE_START_UOT, &[]).await?;
+    debug!(target: "engine", "sudoku: tunnel UoT session started");
+    Ok(Box::new(conn))
+}
+
+/// `StartMultiplexClient` over an HTTPMask tunnel (multiplex.go:14):
+/// handshake, `KIPTypeStartMux`, `WaitTunnelReady`, then the session.
+pub async fn connect_tunnel_mux(
+    cfg: &SudokuOut,
+    dialer: TunnelDialer,
+) -> Result<SudokuMuxSession> {
+    let rc = resolve_config(cfg)?;
+    if !rc.tunnel_mode() {
+        return Err(Error::config(format!(
+            "sudoku: http-mask-mode {:?} does not use the http tunnel — use connect_mux",
+            if rc.http_mask_mode.is_empty() { "legacy" } else { &rc.http_mask_mode }
+        )));
+    }
+    let (mut conn, readiness) = dial_http_mask_tunnel(&rc, dialer).await?;
+    write_kip_message(&mut conn, KIP_TYPE_START_MUX, &[]).await?;
+    if let Some(wait) = readiness {
+        // WaitTunnelReady (tunnel_ready.go:91) — a no-op for ws.
+        wait.wait()
+            .await
+            .map_err(|e| Error::network(format!("sudoku: warm mux tunnel failed: {e}")))?;
+    }
+    debug!(target: "engine", "sudoku: tunnel mux session starting");
+    Ok(SudokuMuxSession::new(Box::new(conn)))
+}
 
 #[cfg(test)]
 mod tests {
@@ -3788,22 +6378,21 @@ mod tests {
         let mut c = base_cfg();
         c.path_root = "a b".into();
         assert!(resolve_config(&c).err().map(|e| e.to_string()).unwrap_or_default().contains("invalid character"));
-        // The tunnel modes are rejected with precise reasons.
-        for (mode, needle) in [
-            ("stream", "tunnel_conn_stream.go"),
-            ("poll", "tunnel_conn_poll.go"),
-            ("auto", "tunnel_dial.go"),
-            ("ws", "tunnel_ws.go"),
-        ] {
+        // Every tunnel mode now resolves; only unknown modes reject.
+        for mode in ["stream", "poll", "auto", "ws"] {
             let mut c = base_cfg();
             c.http_mask_mode = mode.into();
-            let err = resolve_config(&c).err().map(|e| e.to_string()).unwrap_or_default();
-            assert!(err.contains(needle), "mode {mode}: {err}");
-            assert!(err.contains("legacy"), "mode {mode}: {err}");
+            let rc = resolve_config(&c).unwrap();
+            assert_eq!(rc.http_mask_mode, mode);
+            assert!(rc.tunnel_mode(), "{mode}");
         }
         let mut c = base_cfg();
+        c.http_mask_mode = "legacy".into();
+        assert!(!resolve_config(&c).unwrap().tunnel_mode());
+        let mut c = base_cfg();
         c.http_mask_mode = "gopher".into();
-        assert!(resolve_config(&c).err().map(|e| e.to_string()).unwrap_or_default().contains("http-mask-mode"));
+        let err = resolve_config(&c).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(err.contains("http-mask-mode"), "{err}");
         // Padding resolution (config.go ResolvePadding).
         assert_eq!(resolve_padding(None, Some(5), 10, 30), (5, 5));
         assert_eq!(resolve_padding(Some(40), None, 10, 30), (40, 40));
@@ -4667,4 +7256,968 @@ mod tests {
         assert_eq!(hint.unwrap(), t.hint());
         assert!(pick_client_table(&[]).is_err());
     }
+
+    // ------------------------------------------------ httpmask tunnels
+
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use tokio::net::TcpListener;
+
+    /// What the in-test session does after the early handshake.
+    enum TunnelSessionKind {
+        Tcp(NetAddr),
+        Mux,
+    }
+
+    /// The session pipe halves shared by the tunnel endpoints: pushes
+    /// write `wr`, pulls read `rd` (tunnel_server.go's `tunnelSession`).
+    struct MaskPipe {
+        rd: Option<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        wr: Option<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
+    }
+
+    /// Shared mask-server state.
+    struct MaskShared {
+        seed: String,
+        method: RecordMethod,
+        padding: (i64, i64),
+        pure_downlink: bool,
+        tables: Vec<Arc<Table>>,
+        sessions: std::sync::Mutex<HashMap<String, MaskPipe>>,
+        next_upload_seq: std::sync::Mutex<HashMap<String, u64>>,
+        log: std::sync::Mutex<Vec<String>>,
+        /// The `auto` test: refuse stream-mode authorize attempts.
+        reject_stream_authorize: AtomicBool,
+        /// Opt the sessions into mux echo (the mux test).
+        mux_marker: AtomicBool,
+    }
+
+    impl MaskShared {
+        fn log(&self, entry: String) {
+            self.log.lock().unwrap().push(entry);
+        }
+
+        fn logged(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+
+        /// `ProcessEarlyClientPayload` + the KIP server hello, in memory
+        /// (early_handshake.go:215/286).
+        async fn process_early(
+            &self,
+            payload: &[u8],
+        ) -> Result<(Vec<u8>, [u8; 32], [u8; 32])> {
+            let uplink = self.tables[0].clone();
+            let downlink = uplink.opposite_direction();
+            let obfs = ServerObfs::new(
+                MemIo::source(payload.to_vec()),
+                uplink.clone(),
+                downlink,
+                self.padding.0,
+                self.padding.1,
+                self.pure_downlink,
+            );
+            let (psk_c2s, psk_s2c) = derive_psk_directional_bases(&self.seed);
+            let mut rc: RecordConn<BoxProxyStream> = RecordConn::new(
+                Box::new(obfs) as BoxProxyStream,
+                self.method,
+                psk_s2c,
+                psk_c2s,
+            );
+            let (typ, payload) = read_kip_message(&mut rc).await?;
+            if typ != KIP_TYPE_CLIENT_HELLO {
+                return Err(Error::protocol("bad early message"));
+            }
+            let (ts, _user_hash, nonce, client_pub, feats, hint) =
+                decode_kip_client_hello_payload(&payload)?;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            if (now - ts).abs() > KIP_HANDSHAKE_SKEW {
+                return Err(Error::protocol("early time skew"));
+            }
+            // ResolveClientHelloTable: match the hint against candidates.
+            let resolved = match hint {
+                Some(h) => self
+                    .tables
+                    .iter()
+                    .find(|t| t.hint() == h)
+                    .cloned()
+                    .unwrap_or(uplink.clone()),
+                None => uplink.clone(),
+            };
+            let mut scalar = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut scalar);
+            let server_pub =
+                curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(scalar).0;
+            let mut sh = Vec::with_capacity(52);
+            sh.extend_from_slice(&nonce);
+            sh.extend_from_slice(&server_pub);
+            sh.extend_from_slice(&(feats & KIP_FEAT_ALL).to_be_bytes());
+            let written = Arc::new(Mutex::new(Vec::new()));
+            let resp_obfs = ServerObfs::new(
+                MemIo::sink(written.clone()),
+                resolved.clone(),
+                resolved.opposite_direction(),
+                self.padding.0,
+                self.padding.1,
+                self.pure_downlink,
+            );
+            let mut resp: RecordConn<BoxProxyStream> = RecordConn::new(
+                Box::new(resp_obfs) as BoxProxyStream,
+                self.method,
+                psk_s2c,
+                psk_c2s,
+            );
+            write_kip_message(&mut resp, KIP_TYPE_SERVER_HELLO, &sh).await?;
+            let shared = x25519_shared_secret(&scalar, &client_pub)?;
+            let (sess_c2s, sess_s2c) =
+                derive_session_directional_bases(&self.seed, &shared, &nonce)?;
+            let captured = written.lock().unwrap().clone();
+            Ok((captured, sess_c2s, sess_s2c))
+        }
+
+        /// The post-handshake session (`ReadServerSession` or the mux
+        /// echo) over the server half of the pipe.
+        async fn run_session(
+            self: Arc<Self>,
+            kind: TunnelSessionKind,
+            mut conn: RecordConn<BoxProxyStream>,
+        ) {
+            let (first, payload) = match read_kip_message(&mut conn).await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            match kind {
+                TunnelSessionKind::Tcp(target) => {
+                    assert!(
+                        first == KIP_TYPE_OPEN_TCP || first == KIP_TYPE_START_UOT,
+                        "expected OpenTCP/StartUoT, got {first:#x}"
+                    );
+                    if first == KIP_TYPE_OPEN_TCP {
+                        let (addr, used) = decode_address(&payload).unwrap();
+                        assert_eq!(used, payload.len());
+                        assert_eq!(addr, target);
+                    }
+                    let mut buf = vec![0u8; 16 * 1024];
+                    loop {
+                        match conn.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                if conn.write_all(&buf[..n]).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                TunnelSessionKind::Mux => {
+                    assert_eq!(first, KIP_TYPE_START_MUX, "expected StartMux");
+                    let mut buf = Vec::new();
+                    loop {
+                        let mut chunk = [0u8; 8192];
+                        match conn.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                                while buf.len() >= MUX_HEADER_SIZE {
+                                    let len = u32::from_be_bytes([
+                                        buf[5], buf[6], buf[7], buf[8],
+                                    ]) as usize;
+                                    if buf.len() < MUX_HEADER_SIZE + len {
+                                        break;
+                                    }
+                                    let frame: Vec<u8> =
+                                        buf.drain(..MUX_HEADER_SIZE + len).collect();
+                                    let frame_type = frame[0];
+                                    let stream_id = u32::from_be_bytes([
+                                        frame[1], frame[2], frame[3], frame[4],
+                                    ]);
+                                    let payload = frame[MUX_HEADER_SIZE..].to_vec();
+                                    match frame_type {
+                                        MUX_FRAME_DATA => {
+                                            let mut echo =
+                                                Vec::with_capacity(MUX_HEADER_SIZE + len);
+                                            echo.push(MUX_FRAME_DATA);
+                                            echo.extend_from_slice(&stream_id.to_be_bytes());
+                                            echo.extend_from_slice(&(len as u32).to_be_bytes());
+                                            echo.extend_from_slice(&payload);
+                                            if conn.write_all(&echo).await.is_err() {
+                                                return;
+                                            }
+                                        }
+                                        MUX_FRAME_CLOSE => {
+                                            let mut echo = Vec::with_capacity(MUX_HEADER_SIZE);
+                                            echo.push(MUX_FRAME_CLOSE);
+                                            echo.extend_from_slice(&stream_id.to_be_bytes());
+                                            echo.extend_from_slice(&0u32.to_be_bytes());
+                                            let _ = conn.write_all(&echo).await;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// One parsed HTTP request at the mask server.
+    struct MaskRequest {
+        method: String,
+        path: String,
+        query: HashMap<String, String>,
+        headers: HashMap<String, String>,
+        body: Vec<u8>,
+    }
+
+    async fn mask_read_request(io: &mut BoxProxyStream) -> Result<MaskRequest> {
+        let mut head = Vec::new();
+        loop {
+            let line = read_crlf_line(io, 16 * 1024).await?;
+            if line.is_empty() {
+                break;
+            }
+            head.extend_from_slice(&line);
+            head.push(b'\n');
+        }
+        let text = String::from_utf8_lossy(&head).into_owned();
+        let mut lines = text.lines();
+        let request_line = lines.next().unwrap_or_default().to_string();
+        let mut parts = request_line.split(' ');
+        let method = parts.next().unwrap_or_default().to_uppercase();
+        let target = parts.next().unwrap_or_default().to_string();
+        let (path, query_str) = match target.split_once('?') {
+            Some((p, q)) => (p.to_string(), q.to_string()),
+            None => (target.clone(), String::new()),
+        };
+        let mut query = HashMap::new();
+        for pair in query_str.split('&').filter(|p| !p.is_empty()) {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            query.insert(k.to_string(), v.to_string());
+        }
+        let mut headers = HashMap::new();
+        for line in lines {
+            if let Some((k, v)) = line.split_once(':') {
+                headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            }
+        }
+        let content_length: usize = headers
+            .get("content-length")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let mut body = vec![0u8; content_length];
+        if content_length > 0 {
+            io.read_exact(&mut body).await?;
+        }
+        Ok(MaskRequest {
+            method,
+            path,
+            query,
+            headers,
+            body,
+        })
+    }
+
+    async fn mask_simple_response(io: &mut BoxProxyStream, code: u16, body: &str) {
+        let reason = match code {
+            200 => "OK",
+            403 => "Forbidden",
+            404 => "Not Found",
+            _ => "Error",
+        };
+        let resp = format!(
+            "HTTP/1.1 {code} {reason}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = io.write_all(resp.as_bytes()).await;
+    }
+
+    /// The mask server's accept loop.
+    async fn mask_server_loop(
+        listener: TcpListener,
+        shared: Arc<MaskShared>,
+        tls: Option<Arc<rustls::ServerConfig>>,
+    ) {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let shared = shared.clone();
+            let tls = tls.clone();
+            tokio::spawn(async move {
+                let _ = stream.set_nodelay(true);
+                let io: BoxProxyStream = match tls {
+                    Some(config) => {
+                        let acceptor = tokio_rustls::TlsAcceptor::from(config);
+                        match acceptor.accept(stream).await {
+                            Ok(s) => Box::new(s),
+                            Err(_) => return,
+                        }
+                    }
+                    None => Box::new(stream),
+                };
+                let _ = mask_handle_conn(io, &shared).await;
+            });
+        }
+    }
+
+    async fn mask_handle_conn(mut io: BoxProxyStream, shared: &Arc<MaskShared>) -> Result<()> {
+        let req = mask_read_request(&mut io).await?;
+        let mode_header = req.headers.get("x-sudoku-tunnel").cloned().unwrap_or_default();
+        if req.method == "GET" && req.path.ends_with("/session") {
+            shared.log(format!("authorize mode={mode_header}"));
+            if mode_header == "stream"
+                && shared.reject_stream_authorize.load(AtomicOrdering::Relaxed)
+            {
+                mask_simple_response(&mut io, 403, "no stream").await;
+                return Ok(());
+            }
+            // sessionAuthorize: the early handshake, a token, and the
+            // halfpipe session (tunnel_server.go:710).
+            use base64::Engine;
+            let early_payload = match req.query.get("ed") {
+                Some(v) => base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(v)
+                    .map_err(|_| Error::protocol("bad ed"))?,
+                None => Vec::new(),
+            };
+            let kind = if shared.mux_marker.load(AtomicOrdering::Relaxed) {
+                TunnelSessionKind::Mux
+            } else {
+                TunnelSessionKind::Tcp(NetAddr::domain("echo.example", 443).unwrap())
+            };
+            let (response_payload, sess_c2s, sess_s2c) = if early_payload.is_empty() {
+                // No early payload: the client falls back to the in-band
+                // handshake (applyEarlyHandshakeOrUpgrade's Upgrade arm).
+                (Vec::new(), [0u8; 32], [0u8; 32])
+            } else {
+                shared.process_early(&early_payload).await?
+            };
+            let token = format!("tok{}", rand::random::<u64>());
+            let (a, b) = tokio::io::duplex(256 * 1024);
+            let obfs = ServerObfs::new(
+                Box::new(a),
+                shared.tables[0].clone(),
+                shared.tables[0].opposite_direction(),
+                shared.padding.0,
+                shared.padding.1,
+                shared.pure_downlink,
+            );
+            let conn: RecordConn<BoxProxyStream> = RecordConn::new(
+                Box::new(obfs) as BoxProxyStream,
+                shared.method,
+                sess_s2c,
+                sess_c2s,
+            );
+            let shared2 = shared.clone();
+            tokio::spawn(async move {
+                shared2.run_session(kind, conn).await;
+            });
+            let (rd, wr) = tokio::io::split(b);
+            shared.sessions.lock().unwrap().insert(
+                token.clone(),
+                MaskPipe {
+                    rd: Some(rd),
+                    wr: Some(wr),
+                },
+            );
+            shared
+                .next_upload_seq
+                .lock()
+                .unwrap()
+                .insert(token.clone(), 1);
+            let mut body = format!("token={token}");
+            if !response_payload.is_empty() {
+                body += &format!(
+                    "\ned={}",
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&response_payload)
+                );
+            }
+            body += "\ncap=upload-seq";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-store\r\nPragma: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            io.write_all(resp.as_bytes()).await?;
+            return Ok(());
+        }
+        if req.method == "GET" && req.path.ends_with("/stream") {
+            shared.log(format!("pull mode={mode_header}"));
+            // Take the read half; reinsert on a clean long-poll end.
+            let rd = {
+                let mut sessions = shared.sessions.lock().unwrap();
+                match sessions.get_mut(&req.query.get("token").cloned().unwrap_or_default()) {
+                    Some(pipe) => pipe.rd.take(),
+                    None => None,
+                }
+            };
+            let Some(mut rd) = rd else {
+                mask_simple_response(&mut io, 404, "no session").await;
+                return Ok(());
+            };
+            let poll_mode = mode_header == "poll";
+            io.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\nTrailer: X-Sudoku-Stream-EOF\r\nCache-Control: no-store\r\nPragma: no-cache\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n\r\n"
+            ).await?;
+            let mut eof = false;
+            loop {
+                let mut buf = vec![0u8; 16 * 1024];
+                let read = tokio::time::timeout(
+                    std::time::Duration::from_millis(120),
+                    rd.read(&mut buf),
+                )
+                .await;
+                match read {
+                    Err(_) => break, // idle: end this long-poll body
+                    Ok(Ok(0)) => {
+                        eof = true;
+                        break;
+                    }
+                    Ok(Ok(n)) => {
+                        if poll_mode {
+                            use base64::Engine;
+                            let line =
+                                base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
+                            let chunk = format!("{:x}\r\n{line}\n\r\n", line.len() + 1);
+                            io.write_all(chunk.as_bytes()).await?;
+                        } else {
+                            let chunk = format!("{:x}\r\n", n);
+                            io.write_all(chunk.as_bytes()).await?;
+                            io.write_all(&buf[..n]).await?;
+                            io.write_all(b"\r\n").await?;
+                        }
+                    }
+                    Ok(Err(_)) => {
+                        eof = true;
+                        break;
+                    }
+                }
+            }
+            if eof {
+                io.write_all(b"0\r\nX-Sudoku-Stream-EOF: 1\r\n\r\n").await?;
+            } else {
+                io.write_all(b"0\r\n\r\n").await?;
+                // Give the read half back for the next pull.
+                let mut sessions = shared.sessions.lock().unwrap();
+                if let Some(pipe) =
+                    sessions.get_mut(&req.query.get("token").cloned().unwrap_or_default())
+                {
+                    pipe.rd = Some(rd);
+                }
+            }
+            return Ok(());
+        }
+        if req.method == "POST" && req.path.ends_with("/api/v1/upload") {
+            let token = req.query.get("token").cloned().unwrap_or_default();
+            let mode = mode_header.clone();
+            if req.query.get("close").map(|v| v == "1").unwrap_or(false) {
+                shared.log(format!("close mode={mode}"));
+                shared.sessions.lock().unwrap().remove(&token);
+                shared.next_upload_seq.lock().unwrap().remove(&token);
+                mask_simple_response(&mut io, 200, "").await;
+                return Ok(());
+            }
+            if req.query.get("fin").map(|v| v == "1").unwrap_or(false) {
+                shared.log(format!("fin mode={mode}"));
+                // CloseWrite on the session pipe.
+                {
+                    let mut sessions = shared.sessions.lock().unwrap();
+                    if let Some(pipe) = sessions.get_mut(&token) {
+                        pipe.wr = None;
+                    }
+                }
+                mask_simple_response(&mut io, 200, "").await;
+                return Ok(());
+            }
+            let seq: u64 = req.query.get("seq").and_then(|v| v.parse().ok()).unwrap_or(0);
+            let expected = shared.next_upload_seq.lock().unwrap().get(&token).copied();
+            let Some(expected) = expected else {
+                mask_simple_response(&mut io, 404, "no session").await;
+                return Ok(());
+            };
+            assert_eq!(seq, expected, "upload sequence must increment");
+            shared
+                .next_upload_seq
+                .lock()
+                .unwrap()
+                .insert(token.clone(), expected + 1);
+            shared.log(format!(
+                "push mode={mode} ctype={}",
+                req.headers.get("content-type").cloned().unwrap_or_default()
+            ));
+            let payload = if mode == "poll" {
+                use base64::Engine;
+                let text = String::from_utf8_lossy(&req.body).into_owned();
+                let mut out = Vec::new();
+                for line in text.lines().filter(|l| !l.is_empty()) {
+                    out.extend_from_slice(
+                        &base64::engine::general_purpose::STANDARD
+                            .decode(line)
+                            .map_err(|_| Error::protocol("bad push line"))?,
+                    );
+                }
+                out
+            } else {
+                req.body.clone()
+            };
+            let wr = {
+                let mut sessions = shared.sessions.lock().unwrap();
+                match sessions.get_mut(&token) {
+                    Some(pipe) => pipe.wr.take(),
+                    None => None,
+                }
+            };
+            let mut wr = match wr {
+                Some(w) => w,
+                None => {
+                    mask_simple_response(&mut io, 404, "no session").await;
+                    return Ok(());
+                }
+            };
+            wr.write_all(&payload).await.ok();
+            {
+                let mut sessions = shared.sessions.lock().unwrap();
+                if let Some(pipe) = sessions.get_mut(&token) {
+                    pipe.wr = Some(wr);
+                }
+            }
+            mask_simple_response(&mut io, 200, "").await;
+            return Ok(());
+        }
+        if req.method == "GET" && req.path.ends_with("/ws") {
+            shared.log(format!(
+                "ws ed={} auth={}",
+                req.query.contains_key("ed"),
+                req.query.contains_key("auth")
+            ));
+            if let Some(auth) = req.query.get("auth") {
+                let auth_key = client_aead_seed(&shared.seed);
+                assert!(tunnel_auth_verify(auth, &auth_key), "ws auth token must verify");
+                let bearer = req.headers.get("authorization").cloned().unwrap_or_default();
+                assert!(bearer.starts_with("Bearer "), "bearer header: {bearer}");
+            }
+            use base64::Engine;
+            let early_payload = match req.query.get("ed") {
+                Some(v) => base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(v)
+                    .map_err(|_| Error::protocol("bad ed"))?,
+                None => Vec::new(),
+            };
+            let (response_payload, sess_c2s, sess_s2c) = if early_payload.is_empty() {
+                (Vec::new(), [0u8; 32], [0u8; 32])
+            } else {
+                shared.process_early(&early_payload).await?
+            };
+            let mut resp =
+                String::from("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n");
+            if !response_payload.is_empty() {
+                resp += &format!(
+                    "X-Sudoku-Early: {}\r\n",
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&response_payload)
+                );
+            }
+            resp += "\r\n";
+            io.write_all(resp.as_bytes()).await?;
+            // The ws session: frames ↔ the session RecordConn.
+            let (a, b) = tokio::io::duplex(256 * 1024);
+            let obfs = ServerObfs::new(
+                Box::new(a),
+                shared.tables[0].clone(),
+                shared.tables[0].opposite_direction(),
+                shared.padding.0,
+                shared.padding.1,
+                shared.pure_downlink,
+            );
+            let conn: RecordConn<BoxProxyStream> = RecordConn::new(
+                Box::new(obfs) as BoxProxyStream,
+                shared.method,
+                sess_s2c,
+                sess_c2s,
+            );
+            let shared2 = shared.clone();
+            tokio::spawn(async move {
+                shared2
+                    .run_session(
+                        TunnelSessionKind::Tcp(NetAddr::domain("echo.example", 443).unwrap()),
+                        conn,
+                    )
+                    .await;
+            });
+            let (mut rd, mut wr) = tokio::io::split(io);
+            let (mut b_rd, b_wr) = tokio::io::split(b);
+            let pump_up = async move {
+                let mut conn_side = b_wr;
+                loop {
+                    match ws_read_frame(&mut rd).await {
+                        Ok(frame) if frame.opcode == 2 || frame.opcode == 1 => {
+                            if conn_side.write_all(&frame.payload).await.is_err() {
+                                return;
+                            }
+                        }
+                        _ => return,
+                    }
+                }
+            };
+            let pump_down = async move {
+                let mut buf = vec![0u8; 16 * 1024];
+                loop {
+                    match b_rd.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            if wr.write_all(&ws_build_frame(2, &buf[..n])).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            };
+            tokio::join!(pump_up, pump_down);
+            return Ok(());
+        }
+        mask_simple_response(&mut io, 404, "not found").await;
+        Ok(())
+    }
+
+    /// Verify a ws auth token ±60s (ws_auth.go verifyValue).
+    fn tunnel_auth_verify(token: &str, auth_key: &str) -> bool {
+        use base64::Engine;
+        use hmac::{Hmac, Mac};
+        let Ok(raw) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token) else {
+            return false;
+        };
+        if raw.len() != 24 {
+            return false;
+        }
+        let ts = u64::from_be_bytes(raw[..8].try_into().unwrap());
+        let key_material = Sha256::new_with_prefix(b"sudoku-httpmask-auth-v1:")
+            .chain_update(auth_key.as_bytes())
+            .finalize();
+        let key: [u8; 32] = key_material.into();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if (now - ts as i64).abs() > 60 {
+            return false;
+        }
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key).unwrap();
+        mac.update(b"ws");
+        mac.update(&[0]);
+        mac.update(b"GET");
+        mac.update(&[0]);
+        mac.update(b"/ws");
+        mac.update(&[0]);
+        mac.update(&ts.to_be_bytes());
+        let sig = mac.finalize().into_bytes();
+        sig[..16] == raw[8..]
+    }
+
+    /// Spawn the mask server; returns (port, shared).
+    async fn spawn_mask_server(tls: bool) -> (u16, Arc<MaskShared>) {
+        let key = "mask-server-key-0123456789abcdef";
+        let tables =
+            new_client_tables_with_custom_patterns(key, "prefer_entropy", "", &[]).unwrap();
+        let shared = Arc::new(MaskShared {
+            seed: key.to_string(),
+            method: RecordMethod::Chacha20Poly1305,
+            padding: (10, 30),
+            pure_downlink: true,
+            tables,
+            sessions: std::sync::Mutex::new(HashMap::new()),
+            next_upload_seq: std::sync::Mutex::new(HashMap::new()),
+            log: std::sync::Mutex::new(Vec::new()),
+            reject_stream_authorize: AtomicBool::new(false),
+            mux_marker: AtomicBool::new(false),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let tls_config = if tls {
+            let certified = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()])
+                .expect("rcgen cert");
+            let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
+            let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+                certified.key_pair.serialize_der().into(),
+            );
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let mut config = rustls::ServerConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)
+                .unwrap();
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            Some(Arc::new(config))
+        } else {
+            None
+        };
+        tokio::spawn(mask_server_loop(listener, shared.clone(), tls_config));
+        (port, shared)
+    }
+
+    fn tunnel_cfg(mode: &str, port: u16, tls: bool) -> SudokuOut {
+        let mut cfg = SudokuOut::new("127.0.0.1", port, "mask-server-key-0123456789abcdef");
+        cfg.http_mask_mode = mode.into();
+        cfg.http_mask_tls = tls;
+        cfg.http_mask_tls_insecure = tls;
+        cfg
+    }
+
+    fn tcp_dialer(port: u16) -> TunnelDialer {
+        std::sync::Arc::new(move || {
+            let port = port;
+            Box::pin(async move {
+                let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .map_err(|e| Error::network(format!("dial: {e}")))?;
+                Ok(Box::new(stream) as BoxProxyStream)
+            })
+        })
+    }
+
+    async fn tunnel_echo(mode: &str, tls: bool, payload_len: usize) -> Arc<MaskShared> {
+        let (port, shared) = spawn_mask_server(tls).await;
+        let cfg = tunnel_cfg(mode, port, tls);
+        let target = NetAddr::domain("echo.example", 443).unwrap();
+        let stream = connect_tunnel(&cfg, tcp_dialer(port), &target)
+            .await
+            .expect("tunnel connect");
+        let payload: Vec<u8> = (0..payload_len as u32).map(|i| (i % 251) as u8).collect();
+        let (mut rd, mut wr) = tokio::io::split(stream);
+        let want = payload.clone();
+        let echo = tokio::spawn(async move {
+            let mut got = vec![0u8; want.len()];
+            rd.read_exact(&mut got).await.expect("echo read");
+            got
+        });
+        wr.write_all(&payload).await.expect("tunnel write");
+        let got = tokio::time::timeout(Duration::from_secs(30), echo)
+            .await
+            .expect("echo timed out")
+            .expect("echo task");
+        assert_eq!(got, payload);
+        shared
+    }
+
+    #[tokio::test]
+    async fn tunnel_stream_mode_echo() {
+        let shared = tunnel_echo("stream", false, 100_000).await;
+        let logged = shared.logged();
+        assert!(
+            logged.iter().any(|l| l == "authorize mode=stream"),
+            "{logged:?}"
+        );
+        assert!(
+            logged
+                .iter()
+                .any(|l| l.starts_with("push mode=stream ctype=application/octet-stream")),
+            "{logged:?}"
+        );
+        assert!(logged.iter().any(|l| l.starts_with("pull mode=stream")), "{logged:?}");
+    }
+
+    #[tokio::test]
+    async fn tunnel_poll_mode_echo() {
+        let shared = tunnel_echo("poll", false, 80_000).await;
+        let logged = shared.logged();
+        assert!(logged.iter().any(|l| l == "authorize mode=poll"), "{logged:?}");
+        assert!(
+            logged.iter().any(|l| l.starts_with("push mode=poll ctype=text/plain")),
+            "{logged:?}"
+        );
+        assert!(logged.iter().any(|l| l.starts_with("pull mode=poll")), "{logged:?}");
+    }
+
+    #[tokio::test]
+    async fn tunnel_auto_falls_back_to_poll() {
+        let (port, shared) = spawn_mask_server(false).await;
+        shared
+            .reject_stream_authorize
+            .store(true, AtomicOrdering::Relaxed);
+        let cfg = tunnel_cfg("auto", port, false);
+        let target = NetAddr::domain("echo.example", 443).unwrap();
+        let mut stream = connect_tunnel(&cfg, tcp_dialer(port), &target)
+            .await
+            .expect("auto tunnel");
+        stream.write_all(b"auto-fallback").await.unwrap();
+        let mut buf = [0u8; 13];
+        tokio::time::timeout(Duration::from_secs(15), stream.read_exact(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf, b"auto-fallback");
+        let logged = shared.logged();
+        assert!(
+            logged.iter().any(|l| l == "authorize mode=stream"),
+            "the stream probe must run first: {logged:?}"
+        );
+        assert!(logged.iter().any(|l| l == "authorize mode=poll"), "{logged:?}");
+    }
+
+    #[tokio::test]
+    async fn tunnel_auto_prefers_stream() {
+        let shared = tunnel_echo("auto", false, 5_000).await;
+        let logged = shared.logged();
+        assert!(logged.iter().any(|l| l == "authorize mode=stream"), "{logged:?}");
+        assert!(!logged.iter().any(|l| l == "authorize mode=poll"), "{logged:?}");
+    }
+
+    #[tokio::test]
+    async fn tunnel_ws_mode_echo() {
+        let shared = tunnel_echo("ws", false, 100_000).await;
+        assert!(
+            shared.logged().iter().any(|l| l.starts_with("ws ed=true auth=true")),
+            "{:?}",
+            shared.logged()
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnel_stream_mode_tls() {
+        let shared = tunnel_echo("stream", true, 60_000).await;
+        assert!(
+            shared.logged().iter().any(|l| l == "authorize mode=stream"),
+            "https authorize"
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnel_ws_mode_tls() {
+        let shared = tunnel_echo("ws", true, 40_000).await;
+        assert!(
+            shared.logged().iter().any(|l| l.starts_with("ws ed=true")),
+            "wss upgrade"
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnel_uot_over_stream() {
+        let (port, _shared) = spawn_mask_server(false).await;
+        let cfg = tunnel_cfg("stream", port, false);
+        let mut stream = connect_tunnel_udp(&cfg, tcp_dialer(port))
+            .await
+            .expect("uot tunnel");
+        // The mimic's Tcp session echoes raw bytes; UoT datagrams ride it.
+        let target = NetAddr::domain("dns.example", 53).unwrap();
+        let frame = uot_datagram(&target, b"uot-over-tunnel").unwrap();
+        stream.write_all(&frame).await.unwrap();
+        let mut buf = vec![0u8; frame.len()];
+        tokio::time::timeout(Duration::from_secs(15), stream.read_exact(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(buf, frame);
+    }
+
+    #[tokio::test]
+    async fn tunnel_mux_over_stream() {
+        let (port, shared) = spawn_mask_server(false).await;
+        shared.mux_marker.store(true, AtomicOrdering::Relaxed);
+        let cfg = tunnel_cfg("stream", port, false);
+        let session = connect_tunnel_mux(&cfg, tcp_dialer(port))
+            .await
+            .expect("tunnel mux");
+        let target = NetAddr::domain("echo.example", 443).unwrap();
+        let mut s1 = session.open_stream(&target).await.expect("open");
+        s1.write_all(b"mux-over-tunnel").await.unwrap();
+        let mut buf = [0u8; 15];
+        tokio::time::timeout(Duration::from_secs(20), s1.read_exact(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf, b"mux-over-tunnel");
+        session.close();
+    }
+
+    #[tokio::test]
+    async fn tunnel_rejects_single_transport_entry() {
+        let (port, _shared) = spawn_mask_server(false).await;
+        let cfg = tunnel_cfg("stream", port, false);
+        let err = connect(
+            &cfg,
+            Box::new(tokio::io::duplex(16).0),
+            &NetAddr::domain("a", 1).unwrap(),
+        )
+        .await
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+        assert!(err.contains("connect_tunnel"), "{err}");
+        let err = connect_tunnel(
+            &SudokuOut::new("127.0.0.1", port, "k"),
+            tcp_dialer(port),
+            &NetAddr::domain("a", 1).unwrap(),
+        )
+        .await
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+        assert!(err.contains("does not use the http tunnel"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn tunnel_stream_upload_sequence_enforced() {
+        // The mimic asserts seq ordering; a large payload forces several
+        // sequenced uploads through the 256KiB batching.
+        let (port, _shared) = spawn_mask_server(false).await;
+        let cfg = tunnel_cfg("stream", port, false);
+        let target = NetAddr::domain("echo.example", 443).unwrap();
+        let stream = connect_tunnel(&cfg, tcp_dialer(port), &target)
+            .await
+            .expect("connect");
+        let payload: Vec<u8> = (0..700_000u32).map(|i| (i % 251) as u8).collect();
+        let (mut rd, mut wr) = tokio::io::split(stream);
+        let want = payload.clone();
+        let echo = tokio::spawn(async move {
+            let mut got = vec![0u8; want.len()];
+            rd.read_exact(&mut got).await.expect("echo read");
+            got
+        });
+        wr.write_all(&payload).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(40), echo)
+            .await
+            .expect("echo timed out")
+            .expect("echo task");
+        assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn tunnel_helpers_shape() {
+        // canonicalHeaderHost strips default ports, keeps IPv6 bracketed.
+        assert_eq!(canonical_header_host("example.com:443", "https"), "example.com");
+        assert_eq!(canonical_header_host("example.com:80", "http"), "example.com");
+        assert_eq!(
+            canonical_header_host("example.com:8443", "https"),
+            "example.com:8443"
+        );
+        assert_eq!(canonical_header_host("[::1]:443", "https"), "[::1]");
+        // normalizeHTTPDialTarget with host override.
+        let t = normalize_http_dial_target("1.2.3.4:8443", true, "cdn.example").unwrap();
+        assert_eq!(t.scheme, "https");
+        assert_eq!(t.header_host, "cdn.example:8443");
+        assert_eq!(t.server_name, "cdn.example");
+        let t = normalize_ws_dial_target("1.2.3.4", true, "").unwrap();
+        assert_eq!(t.scheme, "wss");
+        assert_eq!(t.server_name, "1.2.3.4");
+        // parseAuthorizeResponse (tunnel_dial.go:65).
+        let body = b"token=abcDEF-_123\ncap=upload-seq";
+        let (token, early) = parse_authorize_response(body).unwrap();
+        assert_eq!(token, "abcDEF-_123");
+        assert!(early.is_none());
+        let body = b"junk\ntoken=tok1";
+        assert!(parse_authorize_response(body).is_err(), "missing cap");
+        // ws auth token shape: base64url of ts_be64 + sig16.
+        let token = tunnel_auth_token("seed", "ws", "GET", "/ws");
+        use base64::Engine;
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&token)
+            .unwrap();
+        assert_eq!(raw.len(), 24);
+        assert!(tunnel_auth_verify(&token, "seed"));
+        assert!(!tunnel_auth_verify(&token, "other-seed"));
+    }
+
 }

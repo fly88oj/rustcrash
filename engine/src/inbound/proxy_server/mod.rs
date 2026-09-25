@@ -78,7 +78,9 @@
 //!   are both served.
 
 pub mod hysteria2;
+pub mod restls;
 pub mod ss;
+pub mod tlsmirror;
 pub mod trojan;
 pub mod tuic;
 pub mod vless;
@@ -168,6 +170,33 @@ pub enum ServerProtocol {
         password: String,
         tls: Option<ServerTls>,
     },
+    /// RestLS camouflage listener (mihomo `listeners` type `restls`):
+    /// the server half of the restls handshake over every accepted TCP
+    /// conn, then a plain relay to `dest` (the camouflage site) —
+    /// unlike the proxy protocols above there is no target inside the
+    /// protocol; the client speaks to `dest` through the tunnel.
+    Restls {
+        password: String,
+        restls_script: Option<String>,
+        min_record_len: u32,
+        rate_limit: u32,
+        /// The camouflage destination the hidden session relays to.
+        dest: String,
+    },
+    /// TLSMirror camouflage listener (mihomo `listeners` type
+    /// `tlsmirror`): dial `dest` first, then the mirror server
+    /// handshake (`ServeConnReady`) between the client conn and the
+    /// forward conn. Enrolment is the (ingress, egress) outbound pair.
+    TlsMirror {
+        primary_key: String,
+        explicit_nonce_cipher_suites: Vec<u16>,
+        defer_write_time: (u64, u64),
+        transport_padding: bool,
+        enrolment: Option<(String, String)>,
+        sequence_watermarking: bool,
+        /// The carrier destination the hidden session relays to.
+        dest: String,
+    },
 }
 
 impl ServerProtocol {
@@ -181,6 +210,8 @@ impl ServerProtocol {
             ServerProtocol::Vless { .. } => "vless",
             ServerProtocol::Hysteria2 { .. } => "hysteria2",
             ServerProtocol::Tuic { .. } => "tuic",
+            ServerProtocol::Restls { .. } => "restls",
+            ServerProtocol::TlsMirror { .. } => "tlsmirror",
         }
     }
 
@@ -193,8 +224,9 @@ impl ServerProtocol {
     ///   UDP port.
     /// * Hysteria2 / TUIC: UDP rides the QUIC listener itself (QUIC
     ///   datagrams, and TUIC uni streams in `quic` mode).
+    /// * RestLS / TLSMirror: camouflage TCP relays — TCP only.
     pub fn supports_udp(&self) -> bool {
-        true
+        !matches!(self, ServerProtocol::Restls { .. } | ServerProtocol::TlsMirror { .. })
     }
 }
 
@@ -220,6 +252,8 @@ pub async fn serve(cfg: &ServerConfig, relay: SharedRelay) -> Result<SocketAddr>
         ServerProtocol::Vless { .. } => vless::serve(cfg, relay).await,
         ServerProtocol::Hysteria2 { .. } => hysteria2::serve(cfg, relay).await,
         ServerProtocol::Tuic { .. } => tuic::serve(cfg, relay).await,
+        ServerProtocol::Restls { .. } => restls::serve(cfg, relay).await,
+        ServerProtocol::TlsMirror { .. } => tlsmirror::serve(cfg, relay).await,
     }
 }
 

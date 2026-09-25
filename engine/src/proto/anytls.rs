@@ -589,14 +589,10 @@ async fn open_session(cfg: &AnyTlsOut, transport: BoxProxyStream) -> Result<AnyT
     if cfg.password.is_empty() {
         return Err(Error::config("anytls: password is required"));
     }
-    if let Some(opts) = &cfg.ech {
-        if opts.enable {
-            return Err(Error::config(
-                "anytls ech-opts.enable: ECH needs a TLS-layer hook neither rustls nor \
-                 quinn provides; the engine's own TLS 1.3 stack wiring is staged next (the \
-                 HPKE + ECHConfig core is complete in proto::ech)",
-            ));
-        }
+    if cfg.ech.as_ref().is_some_and(|o| o.enable) && cfg.jls.is_some() {
+        return Err(Error::config(
+            "anytls: jls-opts and ech-opts both replace the TLS handshake and cannot combine",
+        ));
     }
     let server_name = if cfg.sni.is_empty() {
         cfg.server.clone()
@@ -608,7 +604,43 @@ async fn open_session(cfg: &AnyTlsOut, transport: BoxProxyStream) -> Result<AnyT
         server = %cfg.server, port = %cfg.port, sni = %server_name, skip_verify = cfg.skip_verify,
         "anytls: opening session"
     );
-    let tls = if let Some(user) = &cfg.jls {
+    let tls = if let Some(opts) = cfg.ech.as_ref().filter(|o| o.enable) {
+        // ECH: the engine's own TLS 1.3 stack carries the outer/inner
+        // ClientHello pair (ech-opts on anytls). Self-dialing like the
+        // jls/jls-quic split upstream: ECH owns the transport.
+        use base64::Engine as _;
+        let list = base64::engine::general_purpose::STANDARD
+            .decode(opts.config.as_bytes())
+            .map_err(|e| {
+                Error::config(format!("anytls ech-opts.config is not valid base64: {e}"))
+            })?;
+        let selection = crate::proto::ech::select_ech_config(&list)?;
+        let ech_cfg = crate::proto::reality::tls13::EchCfg::new(
+            server_name.clone(),
+            crate::proto::reality::UtslProfile::Chrome,
+            selection,
+        );
+        let auth = crate::proto::reality::tls13::ServerAuth::WebPki {
+            roots: std::sync::Arc::new(crate::proto::reality::stream::root_store()?),
+            server_name: server_name.clone(),
+        };
+        let dial_server = cfg.server.clone();
+        let dial_port = cfg.port;
+        Box::new(
+            crate::proto::reality::tls13::connect_ech(&ech_cfg, &auth, move || {
+                let server = dial_server.clone();
+                Box::pin(async move {
+                    let tcp = tokio::net::TcpStream::connect((server.as_str(), dial_port))
+                        .await
+                        .map_err(|e| {
+                            Error::network(format!("dial {server}:{dial_port}: {e}"))
+                        })?;
+                    Ok(Box::new(tcp) as BoxProxyStream)
+                })
+            })
+            .await?,
+        )
+    } else if let Some(user) = &cfg.jls {
         crate::proto::jls::connect(
             &crate::proto::jls::JlsOut {
                 username: user.username.clone(),
