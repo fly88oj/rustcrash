@@ -675,6 +675,12 @@ impl Outer {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReadPhase {
+    /// tls13-outer splice path only: the caller wrote the raw VLESS
+    /// request header, so the server's response header (version(1) +
+    /// addons-length(1) + addons) arrives here first and must be
+    /// consumed before the vision frames (the boxed path's VlessStream
+    /// already consumed it).
+    VlessResp,
     /// Fewer than 21 downlink bytes seen: framed or unframed is still unknown.
     Init,
     /// Consuming a 5-byte command/contentLen/paddingLen header.
@@ -816,7 +822,7 @@ impl VisionConn {
         uuid: uuid::Uuid,
         cfg: VisionConfig,
     ) -> Result<Self> {
-        Self::with_outer(Outer::Boxed(outer), target, uuid, cfg).await
+        Self::with_outer(Outer::Boxed(outer), target, uuid, cfg, false).await
     }
 
     /// The full-splice variant: wrap *our own* TLS 1.3 outer stream (the
@@ -836,7 +842,7 @@ impl VisionConn {
         uuid: uuid::Uuid,
         cfg: VisionConfig,
     ) -> Result<Self> {
-        Self::with_outer(Outer::Tls13(Box::new(outer)), target, uuid, cfg).await
+        Self::with_outer(Outer::Tls13(Box::new(outer)), target, uuid, cfg, true).await
     }
 
     async fn with_outer(
@@ -844,6 +850,7 @@ impl VisionConn {
         target: &NetAddr,
         uuid: uuid::Uuid,
         cfg: VisionConfig,
+        expect_vless_resp_header: bool,
     ) -> Result<Self> {
         let splice_capable = outer.is_tls13();
         tracing::debug!(
@@ -864,7 +871,11 @@ impl VisionConn {
             pending: Vec::new(),
             splice_write_after_drain: false,
             in_buf: Vec::new(),
-            phase: ReadPhase::Init,
+            phase: if expect_vless_resp_header {
+                ReadPhase::VlessResp
+            } else {
+                ReadPhase::Init
+            },
             remaining_content: 0,
             remaining_padding: 0,
             current_command: COMMAND_CONTINUE,
@@ -1094,6 +1105,21 @@ impl VisionConn {
     fn poll_read_inner(&mut self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         loop {
             match self.phase {
+                ReadPhase::VlessResp => {
+                    // Response header: version(1) + addons-length(1) then
+                    // addons (`VlessStream`'s consumption, inlined). With
+                    // fewer bytes buffered the arm falls through to the
+                    // loop bottom, which fills from the transport.
+                    if self.in_buf.len() >= 2 {
+                        let addons_len = self.in_buf[1] as usize;
+                        if self.in_buf.len() >= 2 + addons_len {
+                            self.in_buf.drain(..2 + addons_len);
+                            self.phase = ReadPhase::Init;
+                            continue;
+                        }
+                    }
+                    // Not enough bytes yet: fall through to fill.
+                }
                 ReadPhase::Init => {
                     // Upstream only classifies the downlink once it holds 21
                     // bytes and the first 16 match the UUID (`XtlsUnpadding`
@@ -2400,6 +2426,10 @@ mod tests {
                 .expect("first uplink frame");
             assert_eq!(cmd, COMMAND_CONTINUE);
             assert_eq!(content, srv_inner_ch);
+            // The real Xray server prefixes its first downlink bytes with
+            // the VLESS response header (version 0 + addons-length 0) —
+            // live-verified; the splice path consumes it.
+            tls.write_all(&[0x00, 0x00]).await.unwrap();
 
             // 2. Downlink: a continue frame with the ServerHello —
             //    UUID-prefixed, it is the first downlink frame — then, in
