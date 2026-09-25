@@ -27,6 +27,40 @@ All notable changes to RustCrash. Format based on
   passthrough (the framing half of the splice; the raw-transport
   rebind is tracked).
 
+### Engine — wave 11: ECH on QUIC + JLS-in-QUIC (own TLS stack under quinn), tailscale ipn + data plane, snell/anytls frontings, easytier peer tunnel
+
+- **The quinn/rustls blocker is gone**: a `crypto::ClientConfig`
+  implementation over the engine's own TLS 1.3 stack now drives QUIC
+  handshakes (RFC 9001 key schedule, initial keys byte-identical via
+  rustls's public Suite::keys, the finished/exporter chain) — so
+  **ECH works on hysteria2, TUIC and trusttunnel(quic)**, and
+  **shadowquic's JLS credentials activate** (the cover stamps the QUIC
+  ClientHello exactly like jls-quic-go). One Cargo.toml line names
+  quinn-proto explicitly (same crate/version the lockfile already
+  pulled — its crypto traits are otherwise unnameable).
+- **tailscale ipn + data plane**: machine/node key state store,
+  control /key fetch, auth-key RegisterRequest login, the /map
+  long-poll with full delta application, and a WireGuard data session
+  over direct UDP or DERP relay (smoltcp) — a TCP relay works
+  end-to-end through both paths against the engine's own WG endpoint.
+  Wire fact: tailcfg messages are JSON, not protobuf.
+- **snell/anytls frontings**: the snell listener stacks shadow-tls
+  (full v3 server half), res-tls or jls with upstream's mutual
+  exclusion; the anytls listener gained TLS fronting; the snell
+  OUTBOUND fronts the same modes client-side (`obfs-mode`).
+- **jls client uTLS fallback**: the fingerprint path now performs the
+  camouflage HTTP round (h1 + h2c forms) before surfacing the auth
+  error, matching jlsClientHTTPFallback.
+- **easytier milestone 1**: the direct-TCP peer tunnel — framing,
+  plain-mode handshake with network digest identity, packet encryption
+  (AES-GCM/ChaCha, byte-parity proven against upstream's NIST vector),
+  keepalive with backoff, and the IP-frame seam for the next
+  milestone's smoltcp attach. `connect()` now really joins a peer.
+- **Audit corrections**: series/naive/bridge/cloudflare do not exist
+  in current upstream (probed) — recorded as N/A; also fixed a latent
+  wave-8 bug where the TCP-TLS ECH path was dead code behind an
+  over-eager refusal.
+
 ### Engine — wave 10: cross-platform TUN serving, jls/snell/anytls listeners, tlsmirror h2 generator, tailscale wire foundations, overlay config surfaces
 
 - **TUN serves on Windows and macOS**: the netstack was rewritten over a

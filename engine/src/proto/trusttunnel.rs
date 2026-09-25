@@ -49,8 +49,10 @@
 //! * QUIC knobs: `congestion-controller` bbr/cubic/new_reno are applied
 //!   through quinn; `cwnd` and `bbr-profile` are carried but have no
 //!   quinn equivalent (no initial-window / BBR-profile knob).
-//! * ECH (`ech-opts`) composes at the TLS layer and is another
-//!   module's; the option is carried as an opaque blob here.
+//! * ECH (`ech-opts`) rides the QUIC arm through the engine's own
+//!   TLS 1.3 stack (`crate::quic::tls13`, a quinn `crypto::ClientConfig`
+//!   with the ECH cover — the inner hello carries the real SNI and h3);
+//!   the plain-rustls path stays the default when it is unset.
 
 use std::collections::HashMap;
 use std::io;
@@ -158,8 +160,8 @@ pub struct TrustTunnelOut {
     pub max_connections: i64,
     pub min_streams: i64,
     pub max_streams: i64,
-    /// `ech-opts` — carried for the TLS layer (enabling it fails with a
-    /// precise error at connect time; see outbound wiring).
+    /// `ech-opts` — applied on the QUIC arm through the engine's own
+    /// TLS 1.3 stack (ECH cover; see `quic_dial`).
     pub ech: Option<crate::proto::ech::EchOptions>,
 }
 
@@ -1606,7 +1608,14 @@ async fn quic_dial(cfg: &TrustTunnelOut) -> Result<quinn::Connection> {
         udp_relay: false,
         congestion_brutal_bps: None,
     };
-    let mut client_cfg = quic::client_config(&dial)?;
+    let mut client_cfg = if let Some(opts) = cfg.ech.as_ref().filter(|o| o.enable) {
+        // `ech-opts` on the quic arm: the dial runs on the engine's own
+        // TLS 1.3 stack with the ECH cover (crate::quic::tls13); ALPN
+        // still negotiates h3.
+        quic::client_config_custom(&dial, &quic::QuicTlsCover::Ech(quic::ech_selection(opts)?))?
+    } else {
+        quic::client_config(&dial)?
+    };
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(
         quinn::IdleTimeout::try_from(DEFAULT_QUIC_MAX_IDLE_TIMEOUT)
@@ -2673,6 +2682,54 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// The QUIC arm honors `ech-opts` through the engine's own TLS 1.3
+    /// stack (crate::quic::tls13): an ECH-terminating quinn server
+    /// accepts and the h3 CONNECT relay echoes as usual.
+    #[tokio::test]
+    async fn h3_connect_and_echo_with_ech() {
+        let (sk_r, list) = crate::quic::tls13::test_server::ech_server_key(
+            &[17u8; 32],
+            0x88,
+            b"tt-public.example",
+        );
+        let endpoint = crate::quic::tls13::test_server::start_quinn_server(
+            crate::quic::tls13::ServerMode::EchAccept {
+                sk_r,
+                config_list: list.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let port = endpoint.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                if let Ok(conn) = incoming.await {
+                    tokio::spawn(h3_serve_conn(conn));
+                }
+            }
+        });
+        let mut cfg = test_cfg();
+        cfg.port = port;
+        cfg.sni = "tt-inner.example".into();
+        cfg.quic = true;
+        use base64::Engine as _;
+        cfg.ech = Some(crate::proto::ech::EchOptions {
+            enable: true,
+            config: base64::engine::general_purpose::STANDARD.encode(&list),
+            query_server_name: String::new(),
+        });
+        let pool = TrustTunnelPool::new(&cfg, None).await.unwrap();
+        let target = NetAddr::domain("echo.example", 443).unwrap();
+        let mut stream = pool.dial(&target, None).await.unwrap();
+        stream.write_all(b"ping-ech").await.unwrap();
+        let mut buf = [0u8; 8];
+        tokio::time::timeout(Duration::from_secs(15), stream.read_exact(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf, b"ping-ech");
     }
 
     #[tokio::test]

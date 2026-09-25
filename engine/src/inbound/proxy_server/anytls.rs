@@ -13,16 +13,22 @@
 //! `disallow using AnyTLS without certificates/shadow-tls/res-tls/jls/
 //! allow-insecure config` (listener/anytls/server.go:159-163) — via
 //! certificate / ECH key / client-auth / shadow-tls / restls / jls
-//! fields on `LC.AnyTLSServer`. Our [`crate::inbound::proxy_server::ServerProtocol::AnyTls`]
-//! carries only `{password, users}`, so this listener serves PLAIN
-//! TCP + auth (the trojan `tls: None` position): safe for tests and
-//! for transports fronted elsewhere. See [`TLS_REQUIRED_NOTE`] for the
-//! integrator note.
+//! fields on `LC.AnyTLSServer`. [`ServerProtocol::AnyTls`] now carries
+//! `tls: Option<ServerTls>` (upstream's `certificate`/`private-key` →
+//! `tls.NewListener`, server.go:159): when set, TLS is terminated with
+//! the same rustls listener pattern as trojan
+//! ([`build_tls_config`] + [`tls_accept`]) and the anytls session
+//! server runs on the plaintext. `tls: None` keeps the trojan
+//! `tls: None` position — plain TCP + auth for tests and transports
+//! fronted elsewhere. See [`TLS_REQUIRED_NOTE`] for the remaining
+//! integrator deltas (stacking, allow-insecure, ECH, client-auth,
+//! padding-scheme).
 //!
 //! Integrator deltas (upstream `LC.AnyTLSServer` fields our enum
-//! lacks): `certificate`/`private-key` (+ `ServerTls`), `client-auth-*`,
-//! `ech-key`, `shadow-tls`/`res-tls`/`jls` stacking, and
-//! `padding-scheme` (this listener pins the default scheme;
+//! lacks): `client-auth-*`, `ech-key`, `shadow-tls`/`res-tls`/`jls`
+//! stacking, `allow-insecure` (an explicit plain escape hatch upstream;
+//! here `tls: None` IS that position), and `padding-scheme` (this
+//! listener pins the default scheme;
 //! [`crate::proto::anytls::run_server_session`] already accepts a raw
 //! scheme for when the enum grows the field).
 
@@ -34,7 +40,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::addr::{Host, NetAddr};
 use crate::error::{Error, Result};
 use crate::inbound::proxy_server::{
-    hand_off, serve_with, ServerConfig, ServerProtocol, SharedRelay,
+    build_tls_config, hand_off, serve_with, tls_accept, ServerConfig, ServerProtocol, SharedRelay,
 };
 use crate::proto::anytls::{
     parse_uot_packet, parse_uot_request, read_auth, run_server_session, uot_packet_frame,
@@ -42,19 +48,24 @@ use crate::proto::anytls::{
 };
 use crate::stream::BoxProxyStream;
 
-/// The upstream gate this listener cannot express: production anytls is
-/// TLS-fronted. Verbatim upstream error (server.go:162) cited for the
-/// integrator adding `tls`/stacking fields to `ServerProtocol::AnyTls`.
+/// The upstream plaintext gate, cited for the integrator: production
+/// anytls is TLS-fronted (`certificate`/`private-key`, now wired as
+/// `tls: Option<ServerTls>`) or stacked (shadow-tls/res-tls/jls) or
+/// explicitly `allow-insecure`. `tls: None` in this engine is the
+/// allow-insecure position — plain TCP + auth, like trojan's
+/// `tls: None`.
 pub const TLS_REQUIRED_NOTE: &str = concat!(
     "anytls upstream refuses plaintext listeners: 'disallow using AnyTLS ",
     "without certificates/shadow-tls/res-tls/jls/allow-insecure config' ",
-    "(listener/anytls/server.go:159-163); this engine listener serves ",
-    "plain TCP + auth until ServerProtocol::AnyTls grows tls/stacking fields"
+    "(listener/anytls/server.go:159-163); tls: Some(..) now terminates TLS ",
+    "(the certificate/private-key fronting); tls: None serves plain TCP + ",
+    "auth, upstream's allow-insecure position — the shadow-tls/res-tls/jls ",
+    "stackings remain integrator deltas until the enum grows them"
 );
 
 /// Serve an anytls listener; returns the bound address.
 pub async fn serve(cfg: &ServerConfig, relay: SharedRelay) -> Result<SocketAddr> {
-    let ServerProtocol::AnyTls { password, users, .. } = &cfg.protocol else {
+    let ServerProtocol::AnyTls { password, users, tls } = &cfg.protocol else {
         return Err(Error::config(
             "anytls::serve called with a non-anytls protocol",
         ));
@@ -67,20 +78,27 @@ pub async fn serve(cfg: &ServerConfig, relay: SharedRelay) -> Result<SocketAddr>
             "anytls listener requires a password or users",
         ));
     }
-    tracing::debug!(target: "engine", "{TLS_REQUIRED_NOTE}");
+    // The certificate fronting loads once, before binding
+    // (ca.NewTLSKeyPairLoader + tls.NewListener, server.go:52-61, 159).
+    let tls_config = tls.as_ref().map(build_tls_config).transpose()?;
+    if tls_config.is_none() {
+        tracing::debug!(target: "engine", "{TLS_REQUIRED_NOTE}");
+    }
     let tag: Arc<str> = Arc::from(cfg.tag.as_str());
     let user_map = Arc::new(user_map);
     serve_with(cfg, move |stream, peer, port| {
         let user_map = user_map.clone();
         let relay = relay.clone();
         let tag = tag.clone();
-        async move { handle_conn(stream, peer, port, &user_map, tag, relay).await }
+        let tls_config = tls_config.clone();
+        async move { handle_conn(stream, peer, port, &user_map, tag, relay, tls_config).await }
     })
     .await
 }
 
-/// HandleConn (listener/anytls/server.go:206-263): auth, then the
-/// session.
+/// HandleConn (listener/anytls/server.go:206-263): TLS termination
+/// (when configured — the `tls.NewListener` wrap, server.go:159), then
+/// auth, then the session.
 async fn handle_conn(
     stream: BoxProxyStream,
     peer: SocketAddr,
@@ -88,7 +106,12 @@ async fn handle_conn(
     user_map: &AnyTlsUserMap,
     tag: Arc<str>,
     relay: SharedRelay,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<()> {
+    let stream = match &tls_config {
+        Some(config) => tls_accept(config.clone(), stream).await?,
+        None => stream,
+    };
     let mut stream = stream;
     // Auth (server.go:210-240): an unknown hash closes silently — no
     // oracle, nothing relayed.
@@ -222,6 +245,7 @@ async fn uot_relay(stream: AnyTlsServerStream, peer: SocketAddr, tag: Arc<str>, 
 mod tests {
     use super::*;
     use crate::inbound::proxy_server::test_support::Capture;
+    use crate::inbound::proxy_server::ServerTls;
     use crate::proto::anytls::{connect_plain, udp_stream_plain, AnyTlsOut};
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
@@ -231,7 +255,7 @@ mod tests {
         format!("pw-{:016x}", rand::random::<u64>())
     }
 
-    fn cfg(password: &str, users: Vec<(String, String)>) -> ServerConfig {
+    fn cfg(password: &str, users: Vec<(String, String)>, tls: Option<ServerTls>) -> ServerConfig {
         ServerConfig {
             tag: "anytls-test".into(),
             bind: "127.0.0.1".into(),
@@ -239,14 +263,14 @@ mod tests {
             protocol: ServerProtocol::AnyTls {
                 password: password.into(),
                 users,
-                tls: None,
+                tls,
             },
         }
     }
 
     async fn spawn_server(password: &str) -> (Arc<Capture>, SocketAddr) {
         let capture = Capture::new();
-        let addr = serve(&cfg(password, Vec::new()), capture.clone())
+        let addr = serve(&cfg(password, Vec::new(), None), capture.clone())
             .await
             .unwrap();
         (capture, addr)
@@ -297,7 +321,7 @@ mod tests {
         // closed silently.
         let users = vec![("alice".to_string(), "pw-a".to_string())];
         let capture = Capture::new();
-        let addr = serve(&cfg("", users), capture.clone()).await.unwrap();
+        let addr = serve(&cfg("", users, None), capture.clone()).await.unwrap();
         let tcp = TcpStream::connect(addr).await.unwrap();
         let target = NetAddr::domain("echo.test", 443).unwrap();
         let mut stream = connect_plain(&client("pw-a", addr.port()), Box::new(tcp), &target)
@@ -433,16 +457,65 @@ mod tests {
     #[tokio::test]
     async fn empty_credentials_fail_before_binding() {
         let capture = Capture::new();
-        let err = serve(&cfg("", Vec::new()), capture).await.unwrap_err();
+        let err = serve(&cfg("", Vec::new(), None), capture).await.unwrap_err();
         assert!(
             err.to_string().contains("anytls listener requires a password or users"),
             "{err}"
         );
     }
 
+    #[tokio::test]
+    async fn bad_tls_material_fails_before_binding() {
+        // The certificate fronting loads at serve time (server.go:52-61):
+        // a missing PEM is a config error, not a late handshake failure —
+        // the trojan `invalid_credentials_fail_before_binding` position.
+        let capture = Capture::new();
+        let cfg = cfg(
+            "pw",
+            Vec::new(),
+            Some(ServerTls {
+                cert_pem: "/nonexistent/cert.pem".into(),
+                key_pem: "/nonexistent/key.pem".into(),
+            }),
+        );
+        let err = serve(&cfg, capture).await.unwrap_err().to_string();
+        assert!(err.contains("server tls cert"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn tls_fronted_roundtrip_with_engine_client() {
+        // The engine's own anytls CLIENT in TLS mode
+        // (`connect` → tls_connect) through the tls-fronted listener:
+        // rustls termination, then the anytls session server.
+        use crate::inbound::proxy_server::test_support::self_signed_tls;
+        let password = fresh_password();
+        let (tls, _dir) = self_signed_tls();
+        let capture = Capture::new();
+        let addr = serve(&cfg(&password, Vec::new(), Some(tls)), capture.clone())
+            .await
+            .unwrap();
+        let mut client_cfg = client(&password, addr.port());
+        client_cfg.sni = "localhost".into();
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let target = NetAddr::domain("echo.test", 443).unwrap();
+        let mut stream = crate::proto::anytls::connect(&client_cfg, Box::new(tcp), &target)
+            .await
+            .unwrap();
+        stream.write_all(b"tls-anytls").await.unwrap();
+        let mut buf = [0u8; 10];
+        tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf))
+            .await
+            .expect("echo timeout")
+            .unwrap();
+        assert_eq!(&buf, b"tls-anytls");
+        assert_eq!(capture.targets(), vec![target]);
+    }
+
     #[test]
     fn tls_note_cites_upstream() {
         assert!(TLS_REQUIRED_NOTE.contains("listener/anytls/server.go:159-163"));
         assert!(TLS_REQUIRED_NOTE.contains("disallow using AnyTLS"));
+        // The note now reflects the wired fronting + the plain position.
+        assert!(TLS_REQUIRED_NOTE.contains("allow-insecure position"));
     }
 }

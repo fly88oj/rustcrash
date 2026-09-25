@@ -18,7 +18,7 @@
 //! to the association that owns the id, buffering up to 32 packets for
 //! an id whose target is not yet known.
 //!
-//! ## JLS inside the QUIC handshake — scoped out, by construction
+//! ## JLS inside the QUIC handshake — through the engine's own TLS 1.3
 //!
 //! mihomo ALWAYS enables JLS on a ShadowQUIC outbound
 //! (`adapter/outbound/shadowquic.go:104-110`):
@@ -38,20 +38,17 @@
 //! jls-tls `jls.go:232-304`) — carried by the QUIC CRYPTO stream and
 //! covered by the QUIC transport's own encryption.
 //!
-//! quinn 0.11 performs its handshakes through `rustls` via the sealed
-//! `quinn::crypto` trait: there is no hook to replace the ClientHello
-//! random, no pre-key ServerHello interception, and no way to substitute
-//! the TLS stack (rustls offers neither `tls.Config.JLSConfig` nor uTLS'
-//! `SetClientRandom` equivalent). JLS-in-QUIC thus cannot be injected
-//! here — `connect` fails fast with a precise error when username or
-//! password is set. When both are empty the connection works: the
-//! framing layer above is fully independent of JLS (upstream never
-//! exercises this combination, since it always sets `JLSConfig.Enable`,
-//! but nothing in `transport/shadowquic` references the TLS state —
-//! `client.go`/`packet.go`/`state.go`/`protocol.go` touch only
-//! streams and datagrams). A server that would reject a JLS-less QUIC
-//! client is a server this port cannot speak to; that is the documented
-//! delta, not a silent incompatibility.
+//! This port now does the same: when username/password are set,
+//! [`connect`] drives the QUIC handshake through
+//! [`crate::quic::tls13::Tls13QuicClientConfig`] — a quinn
+//! `crypto::ClientConfig` over the engine's own TLS 1.3 stack — with the
+//! JLS cover (the fingerprint ClientHello with the fakeRandom stamped in
+//! over the serialized hello including the QUIC transport parameters,
+//! exactly how the TCP fingerprint path of `proto::jls` stamps it over
+//! `jls::hello_auth_data`; the ServerHello random is validated with
+//! `jls::check_fake_random` and a failure surfaces the upstream
+//! `jls::ERR_AUTH_FAILED` sentinel). With both empty the dial keeps
+//! quinn's rustls path unchanged.
 //!
 //! ## QUIC tuning knobs vs quinn
 //!
@@ -107,7 +104,7 @@ use tokio::sync::{mpsc, Mutex, Notify};
 
 use crate::addr::{decode_socks_addr, encode_socks_addr, Host, NetAddr};
 use crate::error::{Error, Result};
-use crate::quic::{self, QuicStream};
+use crate::quic::{self, QuicDial, QuicStream};
 use crate::stream::BoxProxyStream;
 use crate::transport::{tls_client_config, TlsSettings};
 
@@ -141,14 +138,6 @@ const DEFAULT_MAX_OPEN_STREAMS: u32 = 1024;
 /// exposes no initial-congestion-window knob (module docs).
 #[allow(dead_code)]
 const DEFAULT_CWND: u32 = 32;
-
-/// The error returned when JLS credentials are configured: they can only
-/// be honored inside the QUIC TLS handshake (see the module docs).
-pub const ERR_JLS_IN_QUIC: &str = "shadowquic: jls inside the QUIC TLS \
-     handshake is not supported (upstream applies tls.Config.JLSConfig via \
-     jls-quic-go's tls.QUICClient from metacubex/jls-tls, \
-     crypto_setup.go:93; quinn/rustls expose no ClientHello-random or \
-     handshake-crypto hook — see proto::shadowquic module docs)";
 
 /// `quic_version.go:10-38`: default `[v1]`, parsed aliases for v1/v2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -725,13 +714,13 @@ pub struct Client {
 
 /// Dial the QUIC endpoint and return the relay client. Mirrors
 /// `NewShadowQuic` + `DialQuic` (`shadowquic.go:86-193`,
-/// `dial.go:24-63`): TLS 1.3 with the configured ALPN, the tuned
-/// transport, and — unless empty — the JLS credentials that this port
-/// cannot honor (fails with [`ERR_JLS_IN_QUIC`], see module docs).
+/// `dial.go:24-63`): TLS 1.3 with the configured ALPN and the tuned
+/// transport. With JLS credentials set the handshake runs through the
+/// engine's own TLS 1.3 stack over quinn's crypto trait
+/// ([`crate::quic::tls13`], the engine's equivalent of jls-quic-go's
+/// `tls.QUICClient` from metacubex/jls-tls, crypto_setup.go:93); with
+/// both empty it keeps quinn's rustls path unchanged.
 pub async fn connect(option: &ShadowQuicOption) -> Result<Client> {
-    if option.jls_enabled() {
-        return Err(Error::config(ERR_JLS_IN_QUIC));
-    }
     let versions = option.versions()?;
     if versions.contains(&QuicVersion::V2) {
         return Err(Error::config(
@@ -751,6 +740,13 @@ pub async fn connect(option: &ShadowQuicOption) -> Result<Client> {
     } else {
         option.alpn.clone()
     };
+    // `adapter/outbound/jls.go:10-15 JLSOptions.Parse`: both fields
+    // required when either is set.
+    let jls_user = if option.jls_enabled() {
+        Some(crate::proto::jls::JlsUser::new(&option.username, &option.password)?)
+    } else {
+        None
+    };
 
     let remote = quic::resolve_remote(&option.server, option.port).await?;
     let mut endpoint_config = quinn::EndpointConfig::default();
@@ -764,7 +760,7 @@ pub async fn connect(option: &ShadowQuicOption) -> Result<Client> {
         Arc::new(quinn::TokioRuntime),
     )
     .map_err(|e| Error::network(format!("shadowquic endpoint: {e}")))?;
-    endpoint.set_default_client_config(client_config(option, &alpn)?);
+    endpoint.set_default_client_config(client_config(option, &sni, &alpn, jls_user.as_ref())?);
     let conn = endpoint
         .connect(remote, &sni)
         .map_err(|e| Error::config(format!("shadowquic connect to {remote}: {e}")))?
@@ -774,6 +770,12 @@ pub async fn connect(option: &ShadowQuicOption) -> Result<Client> {
                 "shadowquic quic handshake with {remote} (sni {sni}, alpn {alpn:?}): {e}"
             ))
         })?;
+    if jls_user.is_some() {
+        tracing::debug!(
+            target: "engine",
+            "shadowquic: JLS-authenticated QUIC tunnel to {remote} (sni {sni})"
+        );
+    }
 
     let state = Arc::new(ConnState::new(conn.clone()));
     Arc::clone(&state).spawn_pumps();
@@ -786,23 +788,55 @@ pub async fn connect(option: &ShadowQuicOption) -> Result<Client> {
 
 /// The quinn client config: the engine TLS stack (same verification
 /// behavior as `quic::client_config`) plus the shadowquic transport
-/// knobs (`shadowquic.go:136-158`).
-fn client_config(option: &ShadowQuicOption, alpn: &[String]) -> Result<quinn::ClientConfig> {
-    let settings = TlsSettings {
-        enabled: true,
-        server_name: None,
-        skip_cert_verify: option.skip_cert_verify,
-        alpn: Vec::new(),
+/// knobs (`shadowquic.go:136-158`). With a JLS user the crypto config is
+/// the engine's own TLS 1.3 stack carrying the JLS cover
+/// (`crate::quic::tls13::Tls13QuicClientConfig::new_jls`).
+fn client_config(
+    option: &ShadowQuicOption,
+    sni: &str,
+    alpn: &[String],
+    jls_user: Option<&crate::proto::jls::JlsUser>,
+) -> Result<quinn::ClientConfig> {
+    let mut quic = if let Some(user) = jls_user {
+        // The engine's own TLS 1.3 stack carrying the JLS cover — the
+        // quinn-crypto equivalent of jls-quic-go's tls.QUICClient.
+        quic::client_config_custom(
+            &QuicDial {
+                server: option.server.clone(),
+                port: option.port,
+                sni: sni.to_string(),
+                alpn: alpn.to_vec(),
+                skip_verify: option.skip_cert_verify,
+                udp_relay: true,
+                congestion_brutal_bps: None,
+            },
+            &quic::QuicTlsCover::Jls(user.clone()),
+        )?
+    } else {
+        let settings = TlsSettings {
+            enabled: true,
+            server_name: None,
+            skip_cert_verify: option.skip_cert_verify,
+            alpn: Vec::new(),
+        };
+        let mut tls = (*tls_client_config(&settings)?).clone();
+        tls.alpn_protocols = alpn.iter().map(|a| a.as_bytes().to_vec()).collect();
+        let quic_tls = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls))
+            .map_err(|e| Error::config(format!("shadowquic quic tls initial suite: {e}")))?;
+        quinn::ClientConfig::new(Arc::new(quic_tls))
     };
-    let mut tls = (*tls_client_config(&settings)?).clone();
-    tls.alpn_protocols = alpn.iter().map(|a| a.as_bytes().to_vec()).collect();
+    apply_transport(option, &mut quic);
+    Ok(quic)
+}
 
+/// The shadowquic transport knobs (`shadowquic.go:136-158`) applied over
+/// whichever TLS stack was picked.
+fn apply_transport(option: &ShadowQuicOption, quic: &mut quinn::ClientConfig) {
     let max_open_streams = if option.max_open_streams == 0 {
         DEFAULT_MAX_OPEN_STREAMS
     } else {
         option.max_open_streams
     };
-    // shadowquic.go:151-158: zero windows fall back to the tuic defaults.
     let stream_window = if option.recv_window_conn == 0 {
         DEFAULT_STREAM_RECV_WINDOW
     } else {
@@ -820,11 +854,6 @@ fn client_config(option: &ShadowQuicOption, alpn: &[String]) -> Result<quinn::Cl
     transport.max_concurrent_uni_streams(clamp(u64::from(max_open_streams)));
     transport.stream_receive_window(clamp(stream_window));
     transport.receive_window(clamp(conn_window));
-    // EnableDatagrams (shadowquic.go:146). quinn has no per-frame cap
-    // knob for max-datagram-frame-size (accepted, documented in the
-    // module header); the 64 KiB receive buffer covers any 0xffff
-    // datagram regardless of the configured cap.
-    let _ = option.max_datagram_frame_size;
     transport.datagram_receive_buffer_size(Some(64 * 1024));
     if option.keep_alive_interval > 0 {
         transport.keep_alive_interval(Some(Duration::from_millis(option.keep_alive_interval)));
@@ -832,12 +861,7 @@ fn client_config(option: &ShadowQuicOption, alpn: &[String]) -> Result<quinn::Cl
     if option.disable_mtu_discovery {
         transport.mtu_discovery_config(None);
     }
-
-    let quic_tls = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls))
-        .map_err(|e| Error::config(format!("shadowquic quic tls initial suite: {e}")))?;
-    let mut quic = quinn::ClientConfig::new(Arc::new(quic_tls));
     quic.transport_config(Arc::new(transport));
-    Ok(quic)
 }
 
 impl Client {
@@ -1213,19 +1237,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn jls_credentials_fail_fast_with_precise_error() {
+    async fn jls_credentials_rejected_by_a_wrong_password() {
+        // The JLS cover rides the QUIC TLS handshake: a server that
+        // validates the fakeRandom rejects wrong credentials with the
+        // upstream auth sentinel (jls-tls ErrJLSAuthFailed).
+        let user = crate::proto::jls::JlsUser::new("user1", "pass1").unwrap();
+        let endpoint = crate::quic::tls13::test_server::start_quinn_server(
+            crate::quic::tls13::ServerMode::Jls {
+                users: vec![user.clone()],
+            },
+        )
+        .await
+        .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        // quinn drives server handshakes through accept().
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                let _ = incoming.await;
+            }
+        });
+
+        let mut option = ShadowQuicOption::new("127.0.0.1", addr.port());
+        option.username = "user1".into();
+        option.password = "wrong-password".into();
+        let err = match tokio::time::timeout(Duration::from_secs(15), connect(&option)).await {
+            Err(_) => panic!("jls handshake timed out"),
+            Ok(Err(e)) => e,
+            Ok(Ok(_)) => panic!("wrong password must not authenticate"),
+        };
+        assert!(err.to_string().contains(crate::proto::jls::ERR_AUTH_FAILED), "{err}");
+    }
+
+    #[tokio::test]
+    async fn jls_incomplete_credentials_are_a_config_error() {
+        // JLSOptions.Parse: both fields required when either is set.
         let mut option = ShadowQuicOption::new("server.example", 8443);
         option.username = "user1".into();
+        option.password.clear();
         let err = match connect(&option).await {
-            Ok(_) => panic!("jls credentials must fail fast"),
             Err(e) => e,
+            Ok(_) => panic!("incomplete credentials must be a config error"),
         };
-        let msg = err.to_string();
-        assert!(msg.contains("jls inside the QUIC TLS handshake"), "{msg}");
-        assert!(msg.contains("jls-quic-go"), "{msg}");
+        assert!(err.to_string().contains("jls: password is required"), "{err}");
         option.username.clear();
         option.password = "pass1".into();
-        assert!(connect(&option).await.is_err());
+        let err = match connect(&option).await {
+            Err(e) => e,
+            Ok(_) => panic!("incomplete credentials must be a config error"),
+        };
+        assert!(err.to_string().contains("jls: username is required"), "{err}");
     }
 
     // ------------------------------------------------------ loopback QUIC
@@ -1496,11 +1556,29 @@ mod tests {
     }
 
     async fn start_server() -> (Arc<TestStats>, SocketAddr, quinn::Endpoint) {
-        let endpoint = quinn::Endpoint::server(
+        serve_forever(quinn::Endpoint::server(
             quinn_server_config(),
             SocketAddr::from(([127, 0, 0, 1], 0)),
         )
-        .expect("server endpoint");
+        .expect("server endpoint"))
+        .await
+    }
+
+    /// A JLS-terminating QUIC server: the handshake runs on the engine's
+    /// own TLS 1.3 stack (validating + stamping the JLS randoms), the
+    /// framing layer above is the same mimic.
+    async fn start_jls_server(users: Vec<crate::proto::jls::JlsUser>) -> (Arc<TestStats>, SocketAddr, quinn::Endpoint) {
+        serve_forever(
+            crate::quic::tls13::test_server::start_quinn_server(
+                crate::quic::tls13::ServerMode::Jls { users },
+            )
+            .await
+            .expect("jls server endpoint"),
+        )
+        .await
+    }
+
+    async fn serve_forever(endpoint: quinn::Endpoint) -> (Arc<TestStats>, SocketAddr, quinn::Endpoint) {
         let addr = endpoint.local_addr().expect("local addr");
         let stats = Arc::new(TestStats::default());
         let server_stats = Arc::clone(&stats);
@@ -1521,6 +1599,55 @@ mod tests {
         let mut option = ShadowQuicOption::new("127.0.0.1", port);
         option.skip_cert_verify = true;
         option
+    }
+
+    #[tokio::test]
+    async fn jls_tcp_relay_over_quic() {
+        // The JLS cover rides the QUIC TLS handshake (the engine's own
+        // TLS 1.3 stack under quinn's crypto trait), then the framing
+        // layer relays as usual.
+        let user = crate::proto::jls::JlsUser::new("jls-user", "jls-pass").unwrap();
+        let (stats, addr, _endpoint) =
+            start_jls_server(vec![user.clone()]).await;
+        let mut option = test_option(addr.port());
+        option.username = user.username.clone();
+        option.password = user.password.clone();
+        let client = connect(&option).await.unwrap();
+        let target = NetAddr::domain("jls.example", 443).unwrap();
+        let mut stream = client.dial_tcp(&target).await.unwrap();
+
+        stream.write_all(b"jls over quic").await.unwrap();
+        let mut buf = [0u8; 13];
+        tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf, b"jls over quic");
+        assert_eq!(stats.tcp_streams.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn jls_udp_datagram_mode_roundtrip() {
+        let user = crate::proto::jls::JlsUser::new("jls-user", "jls-pass").unwrap();
+        let (stats, addr, _endpoint) =
+            start_jls_server(vec![user.clone()]).await;
+        let mut option = test_option(addr.port());
+        option.username = user.username.clone();
+        option.password = user.password.clone();
+        let client = connect(&option).await.unwrap();
+        let assoc = client.listen_packet().await.unwrap();
+        assert_eq!(assoc.mode(), UdpMode::Datagram);
+
+        let target = NetAddr::domain("jls-udp.example", 53).unwrap();
+        assert_eq!(assoc.send_to(b"jls dns", &target).await.unwrap(), 7);
+        let packet = tokio::time::timeout(Duration::from_secs(10), assoc.recv_from())
+            .await
+            .expect("udp echo timed out")
+            .expect("association closed");
+        assert_eq!(&packet.data[..], b"jls dns");
+        assert_eq!(packet.addr, target);
+        assoc.close().await.unwrap();
+        assert_eq!(stats.udp_associations.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

@@ -228,6 +228,7 @@ pub enum ServerProtocol {
         /// res-tls fronting: the restls server config (dest host).
         res_tls: Option<crate::proto::restls::RestlsServerConfig>,
         /// jls fronting: (sni, dest, users, alpn, rate-limit).
+        #[allow(clippy::type_complexity)]
         jls: Option<(String, String, Vec<(String, String)>, Vec<String>, u32)>,
     },
     /// AnyTLS server listener (mihomo `listeners` type `anytls`):

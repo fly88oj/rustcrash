@@ -3,6 +3,12 @@
 //! stack (same verification behavior as the TCP transports), a boxed
 //! stream adapter over a quinn stream pair, and the QUIC varint codec
 //! used by the hysteria2 framing.
+//!
+//! Two TLS stacks can drive the same dial path: the default rustls
+//! config ([`client_config`]/[`dial`]) and the engine's own TLS 1.3
+//! stack behind [`client_config_custom`]/[`dial_custom`]
+//! ([`tls13::Tls13QuicClientConfig`], a quinn `crypto::ClientConfig`)
+//! — the seam that carries JLS and ECH into QUIC when a cover is set.
 
 use std::io;
 use std::net::SocketAddr;
@@ -17,6 +23,8 @@ use crate::error::{Error, Result};
 use crate::transport::{tls_client_config, TlsSettings};
 
 pub mod tls13;
+
+pub use tls13::{ech_retry_configs_of, QuicTlsCover, Tls13QuicClientConfig};
 
 /// Settings for one outbound QUIC connection.
 #[derive(Debug, Clone)]
@@ -59,6 +67,42 @@ pub(crate) fn family_bind_addr(remote: SocketAddr) -> SocketAddr {
     }
 }
 
+/// Resolve mihomo `ECHOptions` (`adapter/outbound/ech.go:12-41`) into the
+/// ECHConfig a dial seals its inner hello with: the static base64
+/// `config` list only. The DNS HTTPS-RR source has no engine resolver
+/// yet and stays a documented integrator hook (the same split the
+/// TCP-TLS ECH path of `outbound.rs::tls_ech` makes).
+pub fn ech_selection(
+    opts: &crate::proto::ech::EchOptions,
+) -> Result<crate::proto::ech::EchConfigSelection> {
+    match opts.parse()? {
+        Some(crate::proto::ech::EchConfigSource::Static(list)) => {
+            crate::proto::ech::select_ech_config(&list)
+        }
+        Some(crate::proto::ech::EchConfigSource::DnsHttpsQuery { .. }) => Err(Error::config(
+            "ech-opts.enable requires a static `config` ECHConfigList (base64); the \
+             DNS HTTPS RR query variant has no engine resolver yet (integrator hook)",
+        )),
+        None => Err(Error::config(
+            "ech-opts.enable is required for the ECH dial",
+        )),
+    }
+}
+
+/// The transport settings shared by both TLS stacks (mirrored from the
+/// sing-quic defaults: datagrams for UDP relay, uni streams, keep-alive).
+fn transport_config(cfg: &QuicDial) -> quinn::TransportConfig {
+    let mut transport = quinn::TransportConfig::default();
+    // TUIC (UDP-over-stream) and QPACK control streams arrive on uni
+    // streams; 1024 is far above the traffic shape of these protocols.
+    transport.max_concurrent_uni_streams(1024u32.into());
+    if cfg.udp_relay {
+        transport.datagram_receive_buffer_size(Some(64 * 1024));
+    }
+    transport.keep_alive_interval(Some(Duration::from_secs(10)));
+    transport
+}
+
 /// Build the quinn client config: rustls (reusing the engine TLS
 /// verification paths) with the ALPN list, plus transport settings
 /// mirrored from the sing-quic defaults (datagrams for UDP relay, uni
@@ -73,18 +117,38 @@ pub fn client_config(cfg: &QuicDial) -> Result<quinn::ClientConfig> {
     let mut tls = (*tls_client_config(&settings)?).clone();
     tls.alpn_protocols = cfg.alpn.iter().map(|a| a.as_bytes().to_vec()).collect();
 
-    let mut transport = quinn::TransportConfig::default();
-    // TUIC (UDP-over-stream) and QPACK control streams arrive on uni
-    // streams; 1024 is far above the traffic shape of these protocols.
-    transport.max_concurrent_uni_streams(1024u32.into());
-    if cfg.udp_relay {
-        transport.datagram_receive_buffer_size(Some(64 * 1024));
-    }
-    transport.keep_alive_interval(Some(Duration::from_secs(10)));
     let quic_tls = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls))
         .map_err(|e| Error::config(format!("quic tls initial suite: {e}")))?;
     let mut quic = quinn::ClientConfig::new(Arc::new(quic_tls));
-    quic.transport_config(Arc::new(transport));
+    quic.transport_config(Arc::new(transport_config(cfg)));
+    Ok(quic)
+}
+
+/// [`client_config`] over the engine's own TLS 1.3 stack
+/// ([`tls13::Tls13QuicClientConfig`], a quinn `crypto::ClientConfig`)
+/// with a cover applied — JLS credentials or ECH. The transport side is
+/// identical to the rustls path.
+pub fn client_config_custom(
+    cfg: &QuicDial,
+    cover: &QuicTlsCover,
+) -> Result<quinn::ClientConfig> {
+    let crypto: Arc<Tls13QuicClientConfig> = match cover {
+        QuicTlsCover::Jls(user) => Arc::new(Tls13QuicClientConfig::new_jls(
+            crate::proto::reality::UtslProfile::Chrome,
+            &cfg.sni,
+            cfg.alpn.clone(),
+            user.clone(),
+        )),
+        QuicTlsCover::Ech(selection) => Arc::new(Tls13QuicClientConfig::new_ech(
+            crate::proto::reality::UtslProfile::Chrome,
+            &cfg.sni,
+            cfg.alpn.clone(),
+            selection.clone(),
+            cfg.skip_verify,
+        )?),
+    };
+    let mut quic = quinn::ClientConfig::new(crypto);
+    quic.transport_config(Arc::new(transport_config(cfg)));
     Ok(quic)
 }
 
@@ -106,6 +170,59 @@ pub async fn dial(cfg: &QuicDial) -> Result<quinn::Connection> {
     })?;
     tracing::debug!(target: "engine", "quic connected to {remote} (sni {})", cfg.sni);
     Ok(conn)
+}
+
+/// [`dial`] with the engine's own TLS 1.3 stack under a cover (JLS or
+/// ECH) — the custom-crypto dial path.
+pub async fn dial_custom(
+    cfg: &QuicDial,
+    cover: &QuicTlsCover,
+) -> Result<quinn::Connection> {
+    let remote = resolve_remote(&cfg.server, cfg.port).await?;
+    let mut endpoint = quinn::Endpoint::client(family_bind_addr(remote))
+        .map_err(|e| Error::network(format!("quic bind: {e}")))?;
+    endpoint.set_default_client_config(client_config_custom(cfg, cover)?);
+    let connect = endpoint
+        .connect(remote, &cfg.sni)
+        .map_err(|e| Error::config(format!("quic connect to {}: {e}", remote)))?;
+    let conn = connect.await.map_err(|e| {
+        Error::network(format!(
+            "quic tls13 handshake with {} (sni {}, alpn {:?}): {e}",
+            remote, cfg.sni, cfg.alpn
+        ))
+    })?;
+    tracing::debug!(target: "engine", "quic tls13 connected to {remote} (sni {})", cfg.sni);
+    Ok(conn)
+}
+
+/// ECH dial with the one-shot retry upstream's caller-side loop performs
+/// (`reality::tls13::connect_ech`, reality/tls13.rs:1464-1488): a
+/// rejected handshake surfaces the server's retry ECHConfigList through
+/// the error text; when it parses, the dial repeats once with it.
+pub async fn dial_ech(
+    cfg: &QuicDial,
+    selection: crate::proto::ech::EchConfigSelection,
+) -> Result<quinn::Connection> {
+    let mut selection = selection;
+    for attempt in 0..2 {
+        match dial_custom(cfg, &QuicTlsCover::Ech(selection.clone())).await {
+            Ok(conn) => return Ok(conn),
+            Err(e) => {
+                let text = e.to_string();
+                let Some(retry) = ech_retry_configs_of(&text) else {
+                    return Err(e);
+                };
+                if attempt == 1 {
+                    return Err(Error::protocol(tls13::ERR_ECH_REJECTED.to_string()));
+                }
+                match crate::proto::ech::select_ech_config(&retry) {
+                    Ok(next) => selection = next,
+                    Err(_) => return Err(Error::protocol(tls13::ERR_ECH_REJECTED.to_string())),
+                }
+            }
+        }
+    }
+    unreachable!("the retry loop returns on its second rejection")
 }
 
 /// A bidirectional QUIC stream pair exposed as a tokio duplex stream, so

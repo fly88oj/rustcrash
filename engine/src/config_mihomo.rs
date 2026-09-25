@@ -548,20 +548,101 @@ fn parse_proxy_servers(
                     .unwrap_or(0);
                 let version = crate::proto::snell::parse_server_version(raw_version)
                     .map_err(|e| Error::config(format!("listener {tag:?}: {e}")))?;
+                // Security frontings (listener/config/snell.go):
+                // shadow-tls{enable,password,handshake.dest} /
+                // res-tls{enable,dest,password,restls-script,
+                // min-record-len,rate-limit} / jls-config{enable,users,
+                // sni,dest,alpn,rate-limit} — mutually exclusive at
+                // serve time (upstream's exact message).
+                let sub_map = |key: &str| -> Option<&serde_yaml::Mapping> {
+                    entry.get(key).and_then(Yaml::as_mapping)
+                };
+                let sub_str = |m: &serde_yaml::Mapping, k: &str| {
+                    m.get(Yaml::String(k.into()))
+                        .and_then(Yaml::as_str)
+                        .unwrap_or("")
+                        .to_string()
+                };
+                let sub_enable = |m: &serde_yaml::Mapping| {
+                    m.get(Yaml::String("enable".into()))
+                        .and_then(Yaml::as_bool)
+                        .unwrap_or(false)
+                };
+                let shadow_tls = sub_map("shadow-tls").filter(|m| sub_enable(m)).map(|m| {
+                    // handshake.dest → (password, dest-host, unused)
+                    let dest = m
+                        .get(Yaml::String("handshake".into()))
+                        .and_then(Yaml::as_mapping)
+                        .map(|h| sub_str(h, "dest"))
+                        .unwrap_or_default();
+                    (sub_str(m, "password"), dest, false)
+                });
+                let res_tls = sub_map("res-tls").filter(|m| sub_enable(m)).map(|m| {
+                    crate::proto::restls::RestlsServerConfig {
+                        server_hostname: sub_str(m, "dest"),
+                        password: sub_str(m, "password"),
+                        restls_script: {
+                            let sc = sub_str(m, "restls-script");
+                            if sc.is_empty() { None } else { Some(sc) }
+                        },
+                        min_record_len: m
+                            .get(Yaml::String("min-record-len".into()))
+                            .and_then(Yaml::as_u64)
+                            .unwrap_or(0) as u32,
+                        rate_limit: m
+                            .get(Yaml::String("rate-limit".into()))
+                            .and_then(Yaml::as_u64)
+                            .unwrap_or(0),
+                    }
+                });
+                let jls = sub_map("jls-config").filter(|m| sub_enable(m)).map(|m| {
+                    (
+                        sub_str(m, "sni"),
+                        sub_str(m, "dest"),
+                        users_from_mapping(m),
+                        {
+                            let mut alpn = Vec::new();
+                            if let Some(Yaml::Sequence(l)) =
+                                m.get(Yaml::String("alpn".into()))
+                            {
+                                for v in l {
+                                    if let Yaml::String(a) = v {
+                                        alpn.push(a.clone());
+                                    }
+                                }
+                            }
+                            alpn
+                        },
+                        m.get(Yaml::String("rate-limit".into()))
+                            .and_then(Yaml::as_u64)
+                            .unwrap_or(0) as u32,
+                    )
+                });
                 ServerProtocol::Snell {
                     psk: yaml_str(entry, "psk").unwrap_or_default(),
                     version,
                     obfs_mode: yaml_str(entry, "obfs-mode").unwrap_or_default(),
                     obfs_host: yaml_str(entry, "obfs-host").unwrap_or_default(),
-                    shadow_tls: None,
-                    res_tls: None,
-                    jls: None,
+                    shadow_tls,
+                    res_tls,
+                    jls,
                 }
             }
             "anytls" => ServerProtocol::AnyTls {
                 password: yaml_str(entry, "password").unwrap_or_default(),
                 users: parse_user_list(entry, "users"),
-                tls,
+                // certificate/private-key front (listener/config/
+                // anytls.go); None = the allow-insecure position.
+                tls: match (
+                    yaml_str(entry, "certificate"),
+                    yaml_str(entry, "private-key"),
+                ) {
+                    (Some(cert), Some(key)) => Some(ServerTls {
+                        cert_pem: cert,
+                        key_pem: key,
+                    }),
+                    _ => tls,
+                },
             },
             other => {
                 return Err(Error::config(format!(
@@ -888,6 +969,30 @@ fn parse_user_list(entry: &BTreeMap<String, Yaml>, key: &str) -> Vec<(String, St
             }
         }
         _ => {}
+    }
+    out
+}
+
+/// users: [(username,password)...] from inside a listener sub-mapping.
+fn users_from_mapping(m: &serde_yaml::Mapping) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Some(Yaml::Sequence(list)) = m.get(Yaml::String("users".into())) {
+        for u in list {
+            if let Yaml::Mapping(um) = u {
+                let user = um
+                    .get(Yaml::String("username".into()))
+                    .or_else(|| um.get(Yaml::String("user".into())))
+                    .and_then(Yaml::as_str)
+                    .unwrap_or("");
+                let password = um
+                    .get(Yaml::String("password".into()))
+                    .and_then(Yaml::as_str)
+                    .unwrap_or("");
+                if !user.is_empty() {
+                    out.push((user.to_string(), password.to_string()));
+                }
+            }
+        }
     }
     out
 }
@@ -1441,12 +1546,77 @@ fn parse_proxy(
                 .map_err(|e| Error::config(format!("proxy {name:?}: {e}")))?;
             crate::proto::snell::validate_udp(version, udp)
                 .map_err(|e| Error::config(format!("proxy {name:?}: {e}")))?;
+            // obfs-mode: http keeps the legacy in-band obfs; the
+            // security modes (shadow-tls|res-tls|jls) front the wire
+            // (outbound snell.go:183-240, obfs-opts carries their
+            // fields).
+            let fronting = match yaml_str(entry, "obfs-mode").as_deref() {
+                Some("shadow-tls") => {
+                    let password = plugin_opt(entry, "password").unwrap_or_default();
+                    Some(crate::proto::snell::SnellFronting::ShadowTls {
+                        password,
+                        host: plugin_opt(entry, "host").unwrap_or_default(),
+                    })
+                }
+                Some("res-tls") => {
+                    let version_hint = plugin_opt(entry, "version-hint")
+                        .or_else(|| plugin_opt(entry, "version"))
+                        .unwrap_or_else(|| "tls13".into());
+                    Some(crate::proto::snell::SnellFronting::ResTls(
+                        crate::proto::restls::RestlsOut {
+                            password: plugin_opt(entry, "password").unwrap_or_default(),
+                            sni: plugin_opt(entry, "host").unwrap_or_default(),
+                            version: version_hint,
+                            restls_script: plugin_opt(entry, "restls-script")
+                                .filter(|s| !s.is_empty()),
+                            skip_cert_verify: plugin_bool(entry, "skip-cert-verify"),
+                            udp: false,
+                        },
+                    ))
+                }
+                Some("jls") => {
+                    let username = plugin_opt(entry, "username").unwrap_or_default();
+                    let password = plugin_opt(entry, "password").unwrap_or_default();
+                    if username.is_empty() || password.is_empty() {
+                        return Err(Error::config(format!(
+                            "proxy {name:?}: snell jls fronting requires obfs-opts \
+                             username and password"
+                        )));
+                    }
+                    Some(crate::proto::snell::SnellFronting::Jls(
+                        crate::proto::jls::JlsOut {
+                            username,
+                            password,
+                            sni: plugin_opt(entry, "host").unwrap_or_default(),
+                            alpn: {
+                                let mut v = Vec::new();
+                                if let Some(Yaml::Sequence(l)) = entry
+                                    .get("obfs-opts")
+                                    .and_then(Yaml::as_mapping)
+                                    .and_then(|m| m.get(Yaml::String("alpn".into())))
+                                {
+                                    for a in l {
+                                        if let Yaml::String(x) = a {
+                                            v.push(x.clone());
+                                        }
+                                    }
+                                }
+                                v
+                            },
+                            skip_cert_verify: plugin_bool(entry, "skip-cert-verify"),
+                            fingerprint: None,
+                        },
+                    ))
+                }
+                _ => None,
+            };
             OutboundKind::Snell(crate::proto::snell::SnellOut {
                 psk: yaml_str(entry, "psk").unwrap_or_default(),
                 version,
                 udp,
                 server,
                 port,
+                fronting,
             })
         }
         "anytls" => OutboundKind::AnyTls(crate::proto::anytls::AnyTlsOut {

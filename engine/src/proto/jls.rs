@@ -99,12 +99,21 @@
 //!   the uTLS path, which sets `SessionTicketsDisabled: true`
 //!   (`utls.go:52-54,61`).
 //! * **Client auth-failure camouflage HTTP request** (`utls.go:107-117`,
-//!   `jlsClientHTTPFallback utls.go:120-150`): scope-out inherited from
-//!   the plain path — on a non-JLS server this port fails the dial
-//!   immediately with [`ERR_AUTH_FAILED`] instead of completing the TLS
-//!   handshake against the fallback certificate, issuing a plausible HTTP
-//!   request, and only then returning `ErrJLSAuthFailed`
-//!   (`utls.go:106-112`). The observable dial result is the same error.
+//!   `jlsClientHTTPFallback utls.go:120-150`): PORTED for the
+//!   fingerprint path — when the FINGERPRINT handshake completes but the
+//!   ServerHello random does not verify, the client issues one plausible
+//!   `GET https://<sni>` over the established (non-JLS) tunnel — h2c
+//!   when the peer negotiated h2, HTTP/1.1 otherwise, `User-Agent` =
+//!   the fingerprint's client string, a `padding` cookie of 30..=61
+//!   zeros — and only then returns [`ERR_AUTH_FAILED`]
+//!   ([`jls_client_http_fallback`]). The plain (rustls) path keeps
+//!   erroring immediately at the ServerHello check, matching upstream's
+//!   plain branch (`transport/jls/jls.go:98-119` has no fallback there).
+//!   Deviation: upstream gates the round on `verifyUTLSCertificate`
+//!   (utls.go:190-206 — a cert failing system-pool verification fails
+//!   the handshake without the round); this port's fingerprint path
+//!   carries no trust store, so the round runs for every completed
+//!   handshake.
 //!
 //! ## The fingerprint path (mihomo `transport/jls/utls.go`)
 //!
@@ -162,9 +171,9 @@
 //! `newRateLimitedConn` jls.go:226-265 with the 10 ms-cycle burst
 //! limiter `bitRateLimiter` jls.go:322-335). A wrong password is
 //! therefore NOT a hard close: the client lands on the fallback relay
-//! and only the uTLS client's camouflage HTTP round
-//! (`jlsClientHTTPFallback`, utls.go:120-150) answers it — that
-//! client-side behaviour remains the wave-7 scope-out above.
+//! and the uTLS client's camouflage HTTP round
+//! (`jlsClientHTTPFallback`, utls.go:120-150 — ported in
+//! [`jls_client_http_fallback`]) answers it.
 
 use std::cell::{Cell, RefCell};
 use std::io;
@@ -968,6 +977,16 @@ fn build_profile_hello(
 /// verifies as the JLS fakeRandom over the message's own random-zeroed
 /// bytes. Bytes are inspected, never modified — `engine_tls13::connect`
 /// consumes them unchanged.
+///
+/// On a random that does NOT verify the guard does not fail the stream:
+/// upstream's failure branch (`verifyUTLSCertificate`, utls.go:183-185,
+/// 190-206) decides between "the fallback site is real — complete the
+/// handshake" and "fail now". This port's fingerprint path carries no
+/// trust store (`InsecureSkipVerify`, utls.go:58-60), so the handshake
+/// is always allowed to complete and the shared
+/// [`Self::authenticated`] flag tells [`connect_fingerprint`] to run
+/// the camouflage HTTP round before surfacing [`ERR_AUTH_FAILED`]
+/// (utls.go:106-112).
 struct JlsServerHelloGuard {
     io: BoxProxyStream,
     user: JlsUser,
@@ -975,19 +994,30 @@ struct JlsServerHelloGuard {
     pending: BytesMut,
     /// First handshake message authenticated (or moot: alert/EOF seen).
     verified: bool,
-    /// Sticky auth failure, surfaced on every later operation.
+    /// Sticky hard failure, surfaced on every later operation.
     failed: Option<String>,
+    /// Set when the ServerHello random failed JLS authentication while
+    /// the handshake itself proceeds (shared with the caller).
+    auth_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl JlsServerHelloGuard {
-    fn new(io: BoxProxyStream, user: JlsUser) -> Self {
-        JlsServerHelloGuard {
-            io,
-            user,
-            pending: BytesMut::new(),
-            verified: false,
-            failed: None,
-        }
+    fn new(
+        io: BoxProxyStream,
+        user: JlsUser,
+    ) -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let auth_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (
+            JlsServerHelloGuard {
+                io,
+                user,
+                pending: BytesMut::new(),
+                verified: false,
+                failed: None,
+                auth_failed: auth_failed.clone(),
+            },
+            auth_failed,
+        )
     }
 
     /// Walk the buffered records until the first handshake message is
@@ -1032,7 +1062,12 @@ impl JlsServerHelloGuard {
                             let auth_data = hello_auth_data(msg, HS_SERVER_HELLO)?;
                             let random = &msg[HELLO_RANDOM_OFFSET..][..HELLO_RANDOM_LEN];
                             if !check_fake_random(&self.user, random, &auth_data) {
-                                return Err(Error::crypto(ERR_AUTH_FAILED));
+                                // VerifyConnection's failure branch
+                                // (utls.go:183-185): record it, let the
+                                // handshake proceed — the caller runs the
+                                // camouflage round (utls.go:106-112).
+                                self.auth_failed
+                                    .store(true, std::sync::atomic::Ordering::Release);
                             }
                             self.verified = true;
                             return Ok(true);
@@ -1131,7 +1166,7 @@ async fn connect_fingerprint(
         cfg.alpn.clone()
     };
     let (hello, secret) = build_profile_hello(profile, &cfg.sni, &alpn, user)?;
-    let guard = JlsServerHelloGuard::new(transport, user.clone());
+    let (guard, auth_failed) = JlsServerHelloGuard::new(transport, user.clone());
     debug!(
         target: "engine",
         sni = %cfg.sni, profile = profile.as_str(),
@@ -1149,12 +1184,235 @@ async fn connect_fingerprint(
         ServerAuth::AcceptAny,
     )
     .await?;
+    if auth_failed.load(std::sync::atomic::Ordering::Acquire) {
+        // `utls.go:106-112`: the handshake completed but the ServerHello
+        // random did not verify — finish with a plausible HTTP request
+        // over the (non-JLS) tunnel, then return ErrJLSAuthFailed.
+        debug!(
+            target: "engine",
+            sni = %cfg.sni, profile = profile.as_str(),
+            "jls: server not JLS-authenticated; running the camouflage HTTP round"
+        );
+        jls_client_http_fallback(stream, &cfg.sni, profile).await;
+        return Err(Error::crypto(ERR_AUTH_FAILED));
+    }
+    // `utls.go:113-116`'s post-handshake TLS 1.3 check cannot fire:
+    // tls13.rs is TLS 1.3-only by construction.
     debug!(
         target: "engine",
         sni = %cfg.sni, profile = profile.as_str(),
         "jls: authenticated fingerprint tunnel established"
     );
     Ok(Box::new(stream))
+}
+
+// ------------------------------------------- camouflage HTTP fallback round
+
+/// The uTLS `ClientHelloID.Client` user-agent strings
+/// (metacubex/utls u_common.go:158-159: `helloFirefox = "Firefox"`,
+/// `helloChrome = "Chrome"`) — what upstream's
+/// `request.Header.Set("User-Agent", fingerprint.Client)` sends.
+fn fingerprint_user_agent(profile: UtslProfile) -> &'static str {
+    match profile {
+        UtslProfile::Chrome => "Chrome",
+        UtslProfile::Firefox => "Firefox",
+    }
+}
+
+/// `jlsClientHTTPFallback` (`transport/jls/utls.go:120-150`): after a
+/// completed TLS handshake whose ServerHello failed JLS authentication,
+/// issue one plausible `GET https://<server-name>` over the established
+/// tunnel so the server's fallback relay serves a real-looking page,
+/// then close. Errors are swallowed (`if err != nil { return }`); the
+/// caller surfaces [`ERR_AUTH_FAILED`] regardless of what happened here.
+///
+/// Request shape, exactly as upstream builds it:
+///
+/// * `GET` with URL `https://<server-name>` → request target `/`,
+///   authority `<server-name>` (no port in the URL);
+/// * `User-Agent: <fingerprint.Client>` (Chrome/Firefox);
+/// * `Cookie: padding=<N zeros>` with `N = rand(32)+30` (30..=61);
+/// * HTTP/1.1 when the server did not negotiate h2, unencrypted HTTP/2
+///   (h2c prior knowledge — the TLS layer is already established) when
+///   it did (utls.go:123-129). The engine's minimal h2c client mirrors
+///   the one `proto/tlsmirror.rs` built for its enrolment round.
+/// * Go's transport transparently adds `Accept-Encoding: gzip`
+///   (net/http, no DisableCompression here) — included.
+///
+/// Upstream branches on `verifyUTLSCertificate` (utls.go:190-206)
+/// BEFORE this round: a certificate that fails system-pool verification
+/// fails the handshake outright with no HTTP request. This port's
+/// fingerprint path has no trust store (`InsecureSkipVerify`,
+/// utls.go:58-60), so the round runs for every completed handshake —
+/// the precise deviation.
+async fn jls_client_http_fallback(
+    mut conn: engine_tls13::Tls13Stream,
+    server_name: &str,
+    profile: UtslProfile,
+) {
+    use tokio::io::AsyncWriteExt;
+    // `defer uConn.Close()`: the conn is dropped when this returns.
+    let alpn_h2 = conn.alpn() == Some(b"h2".as_slice());
+    use rand::Rng;
+    let mut padding = String::with_capacity(61);
+    padding.push_str(
+        &(0..rand::rngs::OsRng.gen_range(30..=61))
+            .map(|_| '0')
+            .collect::<String>(),
+    );
+    let user_agent = fingerprint_user_agent(profile);
+    // `ConnectionState().NegotiatedProtocol == "h2"` (utls.go:125):
+    // h2c when the tunnel negotiated h2, HTTP/1 otherwise.
+    let result: Result<()> = if alpn_h2 {
+        h2_camo_get(&mut conn, server_name, user_agent, &padding).await
+    } else {
+        http1_camo_get(&mut conn, server_name, user_agent, &padding).await
+    };
+    // response.Body.Close() + client.CloseIdleConnections(): the conn is
+    // simply closed here; every error is silent (utls.go:144-149).
+    let _ = result;
+    let _ = conn.shutdown().await;
+}
+
+/// `http1_camo_get`: the HTTP/1.1 form of the camouflage request.
+async fn http1_camo_get<W>(
+    conn: &mut W,
+    server_name: &str,
+    user_agent: &str,
+    padding: &str,
+) -> Result<()>
+where
+    W: tokio::io::AsyncRead + Unpin + tokio::io::AsyncWrite + Unpin,
+{
+    tokio::io::AsyncWriteExt::write_all(
+        conn,
+        format!(
+            "GET / HTTP/1.1\r\n\
+             Host: {server_name}\r\n\
+             User-Agent: {user_agent}\r\n\
+             Accept-Encoding: gzip\r\n\
+             Cookie: padding={padding}\r\n\
+             \r\n"
+        )
+        .as_bytes(),
+    )
+    .await?;
+    tokio::io::AsyncWriteExt::flush(conn).await?;
+    // `client.Do`: the response head must arrive; the body is closed
+    // unread. Read to the end of the headers (bounded), then stop.
+    let mut head = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    loop {
+        let n = tokio::io::AsyncReadExt::read(conn, &mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        head.extend_from_slice(&chunk[..n]);
+        if head.windows(4).any(|w| w == b"\r\n\r\n") || head.len() > 64 * 1024 {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// The h2c form (utls.go:123-129 `SetUnencryptedHTTP2(true)`): a
+/// prior-knowledge HTTP/2 GET over the already-established tunnel. The
+/// minimal client mirrors `proto/tlsmirror.rs`'s `h2c_post` (preface +
+/// SETTINGS + one literal-HPACK HEADERS; the response head is awaited,
+/// the body closed).
+async fn h2_camo_get<W>(
+    conn: &mut W,
+    server_name: &str,
+    user_agent: &str,
+    padding: &str,
+) -> Result<()>
+where
+    W: tokio::io::AsyncRead + Unpin + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // The h2c helpers (frame/HPACK) are local to tlsmirror; the shapes
+    // are re-implemented here for a GET.
+    fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(9 + payload.len());
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes()[1..]);
+        out.push(kind);
+        out.push(flags);
+        out.extend_from_slice(&stream.to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+    /// HPACK literal-without-indexing, new name, no Huffman
+    /// (RFC 7541 §6.2.2 — tlsmirror's `hpack_literal_header`).
+    fn hpack_header(out: &mut Vec<u8>, name: &str, value: &str) {
+        fn hpack_integer(out: &mut Vec<u8>, value: usize, prefix_bits: u32, first_byte: u8) {
+            let max = (1usize << prefix_bits) - 1;
+            if value < max {
+                out.push(first_byte | value as u8);
+                return;
+            }
+            out.push(first_byte | max as u8);
+            let mut rest = value - max;
+            while rest >= 0x80 {
+                out.push(rest as u8 | 0x80);
+                rest >>= 7;
+            }
+            out.push(rest as u8);
+        }
+        fn hpack_string(out: &mut Vec<u8>, value: &[u8]) {
+            hpack_integer(out, value.len(), 7, 0x00);
+            out.extend_from_slice(value);
+        }
+        out.push(0x00);
+        hpack_string(out, name.as_bytes());
+        hpack_string(out, value.as_bytes());
+    }
+
+    conn.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").await?;
+    // SETTINGS_INITIAL_WINDOW_SIZE (0x4) = 1 MiB, like tlsmirror's.
+    let mut settings = Vec::new();
+    settings.extend_from_slice(&0x4u16.to_be_bytes());
+    settings.extend_from_slice(&(1u32 << 20).to_be_bytes());
+    conn.write_all(&h2_frame(0x4 /* SETTINGS */, 0, 0, &settings))
+        .await?;
+
+    let mut block = Vec::new();
+    hpack_header(&mut block, ":method", "GET");
+    hpack_header(&mut block, ":scheme", "https");
+    hpack_header(&mut block, ":authority", server_name);
+    hpack_header(&mut block, ":path", "/");
+    hpack_header(&mut block, "user-agent", user_agent);
+    hpack_header(&mut block, "accept-encoding", "gzip");
+    hpack_header(&mut block, "cookie", &format!("padding={padding}"));
+    conn.write_all(&h2_frame(
+        0x1, /* HEADERS */
+        0x4 | 0x1, /* END_HEADERS | END_STREAM (no body on a GET) */
+        1,
+        &block,
+    ))
+    .await?;
+    conn.flush().await?;
+
+    // Await the response head (HEADERS on stream 1); SETTINGS get an
+    // ACK, everything else is read and discarded until then.
+    let mut head = [0u8; 9];
+    loop {
+        conn.read_exact(&mut head).await?;
+        let len =
+            usize::from(head[0]) << 16 | usize::from(head[1]) << 8 | usize::from(head[2]);
+        let kind = head[3];
+        let flags = head[4];
+        let stream = u32::from_be_bytes([head[5], head[6], head[7], head[8]]);
+        let mut payload = vec![0u8; len];
+        conn.read_exact(&mut payload).await?;
+        match kind {
+            0x4 /* SETTINGS */ if flags & 0x1 == 0 => {
+                let _ = conn.write_all(&h2_frame(0x4, 0x1, 0, &[])).await;
+            }
+            0x1 /* HEADERS */ if stream == 1 => return Ok(()),
+            0x7 /* GOAWAY */ => return Ok(()),
+            _ => {}
+        }
+    }
 }
 
 // ----------------------------------------------------------------- connect
@@ -2973,5 +3231,292 @@ mod tests {
             start.elapsed()
         );
     }
-}
 
+    // --------------------------------------- client camouflage HTTP fallback
+    // jlsClientHTTPFallback (transport/jls/utls.go:120-150), exercised
+    // against the wave-10 JLS server LISTENER in fallback mode: a
+    // fingerprint client with the WRONG password completes the TLS
+    // handshake against the camouflage dest, issues the plausible GET,
+    // and only then fails with ErrJLSAuthFailed.
+
+    /// The plaintext a camouflage dest received.
+    type SeenPlaintext = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+
+    /// A fake camouflage site: a real TLS server (self-signed P-256)
+    /// that negotiates `alpn` and answers HTTP/1.1 with a plausible
+    /// page, recording every plaintext byte.
+    async fn spawn_camo_site_http1() -> (std::net::SocketAddr, SeenPlaintext) {
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["jls.test".to_string()]).unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        let cert = CertificateDer::from(cert.der().to_vec());
+        let key = PrivateKeyDer::Pkcs8(key_pair.serialize_der().into());
+        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .unwrap();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let config = Arc::new(config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: SeenPlaintext = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    continue;
+                };
+                let config = config.clone();
+                let seen = seen2.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut tls =
+                        match tokio_rustls::TlsAcceptor::from(config).accept(sock).await {
+                            Ok(t) => t,
+                            Err(_) => return,
+                        };
+                    let mut buf = [0u8; 2048];
+                    loop {
+                        match tls.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                seen.lock().unwrap().extend_from_slice(&buf[..n]);
+                                let _ = tls
+                                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+                                    .await;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (addr, seen)
+    }
+
+    /// The h2 flavor: negotiates `h2` and answers the one GET with a
+    /// static-indexed 200 over a minimal h2 server (the mirror of the
+    /// engine's own h2c client shapes).
+    async fn spawn_camo_site_h2() -> (std::net::SocketAddr, SeenPlaintext) {
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["jls.test".to_string()]).unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        let cert = CertificateDer::from(cert.der().to_vec());
+        let key = PrivateKeyDer::Pkcs8(key_pair.serialize_der().into());
+        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .unwrap();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let config = Arc::new(config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: SeenPlaintext = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    continue;
+                };
+                let config = config.clone();
+                let seen = seen2.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut tls =
+                        match tokio_rustls::TlsAcceptor::from(config).accept(sock).await {
+                            Ok(t) => t,
+                            Err(_) => return,
+                        };
+                    // h2c server: preface, SETTINGS, then the one request.
+                    let mut preface = vec![0u8; 24];
+                    if tls.read_exact(&mut preface).await.is_err()
+                        || &preface != b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+                    {
+                        return;
+                    }
+                    fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+                        let mut out = Vec::with_capacity(9 + payload.len());
+                        out.extend_from_slice(&(payload.len() as u32).to_be_bytes()[1..]);
+                        out.push(kind);
+                        out.push(flags);
+                        out.extend_from_slice(&stream.to_be_bytes());
+                        out.extend_from_slice(payload);
+                        out
+                    }
+                    let _ = tls.write_all(&frame(0x4 /* SETTINGS */, 0, 0, &[])).await;
+                    let mut head = [0u8; 9];
+                    loop {
+                        if tls.read_exact(&mut head).await.is_err() {
+                            return;
+                        }
+                        let len = usize::from(head[0]) << 16
+                            | usize::from(head[1]) << 8
+                            | usize::from(head[2]);
+                        let kind = head[3];
+                        let flags = head[4];
+                        let stream = u32::from_be_bytes([head[5], head[6], head[7], head[8]]);
+                        let mut payload = vec![0u8; len];
+                        if tls.read_exact(&mut payload).await.is_err() {
+                            return;
+                        }
+                        if kind == 0x4 && flags & 0x1 == 0 {
+                            // ACK the client's SETTINGS.
+                            let _ = tls.write_all(&frame(0x4, 0x1, 0, &[])).await;
+                            continue;
+                        }
+                        if kind == 0x1 && stream == 1 {
+                            // The request HEADERS block (literal HPACK,
+                            // no Huffman): record it and answer 200
+                            // (:status 200 = static index 8, END_STREAM).
+                            seen.lock().unwrap().extend_from_slice(&payload);
+                            let _ = tls.write_all(&frame(0x1, 0x4 | 0x1, 1, &[0x88])).await;
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, seen)
+    }
+
+    /// The wave-10 JLS server listener in fallback mode: one user with
+    /// a REAL password, dest = the fake camouflage site.
+    async fn spawn_jls_listener(dest: std::net::SocketAddr) -> std::net::SocketAddr {
+        let capture = crate::inbound::proxy_server::test_support::Capture::new();
+        let cfg = crate::inbound::proxy_server::ServerConfig {
+            tag: "jls-fallback-test".into(),
+            bind: "127.0.0.1".into(),
+            port: 0,
+            protocol: crate::inbound::proxy_server::ServerProtocol::Jls {
+                sni: "jls.test".into(),
+                dest: dest.to_string(),
+                users: vec![("user1".into(), "real-pass".into())],
+                alpn: Vec::new(),
+                rate_limit: 0,
+            },
+        };
+        crate::inbound::proxy_server::jls::serve(&cfg, capture)
+            .await
+            .expect("jls listener")
+    }
+
+    /// The observable shape of the padding cookie (utls.go:143):
+    /// `padding=` followed by 30..=61 zeros.
+    fn padding_len(line: &str) -> Option<usize> {
+        let value = line.strip_prefix("Cookie: padding=")?;
+        let zeros = value.trim_end_matches('\r');
+        if !zeros.bytes().all(|b| b == b'0') {
+            return None;
+        }
+        Some(zeros.len())
+    }
+
+    #[tokio::test]
+    async fn fingerprint_auth_failure_performs_the_http1_camouflage_round() {
+        // utls.go:106-112 + jlsClientHTTPFallback over HTTP/1.1: the
+        // wrong-password fingerprint client completes the handshake
+        // against the camouflage dest (through the listener's fallback
+        // relay), sends the plausible GET, then errors with
+        // ErrJLSAuthFailed.
+        let (dest, seen) = spawn_camo_site_http1().await;
+        let addr = spawn_jls_listener(dest).await;
+
+        let cfg = fp_cfg("user1", "wrong-pass", UtslProfile::parse("chrome").unwrap());
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let err = match connect(&cfg, Box::new(tcp) as BoxProxyStream).await {
+            Ok(_) => panic!("a wrong password must not authenticate"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains(ERR_AUTH_FAILED), "{err}");
+
+        // The camouflage site saw exactly the upstream request shape.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if !seen.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "camouflage site never saw the GET");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let request = String::from_utf8_lossy(&seen.lock().unwrap().clone()).into_owned();
+        let mut lines = request.split("\r\n");
+        assert_eq!(lines.next(), Some("GET / HTTP/1.1"), "{request}");
+        assert!(lines.clone().any(|l| l == "Host: jls.test"), "{request}");
+        assert!(lines.clone().any(|l| l == "User-Agent: Chrome"), "{request}");
+        assert!(lines.clone().any(|l| l == "Accept-Encoding: gzip"), "{request}");
+        let cookie = lines
+            .clone()
+            .find(|l| l.starts_with("Cookie: padding="))
+            .unwrap_or_else(|| panic!("no padding cookie in {request}"));
+        let n = padding_len(cookie).unwrap_or_else(|| panic!("bad cookie line {cookie:?}"));
+        assert!((30..=61).contains(&n), "padding cookie out of range: {n}");
+    }
+
+    #[tokio::test]
+    async fn fingerprint_auth_failure_performs_the_h2_camouflage_round() {
+        // utls.go:123-129: when the camouflage site negotiated h2, the
+        // round speaks unencrypted HTTP/2 over the tunnel.
+        let (dest, seen) = spawn_camo_site_h2().await;
+        let addr = spawn_jls_listener(dest).await;
+
+        let cfg = fp_cfg("user1", "wrong-pass", UtslProfile::parse("firefox").unwrap());
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let err = match connect(&cfg, Box::new(tcp) as BoxProxyStream).await {
+            Ok(_) => panic!("a wrong password must not authenticate"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains(ERR_AUTH_FAILED), "{err}");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if !seen.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "camouflage site never saw the request");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The request HEADERS block (literal HPACK, no Huffman): the
+        // pseudo-headers, the fingerprint user agent and the cookie are
+        // all plain greppable.
+        let block = seen.lock().unwrap().clone();
+        let has = |needle: &[u8]| block.windows(needle.len()).any(|w| w == needle);
+        assert!(has(b":method"), "{block:?}");
+        assert!(has(b"GET"), "{block:?}");
+        assert!(has(b":authority"), "{block:?}");
+        assert!(has(b"jls.test"), "{block:?}");
+        assert!(has(b"user-agent"), "{block:?}");
+        assert!(has(b"Firefox"), "{block:?}");
+        assert!(has(b"cookie"), "{block:?}");
+        assert!(has(b"padding="), "{block:?}");
+        assert!(has(b":path"), "{block:?}");
+    }
+
+    #[tokio::test]
+    async fn plain_path_auth_failure_still_errors_immediately() {
+        // The plain (non-fingerprint) branch keeps failing at the
+        // ServerHello check (transport/jls/jls.go:98-119 has no fallback
+        // round): a wrong-password plain client against the fallback
+        // listener errors without any HTTP bytes reaching the dest.
+        let (dest, seen) = spawn_camo_site_http1().await;
+        let addr = spawn_jls_listener(dest).await;
+
+        let cfg = test_cfg("user1", "wrong-pass");
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let err = match connect(&cfg, Box::new(tcp) as BoxProxyStream).await {
+            Ok(_) => panic!("a wrong password must not authenticate"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains(ERR_AUTH_FAILED), "{err}");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the plain path performs no camouflage round"
+        );
+    }
+}
