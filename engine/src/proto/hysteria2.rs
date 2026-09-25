@@ -1140,24 +1140,14 @@ pub async fn tcp_stream(conn: &quinn::Connection, target: &NetAddr) -> Result<Bo
     let header = tcp_request_header(&target.to_string(), &random_padding(64, 512));
     stream.write_all(&header).await?;
 
-    let mut buf = Vec::with_capacity(1024);
-    let mut chunk = [0u8; 2048];
-    let used = loop {
-        if let Some(used) = parse_tcp_response(&buf)? {
-            break used;
-        }
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            return Err(Error::protocol("hysteria2 tcp: EOF before response"));
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.len() > MAX_MESSAGE_LENGTH + MAX_PADDING_LENGTH + 64 {
-            return Err(Error::protocol("hysteria2 tcp: response too large"));
-        }
-    };
+    // The response frame is consumed lazily on the first read (see
+    // Hysteria2Stream::resp_pending) — blocking here deadlocks against
+    // the real server's lazy first-write framing.
     Ok(Box::new(Hysteria2Stream {
         inner: Box::new(stream),
-        pending: buf[used..].to_vec(),
+        pending: Vec::new(),
+        resp_pending: true,
+        resp_buf: Vec::new(),
     }))
 }
 
@@ -1166,6 +1156,14 @@ pub async fn tcp_stream(conn: &quinn::Connection, target: &NetAddr) -> Result<Bo
 pub struct Hysteria2Stream {
     inner: BoxProxyStream,
     pending: Vec<u8>,
+    /// The server writes its TCPResponse frame LAZILY, together with
+    /// the first data bytes (sing `serverConn.Write` prepends
+    /// `WriteTCPResponse(true, ..)` on the first write), so the client
+    /// must NOT block on it before forwarding the request — the frame
+    /// is consumed on the first READ instead (official client behavior).
+    resp_pending: bool,
+    /// Accumulator for the partially-received response frame.
+    resp_buf: Vec<u8>,
 }
 
 impl AsyncWrite for Hysteria2Stream {
@@ -1193,6 +1191,35 @@ impl AsyncRead for Hysteria2Stream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if this.resp_pending {
+            // Buffer until the response frame parses, then replay the
+            // remainder as payload.
+            loop {
+                match parse_tcp_response(&this.resp_buf) {
+                    Ok(Some(used)) => {
+                        this.pending.extend_from_slice(&this.resp_buf[used..]);
+                        this.resp_pending = false;
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(e) => return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, e))),
+                }
+                let mut chunk = [0u8; 4096];
+                let mut rb = ReadBuf::new(&mut chunk);
+                match Pin::new(&mut this.inner).poll_read(cx, &mut rb) {
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+                if rb.filled().is_empty() {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "hysteria2 tcp: EOF before response frame",
+                    )));
+                }
+                this.resp_buf.extend_from_slice(rb.filled());
+            }
+        }
         if !this.pending.is_empty() {
             let n = this.pending.len().min(buf.remaining());
             buf.put_slice(&this.pending[..n]);
@@ -2194,6 +2221,8 @@ mod tests {
         let mut stream = Hysteria2Stream {
             inner: Box::new(client),
             pending: b"replayed!".to_vec(),
+            resp_pending: false,
+            resp_buf: Vec::new(),
         };
         let mut buf = [0u8; 32];
         let n = stream.read(&mut buf).await.unwrap();
