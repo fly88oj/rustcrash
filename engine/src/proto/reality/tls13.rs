@@ -1262,6 +1262,9 @@ pub async fn connect(
         key_updates: 0,
         eof: false,
         close_notify_sent: false,
+        read_spliced: false,
+        write_spliced: false,
+        splice_prefix: Vec::new(),
     })
 }
 
@@ -1338,6 +1341,48 @@ pub struct Tls13Stream {
     /// `poll_shutdown` already queued close_notify (write side only — the
     /// read side stays open so a half-closed tunnel can still drain replies).
     close_notify_sent: bool,
+    // --- Vision direct-copy rebind (XTLS `commandPaddingDirect`) ----------
+    // Once the peer announces Vision's direct copy, both peers abandon this
+    // record layer and speak raw bytes over the transport (Xray
+    // `proxy/proxy.go:248-283`, `proxy.go:334-347`, main 2026-09; mihomo
+    // `transport/vless/vision/conn.go:142-179` / `:230-232`). The two flags
+    // below allow each *direction* to be abandoned independently: the
+    // client's downlink rebinds when the server's `02` frame is parsed while
+    // its uplink keeps sealing until its own transition, and vice versa.
+    /// Reads bypass the record layer: `splice_prefix` is served first, then
+    /// raw transport bytes (upstream re-binds its reader to the raw conn,
+    /// Xray `proxy/proxy.go:280-282`).
+    read_spliced: bool,
+    /// Writes bypass the record layer; sealed bytes still pending from an
+    /// in-flight `poll_write` are flushed first (upstream re-binds its
+    /// writer after the direct frame went out, mihomo `conn.go:230-232`).
+    write_spliced: bool,
+    /// Bytes recovered from the record layer at read-splice time: decrypted
+    /// read-ahead first (upstream Go `tls.Conn`'s `input`), then any raw
+    /// bytes already pulled off the socket (`rawInput`). Served before the
+    /// transport.
+    splice_prefix: Vec<u8>,
+}
+
+/// What [`Tls13Stream::into_raw_transport`] hands back once the record layer
+/// is abandoned.
+pub struct RawTransport {
+    /// The transport that was under the TLS session.
+    pub transport: BoxProxyStream,
+    /// Bytes the caller must deliver before reading `transport`, in order:
+    /// the decrypted-but-unread plaintext first (upstream Go `tls.Conn`'s
+    /// `input`), then any transport bytes the record layer had already
+    /// pulled off the socket that do not decrypt as records of this session
+    /// (upstream `rawInput`).
+    pub read_ahead: Vec<u8>,
+}
+
+impl std::fmt::Debug for RawTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawTransport")
+            .field("read_ahead_len", &self.read_ahead.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Tls13Stream {
@@ -1363,6 +1408,154 @@ impl Tls13Stream {
     #[cfg(test)]
     pub(crate) fn peer_ccs(&self) -> u8 {
         self.peer_ccs
+    }
+
+    // --- Vision direct-copy rebind -----------------------------------------
+    //
+    // The XTLS Vision splice needs three things from this layer (Xray steals
+    // the first two with reflect+unsafe out of Go's `crypto/tls.Conn`,
+    // `proxy/vless/outbound/outbound.go:284-288` main 2026-09; mihomo
+    // `transport/vless/vision/vision.go:106-111` does the same): the raw
+    // transport under the session, the decrypted-but-unread plaintext
+    // (`input`), and the read-ahead already pulled off the socket
+    // (`rawInput`). Here they are first-class API.
+
+    /// Take (drain) the decrypted-but-unread application plaintext —
+    /// upstream Go `tls.Conn`'s private `input` buffer, which the Vision
+    /// reader drains after the server's direct command (Xray
+    /// `proxy/proxy.go:259-263`).
+    ///
+    /// Sequence state is untouched: no record is decrypted or consumed, so a
+    /// caller staying in TLS mode keeps a fully consistent stream — the next
+    /// `poll_read` decrypts the next record as if nothing happened.
+    pub fn take_read_ahead(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.plain)
+    }
+
+    /// Whether there is decrypted-but-unread plaintext waiting.
+    pub fn has_read_ahead(&self) -> bool {
+        !self.plain.is_empty()
+    }
+
+    /// Decrypt every *complete* record already buffered in `rec` into
+    /// `plain`, without touching the transport. Stops at the first record
+    /// that is not a valid application record of this session — a peer that
+    /// abandoned the record layer writes raw post-splice traffic, which can
+    /// look like a record header; those bytes are left in `rec` so a splice
+    /// can treat them as the raw prefix (this mirrors Go's tls.Conn, which
+    /// has already decrypted every complete record into `input` by the time
+    /// Vision drains it). Only called once reads are being abandoned, so the
+    /// sequence-number consumption of a failed open is harmless.
+    fn drain_buffered_records(&mut self) {
+        loop {
+            if self.rec.len() < 5 {
+                return;
+            }
+            let len = u16::from_be_bytes([self.rec[3], self.rec[4]]) as usize;
+            if self.rec.len() < 5 + len {
+                return;
+            }
+            let record: Vec<u8> = self.rec.drain(..5 + len).collect();
+            if self.handle_record(&record).is_err() {
+                // Not one of ours anymore: put it back at the front (bytes
+                // still in `rec` arrived after it on the wire); a splice
+                // treats it as raw prefix, a TLS-mode caller gets the error
+                // from the next `poll_read`.
+                self.rec.splice(0..0, record);
+                return;
+            }
+        }
+    }
+
+    /// Abandon the record layer for the *read* direction: from now on reads
+    /// return, in order, (a) the decrypted read-ahead recovered above
+    /// (upstream `input`), (b) any bytes already pulled off the socket that
+    /// do not belong to a decryptable record (upstream `rawInput`), then
+    /// (c) raw transport bytes. Writes keep being sealed until
+    /// [`Tls13Stream::splice_writes`].
+    ///
+    /// Upstream equivalent: `VisionReader.ReadMultiBuffer` sets
+    /// `switchToDirectCopy`, drains `input`/`rawInput` and re-binds its
+    /// reader to the raw transport (Xray `proxy/proxy.go:248-250`,
+    /// `:259-283`; mihomo `conn.go:142-175`).
+    pub fn splice_reads(&mut self) {
+        if self.read_spliced {
+            return;
+        }
+        self.read_spliced = true;
+        self.drain_buffered_records();
+        let mut prefix = std::mem::take(&mut self.plain);
+        prefix.append(&mut self.rec);
+        self.splice_prefix = prefix;
+    }
+
+    /// Abandon the record layer for the *write* direction: subsequent writes
+    /// go to the transport raw. Sealed bytes still pending from an in-flight
+    /// `poll_write` are flushed first (they are pre-splice data and must stay
+    /// ordered ahead of the raw bytes). A queued post-handshake control
+    /// record (KeyUpdate reply) is dropped — it cannot be sent once the peer
+    /// stopped reading TLS records.
+    ///
+    /// Upstream equivalent: the Vision writer swaps its writer to the raw
+    /// net conn right after the direct frame went out (mihomo
+    /// `conn.go:230-232`; Xray `proxy/proxy.go:334-347`).
+    pub fn splice_writes(&mut self) {
+        if self.write_spliced {
+            return;
+        }
+        self.write_spliced = true;
+        if !self.ctl.is_empty() {
+            tracing::debug!(
+                "engine: tls13: dropping a queued post-handshake control record; \
+                 the record layer is abandoned"
+            );
+            self.ctl.clear();
+        }
+    }
+
+    /// Whether the read direction was re-bound to the raw transport.
+    pub fn reads_spliced(&self) -> bool {
+        self.read_spliced
+    }
+
+    /// Whether the write direction was re-bound to the raw transport.
+    pub fn writes_spliced(&self) -> bool {
+        self.write_spliced
+    }
+
+    /// Fully unwrap into the raw transport once the record layer can be
+    /// abandoned in both directions. The returned `read_ahead` is exactly
+    /// what a Vision reader must deliver to its caller before reading the
+    /// transport: decrypted-but-unread plaintext first (`input`), then any
+    /// transport bytes the record layer had already pulled off the socket
+    /// that do not decrypt as records of this session (`rawInput`).
+    ///
+    /// Fails while a sealed record is still pending in a write (`out`):
+    /// flush first. Queued control records are dropped, as in
+    /// [`Tls13Stream::splice_writes`]. Once either direction has already
+    /// been spliced this still works — it simply returns the transport and
+    /// whatever prefix remains.
+    pub fn into_raw_transport(mut self) -> Result<RawTransport> {
+        if !self.out.is_empty() {
+            return Err(Error::protocol(
+                "tls13: cannot unwrap while a sealed record is still pending; flush first",
+            ));
+        }
+        self.read_spliced = true;
+        self.drain_buffered_records();
+        let mut read_ahead = std::mem::take(&mut self.plain);
+        read_ahead.append(&mut self.rec);
+        read_ahead.append(&mut self.splice_prefix);
+        if !self.ctl.is_empty() {
+            tracing::debug!(
+                "engine: tls13: dropping a queued post-handshake control record; \
+                 the record layer is abandoned"
+            );
+        }
+        Ok(RawTransport {
+            transport: self.inner,
+            read_ahead,
+        })
     }
 
     /// Read one whole record into `self.rec`; `Ok(None)` is EOF.
@@ -1505,6 +1698,19 @@ impl AsyncRead for Tls13Stream {
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         loop {
+            if this.read_spliced {
+                // Vision direct copy: the drained read-ahead (`input` +
+                // `rawInput`) is delivered before any raw transport byte,
+                // exactly the order upstream's reader merges them
+                // (Xray `proxy/proxy.go:259-266`).
+                if !this.splice_prefix.is_empty() {
+                    let n = this.splice_prefix.len().min(buf.remaining());
+                    buf.put_slice(&this.splice_prefix[..n]);
+                    this.splice_prefix.drain(..n);
+                    return Poll::Ready(Ok(()));
+                }
+                return Pin::new(&mut this.inner).poll_read(cx, buf);
+            }
             if !this.plain.is_empty() {
                 let n = this.plain.len().min(buf.remaining());
                 buf.put_slice(&this.plain[..n]);
@@ -1545,6 +1751,23 @@ impl AsyncWrite for Tls13Stream {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
+        if this.write_spliced {
+            // Vision direct copy: raw passthrough. Sealed bytes still pending
+            // from an in-flight pre-splice write go first, in order.
+            while !this.out.is_empty() {
+                let n = ready!(Pin::new(&mut this.inner).poll_write(cx, &this.out))?;
+                if n == 0 {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "tls13: transport accepted zero bytes",
+                    )));
+                }
+                this.out.drain(..n);
+            }
+            this.out_plain = 0;
+            let n = ready!(Pin::new(&mut this.inner).poll_write(cx, buf))?;
+            return Poll::Ready(Ok(n));
+        }
         if this.out.is_empty() {
             let take = buf.len().min(MAX_PLAINTEXT);
             this.out = this
@@ -1577,7 +1800,12 @@ impl AsyncWrite for Tls13Stream {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if !this.close_notify_sent {
+        // Once either direction abandoned the record layer (Vision direct
+        // copy), no close_notify is sent — the peer is not reading TLS
+        // records anymore; the raw transport is simply shut down (mihomo
+        // `vision/conn.go:306-311` closes the raw net conn for exactly this
+        // reason, skipping tls.Conn's close_notify).
+        if !this.close_notify_sent && !this.read_spliced && !this.write_spliced {
             this.close_notify_sent = true;
             // close_notify (warning, 0) so the peer can distinguish a clean
             // close from a truncated stream. Only the write side ends here:
@@ -1847,6 +2075,9 @@ pub(crate) mod test_server {
                 key_updates: 0,
                 eof: false,
                 close_notify_sent: false,
+                read_spliced: false,
+                write_spliced: false,
+                splice_prefix: Vec::new(),
             },
             hello,
         ))
@@ -2301,6 +2532,223 @@ mod tests {
         assert!(
             server_stream.peer_ccs() >= 1,
             "the client sends the middlebox-compat dummy ChangeCipherSpec"
+        );
+    }
+
+    // --- Vision direct-copy rebind (take/unwrap/splice) --------------------
+    //
+    // These pin the pieces XTLS Vision's `commandPaddingDirect` splice needs:
+    // the decrypted-unread plaintext (`input`), the read-ahead already pulled
+    // off the socket (`rawInput`), and the raw transport under the session
+    // (Xray `proxy/proxy.go:248-283`, `proxy/vless/outbound/outbound.go:284-288`,
+    // main 2026-09).
+
+    /// A connected client/server pair of our own TLS 1.3 implementation over
+    /// a loopback duplex.
+    async fn rebind_pair() -> (Tls13Stream, Tls13Stream) {
+        let cert = self_signed("localhost", &rcgen::PKCS_ED25519);
+        let signing_key = rustls::crypto::ring::sign::any_supported_type(&cert.key).unwrap();
+        let der = cert.der.clone();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        let server_task = tokio::spawn(async move {
+            test_server::accept(
+                Box::new(server_io),
+                CipherSuite::Aes128GcmSha256,
+                move |_| Ok((der.clone(), signing_key.clone())),
+            )
+            .await
+            .unwrap()
+            .0
+        });
+
+        let mut random = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut random);
+        let session_id = [9u8; 32];
+        let (secret, public) = x25519_keygen();
+        let hello = build_client_hello(UtslProfile::Chrome, "localhost", &random, &session_id, &public);
+        let client = connect(
+            Box::new(client_io),
+            &hello,
+            &secret,
+            ServerAuth::AcceptAny,
+        )
+        .await
+        .unwrap();
+        let server = server_task.await.unwrap();
+        (client, server)
+    }
+
+    /// `take_read_ahead` drains exactly the decrypted-unread plaintext and a
+    /// TLS-mode caller keeps a fully working stream afterwards (no sequence
+    /// state is touched).
+    #[tokio::test]
+    async fn take_read_ahead_drains_only_unread_plaintext() {
+        let (mut client, mut server) = rebind_pair().await;
+
+        server.write_all(b"hello").await.unwrap();
+        server.flush().await.unwrap();
+        let mut two = [0u8; 2];
+        tokio::io::AsyncReadExt::read_exact(&mut client, &mut two)
+            .await
+            .unwrap();
+        assert_eq!(&two, b"he");
+        assert!(client.has_read_ahead(), "unread plaintext is buffered");
+        assert_eq!(client.take_read_ahead(), b"llo");
+        assert!(!client.has_read_ahead());
+        assert!(client.take_read_ahead().is_empty(), "draining is idempotent");
+
+        // The stream keeps working in TLS mode: the next records still
+        // decrypt with unbroken sequence numbers.
+        server.write_all(b"-more").await.unwrap();
+        server.flush().await.unwrap();
+        let mut buf = vec![0u8; 5];
+        tokio::io::AsyncReadExt::read_exact(&mut client, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(buf, b"-more");
+    }
+
+    /// Full unwrap: the transport comes back with the buffered read-ahead
+    /// first, then the raw bytes the peer wrote after abandoning its own
+    /// record layer.
+    #[tokio::test]
+    async fn unwrap_yields_raw_transport_with_read_ahead_first() {
+        let (mut client, mut server) = rebind_pair().await;
+
+        client.write_all(b"ping").await.unwrap();
+        client.flush().await.unwrap();
+        let mut p = [0u8; 4];
+        tokio::io::AsyncReadExt::read_exact(&mut server, &mut p)
+            .await
+            .unwrap();
+        assert_eq!(&p, b"ping");
+
+        server.write_all(b"pong").await.unwrap();
+        server.flush().await.unwrap();
+        let mut two = [0u8; 2];
+        tokio::io::AsyncReadExt::read_exact(&mut client, &mut two)
+            .await
+            .unwrap();
+        assert_eq!(&two, b"po");
+
+        // The peer abandons its write record layer; the rest is raw.
+        server.splice_writes();
+        assert!(server.writes_spliced());
+        assert!(!server.reads_spliced());
+        server.write_all(b"|raw-tail").await.unwrap();
+        server.flush().await.unwrap();
+
+        let mut raw = client.into_raw_transport().unwrap();
+        assert_eq!(raw.read_ahead, b"ng", "exactly the buffered bytes first");
+        let mut rest = vec![0u8; 9];
+        tokio::io::AsyncReadExt::read_exact(&mut raw.transport, &mut rest)
+            .await
+            .unwrap();
+        assert_eq!(rest, b"|raw-tail");
+    }
+
+    /// `into_raw_transport` refuses to lose a sealed record that is still
+    /// pending in a write: the caller must flush first.
+    #[tokio::test]
+    async fn unwrap_refuses_a_pending_sealed_write() {
+        let (mut client, _server) = rebind_pair().await;
+        // Simulate a sealed pending write the way a mid-flight `poll_write`
+        // would leave it.
+        let sealed = client.write_key.seal(RECORD_APP, b"z").unwrap();
+        client.out = sealed;
+        client.out_plain = 1;
+        let err = client.into_raw_transport().unwrap_err();
+        assert!(err.to_string().contains("flush first"), "{err}");
+    }
+
+    /// Per-direction splice: after `splice_reads`, reads return the drained
+    /// prefix and then raw transport bytes, while writes are still sealed
+    /// (the uplink's own transition has not happened — upstream's reader
+    /// flag and writer flag are independent, Xray `proxy/proxy.go:248-250`
+    /// vs `:334-347`).
+    #[tokio::test]
+    async fn splice_reads_prefix_then_raw_writes_still_sealed() {
+        let (mut client, mut server) = rebind_pair().await;
+
+        // One sealed write; the client reads 3 bytes, leaving read-ahead.
+        server.write_all(b"framed-tail").await.unwrap();
+        server.flush().await.unwrap();
+        let mut three = [0u8; 3];
+        tokio::io::AsyncReadExt::read_exact(&mut client, &mut three)
+            .await
+            .unwrap();
+        assert_eq!(&three, b"fra");
+
+        // Ensure the sealed record has fully arrived before the peer goes
+        // raw, so the raw bytes are deterministically *not* part of a record.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        server.splice_writes();
+        server.write_all(b"rawdata").await.unwrap();
+        server.flush().await.unwrap();
+
+        client.splice_reads();
+        assert!(client.reads_spliced());
+        assert!(!client.writes_spliced());
+
+        // Prefix ("med-tail" = the unread plaintext) then raw ("rawdata").
+        let mut got = vec![0u8; 8 + 7];
+        tokio::io::AsyncReadExt::read_exact(&mut client, &mut got)
+            .await
+            .unwrap();
+        assert_eq!(got, b"med-tailrawdata".to_vec());
+
+        // The write direction still seals: the server (read side not
+        // spliced) decrypts the client's bytes as a normal record.
+        client.write_all(b"still-sealed").await.unwrap();
+        client.flush().await.unwrap();
+        let mut back = vec![0u8; 12];
+        tokio::io::AsyncReadExt::read_exact(&mut server, &mut back)
+            .await
+            .unwrap();
+        assert_eq!(back, b"still-sealed".to_vec());
+    }
+
+    /// `splice_reads` also recovers *complete but undecrypted* records that
+    /// were already pulled off the socket (upstream's Go tls.Conn has them
+    /// decrypted into `input` by construction; we decrypt on demand, so the
+    /// splice does it) and treats a trailing partial record as raw bytes
+    /// (upstream `rawInput`).
+    #[tokio::test]
+    async fn splice_reads_decrypts_buffered_records_and_keeps_partial_raw() {
+        let (mut client, mut server) = rebind_pair().await;
+
+        // Two sealed records, both fully buffered before the client's first
+        // read: the one `poll_read` that delivers the first byte pulls both
+        // records into `rec` at once.
+        server.write_all(b"first-record").await.unwrap();
+        server.write_all(b"second-record").await.unwrap();
+        server.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut one = [0u8; 1];
+        tokio::io::AsyncReadExt::read_exact(&mut client, &mut one)
+            .await
+            .unwrap();
+        assert_eq!(&one, b"f");
+
+        // The peer abandons its record layer; the bytes after its last
+        // sealed record are raw.
+        server.splice_writes();
+        server.write_all(b"RAW").await.unwrap();
+        server.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        client.splice_reads();
+        let mut got = vec![0u8; 11 + 13 + 3];
+        tokio::io::AsyncReadExt::read_exact(&mut client, &mut got)
+            .await
+            .unwrap();
+        assert_eq!(
+            got,
+            b"irst-recordsecond-recordRAW".to_vec(),
+            "the buffered second record decrypts in order, then the raw tail"
         );
     }
 }

@@ -234,6 +234,11 @@ pub fn load(text: &str) -> Result<EngineConfig> {
                     )?,
                     transport: transport_of(outbound)?,
                     tls: tls_of(outbound)?,
+                    // mihomo-only TLS options (jls/tlsmirror/ech) — sing-box
+                    // has no such fields upstream.
+                    jls: None,
+                    tlsmirror: None,
+                    ech: None,
                 },
             }),
             "vless" => {
@@ -249,8 +254,8 @@ pub fn load(text: &str) -> Result<EngineConfig> {
                 };
                 if vision {
                     tracing::debug!(target: "engine",
-                        "outbound {tag:?}: xtls-rprx-vision (direct splice mode is not \
-                         implemented; framing mode only)");
+                        "outbound {tag:?}: xtls-rprx-vision (full splice on reality \
+                         outers; framing mode on opaque TLS outers)");
                 }
                 let tls = tls_of(outbound)?;
                 let reality = reality_of(outbound, &tag, &tls)?;
@@ -271,6 +276,8 @@ pub fn load(text: &str) -> Result<EngineConfig> {
                         reality,
                         fingerprint,
                         vision,
+                        jls: None,
+                        ech: None,
                     },
                 })
             }
@@ -291,6 +298,8 @@ pub fn load(text: &str) -> Result<EngineConfig> {
                         password: json_str(outbound, "password").unwrap_or_default(),
                         transport: transport_of(outbound)?,
                         tls,
+                        jls: None,
+                        ech: None,
                     },
                 })
             }
@@ -322,6 +331,7 @@ pub fn load(text: &str) -> Result<EngineConfig> {
                             .and_then(|t| t.get("insecure").and_then(Json::as_bool))
                             .unwrap_or(false),
                         obfs,
+                        ech: None,
                     },
                 })
             }
@@ -344,6 +354,7 @@ pub fn load(text: &str) -> Result<EngineConfig> {
                             &json_str(outbound, "udp_relay_mode")
                                 .unwrap_or_else(|| "native".into()),
                         )?,
+                        ech: None,
                     },
                 })
             }
@@ -367,6 +378,8 @@ pub fn load(text: &str) -> Result<EngineConfig> {
                         udp: true,
                         server: server_of(outbound, &tag)?,
                         port: port_of(outbound, &tag)?,
+                        jls: None,
+                        ech: None,
                     }),
                 })
             }

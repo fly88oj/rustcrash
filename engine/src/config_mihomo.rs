@@ -637,6 +637,160 @@ fn yaml_str(entry: &BTreeMap<String, Yaml>, key: &str) -> Option<String> {
     })
 }
 
+/// Scalar yaml helpers for the wave-7 outbound options.
+fn yaml_bool(entry: &BTreeMap<String, Yaml>, key: &str) -> bool {
+    entry.get(key).and_then(Yaml::as_bool).unwrap_or(false)
+}
+
+fn yaml_u64(entry: &BTreeMap<String, Yaml>, key: &str) -> u64 {
+    entry
+        .get(key)
+        .and_then(|v| match v {
+            Yaml::Number(n) => n.as_u64(),
+            Yaml::String(s) => s.parse().ok(),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+fn yaml_i64(entry: &BTreeMap<String, Yaml>, key: &str) -> Option<i64> {
+    entry.get(key).and_then(|v| match v {
+        Yaml::Number(n) => n.as_i64(),
+        Yaml::String(s) => s.parse().ok(),
+        _ => None,
+    })
+}
+
+fn yaml_str_list(entry: &BTreeMap<String, Yaml>, key: &str) -> Vec<String> {
+    entry
+        .get(key)
+        .and_then(Yaml::as_sequence)
+        .map(|list| {
+            list.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `jls-opts: {username, password}` (mihomo JLSOptions → jls.NewConfig:
+/// both fields required when the block is present). JLS replaces the TLS
+/// handshake and rides raw TCP — layered transports are rejected here.
+fn parse_jls_opts(
+    entry: &BTreeMap<String, Yaml>,
+    name: &str,
+    transport: &TransportKind,
+) -> Result<Option<crate::proto::jls::JlsUser>> {
+    let Some(Yaml::Mapping(opts)) = entry.get("jls-opts") else {
+        return Ok(None);
+    };
+    if !matches!(transport, TransportKind::Tcp) {
+        return Err(Error::config(format!(
+            "proxy {name:?}: jls-opts rides raw TCP and cannot combine with a layered \
+             transport (see transport/jls)"
+        )));
+    }
+    let username = opts
+        .get(Yaml::String("username".into()))
+        .and_then(Yaml::as_str)
+        .unwrap_or("");
+    let password = opts
+        .get(Yaml::String("password".into()))
+        .and_then(Yaml::as_str)
+        .unwrap_or("");
+    crate::proto::jls::parse(username, password)
+        .map_err(|e| Error::config(format!("proxy {name:?}: jls-opts: {e}")))
+}
+
+/// `ech-opts: {enable, config, query-server-name}` (mihomo ECHOptions).
+/// Parsed 1:1 and carried; enabling it fails at connect with the precise
+/// blocker (rustls/quinn expose no ECH hook — the engine's own TLS 1.3
+/// wiring is staged; proto::ech holds the full HPKE/ECHConfig core).
+fn parse_ech_opts(entry: &BTreeMap<String, Yaml>) -> Option<crate::proto::ech::EchOptions> {
+    let Yaml::Mapping(opts) = entry.get("ech-opts")? else {
+        return None;
+    };
+    let get = |k: &str| {
+        opts.get(Yaml::String(k.into()))
+            .and_then(Yaml::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    Some(crate::proto::ech::EchOptions {
+        enable: opts
+            .get(Yaml::String("enable".into()))
+            .and_then(Yaml::as_bool)
+            .unwrap_or(false),
+        config: get("config"),
+        query_server_name: get("query-server-name"),
+    })
+}
+
+/// `tlsmirror-opts` on vmess (mihomo TLSMirrorOptions → tlsmirror.Config;
+/// absent or without `primary-key` means disabled). The carrier TLS knobs
+/// come from the proxy-level tls/sni fields.
+fn parse_tlsmirror_opts(
+    entry: &BTreeMap<String, Yaml>,
+    name: &str,
+    tls: &TlsSettings,
+    transport: &TransportKind,
+) -> Result<Option<crate::proto::tlsmirror::TlsMirrorOut>> {
+    let Some(Yaml::Mapping(opts)) = entry.get("tlsmirror-opts") else {
+        return Ok(None);
+    };
+    if !matches!(transport, TransportKind::Tcp) {
+        return Err(Error::config(format!(
+            "proxy {name:?}: tlsmirror-opts rides raw TCP and cannot combine with a \
+             layered transport"
+        )));
+    }
+    let primary_key = opts
+        .get(Yaml::String("primary-key".into()))
+        .and_then(Yaml::as_str)
+        .unwrap_or("");
+    if primary_key.is_empty() {
+        return Ok(None);
+    }
+    let server_name = tls
+        .server_name
+        .clone()
+        .or_else(|| yaml_str(entry, "server"))
+        .unwrap_or_default();
+    let mut out = crate::proto::tlsmirror::TlsMirrorOut::new(primary_key, &server_name);
+    out.skip_cert_verify = tls.skip_cert_verify;
+    // The sub-structs (defer write time, padding, enrolment, generator
+    // steps) are validated by the proto module on use; carry the raw
+    // fields across.
+    if let Some(Yaml::Mapping(sub)) = opts.get(Yaml::String(
+        "defer-instance-derived-write-time".into(),
+    )) {
+        out.defer_instance_derived_write = crate::proto::tlsmirror::TimeSpec {
+            base_nanoseconds: sub
+                .get(Yaml::String("base-nanoseconds".into()))
+                .and_then(Yaml::as_u64)
+                .unwrap_or(0),
+            uniform_random_multiplier_nanoseconds: sub
+                .get(Yaml::String("uniform-random-multiplier-nanoseconds".into()))
+                .and_then(Yaml::as_u64)
+                .unwrap_or(0),
+        };
+    }
+    if let Some(Yaml::Mapping(sub)) =
+        opts.get(Yaml::String("transport-layer-padding".into()))
+    {
+        out.transport_layer_padding = sub
+            .get(Yaml::String("enabled".into()))
+            .and_then(Yaml::as_bool)
+            .unwrap_or(false);
+    }
+    out.sequence_watermarking_enabled = opts
+        .get(Yaml::String("sequence-watermarking-enabled".into()))
+        .and_then(Yaml::as_bool)
+        .unwrap_or(false);
+    let _ = name;
+    Ok(Some(out))
+}
+
 fn parse_proxy(
     entry: &BTreeMap<String, Yaml>,
     index: usize,
@@ -699,6 +853,9 @@ fn parse_proxy(
                      supported by the Rust engine; use an alterId 0 server"
                 )));
             }
+            let jls = parse_jls_opts(entry, &name, &transport)?;
+            let tlsmirror = parse_tlsmirror_opts(entry, &name, &tls, &transport)?;
+            let ech = parse_ech_opts(entry);
             OutboundKind::Vmess {
                 security: VmessSecurity::parse(&yaml_str(entry, "cipher").unwrap_or_default())?,
                 uuid,
@@ -706,6 +863,9 @@ fn parse_proxy(
                 port,
                 transport,
                 tls,
+                jls,
+                tlsmirror,
+                ech,
             }
         }
         "vless" => {
@@ -721,8 +881,8 @@ fn parse_proxy(
             };
             if vision {
                 tracing::debug!(target: "engine",
-                    "proxy {name:?}: xtls-rprx-vision (direct splice mode is not \
-                     implemented; framing mode only)");
+                    "proxy {name:?}: xtls-rprx-vision (full splice on reality outers; \
+                     framing mode on opaque TLS outers)");
             }
             let uuid = yaml_str(entry, "uuid").unwrap_or_default();
             let uuid = uuid::Uuid::parse_str(&uuid)
@@ -761,6 +921,8 @@ fn parse_proxy(
             };
             // A plain fingerprint applies only without reality.
             let fingerprint = if reality.is_some() { None } else { fp };
+            let jls = parse_jls_opts(entry, &name, &transport)?;
+            let ech = parse_ech_opts(entry);
             OutboundKind::Vless {
                 uuid,
                 server,
@@ -770,6 +932,8 @@ fn parse_proxy(
                 reality,
                 fingerprint,
                 vision,
+                jls,
+                ech,
             }
         }
         "trojan" => {
@@ -781,12 +945,16 @@ fn parse_proxy(
                 .unwrap_or(true);
             let mut tls = tls;
             tls.enabled = tls_enabled;
+            let jls = parse_jls_opts(entry, &name, &transport)?;
+            let ech = parse_ech_opts(entry);
             OutboundKind::Trojan {
                 password: yaml_str(entry, "password").unwrap_or_default(),
                 server,
                 port,
                 transport,
                 tls,
+                jls,
+                ech,
             }
         }
         "socks5" => OutboundKind::Socks {
@@ -820,6 +988,7 @@ fn parse_proxy(
             },
             server,
             port,
+            ech: parse_ech_opts(entry),
         },
         "tuic" => OutboundKind::Tuic {
             uuid: yaml_str(entry, "uuid")
@@ -837,6 +1006,7 @@ fn parse_proxy(
             )?,
             server,
             port,
+            ech: parse_ech_opts(entry),
         },
         "ssh" => OutboundKind::Ssh {
             user: yaml_str(entry, "user")
@@ -968,6 +1138,8 @@ fn parse_proxy(
             udp,
             server,
             port,
+            jls: parse_jls_opts(entry, &name, &TransportKind::Tcp)?,
+            ech: parse_ech_opts(entry),
         }),
         "mieru" => {
             let transport = crate::proto::mieru::MieruTransport::parse(
@@ -1013,17 +1185,195 @@ fn parse_proxy(
             server,
             port,
         },
+        "shadowquic" => {
+            let mut opt = crate::proto::shadowquic::ShadowQuicOption::new(
+                server.clone(),
+                port,
+            );
+            opt.name = name.clone();
+            opt.username = yaml_str(entry, "username").unwrap_or_default();
+            opt.password = yaml_str(entry, "password").unwrap_or_default();
+            opt.sni = yaml_str(entry, "sni").unwrap_or_default();
+            opt.alpn = yaml_str_list(entry, "alpn");
+            opt.quic_versions = yaml_str_list(entry, "quic-versions");
+            opt.udp_over_stream = yaml_bool(entry, "udp-over-stream");
+            opt.zero_rtt = yaml_bool(entry, "zero-rtt");
+            opt.keep_alive_interval = yaml_u64(entry, "keep-alive-interval");
+            opt.congestion_controller =
+                yaml_str(entry, "congestion-controller").unwrap_or_default();
+            opt.up = yaml_str(entry, "up").unwrap_or_default();
+            opt.down = yaml_str(entry, "down").unwrap_or_default();
+            opt.cwnd = yaml_u64(entry, "cwnd") as u32;
+            opt.bbr_profile = yaml_str(entry, "bbr-profile").unwrap_or_default();
+            opt.recv_window_conn = yaml_u64(entry, "recv-window-conn") as u32;
+            opt.recv_window = yaml_u64(entry, "recv-window") as u32;
+            opt.disable_mtu_discovery = yaml_bool(entry, "disable-mtu-discovery");
+            opt.max_datagram_frame_size = yaml_u64(entry, "max-datagram-frame-size") as u32;
+            opt.max_open_streams = yaml_u64(entry, "max-open-streams") as u32;
+            opt.skip_cert_verify = yaml_bool(entry, "skip-cert-verify");
+            // JLS-in-QUIC-TLS cannot ride quinn/rustls — surface the
+            // module's precise error at parse time when credentials are
+            // set (upstream always enables JLS; the empty-credential
+            // framing-only mode is this port's documented delta).
+            crate::proto::shadowquic::parse_quic_versions(&opt.quic_versions).map_err(
+                |e| Error::config(format!("proxy {name:?}: shadowquic: {e}")),
+            )?;
+            OutboundKind::ShadowQuic(opt)
+        }
+        "sudoku" => {
+            let key = yaml_str(entry, "key").unwrap_or_default();
+            let mut cfg = crate::proto::sudoku::SudokuOut::new(&server, port, &key);
+            cfg.aead_method = yaml_str(entry, "aead-method");
+            cfg.padding_min = yaml_i64(entry, "padding-min");
+            cfg.padding_max = yaml_i64(entry, "padding-max");
+            cfg.table_type = yaml_str(entry, "table-type").unwrap_or_default();
+            cfg.enable_pure_downlink = entry.get("enable-pure-downlink").and_then(Yaml::as_bool);
+            cfg.http_mask = entry.get("http-mask").and_then(Yaml::as_bool);
+            cfg.http_mask_mode =
+                yaml_str(entry, "http-mask-mode").unwrap_or_default();
+            cfg.http_mask_tls = yaml_bool(entry, "http-mask-tls");
+            cfg.http_mask_host = yaml_str(entry, "http-mask-host").unwrap_or_default();
+            cfg.path_root = yaml_str(entry, "path-root").unwrap_or_default();
+            cfg.multiplex = yaml_str(entry, "multiplex")
+                .or_else(|| yaml_str(entry, "http-mask-multiplex"))
+                .unwrap_or_default();
+            cfg.custom_table = yaml_str(entry, "custom-table").unwrap_or_default();
+            cfg.custom_tables = yaml_str_list(entry, "custom-tables");
+            // The `httpmask:{...}` nested block mirrors the flat fields.
+            if let Some(Yaml::Mapping(sub)) = entry.get("httpmask") {
+                let sub_get = |k: &str| {
+                    sub.get(Yaml::String(k.into()))
+                        .and_then(Yaml::as_str)
+                        .map(str::to_string)
+                };
+                if let Some(v) = sub_get("mode") {
+                    cfg.http_mask_mode = v;
+                }
+                if let Some(v) = sub_get("host") {
+                    cfg.http_mask_host = v;
+                }
+                if let Some(v) = sub_get("path-root") {
+                    cfg.path_root = v;
+                }
+                if let Some(v) = sub_get("multiplex") {
+                    cfg.multiplex = v;
+                }
+                if let Some(Yaml::Bool(b)) = sub.get(Yaml::String("disable".into())) {
+                    cfg.http_mask = Some(!*b);
+                }
+                if let Some(Yaml::Bool(b)) = sub.get(Yaml::String("tls".into())) {
+                    cfg.http_mask_tls = *b;
+                }
+            }
+            OutboundKind::Sudoku(cfg)
+        }
+        "gost-relay" => {
+            let mut cfg = crate::proto::gost_relay::GostRelayOut::new(&server, port);
+            cfg.forward = yaml_bool(entry, "forward");
+            cfg.udp = udp;
+            cfg.tls = yaml_bool(entry, "tls");
+            cfg.mux = yaml_bool(entry, "mux");
+            cfg.sni = yaml_str(entry, "sni").unwrap_or_default();
+            cfg.username = yaml_str(entry, "username").unwrap_or_default();
+            cfg.password = yaml_str(entry, "password").unwrap_or_default();
+            cfg.skip_cert_verify = yaml_bool(entry, "skip-cert-verify");
+            cfg.name_cert_verify =
+                yaml_str(entry, "name-cert-verify").unwrap_or_default();
+            cfg.fingerprint = yaml_str(entry, "fingerprint").unwrap_or_default();
+            cfg.certificate = yaml_str(entry, "certificate").unwrap_or_default();
+            cfg.private_key = yaml_str(entry, "private-key").unwrap_or_default();
+            cfg.client_fingerprint =
+                yaml_str(entry, "client-fingerprint").unwrap_or_default();
+            OutboundKind::GostRelay(cfg)
+        }
+        "trusttunnel" => {
+            let mut cfg = crate::proto::trusttunnel::TrustTunnelOut::new(&server, port);
+            cfg.username = yaml_str(entry, "username").unwrap_or_default();
+            cfg.password = yaml_str(entry, "password").unwrap_or_default();
+            cfg.alpn = yaml_str_list(entry, "alpn");
+            cfg.sni = yaml_str(entry, "sni").unwrap_or_default();
+            cfg.skip_cert_verify = yaml_bool(entry, "skip-cert-verify");
+            cfg.name_cert_verify =
+                yaml_str(entry, "name-cert-verify").unwrap_or_default();
+            cfg.fingerprint = yaml_str(entry, "fingerprint").unwrap_or_default();
+            cfg.certificate = yaml_str(entry, "certificate").unwrap_or_default();
+            cfg.private_key = yaml_str(entry, "private-key").unwrap_or_default();
+            cfg.client_fingerprint =
+                yaml_str(entry, "client-fingerprint").unwrap_or_default();
+            cfg.udp = udp;
+            cfg.health_check = yaml_bool(entry, "health-check");
+            cfg.quic = yaml_bool(entry, "quic");
+            cfg.congestion_controller =
+                yaml_str(entry, "congestion-controller").unwrap_or_default();
+            cfg.cwnd = yaml_i64(entry, "cwnd").unwrap_or(0);
+            cfg.bbr_profile = yaml_str(entry, "bbr-profile").unwrap_or_default();
+            cfg.max_connections = yaml_i64(entry, "max-connections").unwrap_or(0);
+            cfg.min_streams = yaml_i64(entry, "min-streams").unwrap_or(0);
+            cfg.max_streams = yaml_i64(entry, "max-streams").unwrap_or(0);
+            cfg.ech = parse_ech_opts(entry);
+            OutboundKind::TrustTunnel(cfg)
+        }
+        "masque" => {
+            let cfg = crate::proto::masque::MasqueOption {
+                server: server.clone(),
+                port,
+                private_key: yaml_str(entry, "private-key").unwrap_or_default(),
+                public_key: yaml_str(entry, "public-key").unwrap_or_default(),
+                ip: yaml_str(entry, "ip").unwrap_or_default(),
+                ipv6: yaml_str(entry, "ipv6").unwrap_or_default(),
+                uri: yaml_str(entry, "uri").unwrap_or_default(),
+                sni: yaml_str(entry, "sni").unwrap_or_default(),
+                mtu: yaml_u64(entry, "mtu") as u32,
+                udp,
+                handshake_timeout: yaml_u64(entry, "handshake-timeout"),
+                skip_cert_verify: yaml_bool(entry, "skip-cert-verify"),
+                name_cert_verify: yaml_str(entry, "name-cert-verify").unwrap_or_default(),
+                network: yaml_str(entry, "network").unwrap_or_default(),
+                congestion_controller: yaml_str(entry, "congestion-controller")
+                    .unwrap_or_default(),
+                cwnd: yaml_i64(entry, "cwnd").unwrap_or(0),
+                bbr_profile: yaml_str(entry, "bbr-profile").unwrap_or_default(),
+                remote_dns_resolve: yaml_bool(entry, "remote-dns-resolve"),
+                dns: yaml_str_list(entry, "dns"),
+                ip_stack: {
+                    let mut ip_stack = crate::proto::masque::IpStackOption::default();
+                    if let Some(Yaml::Mapping(sub)) = entry.get("ip-stack") {
+                        ip_stack.mode = sub
+                            .get(Yaml::String("mode".into()))
+                            .and_then(Yaml::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                    }
+                    ip_stack
+                },
+            };
+            // The module's own validate (TUN mode, negative timeout, ...)
+            // runs on connect; parse-time validation mirrors masque.go.
+            if let Some(ht) = yaml_i64(entry, "handshake-timeout") {
+                if ht < 0 {
+                    return Err(Error::config(format!(
+                        "proxy {name:?}: masque handshake timeout must be non-negative"
+                    )));
+                }
+            }
+            OutboundKind::Masque(cfg)
+        }
         other => {
-            let supported = "ss, vmess, vless, trojan, socks5, http, hysteria2, tuic, wireguard, snell, anytls, mieru, restls";
+            let supported = "ss, vmess, vless, trojan, socks5, http, hysteria2, tuic, wireguard, snell, anytls, mieru, restls, shadowquic, sudoku, gost-relay, trusttunnel, masque";
             return Err(Error::config(format!(
                 "proxy {name:?}: type {other:?} is not supported by the Rust engine yet \
                  (supported: {supported})"
             )));
         }
     };
-    // hy2/tuic are UDP-native: mihomo defaults their udp to true.
+    // hy2/tuic are UDP-native and the wave-7 QUIC/UoT transports always
+    // answer UDP: mihomo defaults their udp to true.
     let udp = match &kind {
-        OutboundKind::Hysteria2 { .. } | OutboundKind::Tuic { .. } => {
+        OutboundKind::Hysteria2 { .. }
+        | OutboundKind::Tuic { .. }
+        | OutboundKind::ShadowQuic(_)
+        | OutboundKind::Sudoku(_)
+        | OutboundKind::Masque(_) => {
             entry.get("udp").and_then(Yaml::as_bool).unwrap_or(true)
         }
         _ => udp,
@@ -1457,6 +1807,135 @@ rules:
 "#;
         let err = load(restls12).err().unwrap().to_string();
         assert!(err.contains("tls12"), "{err}");
+    }
+
+    /// Wave-7: the five new outbound types parse with their option
+    /// fields, and the TLS options (jls-opts / ech-opts / tlsmirror-opts)
+    /// land on their carrying outbounds.
+    #[test]
+    fn wave7_transports_parse_and_options() {
+        // shadowquic — every tuning knob accepted.
+        let sq = load(
+            r#"
+mixed-port: 7890
+proxies:
+  - name: sq
+    type: shadowquic
+    server: sq.example
+    port: 443
+    username: u1
+    password: p1
+    sni: s.example
+    alpn: [h3]
+    quic-versions: [v1]
+    udp-over-stream: true
+    keep-alive-interval: 2000
+    congestion-controller: bbr
+    up: "50 Mbps"
+    down: "100 Mbps"
+    cwnd: 32
+    recv-window-conn: 65536
+    recv-window: 262144
+    disable-mtu-discovery: true
+    max-open-streams: 64
+rules:
+  - MATCH,sq
+"#,
+        )
+        .unwrap();
+        let at = sq
+            .outbounds
+            .iter()
+            .find(|o| o.name == "sq")
+            .expect("shadowquic outbound");
+        match &at.kind {
+            crate::outbound::OutboundKind::ShadowQuic(opt) => {
+                assert_eq!(opt.username, "u1");
+                assert_eq!(opt.alpn, vec!["h3".to_string()]);
+                assert!(opt.udp_over_stream);
+                assert_eq!(opt.keep_alive_interval, 2000);
+                assert!(opt.disable_mtu_discovery);
+                assert_eq!(opt.max_open_streams, 64);
+            }
+            other => panic!("wrong kind: {other:?}"),
+        }
+
+        // sudoku / gost-relay / trusttunnel / masque parse with defaults.
+        let probe = |ptype: &str| {
+            let cfg = format!(
+                "mixed-port: 7890\nproxies:\n  - {{name: w7, type: {ptype}, server: h.example, port: 443}}\nrules:\n  - MATCH,w7\n"
+            );
+            let parsed = load(&cfg).unwrap_or_else(|e| panic!("{ptype}: {e}"));
+            parsed
+                .outbounds
+                .iter()
+                .find(|o| o.name == "w7")
+                .expect("outbound")
+                .clone()
+        };
+        use crate::outbound::OutboundKind;
+        assert!(matches!(probe("sudoku").kind, OutboundKind::Sudoku(_)));
+        assert!(matches!(probe("gost-relay").kind, OutboundKind::GostRelay(_)));
+        assert!(matches!(probe("trusttunnel").kind, OutboundKind::TrustTunnel(_)));
+        assert!(matches!(probe("masque").kind, OutboundKind::Masque(_)));
+        // Upstream: shadowquic/sudoku/masque are UDP-capable by default;
+        // gost-relay/trusttunnel UDP is opt-in (`udp: true`).
+        for ptype in ["sudoku", "masque"] {
+            assert!(probe(ptype).udp, "{ptype} defaults to udp-capable");
+        }
+        for ptype in ["gost-relay", "trusttunnel"] {
+            assert!(!probe(ptype).udp, "{ptype} udp is opt-in");
+        }
+
+        // jls-opts on trojan (vless/vmess/anytls share the helper).
+        let jls = load(
+            r#"
+mixed-port: 7890
+proxies:
+  - {name: tj, type: trojan, server: t.example, port: 443, password: pw, jls-opts: {username: u, password: p}}
+rules:
+  - MATCH,tj
+"#,
+        )
+        .unwrap();
+        match &jls.outbounds.iter().find(|o| o.name == "tj").unwrap().kind {
+            crate::outbound::OutboundKind::Trojan { jls, .. } => {
+                assert!(jls.is_some(), "jls-opts parsed");
+            }
+            other => panic!("wrong kind: {other:?}"),
+        }
+
+        // jls-opts with a layered transport fails at parse.
+        let bad = r#"
+mixed-port: 7890
+proxies:
+  - {name: bj, type: trojan, server: t.example, port: 443, password: pw, network: ws, ws-opts: {path: /x}, jls-opts: {username: u, password: p}}
+rules:
+  - MATCH,bj
+"#;
+        let err = load(bad).err().unwrap().to_string();
+        assert!(err.contains("jls-opts rides raw TCP"), "{err}");
+
+        // ech-opts + tlsmirror-opts carry through.
+        let opts = load(
+            r#"
+mixed-port: 7890
+proxies:
+  - {name: vm, type: vmess, server: v.example, port: 443, uuid: 66666666-6666-6666-6666-666666666666, cipher: auto, ech-opts: {enable: true, config: aGVsbG8=}, tlsmirror-opts: {primary-key: cHJpbWFyeS1rZXktdmFsdWUtMzItYnl0ZXMhIQ==}}
+rules:
+  - MATCH,vm
+"#,
+        )
+        .unwrap();
+        match &opts.outbounds.iter().find(|o| o.name == "vm").unwrap().kind {
+            crate::outbound::OutboundKind::Vmess { ech, tlsmirror, .. } => {
+                let ech = ech.as_ref().expect("ech-opts parsed");
+                assert!(ech.enable);
+                assert_eq!(ech.config, "aGVsbG8=");
+                assert!(tlsmirror.is_some(), "tlsmirror-opts parsed");
+            }
+            other => panic!("wrong kind: {other:?}"),
+        }
     }
 
     #[test]

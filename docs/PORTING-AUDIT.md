@@ -27,7 +27,7 @@ Status legend:
 |---|---|---|
 | shadowsocks.go | `proto/shadowsocks.rs` (AEAD + 2022 BLAKE3) | ✅ |
 | vmess.go | `proto/vmess.rs` (AEAD, ws/httpupgrade transport) | ✅ |
-| vless.go | `proto/vless.rs` + `proto/vision.rs` (xtls-rprx-vision framing mode; direct splice ⏳) | ✅/🟡 |
+| vless.go | `proto/vless.rs` + `proto/vision.rs` (xtls-rprx-vision framing; **full direct splice on reality outers**: `Tls13Stream` rebind API drains read-ahead + re-binds both directions to the raw transport, Xray `proxy/proxy.go` direct-copy parity; opaque rustls outers keep framing mode) | ✅ |
 | trojan.go | `proto/trojan.rs` | ✅ |
 | socks5.go | `proto/socks.rs` + `outbound.rs` | ✅ |
 | http.go | `proto/httpx.rs` | ✅ |
@@ -36,7 +36,7 @@ Status legend:
 | dns.go | `dns/resolver.rs` (dns-out via engine DNS) | 🟡 no `dns` as a *proxied outbound* — resolved in-process |
 | hysteria2.go | `proto/hysteria2.rs` over quinn (HTTP/3-style auth, salamander obfs, datagram UDP) | ✅ this pass |
 | tuic.go | `proto/tuic.rs` v5 (TLS-exporter token auth, native/quic UDP relay, heartbeats, dissociate) | ✅ this pass |
-| wireguard.go | `proto/wireguard.rs` — hand-rolled Noise_IKpsk2 handshake (KDF/MAC1/2 step-cited from the whitepaper), transport keys, anti-replay, cookie consumption, keepalive/rekey timers, smoltcp client stack for TCP+UDP, mihomo `reserved` bytes per sing-wireguard `client_bind.go` | ✅ this pass (self-consistent: verified against an in-test noise responder; IPv6 inner stack ⏳) |
+| wireguard.go | `proto/wireguard.rs` — hand-rolled Noise_IKpsk2 handshake (KDF/MAC1/2 step-cited from the whitepaper), transport keys, anti-replay, cookie consumption, keepalive/rekey timers, smoltcp client stack for TCP+UDP, mihomo `reserved` bytes per sing-wireguard `client_bind.go` | ✅ this pass (self-consistent: verified against an in-test noise responder; IPv6 inner stack ✅ wave-7 (dual-stack interface, per-family source selection, v4/v6 share one tunnel) |
 | tailscale.go, easytier.go, zerotier.go | — | ⏳ P3 overlay networks |
 | ssh.go | `proto/ssh.rs` via russh (password/PEM keys, direct-tcpip channels, known host keys) | ✅ this pass |
 | shadowtls.go (v3) | `proto/shadowtls.rs` (Hello-HMAC auth, record XOR chains, inner `proxy:` nesting in the mihomo dialect) | ✅ this pass (v1/v2 rejected with a clear error) |
@@ -44,9 +44,17 @@ Status legend:
 | anytls.go | `proto/anytls.rs` — auth sha256(pw), padding-scheme session, uot-v2 UDP | ✅ this pass (session multiplexing/idle pool ⏳) |
 | mieru.go | `proto/mieru.rs` — mihomo adapter subset: hashed password, PBKDF2 time-key, XChaCha20-Poly1305 implicit-nonce sessions, stream transport | 🟡 TCP session path ✅ (UDP packet transport/multiplexing/port-ranges ⏳ with clear config errors) |
 | restls.go | `proto/restls.rs` — TLS1.3 session-id BLAKE3 MAC stamping (rustls SecureRandom trick), XOR auth record, script-driven padding | ✅ this pass (tls12 version-hint rejected: rustls has no KEX hook — error names it) |
-| jls.go, shadowquic.go, sudoku.go, gost_relay.go, masque.go, openvpn.go, tlsmirror.go, trusttunnel.go, ech.go | — | ⏳ planned (P3, one transport per pass); configs fail with "not supported yet" until then |
+| jls.go | `proto/jls.rs` — JLS cover over TLS 1.3: hello randoms replaced by AES-256-GCM seeds keyed by SHA256(user/pw‖authData) (two-pass rustls hello stamping; Go golden vectors), wired as `jls-opts` on vless/trojan/vmess/anytls | ✅ wave-7 (uTLS-fingerprint hello + server-side fallback relay ⏳) |
+| shadowquic.go | `proto/shadowquic.rs` — TCP + UDP (datagram & udp-over-stream) over quinn, control-stream id registration, ≤32 pending demux, Brutal codec; tuned windows/streams | ✅ wave-7 TCP+UDP (jls-in-QUIC-TLS impossible under quinn/rustls — precise error; upstream-always-JLS delta documented; v2/RFC9369 unsupported by quinn) |
+| sudoku.go | `proto/sudoku.rs` — KIP framing, X25519+nonce-echo+rekey handshake, RecordConn epoch AEAD, full table obfs (bit-exact Go math/rand transcription, directional/custom/rotation), legacy HTTP mask, UoT UDP, session mux | ✅ wave-7 (http-mask modes stream/poll/auto/ws + `auto` mux → precise errors) |
+| gost_relay.go | `proto/gost_relay.rs` — relay v1 features (userauth/addr-port-LAST/network), TCP + UDP associations, TLS, forward mode | ✅ wave-7 (mux:true rejected citing smux; TLS cert extras carried) |
+| tlsmirror.go | `proto/tlsmirror.rs` — mirror carrier (CH/SH random + cipher capture, XOR-nonce AES-GCM with counter-retry, HKDF labels, TLS1.2 explicit-nonce path, watermarking ChaCha20, padding, traffic generator) as `tlsmirror-opts` on vmess | ✅ wave-7 (connection-enrolment + h2 generator → precise errors) |
+| trusttunnel.go | `proto/trusttunnel.rs` — pool client; in-tree minimal HTTP/2 (full HPACK incl. Huffman + dynamic table, flow control) and HTTP/3-over-quinn CONNECT tunnels, both UDP framings | ✅ wave-7 (ECH composed at TLS layer; ICMP refused citing icmp.go) |
+| masque.go | `proto/masque.rs` — Cloudflare-flavoured MASQUE: ECDSA cert auth + public-key pinning, minimal in-module H3, `cf-connect-ip` extended CONNECT + capsule ADDRESS_ASSIGN/ROUTE_ADVERTISEMENT, L4 proxy plain-CONNECT TCP | ✅ wave-7 (TUN/ip-stack mode + L4 UDP → precise errors citing upstream lines) |
+| openvpn.go | — | ⏳ P3 (configs fail with "not supported yet") |
+| ech.go | `proto/ech.rs` — ECHConfigList parser (metacubex/tls ech.go 1:1, draft-18/RFC 9460), HPKE base sender (X25519/HKDF-SHA256 + AES-GCM/ChaCha, RFC 9180 vectors), outer-CH extension builder; `ech-opts` parsed on all 7 carriers | 🟡 core ✅ wave-7; runtime handshake needs the engine-TLS hook (rustls/quinn have none) — enable fails with the precise blocker, own-stack wiring staged next |
 | simple-obfs | `proto/obfs.rs` (http/tls obfs client; mihomo `plugin: obfs` + sing-box `obfs-local` plugin_opts) | ✅ this pass |
-| reality.go (utls/reality) | `proto/reality/` — Rust-native TLS 1.3 (byte-controlled ClientHello, SHA-256 + SHA-384 key schedules), Chrome/Firefox uTLS templates, REALITY auth + temp-auth cert verify | ✅ **live-validated against a real Xray server** (tests/docker-reality, 19 checks): handshake+relay, firefox profile, wrong short-id/key refusals, fallback, camo negotiation incl. the 0x1302/SHA-384 path. Vision framing ✅ (`proto/vision.rs`); direct splice ⏳ |
+| reality.go (utls/reality) | `proto/reality/` — Rust-native TLS 1.3 (byte-controlled ClientHello, SHA-256 + SHA-384 key schedules), Chrome/Firefox uTLS templates, REALITY auth + temp-auth cert verify | ✅ **live-validated against a real Xray server** (tests/docker-reality, 19 checks): handshake+relay, firefox profile, wrong short-id/key refusals, fallback, camo negotiation incl. the 0x1302/SHA-384 path. Vision framing ✅ (`proto/vision.rs`); direct splice ✅ wave-7 (reality outers re-bind raw) |
 
 ### adapter/outboundgroup/
 
@@ -221,14 +229,16 @@ stay available as the escape hatch during migration.
 
 | Priority | Gap | Implementation path |
 |---|---|---|
-| **P1** | vless Vision DIRECT splice — FULL (raw-transport rebind) | framing half ✅ (command `02` parsed, verbatim passthrough); the full splice rebinds to raw TCP under the outer TLS and needs read-ahead buffers exposed through `Tls13Stream` (tracked) |
+| **P1** | vless Vision DIRECT splice — FULL (raw-transport rebind) | ✅ wave-7: `Tls13Stream::take_read_ahead/into_raw_transport` + half-splice flags; `VisionConn::connect_tls13` re-binds each direction at the `02` transition (reality outers) |
 | **P1** | TUN on Windows (WinTUN) / macOS (utun) | same netstack, different device backends |
 
 | P2 | hy2/tuic server listeners; SS-2022 multi-user server | hy2 server reuses the quinn plumbing; ss UDP server ✅ landed (legacy + 2022) |
 | P1 | WireGuard (outbound + endpoint) | boringtun for the tunnel; consumes the TUN netstack core from the P0 item |
 | P2 | DHCP / system / hosts-file DNS upstreams; DoH server | small, one module each |
-| P2 | snell / anytls / mieru / jls / restls / shadowquic transports | one protocol per pass, mirroring upstream codecs |
-| P3 | tailscale / tor / openvpn / masque / sudoku / gost-relay / tlsmirror / trusttunnel / series | long tail, driven by user demand |
+| P2 | snell / anytls / mieru / jls / restls / shadowquic transports | ✅ waves 6-7 (client side); snell UDP frame-boundary reader + snell/anytls server listeners remain |
+| P3 | openvpn / tailscale / tor / series | long tail, driven by user demand (masque / sudoku / gost-relay / tlsmirror / trusttunnel ✅ wave-7) |
+| P2 | ECH runtime on the engine's own TLS 1.3 stack | core ✅ (`proto/ech`: HPKE + ECHConfig + outer-CH builder); inner-handshake rebind wiring after the vision rebind API stabilizes |
+| P2 | mieru UDP packet transport / port-ranges; sudoku http-mask tunnel modes | config-rejected with precise errors today |
 | P3 | sip003 external plugins; .mrs writing; misc polish | — |
 
 Cluster e2e note (tests/docker-cluster, 10 checks): the dev machine's

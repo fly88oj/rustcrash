@@ -97,6 +97,13 @@ pub enum OutboundKind {
         security: crate::proto::vmess::VmessSecurity,
         transport: TransportKind,
         tls: TlsSettings,
+        /// mihomo `jls-opts`: JLS cover over the TLS handshake
+        /// (replaces the plain TLS dial when set).
+        jls: Option<crate::proto::jls::JlsUser>,
+        /// mihomo `tlsmirror-opts`: mirror-carrier TLS wrapper (vmess only).
+        tlsmirror: Option<crate::proto::tlsmirror::TlsMirrorOut>,
+        /// mihomo `ech-opts` (carried; see the connect-time error).
+        ech: Option<crate::proto::ech::EchOptions>,
     },
     Vless {
         server: String,
@@ -112,6 +119,8 @@ pub enum OutboundKind {
         /// `flow: xtls-rprx-vision`: XTLS Vision framing after the
         /// vless handshake.
         vision: bool,
+        jls: Option<crate::proto::jls::JlsUser>,
+        ech: Option<crate::proto::ech::EchOptions>,
     },
     Trojan {
         server: String,
@@ -119,6 +128,8 @@ pub enum OutboundKind {
         password: String,
         transport: TransportKind,
         tls: TlsSettings,
+        jls: Option<crate::proto::jls::JlsUser>,
+        ech: Option<crate::proto::ech::EchOptions>,
     },
     Hysteria2 {
         server: String,
@@ -127,6 +138,7 @@ pub enum OutboundKind {
         sni: Option<String>,
         skip_verify: bool,
         obfs: Option<String>,
+        ech: Option<crate::proto::ech::EchOptions>,
     },
     Tuic {
         server: String,
@@ -136,6 +148,7 @@ pub enum OutboundKind {
         sni: Option<String>,
         skip_verify: bool,
         udp_relay_mode: crate::proto::tuic::UdpRelayMode,
+        ech: Option<crate::proto::ech::EchOptions>,
     },
     Ssh {
         server: String,
@@ -166,6 +179,11 @@ pub enum OutboundKind {
         port: u16,
         cfg: crate::proto::restls::RestlsOut,
     },
+    ShadowQuic(crate::proto::shadowquic::ShadowQuicOption),
+    Sudoku(crate::proto::sudoku::SudokuOut),
+    GostRelay(crate::proto::gost_relay::GostRelayOut),
+    TrustTunnel(crate::proto::trusttunnel::TrustTunnelOut),
+    Masque(crate::proto::masque::MasqueOption),
 }
 
 /// Shared, lazily-dialed QUIC connection for the hysteria2/tuic outbounds
@@ -173,12 +191,24 @@ pub enum OutboundKind {
 #[derive(Default)]
 struct QuicConnCache(tokio::sync::Mutex<Option<std::sync::Arc<quinn::Connection>>>);
 
+/// Lazily-dialed stateful clients for the wave-7 QUIC/pool transports
+/// (shadowquic reuses one QUIC connection + demux, trusttunnel keeps its
+/// connection pool, masque shares one H3 session) — one per outbound, like
+/// upstream's cached `connState` / `PoolClient`.
+#[derive(Default)]
+struct W7Clients {
+    shadowquic: tokio::sync::Mutex<Option<std::sync::Arc<crate::proto::shadowquic::Client>>>,
+    trusttunnel: tokio::sync::Mutex<Option<std::sync::Arc<crate::proto::trusttunnel::TrustTunnelPool>>>,
+    masque: tokio::sync::Mutex<Option<std::sync::Arc<crate::proto::masque::MasqueClient>>>,
+}
+
 /// A runtime leaf outbound.
 pub struct Outbound {
     pub name: String,
     pub udp: bool,
     kind: OutboundKind,
     quic: QuicConnCache,
+    w7: W7Clients,
 }
 
 impl Outbound {
@@ -188,6 +218,7 @@ impl Outbound {
             udp: cfg.udp,
             kind: cfg.kind.clone(),
             quic: QuicConnCache::default(),
+            w7: W7Clients::default(),
         })
     }
 
@@ -209,6 +240,99 @@ impl Outbound {
         Ok(conn)
     }
 
+    /// Lazily-dialed shadowquic client (one QUIC connection + UDP demux,
+    /// redialled when the connection died — upstream's cached connState).
+    async fn shadowquic_client(
+        &self,
+        opt: &crate::proto::shadowquic::ShadowQuicOption,
+    ) -> Result<std::sync::Arc<crate::proto::shadowquic::Client>> {
+        let mut slot = self.w7.shadowquic.lock().await;
+        if let Some(c) = slot.as_ref() {
+            if c.connection().close_reason().is_none() {
+                return Ok(c.clone());
+            }
+        }
+        let c = std::sync::Arc::new(crate::proto::shadowquic::connect(opt).await?);
+        *slot = Some(c.clone());
+        Ok(c)
+    }
+
+    /// Lazily-created trusttunnel pool (dials fresh transports as needed).
+    async fn trusttunnel_pool(
+        &self,
+        cfg: &crate::proto::trusttunnel::TrustTunnelOut,
+    ) -> Result<std::sync::Arc<crate::proto::trusttunnel::TrustTunnelPool>> {
+        let mut slot = self.w7.trusttunnel.lock().await;
+        if let Some(p) = slot.as_ref() {
+            return Ok(p.clone());
+        }
+        let p = std::sync::Arc::new(crate::proto::trusttunnel::TrustTunnelPool::new(cfg, None).await?);
+        *slot = Some(p.clone());
+        Ok(p)
+    }
+
+    /// Lazily-dialed masque H3 session (one QUIC connection + tunnel).
+    async fn masque_client(
+        &self,
+        cfg: &crate::proto::masque::MasqueOption,
+    ) -> Result<std::sync::Arc<crate::proto::masque::MasqueClient>> {
+        let mut slot = self.w7.masque.lock().await;
+        if let Some(c) = slot.as_ref() {
+            return Ok(c.clone());
+        }
+        let c = std::sync::Arc::new(
+            crate::proto::masque::MasqueClient::connect(cfg.clone()).await?,
+        );
+        *slot = Some(c.clone());
+        Ok(c)
+    }
+
+    /// The connect-time ECH refusal, shared by every TLS outbound that
+    /// carries `ech-opts` (mihomo embeds it on vless/trojan/vmess/anytls/
+    /// hysteria2/tuic/trusttunnel). Configs parse 1:1; use fails with the
+    /// precise blocker: rustls (and quinn above it) expose no ECH hook, and
+    /// the engine's own TLS 1.3 stack integration is staged — the full
+    /// HPKE/ECHConfig core already lives in `proto::ech`.
+    fn ech_refusal(ech: &Option<crate::proto::ech::EchOptions>) -> Result<()> {
+        if let Some(opts) = ech {
+            if opts.enable {
+                return Err(Error::config(
+                    "ech-opts.enable: ECH needs a TLS-layer hook neither rustls nor quinn \
+                     provides; the engine's own TLS 1.3 stack wiring is staged next (the \
+                     HPKE + ECHConfig core is complete in proto::ech)",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Dial + TLS for the jls-opts carrying outbounds (mihomo
+    /// `vmess/tls.go:84-90`): JLS replaces the plain TLS handshake and
+    /// rides raw TCP (no layered transports — the config parser rejects
+    /// those combinations).
+    async fn tls_or_jls(
+        server: &str,
+        port: u16,
+        tls: &TlsSettings,
+        jls: &Option<crate::proto::jls::JlsUser>,
+    ) -> Result<BoxProxyStream> {
+        if let Some(user) = jls {
+            let tcp = tokio::net::TcpStream::connect((server, port))
+                .await
+                .map_err(|e| Error::network(format!("dial {server}:{port}: {e}")))?;
+            let _ = tcp.set_nodelay(true);
+            let out = crate::proto::jls::JlsOut {
+                username: user.username.clone(),
+                password: user.password.clone(),
+                sni: effective_sni(tls, server, None),
+                alpn: tls.alpn.clone(),
+                skip_cert_verify: tls.skip_cert_verify,
+            };
+            return crate::proto::jls::connect(&out, Box::new(tcp)).await;
+        }
+        Self::dial_transport(server, port, &TransportKind::Tcp, tls).await
+    }
+
     pub fn kind_name(&self) -> &'static str {
         match &self.kind {
             OutboundKind::Direct => "Direct",
@@ -228,6 +352,11 @@ impl Outbound {
             OutboundKind::AnyTls(_) => "AnyTls",
             OutboundKind::Mieru(_) => "Mieru",
             OutboundKind::Restls { .. } => "Restls",
+            OutboundKind::ShadowQuic(_) => "ShadowQuic",
+            OutboundKind::Sudoku(_) => "Sudoku",
+            OutboundKind::GostRelay(_) => "GostRelay",
+            OutboundKind::TrustTunnel(_) => "TrustTunnel",
+            OutboundKind::Masque(_) => "Masque",
         }
     }
 
@@ -463,14 +592,35 @@ async fn vless_front(
                 security,
                 transport,
                 tls,
+                jls,
+                tlsmirror,
+                ech,
             } => {
+                Self::ech_refusal(ech)?;
                 let cfg = VmessOut {
                     server: server.clone(),
                     port: *port,
                     uuid: *uuid,
                     security: *security,
                 };
-                let stream = Self::dial_transport(server, *port, transport, tls).await?;
+                // tlsmirror-opts (vmess only, mihomo TLSMirrorOptions):
+                // the mirror carrier replaces the plain TLS dial entirely.
+                if let Some(mirror) = tlsmirror {
+                    let tcp = tokio::net::TcpStream::connect((server.as_str(), *port))
+                        .await
+                        .map_err(|e| Error::network(format!("dial {server}:{port}: {e}")))?;
+                    let _ = tcp.set_nodelay(true);
+                    let s = crate::proto::tlsmirror::connect(mirror, Box::new(tcp)).await?;
+                    let s = VmessStream::handshake(s, &cfg, target, false).await?;
+                    return Ok(Box::new(s));
+                }
+                // jls rides raw TCP (config rejects layered transports);
+                // the normal path keeps full transport layering.
+                let stream = if jls.is_some() {
+                    Self::tls_or_jls(server, *port, tls, jls).await?
+                } else {
+                    Self::dial_transport(server, *port, transport, tls).await?
+                };
                 let s = VmessStream::handshake(stream, &cfg, target, false).await?;
                 Ok(Box::new(s))
             }
@@ -483,18 +633,79 @@ async fn vless_front(
                 reality,
                 fingerprint,
                 vision,
+                jls,
+                ech,
             } => {
+                Self::ech_refusal(ech)?;
                 let cfg = VlessOut {
                     server: server.clone(),
                     port: *port,
                     uuid: *uuid,
                 };
-                let stream =
-                    Self::vless_front(server, *port, transport, tls, reality, fingerprint).await?;
                 if *vision {
-                    // Vision: the request header carries the flow addons,
-                    // then the framing wraps everything after the
-                    // handshake (the app's TLS records ride inside).
+                    // The full splice: when the outer TLS is our own TLS 1.3
+                    // (REALITY over raw TCP — no layered transport), hand
+                    // the unboxed stream to VisionConn so a server direct
+                    // command rebinds the raw transport (Xray direct copy).
+                    if reality.is_some()
+                        && matches!(transport, TransportKind::Tcp)
+                        && jls.is_none()
+                    {
+                        let raw = tokio::net::TcpStream::connect((server.as_str(), *port))
+                            .await
+                            .map_err(|e| {
+                                Error::network(format!("dial {server}:{port}: {e}"))
+                            })?;
+                        let _ = raw.set_nodelay(true);
+                        let rs = crate::proto::reality::reality_connect_stream(
+                            reality.as_ref().expect("checked above"),
+                            Box::new(raw),
+                        )
+                        .await?;
+                        // The vless request header (flow addons included)
+                        // must precede the first Vision frame.
+                        let mut outer = rs.into_inner();
+                        use tokio::io::AsyncWriteExt;
+                        let hdr = VlessStream::request_header_bytes(
+                            &cfg,
+                            target,
+                            false,
+                            Some(&crate::proto::vision::vision_request_addons()),
+                        );
+                        outer.write_all(&hdr).await?;
+                        outer.flush().await?;
+                        let conn = crate::proto::vision::VisionConn::connect_tls13(
+                            outer,
+                            target,
+                            *uuid,
+                            crate::proto::vision::VisionConfig::default(),
+                        )
+                        .await?;
+                        return Ok(Box::new(conn));
+                    }
+                    // Framing-level vision (opaque rustls/utls outer): the
+                    // request header carries the flow addons, then the
+                    // framing wraps everything after the handshake.
+                    let stream = if let Some(user) = jls {
+                        // JLS + vision: cover the handshake, then frame.
+                        let tcp = tokio::net::TcpStream::connect((server.as_str(), *port))
+                            .await
+                            .map_err(|e| {
+                                Error::network(format!("dial {server}:{port}: {e}"))
+                            })?;
+                        let _ = tcp.set_nodelay(true);
+                        let out = crate::proto::jls::JlsOut {
+                            username: user.username.clone(),
+                            password: user.password.clone(),
+                            sni: effective_sni(tls, server, None),
+                            alpn: tls.alpn.clone(),
+                            skip_cert_verify: tls.skip_cert_verify,
+                        };
+                        crate::proto::jls::connect(&out, Box::new(tcp)).await?
+                    } else {
+                        Self::vless_front(server, *port, transport, tls, reality, fingerprint)
+                            .await?
+                    };
                     let addons = crate::proto::vision::vision_request_addons();
                     let vs = VlessStream::handshake_with_addons(
                         stream,
@@ -513,6 +724,15 @@ async fn vless_front(
                     .await?;
                     return Ok(Box::new(conn));
                 }
+                // jls replaces the front entirely (raw TCP, no layered
+                // transports — enforced at parse time); otherwise the
+                // normal front (reality/utls + transport layering).
+                let stream = if jls.is_some() {
+                    Self::tls_or_jls(server, *port, tls, jls).await?
+                } else {
+                    Self::vless_front(server, *port, transport, tls, reality, fingerprint)
+                        .await?
+                };
                 let s = VlessStream::handshake(stream, &cfg, target, false).await?;
                 Ok(Box::new(s))
             }
@@ -522,13 +742,20 @@ async fn vless_front(
                 password,
                 transport,
                 tls,
+                jls,
+                ech,
             } => {
+                Self::ech_refusal(ech)?;
                 let cfg = TrojanOut {
                     server: server.clone(),
                     port: *port,
                     password: password.clone(),
                 };
-                let stream = Self::dial_transport(server, *port, transport, tls).await?;
+                let stream = if jls.is_some() {
+                    Self::tls_or_jls(server, *port, tls, jls).await?
+                } else {
+                    Self::dial_transport(server, *port, transport, tls).await?
+                };
                 let s = TrojanStream::handshake(stream, &cfg, target, false).await?;
                 Ok(Box::new(s))
             }
@@ -539,7 +766,9 @@ async fn vless_front(
                 sni,
                 skip_verify,
                 obfs,
+                ech,
             } => {
+                Self::ech_refusal(ech)?;
                 let cfg = crate::proto::hysteria2::Hysteria2Cfg {
                     server: server.clone(),
                     port: *port,
@@ -560,8 +789,10 @@ async fn vless_front(
                 password,
                 sni,
                 skip_verify,
+                ech,
                 ..
             } => {
+                Self::ech_refusal(ech)?;
                 let cfg = crate::proto::tuic::TuicCfg {
                     server: server.clone(),
                     port: *port,
@@ -647,6 +878,27 @@ async fn vless_front(
                 let tcp = Self::dial_transport(server, *port, &TransportKind::Tcp, &TlsSettings::default()).await?;
                 crate::proto::restls::connect(cfg, tcp).await
             }
+            OutboundKind::ShadowQuic(opt) => {
+                let client = self.shadowquic_client(opt).await?;
+                client.dial_tcp(target).await
+            }
+            OutboundKind::Sudoku(cfg) => {
+                let tcp = Self::dial_transport(&cfg.server, cfg.port, &TransportKind::Tcp, &TlsSettings::default()).await?;
+                crate::proto::sudoku::connect(cfg, tcp, target).await
+            }
+            OutboundKind::GostRelay(cfg) => {
+                let tcp = Self::dial_transport(&cfg.server, cfg.port, &TransportKind::Tcp, &TlsSettings::default()).await?;
+                crate::proto::gost_relay::connect(cfg, tcp, target).await
+            }
+            OutboundKind::TrustTunnel(cfg) => {
+                Self::ech_refusal(&cfg.ech)?;
+                let pool = self.trusttunnel_pool(cfg).await?;
+                pool.dial(target, None).await
+            }
+            OutboundKind::Masque(cfg) => {
+                let client = self.masque_client(cfg).await?;
+                client.dial_tcp(target).await
+            }
         }
     }
 
@@ -713,6 +965,7 @@ async fn vless_front(
                 security,
                 transport,
                 tls,
+                ..
             } => {
                 let cfg = VmessOut {
                     server: server.clone(),
@@ -736,6 +989,7 @@ async fn vless_front(
                 reality,
                 fingerprint,
                 vision,
+                ..
             } => {
                 if *vision {
                     return Err(Error::protocol(
@@ -759,6 +1013,7 @@ async fn vless_front(
                 password,
                 transport,
                 tls,
+                ..
             } => {
                 let cfg = TrojanOut {
                     server: server.clone(),
@@ -781,6 +1036,7 @@ async fn vless_front(
                 sni,
                 skip_verify,
                 obfs,
+                ..
             } => {
                 let cfg = crate::proto::hysteria2::Hysteria2Cfg {
                     server: server.clone(),
@@ -822,6 +1078,7 @@ async fn vless_front(
                 sni,
                 skip_verify,
                 udp_relay_mode,
+                ..
             } => {
                 let cfg = crate::proto::tuic::TuicCfg {
                     server: server.clone(),
@@ -890,6 +1147,33 @@ async fn vless_front(
             OutboundKind::Snell(_) => Err(Error::protocol(
                 "snell UDP is not wired yet (frame-boundary reader pending)",
             )),
+            OutboundKind::ShadowQuic(opt) => {
+                let client = self.shadowquic_client(opt).await?;
+                Ok(UdpChannel::ShadowQuic(client.listen_packet().await?))
+            }
+            OutboundKind::Sudoku(cfg) => {
+                let tcp = Self::dial_transport(&cfg.server, cfg.port, &TransportKind::Tcp, &TlsSettings::default()).await?;
+                let s = crate::proto::sudoku::connect_udp(cfg, tcp).await?;
+                Ok(UdpChannel::SudokuUot(tokio::sync::Mutex::new(s)))
+            }
+            OutboundKind::GostRelay(cfg) => {
+                let tcp = Self::dial_transport(&cfg.server, cfg.port, &TransportKind::Tcp, &TlsSettings::default()).await?;
+                let s = crate::proto::gost_relay::connect_udp(cfg, tcp, initial).await?;
+                Ok(UdpChannel::GostRelay {
+                    stream: tokio::sync::Mutex::new(s),
+                    peer: initial.clone(),
+                })
+            }
+            OutboundKind::TrustTunnel(cfg) => {
+                Self::ech_refusal(&cfg.ech)?;
+                let pool = self.trusttunnel_pool(cfg).await?;
+                let s = pool.listen_packet(None).await?;
+                Ok(UdpChannel::TrustTunnel(tokio::sync::Mutex::new(s)))
+            }
+            OutboundKind::Masque(cfg) => {
+                let client = self.masque_client(cfg).await?;
+                Ok(UdpChannel::Masque(client.open_udp().await?))
+            }
             OutboundKind::AnyTls(_) | OutboundKind::Mieru(_)
             | OutboundKind::Restls { .. } => Err(Error::protocol(format!(
                 "{} does not support UDP",
@@ -977,6 +1261,11 @@ fn other_kind_name(kind: &OutboundKind) -> &'static str {
         OutboundKind::AnyTls(_) => "AnyTls",
         OutboundKind::Mieru(_) => "Mieru",
         OutboundKind::Restls { .. } => "Restls",
+        OutboundKind::ShadowQuic(_) => "ShadowQuic",
+        OutboundKind::Sudoku(_) => "Sudoku",
+        OutboundKind::GostRelay(_) => "GostRelay",
+        OutboundKind::TrustTunnel(_) => "TrustTunnel",
+        OutboundKind::Masque(_) => "Masque",
     }
 }
 
@@ -1027,6 +1316,21 @@ pub enum UdpChannel {
     Wg(crate::proto::wireguard::WgUdp),
     /// AnyTLS UDP-over-TCP (uot v2).
     AnyTls(crate::proto::anytls::AnyTlsUdp),
+    /// shadowquic UDP association (datagram or udp-over-stream mode).
+    ShadowQuic(crate::proto::shadowquic::Association),
+    /// sudoku UoT session (`uot_datagram` framing).
+    SudokuUot(tokio::sync::Mutex<BoxProxyStream>),
+    /// gost-relay UDP association: address-less `len‖payload` frames over
+    /// a stream bound to one peer at SETUP time (the server rejects other
+    /// destinations), so recv reports that fixed peer.
+    GostRelay {
+        stream: tokio::sync::Mutex<BoxProxyStream>,
+        peer: NetAddr,
+    },
+    /// trusttunnel UDP association (`trusttunnel_udp` framing).
+    TrustTunnel(tokio::sync::Mutex<BoxProxyStream>),
+    /// masque UDP (CONNECT-udp capsules / CONNECT-IP datagrams).
+    Masque(crate::proto::masque::MasqueUdpSession),
 }
 
 impl UdpChannel {
@@ -1115,6 +1419,44 @@ impl UdpChannel {
                     .map_err(|e| Error::network(format!("trojan udp send: {e}")))?;
                 Ok(())
             }
+            UdpChannel::ShadowQuic(assoc) => {
+                assoc.send_to(data, target).await?;
+                Ok(())
+            }
+            UdpChannel::SudokuUot(stream) => {
+                let frame = crate::proto::sudoku::uot_datagram(target, data)?;
+                use tokio::io::AsyncWriteExt;
+                stream
+                    .lock()
+                    .await
+                    .write_all(&frame)
+                    .await
+                    .map_err(|e| Error::network(format!("sudoku uot send: {e}")))?;
+                Ok(())
+            }
+            UdpChannel::GostRelay { stream, .. } => {
+                let frame = crate::proto::gost_relay::relay_udp_frame(data)?;
+                use tokio::io::AsyncWriteExt;
+                stream
+                    .lock()
+                    .await
+                    .write_all(&frame)
+                    .await
+                    .map_err(|e| Error::network(format!("gost-relay udp send: {e}")))?;
+                Ok(())
+            }
+            UdpChannel::TrustTunnel(stream) => {
+                let frame = crate::proto::trusttunnel::trusttunnel_udp_frame(target, data)?;
+                use tokio::io::AsyncWriteExt;
+                stream
+                    .lock()
+                    .await
+                    .write_all(&frame)
+                    .await
+                    .map_err(|e| Error::network(format!("trusttunnel udp send: {e}")))?;
+                Ok(())
+            }
+            UdpChannel::Masque(session) => session.send_to(target, data).await,
         }
     }
 
@@ -1182,6 +1524,24 @@ impl UdpChannel {
                 let (addr, n) = a.recv_from(&mut buf).await?;
                 Ok((addr, buf[..n].to_vec()))
             }
+            UdpChannel::ShadowQuic(assoc) => {
+                let packet = assoc.recv_from().await?;
+                Ok((packet.addr, packet.data.to_vec()))
+            }
+            UdpChannel::SudokuUot(stream) => {
+                let mut stream = stream.lock().await;
+                crate::proto::sudoku::read_uot_datagram(&mut *stream).await
+            }
+            UdpChannel::GostRelay { stream, peer } => {
+                let payload = crate::proto::gost_relay::read_relay_udp(&mut *stream.lock().await)
+                    .await?;
+                Ok((peer.clone(), payload))
+            }
+            UdpChannel::TrustTunnel(stream) => {
+                let mut stream = stream.lock().await;
+                crate::proto::trusttunnel::read_trusttunnel_udp(&mut *stream).await
+            }
+            UdpChannel::Masque(session) => session.recv_from().await,
         }
     }
 }

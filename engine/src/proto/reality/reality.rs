@@ -278,6 +278,13 @@ impl AsyncWrite for RealityStream {
 /// (VLESS/Trojan payloads go straight in); `Box::new(RealityStream)` is a
 /// [`BoxProxyStream`].
 pub async fn connect(cfg: &RealityCfg, transport: BoxProxyStream) -> Result<BoxProxyStream> {
+    Ok(Box::new(connect_stream(cfg, transport).await?))
+}
+
+/// The unboxed [`RealityStream`] variant: the Vision splice path needs the
+/// underlying [`Tls13Stream`] (via [`RealityStream::into_inner`]) so a
+/// server direct command can rebind the raw transport under the TLS layer.
+pub async fn connect_stream(cfg: &RealityCfg, transport: BoxProxyStream) -> Result<RealityStream> {
     let server_public_key = parse_public_key(&cfg.public_key)?;
     let short_id = parse_short_id(&cfg.short_id)?;
 
@@ -323,7 +330,7 @@ pub async fn connect(cfg: &RealityCfg, transport: BoxProxyStream) -> Result<BoxP
         ));
     }
 
-    Ok(Box::new(RealityStream::new(tls)))
+    Ok(RealityStream::new(tls))
 }
 
 /// Best-effort `spiderX` pass over the authenticated connection.

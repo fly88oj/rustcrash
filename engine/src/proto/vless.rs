@@ -53,6 +53,26 @@ impl VlessStream {
         is_udp: bool,
         addons: Option<&[u8]>,
     ) -> Result<Self> {
+        let hdr = Self::request_header_bytes(cfg, target, is_udp, addons);
+        Ok(VlessStream {
+            inner: transport,
+            pending: hdr,
+            consumed_resp_header: false,
+            resp_hdr_buf: Vec::new(),
+        })
+    }
+
+    /// Serialize the VLESS request header — the exact bytes
+    /// [`VlessStream::handshake_with_addons`] defers to its first write.
+    /// The Vision splice path needs them eagerly: the header must reach the
+    /// wire before the first Vision frame, and there the outer stream is a
+    /// `Tls13Stream`, not a `VlessStream`.
+    pub fn request_header_bytes(
+        cfg: &VlessOut,
+        target: &NetAddr,
+        is_udp: bool,
+        addons: Option<&[u8]>,
+    ) -> Vec<u8> {
         let mut hdr = Vec::with_capacity(48);
         hdr.push(0x00); // version
         hdr.extend_from_slice(cfg.uuid.as_bytes());
@@ -63,12 +83,7 @@ impl VlessStream {
         hdr.push(if is_udp { CMD_UDP } else { CMD_TCP });
         // mihomo's vless shares sing-vmess's AddressSerializer: port first.
         crate::addr::encode_port_first_addr(&mut hdr, &target.host, target.port);
-        Ok(VlessStream {
-            inner: transport,
-            pending: hdr,
-            consumed_resp_header: false,
-            resp_hdr_buf: Vec::new(),
-        })
+        hdr
     }
 }
 
