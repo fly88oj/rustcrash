@@ -27,6 +27,36 @@ All notable changes to RustCrash. Format based on
   passthrough (the framing half of the splice; the raw-transport
   rebind is tracked).
 
+### Engine — wave 13: stall fixes everywhere, easytier M3, tailscale disco + key renewal, API finishers
+
+- **The wireguard stall fixes applied to the siblings**: tailscale/wg.rs
+  and openvpn.rs gained the same writer-hang-on-reset fix, read-side
+  wake, and (where a listener exists) the arm-before-stage re-arm —
+  each proven by fail-before repro tests. The two stacks are
+  initiator-only, so the listener race only existed in openvpn's test
+  mimic (fixed there).
+- **easytier M3**: the UDP peer transport (8-byte header, SYN/SACK,
+  PMH-framed datagrams — the no-length-prefix wire form was found
+  live against the real binary), and the multi-peer `serve()` listener
+  (inbound peers join the running node; shared registry with the dial
+  path). Secure mode assessed and gated: the Noise_XX handshake is
+  bounded but the payload-layer SecureDatagramSession is not — the
+  precise map lives in SECURE_MODE_NOT_PORTED. Four real-binary
+  interop tests pass (TCP/UDP × dial/listen against easytier-core
+  v2.6.4).
+- **tailscale disco + key-expiry renewal**: the disco codec (1:1 with
+  disco/disco.go) with ping/pong path confirmation and CallMeMaybe via
+  DERP (a pong-confirmed address overrides a DERP-learned session);
+  node-key expiry detection from the map + the OldNodeKey re-register
+  rotation flow. Remaining: inbound ACLs (nothing to filter on an
+  outbound) and browser login (headless) — stated precisely.
+- **API finishers**: DELETE /connections{,/id} really kills live
+  relays (a race-free CancelToken per connection observed by the
+  relay select loops), /cache/dns/flush clears the resolver cache, and
+  PUT/PATCH /configs hot-swaps `mode` (listener fields rejected 400
+  with the restart reason, all-or-nothing like upstream's patch
+  semantics).
+
 ### Engine — wave 12b: the last live-found bugs — vision response header + hy2 lazy framing
 
 - **Vision splice LIVE-FIX**: the splice path never consumed the VLESS
