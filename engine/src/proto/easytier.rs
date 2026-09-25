@@ -87,7 +87,8 @@
 //! Secure mode (the Noise_XX `PeerConnNoiseMsg1/2/3` handshake of
 //! `peer_conn.rs:779-1170`) is NOT ported: hand-rolling snow's
 //! `Noise_XX_25519_ChaChaPoly_SHA256` is its own follow-up and only
-//! `[secure_mode]` configs need it.
+//! `[secure_mode]` configs need it — see [`SECURE_MODE_NOT_PORTED`]
+//! for the precise map of what it entails beyond the handshake.
 //!
 //! # Second milestone — LANDED (route gossip + the userspace stack)
 //!
@@ -120,17 +121,51 @@
 //!   process-global node cache keyed by config identity (the
 //!   wireguard.rs/openvpn.rs tunnel registry pattern).
 //!
+//! # Third milestone — LANDED (the UDP transport + the listener)
+//!
+//! M3 (sources cached under `/tmp/wave13-upstream/`, the v2.6.4 tag
+//! clone `et264/` — the line the released binaries speak):
+//!
+//! * **The UDP peer transport** — `tunnel/udp.rs` + the
+//!   `UDPTunnelHeader` of `tunnel/packet_def.rs`: a `udp://host:port`
+//!   peer URI dials a datagram virtual circuit (SYN/SACK exchange with
+//!   a random conn id + echoed magic, `try_connect_with_socket`,
+//!   tunnel/udp.rs:844-873); every write becomes one
+//!   `[hdr{Data, conn_id, len}][payload]` datagram and the same
+//!   M1 framing rides inside ([`connect_udp_tunnel`],
+//!   [`UdpVtStream`], [`parse_peer_endpoint`]). Reached from the peer
+//!   connector via `IpScheme::Udp => UdpTunnelConnector`
+//!   (connector/mod.rs:248).
+//! * **The listener** — the `create_listener_by_url` dispatch +
+//!   `ListenerManager` accept loop of `instance/listeners.rs`:
+//!   [`serve`] binds every configured listener (`tcp://` and `udp://`),
+//!   dials the first supported peer when one is configured, and feeds
+//!   every accepted tunnel through the SAME server handshake, crypto
+//!   and keepalive the client side speaks; inbound peers join the one
+//!   overlay node (shared peer id, shared overlay address, one gossip
+//!   session per edge) and relays dial both ways
+//!   ([`EasyTierServer`]).
+//! * **The multi-peer node** — [`EtStack`] grew a peer table: each
+//!   attached session carries its own `RouteGossip`/`RpcRouter`, egress
+//!   frames route by longest-prefix over the union LSDB (two-node
+//!   default: the first live peer), and the dhcp allocation is
+//!   node-wide.
+//! * **Secure mode — assessed, NOT ported** — the handshake is bounded
+//!   but worthless alone: after it every payload switches from the
+//!   network-secret AEAD to the per-peer session AEAD
+//!   (`PeerSessionStore` + `SecureDatagramSession`). Configuring it
+//!   fails fast with the map ([`SECURE_MODE_NOT_PORTED`]); a
+//!   NoiseHandshakeMsg1-first inbound peer is named precisely.
+//!
 //! # Remaining milestones
 //!
-//! 1. **The listener side** (`listener/{mod,transport}.rs` — accepting
-//!    our own peers) and the remaining transports (`udp`/`wg`/`quic`/
-//!    `ws`, `socket/udp/` + the quinn QUIC tunnel + the websocket
-//!    upgrader behind `enable-kcp/quic-proxy`).
-//! 2. Secure mode (the Noise_XX `PeerConnNoiseMsg1/2/3` handshake of
-//!    `peer_conn.rs:779-1170` + peer sessions), the relay path, foreign
+//! 1. The remaining transports (`wg`/`quic`/`ws`, the quinn QUIC tunnel
+//!    + the websocket upgrader behind `enable-kcp/quic-proxy`).
+//! 2. Secure mode (see the map above), the relay path, foreign
 //!    networks, and the exit-node/proxy-network pieces.
-//! 3. Multi-hop OSPF (SPF over `graph_algo.rs`) once a listener lets
-//!    this node sit inside a larger mesh.
+//! 3. Multi-hop OSPF (SPF over `graph_algo.rs`) — the node table and
+//!    forwarding are multi-peer now, but adjacency is still the
+//!    direct-neighbor bitmap.
 //!
 //! # Config surface
 //!
@@ -908,6 +943,9 @@ pub mod packet_type {
     pub const PONG: u8 = 5;
     pub const RPC_REQ: u8 = 8;
     pub const RPC_RESP: u8 = 9;
+    /// `NoiseHandshakeMsg1` (packet_def.rs:86) — received only from a
+    /// secure-mode client; named so the staged error can cite it.
+    pub const NOISE_HANDSHAKE_MSG1: u8 = 13;
 }
 
 /// `PeerManagerHeaderFlags` (packet/mod.rs:110-123) — the bits this port
@@ -1088,6 +1126,575 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<P
     let mut body = vec![0u8; body_len];
     reader.read_exact(&mut body).await?;
     PeerPacket::from_frame_body(&body).map(Some)
+}
+
+// ---------------------------------------------------------------------------
+// The UDP peer tunnel (easytier-core/src/tunnel/udp.rs + the
+// `UDPTunnelHeader` of tunnel/packet_def.rs:22-59 — v2.6.4, the line the
+// released binaries speak; reached from the peer connector via
+// `IpScheme::Udp => UdpTunnelConnector::new(url)`, connector/mod.rs:248
+// and connector/direct.rs:234)
+// ---------------------------------------------------------------------------
+//
+// The UDP tunnel is a **datagram virtual circuit**: each write of one
+// peer frame becomes one UDP datagram carrying `[PeerManagerHeader]
+// [payload]` — the SAME peer-manager header as the TCP side but WITHOUT
+// the u32 length prefix (the datagram bounds the frame; the
+// `ZCPacketType::UDP` offsets of packet_def.rs:393-400), wrapped in an
+// 8-byte session header. The circuit is established with a SYN/SACK
+// exchange (`try_connect_with_socket` / `handle_new_connect`,
+// tunnel/udp.rs:844-873, 417-477):
+//
+// * client: random `conn_id` (u32) + random `magic` (u64); sends
+//   `[hdr{Syn, conn_id, len:8}][magic LE]`, then waits (3s budget,
+//   `wait_sack_loop` tunnel/udp.rs:747-762) for the SACK echoing both;
+// * server: on a Syn from an address, replies `[hdr{Sack, conn_id,
+//   len:8}][magic LE]` and keys a connection by that remote address
+//   (`sock_map`, tunnel/udp.rs:455) — the conn id of both directions is
+//   the one the client chose;
+// * data: every write becomes `[hdr{Data, conn_id, len=payload}]
+//   [payload]`; the receiver keeps only Data packets whose conn id
+//   matches (`UdpConnection::handle_packet_from_remote`,
+//   tunnel/udp.rs:372-390).
+//
+// Upstream shuttles the payloads through a ring-buffer stream pair
+// (`RingTunnel`, tunnel/ring.rs); this port collapses that into one
+// duplex stream with datagram-sized queues (the engine's EtStream
+// pattern). The STUN responder and the loopback hole-punch forwards of
+// the listener's forward task (tunnel/udp.rs:182-241, 479-545) stay
+// out — a hermetic mesh never sends them (see NOT_PORTED).
+
+/// `UDP_TUNNEL_HEADER_SIZE` (packet_def.rs:59).
+pub const UDP_TUNNEL_HEADER_SIZE: usize = 8;
+/// `UDP_DATA_MTU` (tunnel/udp.rs:41): the datagram budget the tunnel is
+/// sized for.
+pub const UDP_DATA_MTU: usize = 2000;
+/// The SACK wait budget (`Duration::from_secs(3)`, tunnel/udp.rs:862).
+const UDP_SACK_TIMEOUT: Duration = Duration::from_secs(3);
+/// How many datagrams may sit in one direction's queue (the ring is 128
+/// slots, tunnel/udp.rs:439-440).
+const UDP_CHAN_DATAGRAMS: usize = 128;
+/// The receive buffer: generous over `UDP_DATA_MTU` so a reassembled
+/// oversized datagram is never truncated (tokio's `recv_buf_from` grows
+/// to 4x MTU upstream, tunnel/udp.rs:310).
+const UDP_RECV_BUF: usize = 16 * 1024;
+
+/// `UdpPacketType` (packet_def.rs:22-35).
+pub mod udp_packet_type {
+    pub const INVALID: u8 = 0;
+    pub const SYN: u8 = 1;
+    pub const SACK: u8 = 2;
+    pub const DATA: u8 = 3;
+    pub const FIN: u8 = 4;
+    pub const HOLE_PUNCH: u8 = 5;
+    pub const V4_HOLE_PUNCH: u8 = 6;
+    pub const V6_HOLE_PUNCH: u8 = 7;
+}
+
+/// The 8-byte packed little-endian `UDPTunnelHeader`
+/// `{ conn_id: U32, msg_type: u8, padding: u8, len: U16 }`
+/// (packet_def.rs:51-58).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UdpTunnelHeader {
+    conn_id: u32,
+    msg_type: u8,
+    len: u16,
+}
+
+impl UdpTunnelHeader {
+    fn to_bytes(self) -> [u8; UDP_TUNNEL_HEADER_SIZE] {
+        let mut out = [0u8; UDP_TUNNEL_HEADER_SIZE];
+        out[0..4].copy_from_slice(&self.conn_id.to_le_bytes());
+        out[4] = self.msg_type;
+        // out[5] is padding, always zero.
+        out[6..8].copy_from_slice(&self.len.to_le_bytes());
+        out
+    }
+
+    fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.len() < UDP_TUNNEL_HEADER_SIZE {
+            return None;
+        }
+        Some(UdpTunnelHeader {
+            conn_id: u32::from_le_bytes(buf[0..4].try_into().ok()?),
+            msg_type: buf[4],
+            len: u16::from_le_bytes(buf[6..8].try_into().ok()?),
+        })
+    }
+
+    /// `new_udp_packet` (tunnel/udp.rs:46-61): header plus body, `len`
+    /// the body length.
+    fn datagram(msg_type: u8, conn_id: u32, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(UDP_TUNNEL_HEADER_SIZE + body.len());
+        out.extend_from_slice(
+            &UdpTunnelHeader {
+                conn_id,
+                msg_type,
+                len: body.len() as u16,
+            }
+            .to_bytes(),
+        );
+        out.extend_from_slice(body);
+        out
+    }
+}
+
+/// `get_zcpacket_from_buf` (tunnel/udp.rs:243-267) without the STUN
+/// branch: a datagram must carry the 8-byte header and its `len` must
+/// equal the body length, else it is not tunnel traffic.
+fn parse_udp_datagram(buf: &[u8]) -> Option<(UdpTunnelHeader, &[u8])> {
+    let header = UdpTunnelHeader::from_bytes(buf)?;
+    let body = &buf[UDP_TUNNEL_HEADER_SIZE..];
+    if header.len as usize != body.len() {
+        return None;
+    }
+    Some((header, body))
+}
+
+/// The tunnel payload a UDP datagram carries: `[PeerManagerHeader]
+/// [payload]` — NO length prefix (the datagram bounds the frame), the
+/// `ZCPacketType::UDP` offsets of packet_def.rs:393-400. The peer
+/// framing layer writes `[u32 len][PMH][payload]` byte streams; this
+/// strips the prefix when segmenting a stream frame into its datagram.
+fn udp_wire_datagram(frame: &[u8]) -> Option<&[u8]> {
+    if frame.len() < TCP_TUNNEL_HEADER_SIZE + PEER_MANAGER_HEADER_SIZE {
+        return None;
+    }
+    let len = u32::from_le_bytes(frame[..TCP_TUNNEL_HEADER_SIZE].try_into().ok()?) as usize;
+    let end = TCP_TUNNEL_HEADER_SIZE.checked_add(len)?;
+    if len < PEER_MANAGER_HEADER_SIZE || len > u16::MAX as usize || end != frame.len() {
+        return None;
+    }
+    Some(&frame[TCP_TUNNEL_HEADER_SIZE..end])
+}
+
+/// One queued-datagram duplex end (`UdpVtShared`): the read side serves
+/// bytes out of received datagrams (each datagram is re-prefixed with
+/// its u32 length so the framing reader sees a normal byte stream; a
+/// partially-consumed datagram is retained — the framing reader pulls
+/// its frame in several small reads); the write side stages the framed
+/// byte stream, cutting one `[PMH][payload]` datagram per complete
+/// stream frame for the sender task.
+struct UdpVtHalf {
+    rx_queue: VecDeque<Vec<u8>>,
+    partial: Vec<u8>,
+    partial_pos: usize,
+    read_waker: Option<Waker>,
+    tx_stage: Vec<u8>,
+    tx_queue: VecDeque<Vec<u8>>,
+    write_waker: Option<Waker>,
+    write_closed: bool,
+    write_error: bool,
+    read_closed: bool,
+}
+
+impl UdpVtHalf {
+    fn new() -> Self {
+        UdpVtHalf {
+            rx_queue: VecDeque::new(),
+            partial: Vec::new(),
+            partial_pos: 0,
+            read_waker: None,
+            tx_stage: Vec::new(),
+            tx_queue: VecDeque::new(),
+            write_waker: None,
+            write_closed: false,
+            write_error: false,
+            read_closed: false,
+        }
+    }
+
+    /// One received `[PMH][payload]` datagram becomes a `[u32 len]
+    /// [PMH][payload]` byte-stream chunk (the inverse of the write-side
+    /// segmentation).
+    fn push_datagram(&mut self, data: &[u8]) {
+        if self.rx_queue.len() >= UDP_CHAN_DATAGRAMS {
+            return;
+        }
+        let mut framed = Vec::with_capacity(TCP_TUNNEL_HEADER_SIZE + data.len());
+        framed.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        framed.extend_from_slice(data);
+        self.rx_queue.push_back(framed);
+    }
+
+    /// Cut every complete stream frame staged in `tx_stage` into its
+    /// datagram. Returns false on a malformed stage.
+    fn segment_staged(&mut self) -> bool {
+        loop {
+            if self.tx_stage.len() < TCP_TUNNEL_HEADER_SIZE {
+                return true;
+            }
+            let Some(datagram) = udp_wire_datagram(&self.tx_stage) else {
+                self.write_error = true;
+                return false;
+            };
+            if self.tx_queue.len() >= UDP_CHAN_DATAGRAMS {
+                return true;
+            }
+            self.tx_queue.push_back(datagram.to_vec());
+            self.tx_stage.drain(..TCP_TUNNEL_HEADER_SIZE + datagram.len());
+        }
+    }
+}
+
+/// The client/accepted UDP tunnel stream: `AsyncRead` + `AsyncWrite`
+/// over the shared half, the sender task woken through `Notify`.
+pub struct UdpVtStream {
+    half: Arc<StdMutex<UdpVtHalf>>,
+    send_wake: Arc<Notify>,
+}
+
+impl AsyncRead for UdpVtStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let mut half = self.half.lock().unwrap_or_else(|e| e.into_inner());
+        if half.partial_pos < half.partial.len() {
+            let n = (half.partial.len() - half.partial_pos).min(buf.remaining());
+            buf.put_slice(&half.partial[half.partial_pos..half.partial_pos + n]);
+            half.partial_pos += n;
+            if half.partial_pos == half.partial.len() {
+                half.partial.clear();
+                half.partial_pos = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+        if let Some(next) = half.rx_queue.pop_front() {
+            half.partial = next;
+            half.partial_pos = 0;
+            drop(half);
+            return self.poll_read(cx, buf);
+        }
+        if half.read_closed {
+            return Poll::Ready(Ok(()));
+        }
+        half.read_waker = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+impl AsyncWrite for UdpVtStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut half = self.half.lock().unwrap_or_else(|e| e.into_inner());
+        if half.write_error {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "easytier: udp tunnel send failed",
+            )));
+        }
+        if half.write_closed {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "easytier: udp tunnel is closed",
+            )));
+        }
+        if half.tx_queue.len() >= UDP_CHAN_DATAGRAMS {
+            half.write_waker = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+        // Stage the framed byte stream, then cut every complete frame
+        // into its `[PMH][payload]` datagram (the ring carries whole
+        // ZCPackets upstream — one frame per datagram).
+        half.tx_stage.extend_from_slice(buf);
+        if !half.segment_staged() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "easytier: udp datagram stream is not frame-aligned",
+            )));
+        }
+        drop(half);
+        self.send_wake.notify_one();
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut half = self.half.lock().unwrap_or_else(|e| e.into_inner());
+        // `UdpPacketType::Fin` exists but is never sent by the v2.6.4
+        // tunnel; closing is simply going silent (the peer's ping losses
+        // tear the circuit down).
+        half.write_closed = true;
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Wake a waiting reader/writer after external state changed.
+fn wake_udp_half(half: &Arc<StdMutex<UdpVtHalf>>) {
+    let mut half = half.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(w) = half.read_waker.take() {
+        w.wake();
+    }
+    if let Some(w) = half.write_waker.take() {
+        w.wake();
+    }
+}
+
+/// The sender task (`forward_from_ring_to_udp`, tunnel/udp.rs:269-302):
+/// drain the write queue into Data datagrams for `dst`.
+async fn run_udp_sender(
+    socket: Arc<tokio::net::UdpSocket>,
+    dst: SocketAddr,
+    conn_id: u32,
+    half: Arc<StdMutex<UdpVtHalf>>,
+    wake: Arc<Notify>,
+) {
+    loop {
+        wake.notified().await;
+        loop {
+            let next = {
+                let mut guard = half.lock().unwrap_or_else(|e| e.into_inner());
+                guard.tx_queue.pop_front()
+            };
+            let Some(body) = next else { break };
+            if let Some(w) = half
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .write_waker
+                .take()
+            {
+                w.wake();
+            }
+            let datagram = UdpTunnelHeader::datagram(udp_packet_type::DATA, conn_id, &body);
+            if socket.send_to(&datagram, dst).await.is_err() {
+                let mut guard = half.lock().unwrap_or_else(|e| e.into_inner());
+                guard.write_error = true;
+                guard.read_closed = true;
+                drop(guard);
+                wake_udp_half(&half);
+                return;
+            }
+        }
+    }
+}
+
+/// The client connect (`UdpTunnelConnector::connect` →
+/// `try_connect_with_socket`, tunnel/udp.rs:844-873): bind an ephemeral
+/// socket, SYN/SACK, then run the receiver task (`build_tunnel`'s
+/// recv_loop, tunnel/udp.rs:793-809 — Data packets are matched by conn
+/// id only).
+pub async fn connect_udp_tunnel(dst: SocketAddr) -> Result<UdpVtStream> {
+    let bind_addr: &str = if dst.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let socket = tokio::net::UdpSocket::bind(bind_addr)
+        .await
+        .map_err(|e| Error::network(format!("easytier: udp bind: {e}")))?;
+    let socket = Arc::new(socket);
+    let conn_id: u32 = rand::random();
+    let magic: u64 = rand::random();
+    let syn = UdpTunnelHeader::datagram(udp_packet_type::SYN, conn_id, &magic.to_le_bytes());
+    socket
+        .send_to(&syn, dst)
+        .await
+        .map_err(|e| Error::network(format!("easytier: udp send syn: {e}")))?;
+
+    // `wait_sack_loop`: retry on any invalid packet, bounded by the 3s
+    // outer timeout (tunnel/udp.rs:862-866).
+    let deadline = tokio::time::Instant::now() + UDP_SACK_TIMEOUT;
+    let mut buf = vec![0u8; UDP_RECV_BUF];
+    loop {
+        let recv = match tokio::time::timeout_at(deadline, socket.recv_from(&mut buf)).await {
+            Err(_) => {
+                return Err(Error::network("easytier: udp connect timeout (no sack)"));
+            }
+            Ok(Err(e)) => return Err(Error::network(format!("easytier: udp recv: {e}"))),
+            Ok(Ok((n, _addr))) => &buf[..n],
+        };
+        if let Some((header, body)) = parse_udp_datagram(recv) {
+            if header.msg_type == udp_packet_type::SACK
+                && header.conn_id == conn_id
+                && body == magic.to_le_bytes()
+            {
+                break;
+            }
+        }
+    }
+
+    let half = Arc::new(StdMutex::new(UdpVtHalf::new()));
+    let wake = Arc::new(Notify::new());
+    let recv_socket = socket.clone();
+    let recv_half = half.clone();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; UDP_RECV_BUF];
+        loop {
+            match recv_socket.recv_from(&mut buf).await {
+                Ok((n, _)) => {
+                    if let Some((header, body)) = parse_udp_datagram(&buf[..n]) {
+                        if header.msg_type == udp_packet_type::DATA && header.conn_id == conn_id {
+                            let mut guard = recv_half.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.push_datagram(body);
+                            drop(guard);
+                            wake_udp_half(&recv_half);
+                        }
+                    }
+                }
+                Err(_) => {
+                    let mut guard = recv_half.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.read_closed = true;
+                    drop(guard);
+                    wake_udp_half(&recv_half);
+                    break;
+                }
+            }
+        }
+    });
+    tokio::spawn(run_udp_sender(socket, dst, conn_id, half.clone(), wake.clone()));
+    Ok(UdpVtStream { half, send_wake: wake })
+}
+
+/// One accepted server-side circuit (`UdpConnection` keyed by remote
+/// address, tunnel/udp.rs:337-391).
+struct UdpAcceptedConn {
+    conn_id: u32,
+    half: Arc<StdMutex<UdpVtHalf>>,
+}
+
+/// The UDP tunnel listener (`UdpTunnelListener`, tunnel/udp.rs:562-678):
+/// one socket; a Syn from an address establishes a circuit (SACK back,
+/// connection keyed by the remote address); Data datagrams are routed to
+/// that circuit by address and conn id. Hole-punch and STUN datagrams
+/// are ignored (upstream answers them, tunnel/udp.rs:483-492).
+pub struct UdpVtListener {
+    local: SocketAddr,
+    accept_rx: mpsc::Receiver<UdpVtStream>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl UdpVtListener {
+    /// `UdpTunnelListener::listen` (tunnel/udp.rs:599-639).
+    pub async fn bind(local: SocketAddr) -> Result<Self> {
+        let bind_addr: std::net::SocketAddr = match local {
+            SocketAddr::V4(v4) => {
+                std::net::SocketAddr::V4(std::net::SocketAddrV4::new(v4.ip().to_owned(), v4.port()))
+            }
+            SocketAddr::V6(_) => local,
+        };
+        let socket = tokio::net::UdpSocket::bind(bind_addr)
+            .await
+            .map_err(|e| Error::network(format!("easytier: udp listen {local}: {e}")))?;
+        let local = socket
+            .local_addr()
+            .map_err(|e| Error::network(format!("easytier: udp local addr: {e}")))?;
+        let socket = Arc::new(socket);
+        let (accept_tx, accept_rx) = mpsc::channel(16);
+        let conns: Arc<StdMutex<HashMap<SocketAddr, UdpAcceptedConn>>> =
+            Arc::new(StdMutex::new(HashMap::new()));
+        let task = tokio::spawn(run_udp_listener(socket, conns, accept_tx));
+        Ok(UdpVtListener {
+            local,
+            accept_rx,
+            task,
+        })
+    }
+
+    /// The bound address (port 0 resolves, `local_url`, tunnel/udp.rs:613).
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local
+    }
+
+    /// `accept` (tunnel/udp.rs:641-649): the next established circuit.
+    pub async fn accept(&mut self) -> Result<UdpVtStream> {
+        self.accept_rx
+            .recv()
+            .await
+            .ok_or_else(|| Error::network("easytier: udp listener closed"))
+    }
+}
+
+impl Drop for UdpVtListener {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// The listener forward task (`do_forward_task` +
+/// `do_forward_one_packet_to_conn`, tunnel/udp.rs:479-559): Syn →
+/// `handle_new_connect`; Data → the circuit for that address.
+async fn run_udp_listener(
+    socket: Arc<tokio::net::UdpSocket>,
+    conns: Arc<StdMutex<HashMap<SocketAddr, UdpAcceptedConn>>>,
+    accept_tx: mpsc::Sender<UdpVtStream>,
+) {
+    let mut buf = vec![0u8; UDP_RECV_BUF];
+    loop {
+        let (n, addr) = match socket.recv_from(&mut buf).await {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        let Some((header, body)) = parse_udp_datagram(&buf[..n]) else {
+            continue;
+        };
+        match header.msg_type {
+            udp_packet_type::SYN => {
+                // `handle_new_connect`: an 8-byte magic payload, SACK it
+                // back, then the circuit joins the map (a reconnect from
+                // the same address replaces, tunnel/udp.rs:455).
+                if body.len() != 8 {
+                    continue;
+                }
+                let sack =
+                    UdpTunnelHeader::datagram(udp_packet_type::SACK, header.conn_id, body);
+                if socket.send_to(&sack, addr).await.is_err() {
+                    continue;
+                }
+                let half = Arc::new(StdMutex::new(UdpVtHalf::new()));
+                conns.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                    addr,
+                    UdpAcceptedConn {
+                        conn_id: header.conn_id,
+                        half: half.clone(),
+                    },
+                );
+                let stream_socket = socket.clone();
+                let send_wake = Arc::new(Notify::new());
+                tokio::spawn(run_udp_sender(
+                    stream_socket,
+                    addr,
+                    header.conn_id,
+                    half.clone(),
+                    send_wake.clone(),
+                ));
+                let stream = UdpVtStream {
+                    half,
+                    send_wake,
+                };
+                if accept_tx.send(stream).await.is_err() {
+                    return;
+                }
+            }
+            udp_packet_type::DATA => {
+                // Route by address, then conn id
+                // (`UdpConnection::handle_packet_from_remote`).
+                let conns = conns.clone();
+                let Some(conn) = conns
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&addr)
+                    .map(|c| (c.conn_id, c.half.clone()))
+                else {
+                    continue;
+                };
+                if conn.0 != header.conn_id {
+                    continue;
+                }
+                let mut half = conn.1.lock().unwrap_or_else(|e| e.into_inner());
+                half.push_datagram(body);
+                drop(half);
+                wake_udp_half(&conn.1);
+            }
+            // Fin/HolePunch/V4/V6HolePunch/Invalid: ignored (the punch
+            // forwards live behind the hole-punch connector, not the
+            // plain listener port).
+            _ => {}
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2975,39 +3582,7 @@ impl EasyTierNode {
     /// One explicit ping/pong round trip (`do_pingpong_once`,
     /// peer_conn_ping.rs:167-236): returns the latency.
     pub async fn ping(&self) -> Result<Duration> {
-        let seq: u32 = rand::random();
-        let ping = PeerPacket::new(
-            self.my_peer_id,
-            self.peer_id,
-            packet_type::PING,
-            &seq.to_le_bytes(),
-        );
-        let mut receiver = self.state.pong_tx.subscribe();
-        self.state
-            .sink
-            .send(ping)
-            .await
-            .map_err(|_| Error::network("easytier: peer connection closed"))?;
-        let start = std::time::Instant::now();
-        tokio::time::timeout(PONG_TIMEOUT, async {
-            loop {
-                match receiver.recv().await {
-                    Ok(p) if p.payload.len() >= 4
-                        && u32::from_le_bytes(p.payload[0..4].try_into().unwrap()) == seq =>
-                    {
-                        return Ok(())
-                    }
-                    Ok(_) => continue,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => {
-                        return Err(Error::network("easytier: peer connection closed"))
-                    }
-                }
-            }
-        })
-        .await
-        .map_err(|_| Error::network("easytier: wait ping response timeout"))??;
-        let latency = start.elapsed();
+        let latency = conn_ping(&self.state).await?;
         self.state
             .latency_us
             .store(latency.as_micros() as u64, Ordering::Relaxed);
@@ -3036,10 +3611,83 @@ impl EasyTierNode {
     }
 }
 
+/// The consumed halves of one connected stream: the shared connection
+/// state (the send path — everything an overlay node needs to emit
+/// packets to this peer) plus the receive channels its event pump
+/// drains, and the tasks to abort when the session ends.
+pub struct SessionHalves {
+    state: Arc<ConnState>,
+    data_rx: mpsc::Receiver<Vec<u8>>,
+    ctrl_rx: mpsc::Receiver<PeerPacket>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl SessionHalves {
+    /// Wrap back into the standalone per-connection node object (the
+    /// shape the plain `connect_peer`/`serve_peer` APIs return).
+    fn into_node(self, network_name: String) -> EasyTierNode {
+        EasyTierNode {
+            my_peer_id: self.state.my_peer_id,
+            peer_id: self.state.peer_id,
+            network_name,
+            state: self.state,
+            data_rx: Mutex::new(self.data_rx),
+            ctrl_rx: Mutex::new(self.ctrl_rx),
+            tasks: Mutex::new(self.tasks),
+        }
+    }
+}
+
+/// One ping/pong round trip over a live connection state — the shared
+/// body of [`EasyTierNode::ping`] and the post-dial liveness check.
+async fn conn_ping(state: &Arc<ConnState>) -> Result<Duration> {
+    let seq: u32 = rand::random();
+    let ping = PeerPacket::new(
+        state.my_peer_id,
+        state.peer_id,
+        packet_type::PING,
+        &seq.to_le_bytes(),
+    );
+    let mut receiver = state.pong_tx.subscribe();
+    state
+        .sink
+        .send(ping)
+        .await
+        .map_err(|_| Error::network("easytier: peer connection closed"))?;
+    let start = std::time::Instant::now();
+    tokio::time::timeout(PONG_TIMEOUT, async {
+        loop {
+            match receiver.recv().await {
+                Ok(p) if p.payload.len() >= 4
+                    && u32::from_le_bytes(p.payload[0..4].try_into().unwrap()) == seq =>
+                {
+                    return Ok(())
+                }
+                Ok(_) => continue,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => {
+                    return Err(Error::network("easytier: peer connection closed"))
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| Error::network("easytier: wait ping response timeout"))??;
+    Ok(start.elapsed())
+}
+
 /// Spawn the shared post-handshake machinery around a connected stream
 /// (the `start_recv_loop` + `start_pingpong` + MpscTunnel wiring of
-/// `PeerConn::new_with_peer_id_hint_and_origin`, peer_conn.rs:340-413).
-async fn spawn_connection<I>(io: I, my_peer_id: PeerId, peer: &PeerInfo, encryptor: PacketEncryptor) -> EasyTierNode
+/// `PeerConn::new_with_peer_id_hint_and_origin`, peer_conn.rs:340-413),
+/// returning the raw halves — what the multi-peer overlay node attaches
+/// to its peer table (the standalone per-connection object is
+/// `SessionHalves::into_node`).
+async fn spawn_connection_halves<I>(
+    io: I,
+    my_peer_id: PeerId,
+    peer: &PeerInfo,
+    encryptor: PacketEncryptor,
+) -> SessionHalves
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -3067,14 +3715,11 @@ where
         tokio::spawn(run_writer_loop(writer, state.clone(), sink_rx)),
         tokio::spawn(run_ping_loop(state.clone())),
     ];
-    EasyTierNode {
-        my_peer_id,
-        peer_id: peer.peer_id,
-        network_name: peer.network_name.clone(),
+    SessionHalves {
         state,
-        data_rx: Mutex::new(data_rx),
-        ctrl_rx: Mutex::new(ctrl_rx),
-        tasks: Mutex::new(tasks),
+        data_rx,
+        ctrl_rx,
+        tasks,
     }
 }
 
@@ -3202,6 +3847,11 @@ where
             .ok_or_else(|| Error::network("easytier: conn closed during wait handshake"))?;
         if packet.hdr.packet_type == packet_type::HANDSHAKE {
             Ok(packet)
+        } else if packet.hdr.packet_type == packet_type::NOISE_HANDSHAKE_MSG1 {
+            // A secure-mode client opens with the Noise_XX msg1 instead of
+            // the plain handshake (`do_noise_handshake_as_server`,
+            // peer_conn.rs:1252-1255).
+            Err(Error::config(SECURE_MODE_NOT_PORTED))
         } else {
             Err(Error::protocol(format!(
                 "easytier: unexpected packet type during handshake: {}",
@@ -3238,9 +3888,20 @@ where
     })
 }
 
-/// One parsed `tcp://` peer endpoint.
+/// The transport of one parsed peer URI (the `IpScheme` arms the peer
+/// connector dispatches on, connector/mod.rs:239-248; `ws`/`wss` ride
+/// TCP but behind the websocket upgrader, `quic` behind quinn — both
+/// stay unported).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerTransport {
+    Tcp,
+    Udp,
+}
+
+/// One parsed `tcp://`/`udp://` peer endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerEndpoint {
+    pub transport: PeerTransport,
     pub host: String,
     pub port: u16,
 }
@@ -3249,13 +3910,19 @@ pub struct PeerEndpoint {
 /// via `protocol_port_offset`: 11010 + 0.
 pub const DEFAULT_PEER_PORT: u16 = 11010;
 
-/// Parse a peer URI down to host + port. Only the plain TCP scheme is
-/// live (`protocol_transport`, connectivity/protocol/mod.rs:23-36):
-/// `ws`/`wss` ride TCP too but behind the websocket upgrader.
-pub fn parse_tcp_peer_uri(uri: &str) -> Result<PeerEndpoint> {
-    let rest = uri
-        .strip_prefix("tcp://")
-        .ok_or_else(|| Error::config(format!("easytier: unsupported peer transport scheme in {uri:?}")))?;
+/// Parse a peer URI down to transport + host + port. The plain TCP and
+/// UDP schemes are live; anything else names the unported transports.
+pub fn parse_peer_endpoint(uri: &str) -> Result<PeerEndpoint> {
+    let (transport, rest) = if let Some(rest) = uri.strip_prefix("tcp://") {
+        (PeerTransport::Tcp, rest)
+    } else if let Some(rest) = uri.strip_prefix("udp://") {
+        (PeerTransport::Udp, rest)
+    } else {
+        let scheme = uri.split("://").next().unwrap_or(uri);
+        return Err(Error::config(format!(
+            "easytier: unsupported peer transport scheme {scheme:?} in {uri:?} (the quic/ws/wg transports are not ported yet)"
+        )));
+    };
     let rest = rest.split('/').next().unwrap_or(rest);
     let (host, port) = if let Some(rest) = rest.strip_prefix('[') {
         // IPv6 literal: `[::1]:port`.
@@ -3286,55 +3953,147 @@ pub fn parse_tcp_peer_uri(uri: &str) -> Result<PeerEndpoint> {
     if host.is_empty() {
         return Err(Error::config(format!("easytier: peer URI has no host: {uri:?}")));
     }
-    Ok(PeerEndpoint { host, port })
+    Ok(PeerEndpoint {
+        transport,
+        host,
+        port,
+    })
 }
 
-/// Dial one `tcp://` peer and run the plain-mode client handshake —
-/// the `PeerManager::add_tunnel_as_client` path
-/// (peers/peer_manager.rs:1990-2021) over `TcpStream::connect` with the
-/// connector's 3s budget (connectivity/direct/mod.rs:64). DELTA: after
-/// the channel is up, one explicit ping confirms liveness — upstream's
-/// `ensureStarted` equivalent — which also fails the dial fast when the
-/// peer rejects our identity right after its handshake reply.
+/// Resolve a peer endpoint's host to the first socket address
+/// (`SocketAddr::from_url`, tunnel/common.rs — both families accepted).
+async fn resolve_peer_addr(endpoint: &PeerEndpoint) -> Result<SocketAddr> {
+    let target = (endpoint.host.as_str(), endpoint.port);
+    let addr = tokio::net::lookup_host(target)
+        .await
+        .map_err(|e| Error::network(format!("easytier: resolve peer {}: {e}", endpoint.host)))?
+        .next()
+        .ok_or_else(|| Error::network(format!("easytier: peer host resolved to nothing: {}", endpoint.host)))?;
+    Ok(addr)
+}
+
+/// Dial one `tcp://`/`udp://` peer and run the plain-mode client
+/// handshake — the `PeerManager::add_tunnel_as_client` path
+/// (peers/peer_manager.rs:1990-2021): TCP over `TcpStream::connect`,
+/// UDP over the datagram virtual circuit (`UdpTunnelConnector`, the
+/// connector's `IpScheme::Udp` arm, connector/mod.rs:248), both with the
+/// direct connector's 3s budget (connectivity/direct/mod.rs:64). DELTA:
+/// after the channel is up, one explicit ping confirms liveness —
+/// upstream's `ensureStarted` equivalent — which also fails the dial
+/// fast when the peer rejects our identity right after its handshake
+/// reply.
 pub async fn connect_peer(
     endpoint: &PeerEndpoint,
     network_name: &str,
     network_secret: &str,
     encryptor: PacketEncryptor,
 ) -> Result<EasyTierNode> {
-    let digest = network_secret_digest(network_name, network_secret);
-    let my_peer_id = random_peer_id();
-    let stream = tokio::time::timeout(
-        DIRECT_CONNECT_TIMEOUT,
-        tokio::net::TcpStream::connect((endpoint.host.as_str(), endpoint.port)),
+    connect_peer_as(
+        endpoint,
+        random_peer_id(),
+        network_name,
+        network_secret,
+        encryptor,
     )
     .await
-    .map_err(|_| Error::network("easytier: direct connect timeout"))??;
-    let mut stream = stream;
-    let peer = handshake_as_client(&mut stream, my_peer_id, network_name, &digest).await?;
-    check_network_identity(network_name, &digest, &peer)?;
-    let node = spawn_connection(stream, my_peer_id, &peer, encryptor).await;
-    node.ping().await?;
-    Ok(node)
+}
+
+/// [`connect_peer`] under a caller-chosen `my_peer_id` — every
+/// connection of ONE overlay node shares the node's peer id (upstream:
+/// one `PeerId` per node, all its `PeerConn`s carry it), so the
+/// multi-peer node and the listener pass theirs here.
+pub async fn connect_peer_as(
+    endpoint: &PeerEndpoint,
+    my_peer_id: PeerId,
+    network_name: &str,
+    network_secret: &str,
+    encryptor: PacketEncryptor,
+) -> Result<EasyTierNode> {
+    let halves = dial_session(endpoint, my_peer_id, network_name, network_secret, encryptor).await?;
+    Ok(halves.into_node(network_name.to_owned()))
+}
+
+/// The [`connect_peer_as`] path returning the raw session halves — what
+/// the multi-peer overlay node attaches.
+async fn dial_session(
+    endpoint: &PeerEndpoint,
+    my_peer_id: PeerId,
+    network_name: &str,
+    network_secret: &str,
+    encryptor: PacketEncryptor,
+) -> Result<SessionHalves> {
+    let digest = network_secret_digest(network_name, network_secret);
+    match endpoint.transport {
+        PeerTransport::Tcp => {
+            let stream = tokio::time::timeout(
+                DIRECT_CONNECT_TIMEOUT,
+                tokio::net::TcpStream::connect((endpoint.host.as_str(), endpoint.port)),
+            )
+            .await
+            .map_err(|_| Error::network("easytier: direct connect timeout"))??;
+            client_session(stream, my_peer_id, network_name, &digest, encryptor).await
+        }
+        PeerTransport::Udp => {
+            let addr = resolve_peer_addr(endpoint).await?;
+            let stream = tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, connect_udp_tunnel(addr))
+                .await
+                .map_err(|_| Error::network("easytier: udp connect timeout"))??;
+            client_session(stream, my_peer_id, network_name, &digest, encryptor).await
+        }
+    }
+}
+
+/// Handshake + identity check + machinery for one dialed stream.
+async fn client_session<I>(
+    io: I,
+    my_peer_id: PeerId,
+    network_name: &str,
+    digest: &NetworkSecretDigest,
+    encryptor: PacketEncryptor,
+) -> Result<SessionHalves>
+where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut stream = io;
+    let peer = handshake_as_client(&mut stream, my_peer_id, network_name, digest).await?;
+    check_network_identity(network_name, digest, &peer)?;
+    let halves = spawn_connection_halves(stream, my_peer_id, &peer, encryptor).await;
+    // The liveness ping (`do_pingpong_once` via the client connect path).
+    conn_ping(&halves.state).await?;
+    Ok(halves)
 }
 
 /// The server side of one accepted stream: run the plain-mode handshake
 /// and the same post-handshake machinery. This is the peer side the
-/// hermetic tests drive, and the seam for the future listener
-/// (`PeerManager::add_tunnel_as_server`, peers/peer_manager.rs:2042+).
+/// listener productionizes below (`PeerManager::add_tunnel_as_server`,
+/// peers/peer_manager.rs:2042+).
 pub async fn serve_peer(
     stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
     network_name: &str,
     network_secret: &str,
     encryptor: PacketEncryptor,
 ) -> Result<(EasyTierNode, PeerInfo)> {
-    let digest = network_secret_digest(network_name, network_secret);
     let my_peer_id = random_peer_id();
+    let (halves, peer) =
+        serve_peer_as(stream, my_peer_id, network_name, network_secret, encryptor).await?;
+    Ok((halves.into_node(network_name.to_owned()), peer))
+}
+
+/// [`serve_peer`] under a caller-chosen `my_peer_id` (the shared node
+/// identity of the listener), returning the raw halves.
+pub async fn serve_peer_as(
+    stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    my_peer_id: PeerId,
+    network_name: &str,
+    network_secret: &str,
+    encryptor: PacketEncryptor,
+) -> Result<(SessionHalves, PeerInfo)> {
+    let digest = network_secret_digest(network_name, network_secret);
     let mut stream = stream;
     let peer = handshake_as_server(&mut stream, my_peer_id, network_name, &digest).await?;
     check_network_identity(network_name, &digest, &peer)?;
-    let node = spawn_connection(stream, my_peer_id, &peer, encryptor).await;
-    Ok((node, peer))
+    let halves = spawn_connection_halves(stream, my_peer_id, &peer, encryptor).await;
+    Ok((halves, peer))
 }
 
 /// `random_peer_id` (peers/peer_manager.rs:192-198): any non-zero u32.
@@ -3347,42 +4106,92 @@ fn random_peer_id() -> PeerId {
     }
 }
 
-/// What is still missing after the route gossip + userspace stack
-/// landed (M2): the transports and roles a full mesh node carries. The
-/// message names the next milestones precisely.
-pub const NOT_PORTED: &str = concat!(
-    "easytier: the direct TCP peer tunnel (M1: handshake + framing + ",
-    "AEAD packet encryption + ping/pong) and the route layer (M2: the ",
-    "peer RPC framework subset + OspfRouteRpc.SyncRouteInfo gossip + the ",
-    "smoltcp userspace stack + connect_tcp/EasyTierUdp dials) are ",
-    "in-tree; NOT ported: the udp/quic/ws/wg peer transports (socket/udp/",
-    " + the quinn QUIC tunnel + the websocket upgrader), the listener ",
-    "side (listener/{mod,transport}.rs — accepting our own peers), ",
-    "secure mode (the Noise_XX PeerConnNoiseMsg1/2/3 handshake of ",
-    "peers/conn/peer_conn.rs:779-1170), the relay path + foreign ",
-    "networks (RouteForeignNetworkInfos), multi-hop OSPF convergence ",
-    "(graph_algo.rs SPF beyond the direct-neighbor adjacency), IPv6 ",
-    "overlay addressing, exit-node/proxy-network policy, and MagicDNS ",
-    "serving (the resolver helpers are ported; the dns server is not)"
+/// Secure mode, assessed and deliberately NOT ported (M3). Upstream
+/// secure mode is NOT just the Noise_XX handshake: the three messages
+/// ride in peer packets `NoiseHandshakeMsg1/2/3` (types 13/14/15,
+/// packet_def.rs:86-88) with snow's `Noise_XX_25519_ChaChaPoly_SHA256`
+/// and the prologue `easytier-peerconn-noise`
+/// (`do_noise_handshake_as_client/_as_server`, peer_conn.rs:793-1170 on
+/// the v2.6.4 tag):
+///
+/// * `PeerConnNoiseMsg1Pb { version, a_network_name, a_session_generation?,
+///   a_conn_id(UUID), client_encryption_algorithm }` (peer_rpc.proto:343-349);
+/// * `PeerConnNoiseMsg2Pb { b_network_name, role_hint, action(Join/Sync/Create),
+///   b_session_generation, root_key_32?, initial_epoch, b_conn_id,
+///   a_conn_id_echo, secret_proof_32?, server_encryption_algorithm }`
+///   (peer_rpc.proto:351-362);
+/// * `PeerConnNoiseMsg3Pb { a_conn_id_echo, b_conn_id_echo, secret_proof_32?,
+///   secret_digest }` (peer_rpc.proto:381-386).
+///
+/// The handshake itself is bounded (the engine has hand-rolled Noise IK
+/// in wireguard.rs), but it is worthless alone: after it, EVERY payload
+/// packet stops using the network-secret AEAD of M1 and switches to the
+/// session AEAD — `PeerSession::encrypt_payload`/`decrypt_payload`
+/// (peer_conn.rs:167-232) over `SecureDatagramSession`
+/// (peers/secure_datagram.rs, 1020 lines: epoch-keyed AEAD with replay
+/// windows, epoch rotation and root-key sync with rx grace) driven by
+/// the `PeerSessionStore` state machine (peers/peer_session.rs, 422
+/// lines: per-peer sessions, Join/Sync/Create generations, pinned
+/// remote static keys) plus the auth/identity classification
+/// (`verify_remote_auth` + `classify_remote_identity`, peer_conn.rs:
+/// 700-791: HMAC secret proofs, Admin/Credential/SharedNode). A
+/// handshake-only port would complete msg1-3 and then fail every Data
+/// packet. What a real port additionally needs: X25519 (in-tree only as
+/// the wireguard/tailscale hand-rolled curves), UUID wire encoding, the
+/// session store, the datagram layer, and the rekey/sync RPCs.
+pub const SECURE_MODE_NOT_PORTED: &str = concat!(
+    "easytier: secure mode (config [secure_mode]/secure-mode) is not ported: ",
+    "it is the Noise_XX PeerConnNoiseMsg1/2/3 handshake (peer_conn.rs:799-1170) ",
+    "PLUS the per-peer session AEAD that replaces the network-secret ",
+    "encryption afterwards (PeerSessionStore + SecureDatagramSession, ",
+    "peer_session.rs + secure_datagram.rs) — without the session layer a ",
+    "completed handshake cannot carry data. Remove secure-mode/local-private-key/",
+    "peer-public-key to run the plain (still AEAD-encrypted) mesh"
 );
 
-/// Bring the mesh up against the first `tcp://` peer and return the
-/// joined peer connection — the counterpart of upstream `NewEasyTier` +
-/// `ensureStarted` + the direct connector's first task (adapter cached
-/// lines 172-209; connectivity/direct/mod.rs). The config is validated
-/// exactly like the rendered TOML demands, and the packet encryption
-/// follows the core defaults (`enable_encryption: true`, `aes-gcm`,
-/// config/toml.rs:34,64).
+/// What is still missing after the listener + UDP transport landed
+/// (M3): the remaining transports and the mesh roles beyond the direct
+/// neighborhood. The message names the next milestones precisely.
+pub const NOT_PORTED: &str = concat!(
+    "easytier: the direct TCP peer tunnel (M1: handshake + framing + ",
+    "AEAD packet encryption + ping/pong), the route layer (M2: the ",
+    "peer RPC framework subset + OspfRouteRpc.SyncRouteInfo gossip + the ",
+    "smoltcp userspace stack + connect_tcp/EasyTierUdp dials), and the ",
+    "M3 listener + UDP transport (serve(cfg) accepting tcp:// and udp:// ",
+    "peers into the same node, the udp:// peer dial over the SYN/SACK ",
+    "datagram circuit) are in-tree; NOT ported: the quic/ws/wg peer ",
+    "transports (the quinn QUIC tunnel + the websocket upgrader + the ",
+    "wireguard tunnel), secure mode (see SECURE_MODE_NOT_PORTED), the ",
+    "relay path + foreign networks (RouteForeignNetworkInfos), multi-hop ",
+    "OSPF convergence (graph_algo.rs SPF beyond the direct-neighbor ",
+    "adjacency), IPv6 overlay addressing, exit-node/proxy-network policy ",
+    "(proxy_networks are announced but not routed), and MagicDNS serving ",
+    "(the resolver helpers are ported; the dns server is not)"
+);
+
+/// Bring the mesh up against the first `tcp://`/`udp://` peer and
+/// return the joined peer connection — the counterpart of upstream
+/// `NewEasyTier` + `ensureStarted` + the direct connector's first task
+/// (adapter cached lines 172-209; connectivity/direct/mod.rs). The
+/// config is validated exactly like the rendered TOML demands, and the
+/// packet encryption follows the core defaults (`enable_encryption:
+/// true`, `aes-gcm`, config/toml.rs:34,64).
 pub async fn connect(config: &EasyTierConfig) -> Result<EasyTierNode> {
     let structured = config.structured_config();
     structured.validate()?;
+    if structured.secure_mode_enabled() {
+        return Err(Error::config(SECURE_MODE_NOT_PORTED));
+    }
     let peers = structured.parsed_peers()?;
     let peer = peers
         .iter()
-        .find(|p| p.uri.trim().to_ascii_lowercase().starts_with("tcp://"))
+        .find(|p| {
+            let uri = p.uri.trim().to_ascii_lowercase();
+            uri.starts_with("tcp://") || uri.starts_with("udp://")
+        })
         .ok_or_else(|| {
             Error::config(
-                "easytier: no tcp:// peer to dial for the direct TCP tunnel; the udp/quic/ws transports are not ported yet",
+                "easytier: no tcp:// or udp:// peer to dial for the direct tunnel; the quic/ws/wg transports are not ported yet",
             )
         })?;
     let algorithm = config
@@ -3394,7 +4203,7 @@ pub async fn connect(config: &EasyTierConfig) -> Result<EasyTierNode> {
         config.enable_encryption.unwrap_or(true),
         &config.network_secret,
     )?;
-    let endpoint = parse_tcp_peer_uri(&peer.uri)?;
+    let endpoint = parse_peer_endpoint(&peer.uri)?;
     connect_peer(&endpoint, &config.network_name, &config.network_secret, encryptor).await
 }
 
@@ -3716,6 +4525,21 @@ impl RouteGossip {
         true
     }
 
+    /// Adopt an address the owning overlay node allocated (or carried
+    /// statically) — the multi-peer node allocates once and announces the
+    /// same address over every edge. Idempotent; bumps the announcement
+    /// version only on change.
+    pub fn set_announced_ipv4(&mut self, addr: Ipv4Addr, network_length: u32) {
+        if self.my_ipv4 == Some(addr) {
+            return;
+        }
+        self.my_ipv4 = Some(addr);
+        self.my_network_length = network_length;
+        self.dhcp_allocated = true;
+        self.my_version += 1;
+        self.need_announce = true;
+    }
+
     /// Whether the route exchange has done its job for dialing: our
     /// address is known and at least one sync succeeded.
     pub fn is_ready(&self) -> bool {
@@ -4000,17 +4824,154 @@ enum Cmd {
     UdpClose {
         id: u32,
     },
+    /// Hand one freshly handshaked inbound peer (the listener's accept
+    /// loop) to the running node so it joins the peer table
+    /// (`ListenerManager`'s `peer_manager.handle_tunnel`,
+    /// instance/listeners.rs:239-253).
+    AttachPeer {
+        session: Box<SessionHalves>,
+    },
+    /// The MagicDNS node table of the whole node (`ShowNodeInfo` /
+    /// `ListRoute` behind the overlay resolver).
+    ListNodes {
+        reply: oneshot::Sender<Vec<OverlayNode>>,
+    },
+    /// The node's peer id (accepted peers must announce THEMSELVES as
+    /// that same node identity).
+    MyPeerId {
+        reply: oneshot::Sender<PeerId>,
+    },
+    /// Deterministic teardown of the node task (`EasyTierServer::
+    /// shutdown`).
+    Shutdown {
+        reply: oneshot::Sender<()>,
+    },
 }
 
-/// One overlay node task: the joined peer connection, the route gossip
-/// riding its RPC seam, and the smoltcp stack bridging the IP-frame seam
-/// to TCP/UDP sessions — the userspace counterpart of the core's
-/// `PeerManager` + `gateway` for a direct two-node mesh.
-struct EtStack {
-    node: EasyTierNode,
+/// One attached mesh neighbor of the overlay node: the connection's
+/// send-side state plus its OWN route-gossip session (each edge carries
+/// its own `SyncRouteSession` — my/dst session ids and initiator role
+/// are per-connection, peer_ospf_route.rs:2000-2340).
+struct PeerSession {
+    state: Arc<ConnState>,
+    peer_id: PeerId,
     gossip: RouteGossip,
     router: RpcRouter,
     descriptor: RpcDescriptor,
+    /// The outstanding route-sync call of this session's single-call
+    /// client (the transaction id of the in-flight request, if any).
+    outstanding_sync: Option<i64>,
+    sync_deadline: Option<std::time::Instant>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    closed: bool,
+}
+
+impl PeerSession {
+    /// The shared encrypting sender for every payload-bearing packet
+    /// type: `Data` (`send_msg_by_ip` → `try_compress_and_encrypt`,
+    /// peer_manager.rs:2641-2660) and `RpcReq`/`RpcResp`
+    /// (`RpcTransport::send` → `encryptor.encrypt`, peer_manager.rs:
+    /// 153-169) both leave the node sealed by the network-secret
+    /// encryptor in plain (non-secure) mode.
+    async fn send_packet(&self, packet_type: u8, payload: &[u8]) -> Result<()> {
+        let mut hdr = PeerManagerHeader {
+            from_peer_id: self.state.my_peer_id,
+            to_peer_id: self.peer_id,
+            packet_type,
+            flags: 0,
+            forward_counter: 1,
+            reserved: 0,
+            len: payload.len() as u32,
+        };
+        let mut payload = payload.to_vec();
+        self.state
+            .encryptor
+            .encrypt_packet(&mut hdr, &mut payload)?;
+        self.state
+            .sink
+            .send(PeerPacket { hdr, payload })
+            .await
+            .map_err(|_| Error::network("easytier: peer connection closed"))
+    }
+
+    async fn send_ip_frame(&self, frame: &[u8]) -> Result<()> {
+        self.send_packet(packet_type::DATA, frame).await
+    }
+
+    async fn send_rpc_packet(&self, is_request: bool, payload: &[u8]) -> Result<()> {
+        self.send_packet(
+            if is_request {
+                packet_type::RPC_REQ
+            } else {
+                packet_type::RPC_RESP
+            },
+            payload,
+        )
+        .await
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed || self.state.close_flag.load(Ordering::Acquire) == 1
+    }
+}
+
+/// One event off one attached peer, multiplexed into the node loop (the
+/// per-connection packet channels the upstream `PeerManager` fans in).
+enum PeerEvent {
+    Ctrl(usize, PeerPacket),
+    Data(usize, Vec<u8>),
+    Closed(usize),
+}
+
+/// Pump one session's two receive channels into the node's event
+/// channel; `Closed` fires when the connection's recv loop ended.
+async fn run_peer_events(
+    mut data_rx: mpsc::Receiver<Vec<u8>>,
+    mut ctrl_rx: mpsc::Receiver<PeerPacket>,
+    idx: usize,
+    tx: mpsc::Sender<PeerEvent>,
+) {
+    loop {
+        tokio::select! {
+            ctrl = ctrl_rx.recv() => match ctrl {
+                Some(p) => {
+                    if tx.send(PeerEvent::Ctrl(idx, p)).await.is_err() {
+                        break;
+                    }
+                }
+                None => break,
+            },
+            data = data_rx.recv() => match data {
+                Some(f) => {
+                    if tx.send(PeerEvent::Data(idx, f)).await.is_err() {
+                        break;
+                    }
+                }
+                None => break,
+            },
+        }
+    }
+    let _ = tx.send(PeerEvent::Closed(idx)).await;
+}
+
+/// One overlay node task: the attached peer sessions (dialed and
+/// accepted — every one joins the same node identity and address), the
+/// route gossip riding each session's RPC seam, and the smoltcp stack
+/// bridging the IP-frame seam to TCP/UDP sessions — the userspace
+/// counterpart of the core's `PeerManager` + `gateway`.
+struct EtStack {
+    /// The ONE peer id this node announces on every edge (upstream: one
+    /// `PeerId` per node; all its `PeerConn`s share it).
+    my_peer_id: PeerId,
+    network_name: String,
+    hostname: String,
+    /// The overlay address of the node: static from the config, or
+    /// allocated once from the learned routes and announced everywhere.
+    my_ipv4: Option<Ipv4Addr>,
+    my_network_length: u32,
+    want_dhcp: bool,
+    proxy_cidrs: Vec<String>,
+    peers: Vec<PeerSession>,
     iface: Interface,
     sockets: SocketSet<'static>,
     shim: Shim,
@@ -4021,10 +4982,6 @@ struct EtStack {
     wake: Arc<Notify>,
     start: std::time::Instant,
     pump_buf: Vec<u8>,
-    /// The outstanding route-sync call (single-call client; the
-    /// transaction id of the in-flight request, if any).
-    outstanding_sync: Option<i64>,
-    sync_deadline: Option<std::time::Instant>,
     /// The overlay address already installed on the interface.
     installed_addr: Option<Ipv4Addr>,
     /// Dials parked until the route exchange completes (the handshake
@@ -4035,8 +4992,17 @@ struct EtStack {
 }
 
 impl EtStack {
-    fn new(node: EasyTierNode, gossip: RouteGossip, mtu: usize, static_addr: Option<Ipv4Addr>) -> Self {
-        let descriptor = ospf_route_descriptor(gossip.network_name());
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        my_peer_id: PeerId,
+        network_name: &str,
+        hostname: &str,
+        mtu: usize,
+        static_addr: Option<Ipv4Addr>,
+        static_prefix: u32,
+        want_dhcp: bool,
+        proxy_cidrs: Vec<String>,
+    ) -> Self {
         let wake = Arc::new(Notify::new());
         let mut shim = Shim::new(mtu);
         let mut iface_cfg = IfaceConfig::new(HardwareAddress::Ip);
@@ -4051,10 +5017,18 @@ impl EtStack {
             let _ = iface.routes_mut().add_default_ipv4_route(addr);
         }
         EtStack {
-            node,
-            gossip,
-            router: RpcRouter::default(),
-            descriptor,
+            my_peer_id,
+            network_name: network_name.to_owned(),
+            hostname: hostname.to_owned(),
+            my_ipv4: static_addr,
+            my_network_length: if static_addr.is_some() && static_prefix == 0 {
+                32
+            } else {
+                static_prefix
+            },
+            want_dhcp,
+            proxy_cidrs,
+            peers: Vec::new(),
             iface,
             sockets: SocketSet::new(Vec::new()),
             shim,
@@ -4065,17 +5039,103 @@ impl EtStack {
             wake,
             start: std::time::Instant::now(),
             pump_buf: vec![0u8; PUMP_CHUNK],
-            outstanding_sync: None,
-            sync_deadline: None,
             installed_addr: static_addr,
             wait_ready: Vec::new(),
             fail: None,
         }
     }
 
+    /// Attach one handshaked session (dialed or accepted) and start its
+    /// event pump. Returns the session's index. The gossip starts from
+    /// the node's current announcement; the initiator flag marks which
+    /// side dialed (`we_are_initiator` — the connector of an edge is
+    /// the initiator).
+    fn attach_session(
+        &mut self,
+        halves: SessionHalves,
+        initiator: bool,
+        events: &mpsc::Sender<PeerEvent>,
+    ) -> usize {
+        let idx = self.peers.len();
+        let gossip = RouteGossip::new(
+            &self.network_name,
+            self.my_peer_id,
+            halves.state.peer_id,
+            &self.hostname,
+            self.my_ipv4,
+            self.my_network_length,
+            false,
+            self.proxy_cidrs.clone(),
+            initiator,
+        );
+        let peer_id = halves.state.peer_id;
+        let (data_rx, ctrl_rx) = (halves.data_rx, halves.ctrl_rx);
+        tokio::spawn(run_peer_events(data_rx, ctrl_rx, idx, events.clone()));
+        self.peers.push(PeerSession {
+            state: halves.state,
+            peer_id,
+            gossip,
+            router: RpcRouter::default(),
+            descriptor: ospf_route_descriptor(&self.network_name),
+            outstanding_sync: None,
+            sync_deadline: None,
+            tasks: halves.tasks,
+            closed: false,
+        });
+        idx
+    }
+
+    /// The mutable session at `idx`, when it exists.
+    fn sess(&mut self, idx: usize) -> Option<&mut PeerSession> {
+        self.peers.get_mut(idx)
+    }
+
+    /// Whether any live session finished a route exchange with our
+    /// address known — the dial gate.
+    fn ready(&self) -> bool {
+        self.peers
+            .iter()
+            .any(|s| !s.is_closed() && s.gossip.is_ready())
+    }
+
+    /// The node's DHCP allocation (`DhcpIpv4Allocator::evaluate`,
+    /// gateway/dhcp.rs:51-78) over the UNION of every session's LSDB —
+    /// one address for the whole node, then announced on every edge.
+    /// Returns true when a fresh address was picked.
+    fn maybe_allocate_dhcp(&mut self) -> bool {
+        if !self.want_dhcp || self.my_ipv4.is_some() {
+            return false;
+        }
+        let Some((subnet, length)) = self
+            .peers
+            .iter()
+            .flat_map(|s| s.gossip.lsdb.values())
+            .filter_map(|i| i.ipv4().map(|a| (a, i.network_length)))
+            .min_by_key(|(addr, _)| u32::from(*addr))
+        else {
+            return false;
+        };
+        let prefix = if length == 0 { 24 } else { length.min(32) };
+        let used: Vec<Ipv4Addr> = self
+            .peers
+            .iter()
+            .flat_map(|s| s.gossip.used_ipv4())
+            .collect();
+        let Some(picked) = allocate_overlay_ipv4(&used, subnet, prefix as u8) else {
+            return false;
+        };
+        tracing::debug!(target: "engine", "easytier: dhcp allocated overlay address {picked}");
+        self.my_ipv4 = Some(picked);
+        self.my_network_length = prefix;
+        for s in &mut self.peers {
+            s.gossip.set_announced_ipv4(picked, prefix);
+        }
+        true
+    }
+
     /// Complete or expire the dials parked on route readiness.
     fn service_ready(&mut self) {
-        let ready = self.gossip.is_ready();
+        let ready = self.ready();
         let now = Instant::now();
         let mut parked = std::mem::take(&mut self.wait_ready);
         self.wait_ready = parked
@@ -4089,10 +5149,9 @@ impl EtStack {
                 }
             })
             .collect();
-        if ready {
-            if let Some(addr) = self.gossip.my_ipv4() {
-                self.install_address(addr);
-            }
+        self.maybe_allocate_dhcp();
+        if let Some(addr) = self.my_ipv4 {
+            self.install_address(addr);
         }
     }
 
@@ -4102,7 +5161,7 @@ impl EtStack {
 
     /// Install the overlay address once known (the TUN `update_addr`
     /// path; a /32 plus the default route through it, wireguard.rs
-    /// parity — every overlay destination is reached via the peer).
+    /// parity — every overlay destination is reached via a peer).
     /// Idempotent: a repeat sync announcing the same address leaves the
     /// interface untouched.
     fn install_address(&mut self, addr: Ipv4Addr) {
@@ -4120,49 +5179,59 @@ impl EtStack {
 
     // -- gossip driver ------------------------------------------------------
 
-    /// Fire the route sync RPC (`sync_route_with_peer`'s send half,
-    /// peer_ospf_route.rs:3507-3553).
-    async fn start_sync(&mut self) {
-        if self.outstanding_sync.is_some() {
+    /// Fire the route sync RPC of one session
+    /// (`sync_route_with_peer`'s send half, peer_ospf_route.rs:3507-3553).
+    async fn start_sync(&mut self, idx: usize) {
+        let my_peer_id = self.my_peer_id;
+        let Some(session) = self.sess(idx) else {
+            return;
+        };
+        if session.is_closed() || session.outstanding_sync.is_some() {
             return;
         }
-        let request = self.gossip.build_request().encode();
-        let (transaction_id, wire) = self.router.begin_call(
-            self.node.my_peer_id(),
-            self.node.peer_id(),
-            self.descriptor.clone(),
+        let request = session.gossip.build_request().encode();
+        let (transaction_id, wire) = session.router.begin_call(
+            my_peer_id,
+            session.peer_id,
+            session.descriptor.clone(),
             &request,
             ROUTE_SYNC_TIMEOUT.as_millis().min(i32::MAX as u128) as i32,
         );
-        self.outstanding_sync = Some(transaction_id);
-        self.sync_deadline = Some(std::time::Instant::now() + ROUTE_SYNC_TIMEOUT);
-        self.gossip.mark_sync_started();
-        if let Err(e) = self.node.send_rpc_packet(true, &wire).await {
-            self.fail_route_sync(transaction_id, &e);
+        session.outstanding_sync = Some(transaction_id);
+        session.sync_deadline = Some(std::time::Instant::now() + ROUTE_SYNC_TIMEOUT);
+        session.gossip.mark_sync_started();
+        if let Err(e) = session.send_rpc_packet(true, &wire).await {
+            self.fail_route_sync(idx, transaction_id, &e);
         }
     }
 
-    fn fail_route_sync(&mut self, transaction_id: i64, e: &Error) {
+    fn fail_route_sync(&mut self, idx: usize, transaction_id: i64, e: &Error) {
         tracing::debug!(target: "engine", "easytier: sync_route_info failed: {e}");
-        self.router.cancel(transaction_id);
-        if self.outstanding_sync == Some(transaction_id) {
-            self.outstanding_sync = None;
-            self.sync_deadline = None;
+        if let Some(session) = self.sess(idx) {
+            session.router.cancel(transaction_id);
+            if session.outstanding_sync == Some(transaction_id) {
+                session.outstanding_sync = None;
+                session.sync_deadline = None;
+            }
         }
     }
 
     /// The client's response pump (client.rs:161-221) for the single
-    /// outstanding route-sync call.
-    fn on_rpc_response(&mut self, packet: RpcPacket) {
-        let Some(transaction_id) = self.outstanding_sync else {
+    /// outstanding route-sync call of one session.
+    fn on_rpc_response(&mut self, idx: usize, packet: RpcPacket) {
+        let Some(transaction_id) = self
+            .sess(idx)
+            .and_then(|s| s.outstanding_sync)
+        else {
             return;
         };
         if packet.transaction_id != transaction_id {
             // Not our call (a late response to a cancelled sync).
             return;
         }
-        self.outstanding_sync = None;
-        self.sync_deadline = None;
+        let session = self.sess(idx).unwrap();
+        session.outstanding_sync = None;
+        session.sync_deadline = None;
         let body = match RpcResponseBody::decode(&packet.body) {
             Ok(body) => body,
             Err(e) => {
@@ -4175,62 +5244,69 @@ impl EtStack {
             return;
         }
         match SyncRouteInfoResponse::decode(&body.response) {
-            Ok(resp) => self.gossip.apply_response(&resp),
+            Ok(resp) => session.gossip.apply_response(&resp),
             Err(e) => tracing::debug!(target: "engine", "easytier: decode sync response: {e}"),
-        }
-        if self.gossip.is_ready() {
-            if let Some(addr) = self.gossip.my_ipv4() {
-                self.install_address(addr);
-            }
         }
     }
 
     /// The server dispatch (`dispatch_request` + the registered
     /// `OspfRouteRpcServer`, service_registry.rs:166-200 collapsed to
     /// the one service).
-    async fn on_rpc_request(&mut self, packet: RpcPacket) {
-        let Some(desc) = packet.descriptor.clone() else {
-            tracing::debug!(target: "engine", "easytier: rpc request without a descriptor");
-            return;
-        };
-        if desc != self.descriptor {
-            tracing::debug!(target: "engine", "easytier: rpc request for unknown service {}", desc.service_name);
-            return;
-        }
-        if desc.method_index != rpc_method::OSPF_SYNC_ROUTE_INFO {
-            // `Error::InvalidMethodIndex` upstream; answered by silence
-            // here — the subset speaks one method.
-            tracing::debug!(target: "engine", "easytier: rpc method index {} is not SyncRouteInfo", desc.method_index);
-            return;
-        }
-        let body = match RpcRequestBody::decode(&packet.body) {
-            Ok(body) => body,
-            Err(e) => {
-                tracing::debug!(target: "engine", "easytier: decode rpc request: {e}");
+    async fn on_rpc_request(&mut self, idx: usize, packet: RpcPacket) {
+        let request = {
+            let Some(session) = self.sess(idx) else {
+                return;
+            };
+            let Some(desc) = packet.descriptor.clone() else {
+                tracing::debug!(target: "engine", "easytier: rpc request without a descriptor");
+                return;
+            };
+            if desc != session.descriptor {
+                tracing::debug!(target: "engine", "easytier: rpc request for unknown service {}", desc.service_name);
                 return;
             }
-        };
-        let request = match SyncRouteInfoRequest::decode(&body.request) {
-            Ok(req) => req,
-            Err(e) => {
-                tracing::debug!(target: "engine", "easytier: decode route request: {e}");
+            if desc.method_index != rpc_method::OSPF_SYNC_ROUTE_INFO {
+                // `Error::InvalidMethodIndex` upstream; answered by silence
+                // here — the subset speaks one method.
+                tracing::debug!(target: "engine", "easytier: rpc method index {} is not SyncRouteInfo", desc.method_index);
                 return;
             }
+            let body = match RpcRequestBody::decode(&packet.body) {
+                Ok(body) => body,
+                Err(e) => {
+                    tracing::debug!(target: "engine", "easytier: decode rpc request: {e}");
+                    return;
+                }
+            };
+            match SyncRouteInfoRequest::decode(&body.request) {
+                Ok(req) => req,
+                Err(e) => {
+                    tracing::debug!(target: "engine", "easytier: decode route request: {e}");
+                    return;
+                }
+            }
         };
-        let response = self.gossip.handle_sync_request(&request);
+        let response = {
+            let Some(session) = self.sess(idx) else {
+                return;
+            };
+            session.gossip.handle_sync_request(&request)
+        };
         let resp_packet = build_rpc_response(&packet, &response.encode());
-        if let Err(e) = self.node.send_rpc_packet(false, &resp_packet.encode()).await {
-            tracing::debug!(target: "engine", "easytier: send sync response: {e}");
+        if let Some(session) = self.sess(idx) {
+            if let Err(e) = session.send_rpc_packet(false, &resp_packet.encode()).await {
+                tracing::debug!(target: "engine", "easytier: send sync response: {e}");
+            }
         }
         // Serving a request may have taught us the subnet we still need
         // for the dhcp allocation.
-        if self.gossip.allocate_dhcp_ipv4() {
-            self.start_sync().await;
+        if self.maybe_allocate_dhcp() {
+            self.start_sync(idx).await;
         }
     }
 
-    /// One decrypted control packet off the peer channel.
-    async fn on_ctrl(&mut self, packet: PeerPacket) {
+    /// One decrypted control packet off one session's channel.
+    async fn on_ctrl(&mut self, idx: usize, packet: PeerPacket) {
         if packet.hdr.packet_type != packet_type::RPC_REQ && packet.hdr.packet_type != packet_type::RPC_RESP
         {
             return;
@@ -4243,41 +5319,74 @@ impl EtStack {
             }
         };
         if rpc.is_request {
-            match self.router.on_request(rpc) {
-                Ok(Some(whole)) => self.on_rpc_request(whole).await,
-                Ok(None) => {}
-                Err(e) => tracing::debug!(target: "engine", "easytier: merge rpc pieces: {e}"),
+            let merged = {
+                let Some(session) = self.sess(idx) else {
+                    return;
+                };
+                match session.router.on_request(rpc) {
+                    Ok(whole) => whole,
+                    Err(e) => {
+                        tracing::debug!(target: "engine", "easytier: merge rpc pieces: {e}");
+                        return;
+                    }
+                }
+            };
+            if let Some(whole) = merged {
+                self.on_rpc_request(idx, whole).await;
             }
         } else {
             // Response pieces merge inside the router's per-call merger;
             // a complete packet is read back by the outstanding call.
             let transaction_id = rpc.transaction_id;
-            self.router.on_response(rpc);
-            if self.outstanding_sync == Some(transaction_id) {
-                if let Some(merged) = self.router.take_merged(transaction_id) {
-                    self.on_rpc_response(merged);
-                }
+            let merged = {
+                let Some(session) = self.sess(idx) else {
+                    return;
+                };
+                session.router.on_response(rpc);
+                (session.outstanding_sync == Some(transaction_id))
+                    .then(|| session.router.take_merged(transaction_id))
+                    .flatten()
+            };
+            if let Some(merged) = merged {
+                self.on_rpc_response(idx, merged);
             }
         }
     }
 
-    /// The gossip tick: fire the periodic sync, time out a stuck one,
-    /// and retry the dhcp allocation as routes arrive.
+    /// The gossip tick of every session: fire the periodic sync, time
+    /// out a stuck one, and retry the dhcp allocation as routes arrive.
     async fn gossip_tick(&mut self) {
-        if let Some(deadline) = self.sync_deadline {
-            if std::time::Instant::now() >= deadline {
-                if let Some(transaction_id) = self.outstanding_sync.take() {
-                    self.router.cancel(transaction_id);
-                    tracing::debug!(target: "engine", "easytier: sync_route_info timed out");
+        let mut due: Vec<usize> = Vec::new();
+        for idx in 0..self.peers.len() {
+            let Some(session) = self.peers.get_mut(idx) else {
+                continue;
+            };
+            if session.is_closed() {
+                continue;
+            }
+            if let Some(deadline) = session.sync_deadline {
+                if std::time::Instant::now() >= deadline {
+                    if let Some(transaction_id) = session.outstanding_sync.take() {
+                        session.router.cancel(transaction_id);
+                        tracing::debug!(target: "engine", "easytier: sync_route_info timed out");
+                    }
+                    session.sync_deadline = None;
                 }
-                self.sync_deadline = None;
+            }
+            if session.gossip.sync_due() && session.outstanding_sync.is_none() {
+                due.push(idx);
             }
         }
-        if self.gossip.sync_due() && self.outstanding_sync.is_none() {
-            self.start_sync().await;
+        for idx in due {
+            self.start_sync(idx).await;
         }
-        if self.gossip.allocate_dhcp_ipv4() {
-            self.start_sync().await;
+        if self.maybe_allocate_dhcp() {
+            let live: Vec<usize> = (0..self.peers.len())
+                .filter(|&i| self.peers.get(i).is_some_and(|s| !s.is_closed()))
+                .collect();
+            for idx in live {
+                self.start_sync(idx).await;
+            }
         }
     }
 
@@ -4396,13 +5505,67 @@ impl EtStack {
         }
     }
 
+    /// Route one egress frame to the session whose LSDB announces the
+    /// destination (longest prefix over the learned `RoutePeerInfo`
+    /// addresses and `proxy_cidrs`); the two-node default falls back to
+    /// the first live peer (the /32 + default-route interface sends
+    /// everything to a peer when nothing matches — `send_msg_by_ip`
+    /// looks the route up in the OSPF table, peer_manager.rs:2793-2855).
+    fn route_frame(&self, dst: Ipv4Addr) -> Option<usize> {
+        let mut best: Option<(u32, usize)> = None;
+        for (idx, session) in self.peers.iter().enumerate() {
+            if session.is_closed() {
+                continue;
+            }
+            for info in session.gossip.lsdb.values() {
+                if info.peer_id == self.my_peer_id {
+                    continue;
+                }
+                if let Some(addr) = info.ipv4() {
+                    let len = if info.network_length == 0 {
+                        24
+                    } else {
+                        info.network_length.min(32)
+                    };
+                    if ipv4_in_subnet(dst, addr, len as u8) && best.is_none_or(|(b, _)| len > b) {
+                        best = Some((len, idx));
+                    }
+                }
+                for cidr in &info.proxy_cidrs {
+                    if let Some((addr, len)) = parse_cidr(cidr) {
+                        let len = len as u32;
+                        if ipv4_in_subnet(dst, addr, len as u8) && best.is_none_or(|(b, _)| len > b)
+                        {
+                            best = Some((len, idx));
+                        }
+                    }
+                }
+            }
+        }
+        best.map(|(_, idx)| idx)
+            .or_else(|| self.peers.iter().position(|s| !s.is_closed()))
+    }
+
     async fn drain_egress(&mut self) {
         let pkts: Vec<Vec<u8>> = self.shim.egress.drain(..).collect();
         for pkt in pkts {
-            if let Err(e) = self.node.send_ip_frame(&pkt).await {
-                tracing::debug!(target: "engine", "easytier: send ip frame: {e}");
-                self.fail = Some(e);
-                return;
+            let dst = ipv4_destination(&pkt);
+            let Some(idx) = dst.and_then(|dst| self.route_frame(dst)) else {
+                // No live peer to forward through: drop (upstream queues
+                // into the peer manager's route miss counter).
+                continue;
+            };
+            if let Some(session) = self.peers.get(idx) {
+                if let Err(e) = session.send_ip_frame(&pkt).await {
+                    tracing::debug!(target: "engine", "easytier: send ip frame: {e}");
+                    if let Some(session) = self.peers.get_mut(idx) {
+                        session.closed = true;
+                    }
+                    if !self.peers.iter().any(|s| !s.is_closed()) {
+                        self.fail = Some(e);
+                        return;
+                    }
+                }
             }
         }
     }
@@ -4419,16 +5582,15 @@ impl EtStack {
     /// Source-address selection: the overlay address (IPv4-only, like
     /// the mihomo adapter's `Dial(ctx, "tcp4", …)`).
     fn local_address_for(&self) -> Result<IpAddress> {
-        self.gossip
-            .my_ipv4()
+        self.my_ipv4
             .map(IpAddress::Ipv4)
             .ok_or_else(|| Error::network("easytier: no overlay IPv4 address yet"))
     }
 
-    async fn on_cmd(&mut self, cmd: Cmd) {
+    async fn on_cmd(&mut self, cmd: Cmd, events: &mpsc::Sender<PeerEvent>) {
         match cmd {
             Cmd::WaitReady { reply } => {
-                if self.gossip.is_ready() {
+                if self.ready() {
                     let _ = reply.send(());
                 } else {
                     self.wait_ready.push((Instant::now() + ROUTE_READY_TIMEOUT, reply));
@@ -4439,7 +5601,7 @@ impl EtStack {
                     let _ = reply.send(Err(Error::network(e.to_string())));
                     return;
                 }
-                if !self.gossip.is_ready() {
+                if !self.ready() {
                     let _ = reply.send(Err(Error::network(
                         "easytier: route exchange not complete yet",
                     )));
@@ -4493,7 +5655,7 @@ impl EtStack {
                     let _ = reply.send(Err(Error::network(e.to_string())));
                     return;
                 }
-                if !self.gossip.is_ready() {
+                if !self.ready() {
                     let _ = reply.send(Err(Error::network(
                         "easytier: route exchange not complete yet",
                     )));
@@ -4551,6 +5713,21 @@ impl EtStack {
                     self.used_ports.remove(&u.port);
                 }
             }
+            Cmd::AttachPeer { session } => {
+                let peer_id = session.state.peer_id;
+                self.attach_session(*session, false, events);
+                tracing::debug!(target: "engine", "easytier: inbound peer {peer_id} joined the node");
+            }
+            Cmd::ListNodes { reply } => {
+                let _ = reply.send(self.overlay_nodes());
+            }
+            Cmd::MyPeerId { reply } => {
+                let _ = reply.send(self.my_peer_id);
+            }
+            Cmd::Shutdown { .. } => {
+                // Handled by the driver loop (it must break out of the
+                // select, not just the command dispatch).
+            }
         }
     }
 
@@ -4562,20 +5739,88 @@ impl EtStack {
                 .map(|d| Duration::from_micros(d.total_micros()))
                 .unwrap_or(MAX_TICK)
                 .clamp(MIN_TICK, MAX_TICK);
-        if let Some(deadline) = self.sync_deadline {
-            until = until.min(deadline);
-        }
-        if self.gossip.sync_due() {
-            until = until.min(std::time::Instant::now() + Duration::from_millis(50));
+        for session in &self.peers {
+            if let Some(deadline) = session.sync_deadline {
+                until = until.min(deadline);
+            }
+            if session.gossip.sync_due() {
+                until = until.min(std::time::Instant::now() + Duration::from_millis(50));
+            }
         }
         until
     }
+
+    /// The MagicDNS node table of the whole node: every address learned
+    /// over any session (`ShowNodeInfo` / `ListRoute` behind the overlay
+    /// resolver — the merged LSDB view).
+    fn overlay_nodes(&self) -> Vec<OverlayNode> {
+        let mut nodes = Vec::new();
+        for session in &self.peers {
+            for info in session.gossip.lsdb.values() {
+                if let (Some(ipv4), true) = (info.ipv4(), info.peer_id != self.my_peer_id) {
+                    nodes.push(OverlayNode {
+                        hostname: info.hostname.clone().unwrap_or_default(),
+                        ipv4,
+                    });
+                }
+            }
+        }
+        if let Some(ipv4) = self.my_ipv4 {
+            nodes.push(OverlayNode {
+                hostname: self.hostname.clone(),
+                ipv4,
+            });
+        }
+        nodes
+    }
 }
 
-/// Drive one overlay node until the last command sender is gone: the
-/// gossip timer, the peer channel (IP frames + control), the command
-/// queue and the netstack all make progress in one loop.
-async fn run_overlay(mut stack: EtStack, mut cmd_rx: mpsc::Receiver<Cmd>) {
+/// The IPv4 destination of one overlay frame (`version == 4`, dst at
+/// bytes 16..20) — None for anything else (the overlay is IPv4-only).
+fn ipv4_destination(frame: &[u8]) -> Option<Ipv4Addr> {
+    if frame.len() < 20 || frame[0] >> 4 != 4 {
+        return None;
+    }
+    Some(Ipv4Addr::new(
+        frame[16],
+        frame[17],
+        frame[18],
+        frame[19],
+    ))
+}
+
+/// `addr` inside `subnet/len` (the route lookup of `send_msg_by_ip`).
+fn ipv4_in_subnet(addr: Ipv4Addr, subnet: Ipv4Addr, len: u8) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let mask = if len >= 32 {
+        u32::MAX
+    } else {
+        u32::MAX << (32 - len)
+    };
+    (u32::from(addr) & mask) == (u32::from(subnet) & mask)
+}
+
+/// Parse one `a.b.c.d/len` proxy CIDR.
+fn parse_cidr(cidr: &str) -> Option<(Ipv4Addr, u8)> {
+    let (addr, len) = cidr.trim().split_once('/')?;
+    Some((addr.parse().ok()?, len.parse().ok()?))
+        .filter(|(_, len)| *len <= 32)
+}
+
+/// Drive one overlay node: the per-session gossip timers, every peer's
+/// channel (IP frames + control, multiplexed through [`PeerEvent`]), the
+/// command queue and the netstack all make progress in one loop. The
+/// loop runs until a `Shutdown` command or the last command sender
+/// drops (listener acceptors hold senders, so a serving node outlives
+/// its peers).
+async fn run_overlay(
+    mut stack: EtStack,
+    mut cmd_rx: mpsc::Receiver<Cmd>,
+    events_tx: mpsc::Sender<PeerEvent>,
+    mut events_rx: mpsc::Receiver<PeerEvent>,
+) {
     let wake = stack.wake.clone();
     // The first sync fires immediately (an unsynced session syncs on the
     // first tick).
@@ -4587,8 +5832,7 @@ async fn run_overlay(mut stack: EtStack, mut cmd_rx: mpsc::Receiver<Cmd>) {
         let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
         enum Event {
             Cmd(Cmd),
-            Ctrl(PeerPacket),
-            Data(Vec<u8>),
+            Peer(Option<PeerEvent>),
             Wake,
             Tick,
         }
@@ -4601,27 +5845,41 @@ async fn run_overlay(mut stack: EtStack, mut cmd_rx: mpsc::Receiver<Cmd>) {
                 Some(c) => Event::Cmd(c),
                 None => break,
             },
-            ctrl = stack.node.recv_ctrl_packet() => match ctrl {
-                Some(p) => Event::Ctrl(p),
-                None => break,
-            },
-            frame = stack.node.recv_ip_frame() => match frame {
-                Some(f) => Event::Data(f),
-                None => break,
-            },
+            ev = events_rx.recv() => Event::Peer(ev),
             _ = wake.notified() => Event::Wake,
             _ = sleep => Event::Tick,
         };
         match event {
-            Event::Cmd(c) => stack.on_cmd(c).await,
-            Event::Ctrl(p) => stack.on_ctrl(p).await,
-            Event::Data(f) => {
+            Event::Cmd(Cmd::Shutdown { reply }) => {
+                // Tear the sessions' tasks down deterministically (the
+                // standalone node does this in `EasyTierNode::close`).
+                for session in &stack.peers {
+                    for task in &session.tasks {
+                        task.abort();
+                    }
+                }
+                let _ = reply.send(());
+                break;
+            }
+            Event::Cmd(c) => stack.on_cmd(c, &events_tx).await,
+            Event::Peer(Some(PeerEvent::Ctrl(idx, p))) => stack.on_ctrl(idx, p).await,
+            Event::Peer(Some(PeerEvent::Data(_idx, f))) => {
                 stack.shim.stage(&f);
                 stack.wake.notify_one();
             }
+            Event::Peer(Some(PeerEvent::Closed(idx))) => {
+                if let Some(session) = stack.peers.get_mut(idx) {
+                    session.closed = true;
+                    tracing::debug!(target: "engine", "easytier: peer {} left", session.peer_id);
+                }
+            }
+            Event::Peer(None) => {
+                // Unreachable while this loop holds its own sender; treat
+                // as a tick.
+            }
             Event::Wake | Event::Tick => {}
         }
-        if stack.fail.is_some() || stack.node.is_closed() {
+        if stack.fail.is_some() {
             break;
         }
     }
@@ -4636,7 +5894,8 @@ static NODES: std::sync::OnceLock<tokio::sync::Mutex<HashMap<String, mpsc::Sende
     std::sync::OnceLock::new();
 
 /// The config identity a node is cached by: everything that changes the
-/// peer session or the announced routes.
+/// peer session or the announced routes — plus the listener set (a
+/// serving node is a different animal than a dial-only one).
 fn node_cache_key(cfg: &EasyTierConfig) -> String {
     [
         cfg.name.as_str(),
@@ -4651,6 +5910,8 @@ fn node_cache_key(cfg: &EasyTierConfig) -> String {
         &cfg.enable_encryption.map(|b| b.to_string()).unwrap_or_default(),
         &cfg.mtu.to_string(),
         &cfg.proxy_networks.join(","),
+        &cfg.no_listener.map(|b| b.to_string()).unwrap_or_default(),
+        &cfg.listeners.join(","),
     ]
     .join("\u{1f}")
 }
@@ -4682,12 +5943,18 @@ fn static_overlay_address(cfg: &EasyTierConfig) -> Result<Option<(Ipv4Addr, u32)
     Ok(Some((addr, prefix)))
 }
 
-/// Bring the mesh up for `cfg` (or reuse the live one): the direct TCP
-/// peer connection, the route exchange, and the overlay address — then
-/// hand back the command channel every dial shares.
+/// Bring the mesh up for `cfg` (or reuse the live one): the direct
+/// peer connection over the first supported transport, the route
+/// exchange, and the overlay address — then hand back the command
+/// channel every dial shares. DELTA: the dial-only registry path binds
+/// no listeners even when the config carries them (the adapter use
+/// case never serves); `serve` is the listener entry.
 async fn node_for(cfg: &EasyTierConfig) -> Result<mpsc::Sender<Cmd>> {
     let structured = cfg.structured_config();
     structured.validate()?;
+    if structured.secure_mode_enabled() {
+        return Err(Error::config(SECURE_MODE_NOT_PORTED));
+    }
     let key = node_cache_key(cfg);
     let cache = NODES.get_or_init(Default::default);
     let mut map = cache.lock().await;
@@ -4696,32 +5963,63 @@ async fn node_for(cfg: &EasyTierConfig) -> Result<mpsc::Sender<Cmd>> {
             return Ok(tx.clone());
         }
     }
-    let node = connect(cfg).await?;
-    let static_addr = static_overlay_address(cfg)?;
+    let algorithm = cfg
+        .encryption_algorithm
+        .clone()
+        .unwrap_or_else(|| EncryptionAlgorithm::default().as_str().to_owned());
+    let encryptor = create_encryptor(
+        &algorithm,
+        cfg.enable_encryption.unwrap_or(true),
+        &cfg.network_secret,
+    )?;
+    let my_peer_id = random_peer_id();
     let hostname = cfg
         .hostname
         .clone()
-        .unwrap_or_else(|| format!("rustcrash-{}", node.my_peer_id() & 0xffff));
+        .unwrap_or_else(|| format!("rustcrash-{}", my_peer_id & 0xffff));
+    let static_addr = static_overlay_address(cfg)?;
     let (addr, prefix) = static_addr.unzip();
-    let gossip = RouteGossip::new(
-        &cfg.network_name,
-        node.my_peer_id(),
-        node.peer_id(),
-        &hostname,
-        addr,
-        prefix.unwrap_or(32),
-        addr.is_none() && (cfg.dhcp || cfg.ipv4.as_deref().unwrap_or("").trim().is_empty()),
-        cfg.proxy_networks.clone(),
-        true,
-    );
+    let want_dhcp = addr.is_none() && (cfg.dhcp || cfg.ipv4.as_deref().unwrap_or("").trim().is_empty());
     let mtu = if cfg.mtu > 0 {
         cfg.mtu as usize
     } else {
         DEFAULT_MTU
     };
-    let stack = EtStack::new(node, gossip, mtu, addr);
+    let mut stack = EtStack::new(
+        my_peer_id,
+        &cfg.network_name,
+        &hostname,
+        mtu,
+        addr,
+        prefix.unwrap_or(32),
+        want_dhcp,
+        cfg.proxy_networks.clone(),
+    );
+    let (events_tx, events_rx) = mpsc::channel::<PeerEvent>(64);
+    // The outbound session: dial the first supported peer (the direct
+    // connector's first task).
+    let peers = structured.parsed_peers()?;
+    let supported = peers
+        .iter()
+        .find(|p| {
+            let uri = p.uri.trim().to_ascii_lowercase();
+            uri.starts_with("tcp://") || uri.starts_with("udp://")
+        })
+        .map(|p| p.uri.clone());
+    if let Some(uri) = supported {
+        let endpoint = parse_peer_endpoint(&uri)?;
+        let halves = dial_session(
+            &endpoint,
+            my_peer_id,
+            &cfg.network_name,
+            &cfg.network_secret,
+            encryptor,
+        )
+        .await?;
+        stack.attach_session(halves, true, &events_tx);
+    }
     let (tx, rx) = mpsc::channel::<Cmd>(64);
-    tokio::spawn(run_overlay(stack, rx));
+    tokio::spawn(run_overlay(stack, rx, events_tx, events_rx));
     map.insert(key, tx.clone());
     Ok(tx)
 }
@@ -4762,6 +6060,406 @@ async fn wait_ready(tunnel: &mpsc::Sender<Cmd>) -> Result<()> {
         .await
         .map_err(|_| Error::network("easytier: route exchange did not complete in time"))?
         .map_err(|_| Error::network("easytier: route exchange failed"))
+}
+
+// ---------------------------------------------------------------------------
+// The listener side (instance/listeners.rs of the v2.6.4 core: the
+// `create_listener_by_url` dispatch — `IpScheme::Tcp =>
+// TcpTunnelListener`, `IpScheme::Udp => UdpTunnelListener`,
+// listeners.rs:26-59 — plus `ListenerManager::run_listener`'s accept
+// loop feeding every accepted tunnel to the SAME peer manager,
+// listeners.rs:179-256)
+// ---------------------------------------------------------------------------
+
+/// One bound listener of the serving node.
+enum BoundListener {
+    Tcp(tokio::net::TcpListener),
+    Udp(UdpVtListener),
+}
+
+/// The inbound stream of one accepted peer: a TCP connection or an
+/// established UDP circuit (`Box<dyn Tunnel>` upstream — the tunnel
+/// trait's stream side).
+pub enum InboundPeerStream {
+    Tcp(tokio::net::TcpStream),
+    Udp(UdpVtStream),
+}
+
+impl AsyncRead for InboundPeerStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            InboundPeerStream::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
+            InboundPeerStream::Udp(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for InboundPeerStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            InboundPeerStream::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
+            InboundPeerStream::Udp(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            InboundPeerStream::Tcp(stream) => Pin::new(stream).poll_flush(cx),
+            InboundPeerStream::Udp(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            InboundPeerStream::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
+            InboundPeerStream::Udp(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
+impl BoundListener {
+    /// `TunnelListener::accept` — the next inbound tunnel.
+    async fn accept(&mut self) -> Result<InboundPeerStream> {
+        match self {
+            BoundListener::Tcp(listener) => {
+                let (stream, _addr) = listener
+                    .accept()
+                    .await
+                    .map_err(|e| Error::network(format!("easytier: tcp accept: {e}")))?;
+                Ok(InboundPeerStream::Tcp(stream))
+            }
+            BoundListener::Udp(listener) => {
+                let stream = listener.accept().await?;
+                Ok(InboundPeerStream::Udp(stream))
+            }
+        }
+    }
+}
+
+/// A serving EasyTier node: the process-global overlay node of `cfg`
+/// (shared with `connect_tcp`/`EasyTierUdp` through the registry) plus
+/// its listener tasks. Dropping the handle does NOT stop the node (the
+/// registry keeps it); [`EasyTierServer::shutdown`] does.
+pub struct EasyTierServer {
+    cmd: mpsc::Sender<Cmd>,
+    local_addrs: Vec<SocketAddr>,
+    acceptors: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for EasyTierServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EasyTierServer")
+            .field("local_addrs", &self.local_addrs)
+            .finish()
+    }
+}
+
+impl EasyTierServer {
+    /// The addresses the listeners actually bound (port 0 resolved).
+    pub fn local_addrs(&self) -> &[SocketAddr] {
+        &self.local_addrs
+    }
+
+    /// Block until the node has an overlay address and at least one
+    /// finished route exchange (an inbound peer must have joined and
+    /// synced).
+    pub async fn wait_ready(&self) -> Result<()> {
+        wait_ready(&self.cmd).await
+    }
+
+    /// The node table of the mesh as this node sees it (the
+    /// `ShowNodeInfo`/`ListRoute` view behind the overlay resolver).
+    pub async fn overlay_nodes(&self) -> Result<Vec<OverlayNode>> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd
+            .send(Cmd::ListNodes { reply: tx })
+            .await
+            .map_err(|_| Error::network("easytier: overlay node task is gone"))?;
+        rx.await
+            .map_err(|_| Error::network("easytier: overlay node task is gone"))
+    }
+
+    /// Stop the node deterministically: abort the acceptors, tear the
+    /// node task down, leave the registry entry dead (the next dial
+    /// with this config creates a fresh node).
+    pub async fn shutdown(self) {
+        for acceptor in &self.acceptors {
+            acceptor.abort();
+        }
+        let (tx, rx) = oneshot::channel();
+        if self.cmd.send(Cmd::Shutdown { reply: tx }).await.is_ok() {
+            let _ = tokio::time::timeout(Duration::from_secs(2), rx).await;
+        }
+    }
+}
+
+/// `create_listener_by_url` (listeners.rs:26-59) reduced to the two
+/// direct transports: parse the URI, bind it. Unhandled schemes name
+/// the unported transports.
+async fn bind_listener_uri(uri: &str) -> Result<BoundListener> {
+    let endpoint = parse_peer_endpoint(uri)?;
+    match endpoint.transport {
+        PeerTransport::Tcp => {
+            let listener = tokio::net::TcpListener::bind((endpoint.host.as_str(), endpoint.port))
+                .await
+                .map_err(|e| {
+                    Error::network(format!("easytier: listen on {uri}: {e}"))
+                })?;
+            Ok(BoundListener::Tcp(listener))
+        }
+        PeerTransport::Udp => {
+            let addr = resolve_peer_addr(&endpoint).await?;
+            Ok(BoundListener::Udp(UdpVtListener::bind(addr).await?))
+        }
+    }
+}
+
+/// The local address a bound listener reports.
+async fn listener_local_addr(listener: &mut BoundListener) -> Result<SocketAddr> {
+    match listener {
+        BoundListener::Tcp(l) => l
+            .local_addr()
+            .map_err(|e| Error::network(format!("easytier: tcp local addr: {e}"))),
+        BoundListener::Udp(l) => Ok(l.local_addr()),
+    }
+}
+
+/// Serve the mesh described by `cfg`: bind every configured listener
+/// (`listeners:`; the default `tcp://0.0.0.0:11010` when unset), dial
+/// the first supported peer when one is configured, and run the shared
+/// overlay node — every inbound peer joins it through the SAME
+/// handshake, crypto and keepalive the client side speaks
+/// (`serve_peer_as`), then gossips routes and relays overlay traffic
+/// like any attached session.
+///
+/// This is the productionized counterpart of upstream's
+/// `ListenerManager::run` + the peer manager's `add_tunnel_as_server`
+/// (instance/listeners.rs:258-277, peers/peer_manager.rs:703+); the
+/// returned handle controls the acceptors. DELTA vs upstream: no
+/// listen-retry loop (a bind failure fails `serve` — the caller
+/// retries), and the IPv6 dual-stack mirror listener
+/// (listeners.rs:145-161, gated by `enable-ipv6`) is opened best-effort
+/// only for `tcp://0.0.0.0:port` since the config surface carries no
+/// IPv6 flag.
+pub async fn serve(cfg: &EasyTierConfig) -> Result<EasyTierServer> {
+    let structured = cfg.structured_config();
+    structured.validate()?;
+    if structured.secure_mode_enabled() {
+        return Err(Error::config(SECURE_MODE_NOT_PORTED));
+    }
+    let listener_uris = structured.listeners();
+    if listener_uris.is_empty() {
+        return Err(Error::config(
+            "easytier: serve: no-listener is set and no listeners configured; nothing to accept on",
+        ));
+    }
+
+    // `ListenerManager::run`: every must-succeed listener binds before
+    // the node starts (listeners.rs:258-277).
+    let mut bound_listeners: Vec<BoundListener> = Vec::new();
+    for uri in &listener_uris {
+        bound_listeners.push(bind_listener_uri(uri).await?);
+    }
+    // The IPv6 dual-stack mirror (listeners.rs:145-161): an unspecified
+    // v4 host additionally gets a `[::]` listener on the same port,
+    // best-effort (`must_succ = false`; on Linux the v4 listener usually
+    // owns the port already unless v6-only).
+    for uri in &listener_uris {
+        if uri.starts_with("tcp://0.0.0.0:") {
+            let v6 = uri.replacen("tcp://0.0.0.0:", "tcp://[::]:", 1);
+            if let Ok(listener) = bind_listener_uri(&v6).await {
+                bound_listeners.push(listener);
+            }
+        }
+    }
+
+    // The shared node: reuse a live registry entry (a previous serve or
+    // dial of the identical config) or create it.
+    let key = node_cache_key(cfg);
+    let cache = NODES.get_or_init(Default::default);
+    let mut map = cache.lock().await;
+    let cmd = if let Some(tx) = map.get(&key).filter(|tx| !tx.is_closed()) {
+        tx.clone()
+    } else {
+        let my_peer_id = random_peer_id();
+        let hostname = cfg
+            .hostname
+            .clone()
+            .unwrap_or_else(|| format!("rustcrash-{}", my_peer_id & 0xffff));
+        let static_addr = static_overlay_address(cfg)?;
+        let (addr, prefix) = static_addr.unzip();
+        let want_dhcp =
+            addr.is_none() && (cfg.dhcp || cfg.ipv4.as_deref().unwrap_or("").trim().is_empty());
+        let mtu = if cfg.mtu > 0 {
+            cfg.mtu as usize
+        } else {
+            DEFAULT_MTU
+        };
+        let mut stack = EtStack::new(
+            my_peer_id,
+            &cfg.network_name,
+            &hostname,
+            mtu,
+            addr,
+            prefix.unwrap_or(32),
+            want_dhcp,
+            cfg.proxy_networks.clone(),
+        );
+        let (events_tx, events_rx) = mpsc::channel::<PeerEvent>(64);
+        // The outbound side: dial the first supported peer when one is
+        // configured (the direct connector's first task). A serving node
+        // with no reachable peer stays up — its job is to accept.
+        let peers = structured.parsed_peers()?;
+        let supported = peers
+            .iter()
+            .find(|p| {
+                let uri = p.uri.trim().to_ascii_lowercase();
+                uri.starts_with("tcp://") || uri.starts_with("udp://")
+            })
+            .map(|p| p.uri.clone());
+        if let Some(uri) = supported {
+            let dial = parse_peer_endpoint(&uri).and_then(|endpoint| {
+                let algorithm = cfg
+                    .encryption_algorithm
+                    .clone()
+                    .unwrap_or_else(|| EncryptionAlgorithm::default().as_str().to_owned());
+                let encryptor =
+                    create_encryptor(&algorithm, cfg.enable_encryption.unwrap_or(true), &cfg.network_secret)?;
+                Ok((endpoint, encryptor))
+            });
+            match dial {
+                Ok((endpoint, peer_encryptor)) => {
+                    match dial_session(
+                        &endpoint,
+                        my_peer_id,
+                        &cfg.network_name,
+                        &cfg.network_secret,
+                        peer_encryptor,
+                    )
+                    .await
+                    {
+                        Ok(halves) => {
+                            stack.attach_session(halves, true, &events_tx);
+                        }
+                        Err(e) => {
+                            // DELTA: no connector retry loop — the
+                            // listener is the point; log and serve.
+                            tracing::debug!(target: "engine", "easytier: outbound peer {uri} unreachable: {e}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(target: "engine", "easytier: outbound peer {uri}: {e}");
+                }
+            }
+        }
+        let (tx, rx) = mpsc::channel::<Cmd>(64);
+        tokio::spawn(run_overlay(stack, rx, events_tx, events_rx));
+        map.insert(key.clone(), tx.clone());
+        tx
+    };
+    drop(map);
+
+    // The accept loops (listeners.rs:209-256): every accepted tunnel is
+    // handshaked as the server and joins the running node.
+    let mut local_addrs = Vec::new();
+    let mut acceptors = Vec::new();
+    for mut listener in bound_listeners {
+        local_addrs.push(listener_local_addr(&mut listener).await?);
+        let cmd = cmd.clone();
+        let network_name = cfg.network_name.clone();
+        let network_secret = cfg.network_secret.clone();
+        let algorithm = cfg
+            .encryption_algorithm
+            .clone()
+            .unwrap_or_else(|| EncryptionAlgorithm::default().as_str().to_owned());
+        let enable_encryption = cfg.enable_encryption.unwrap_or(true);
+        let my_peer_id = cmd_my_peer_id(&cmd).await;
+        let acceptor = tokio::spawn(async move {
+            loop {
+                let stream = match listener.accept().await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        // Accept errors break to the outer retry loop
+                        // upstream (listeners.rs:210-220); here the
+                        // acceptor just ends — the node survives.
+                        tracing::debug!(target: "engine", "easytier: accept: {e}");
+                        break;
+                    }
+                };
+                // A fresh encryptor per connection (deterministic from
+                // the network secret).
+                let encryptor = match create_encryptor(&algorithm, enable_encryption, &network_secret)
+                {
+                    Ok(encryptor) => encryptor,
+                    Err(e) => {
+                        tracing::debug!(target: "engine", "easytier: encryptor: {e}");
+                        continue;
+                    }
+                };
+                match serve_peer_as(
+                    stream,
+                    my_peer_id,
+                    &network_name,
+                    &network_secret,
+                    encryptor,
+                )
+                .await
+                {
+                    Ok((halves, peer)) => {
+                        tracing::debug!(
+                            target: "engine",
+                            "easytier: accepted peer {} ({})",
+                            peer.peer_id,
+                            peer.network_name
+                        );
+                        if cmd
+                            .send(Cmd::AttachPeer {
+                                session: Box::new(halves),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        // `handle conn error` — one bad peer never stops
+                        // the listener (listeners.rs:244-252).
+                        tracing::debug!(target: "engine", "easytier: inbound handshake: {e}");
+                    }
+                }
+            }
+        });
+        acceptors.push(acceptor);
+    }
+
+    Ok(EasyTierServer {
+        cmd,
+        local_addrs,
+        acceptors,
+    })
+}
+
+/// Ask a running node for its peer id (used so every accepted peer sees
+/// the SAME node identity). A node that never answers gets a fresh id —
+/// the handshake only needs non-zero.
+async fn cmd_my_peer_id(cmd: &mpsc::Sender<Cmd>) -> PeerId {
+    let (tx, rx) = oneshot::channel();
+    if cmd.send(Cmd::MyPeerId { reply: tx }).await.is_ok() {
+        if let Ok(id) = rx.await {
+            return id;
+        }
+    }
+    random_peer_id()
 }
 
 /// A UDP socket inside the EasyTier overlay: send to any overlay target,
@@ -5182,13 +6880,22 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("peers is required when listeners are empty"), "{err}");
-        // A non-TCP peer names the not-yet-ported transports.
+        // A quic peer names the not-yet-ported transports; udp now dials.
         let cfg = EasyTierConfig {
-            peers: vec!["udp://192.0.2.10:11010".into()],
+            peers: vec!["quic://192.0.2.10:11010".into()],
             ..EasyTierConfig::new("et", "net")
         };
         let err = connect(&cfg).await.unwrap_err().to_string();
-        assert!(err.contains("no tcp:// peer"), "{err}");
+        assert!(err.contains("no tcp:// or udp:// peer"), "{err}");
+        // Secure mode is refused with the staged map.
+        let cfg = EasyTierConfig {
+            peers: vec!["tcp://192.0.2.10:11010".into()],
+            secure_mode: Some(true),
+            ..EasyTierConfig::new("et", "net")
+        };
+        let err = connect(&cfg).await.unwrap_err().to_string();
+        assert!(err.contains("secure mode"), "{err}");
+        assert!(err.contains("PeerConnNoiseMsg1/2/3"), "{err}");
         // An unknown encryption algorithm fails the dial (peer_manager.rs:
         // 902-908 validate_algorithm).
         let cfg = EasyTierConfig {
@@ -5450,31 +7157,51 @@ mod tests {
     // ------------------------------------------------------- peer URI
 
     #[test]
-    fn parse_tcp_peer_uri_forms() {
+    fn parse_peer_endpoint_forms() {
         assert_eq!(
-            parse_tcp_peer_uri("tcp://192.0.2.10:11010").unwrap(),
-            PeerEndpoint { host: "192.0.2.10".into(), port: 11010 }
+            parse_peer_endpoint("tcp://192.0.2.10:11010").unwrap(),
+            PeerEndpoint { transport: PeerTransport::Tcp, host: "192.0.2.10".into(), port: 11010 }
         );
         // protocol_default_port("tcp") = 11010
         // (connectivity/protocol/mod.rs:55-64).
         assert_eq!(
-            parse_tcp_peer_uri("tcp://node.example.com").unwrap(),
-            PeerEndpoint { host: "node.example.com".into(), port: DEFAULT_PEER_PORT }
+            parse_peer_endpoint("tcp://node.example.com").unwrap(),
+            PeerEndpoint {
+                transport: PeerTransport::Tcp,
+                host: "node.example.com".into(),
+                port: DEFAULT_PEER_PORT
+            }
         );
         assert_eq!(
-            parse_tcp_peer_uri("tcp://[2001:db8::1]:11011").unwrap(),
-            PeerEndpoint { host: "2001:db8::1".into(), port: 11011 }
+            parse_peer_endpoint("tcp://[2001:db8::1]:11011").unwrap(),
+            PeerEndpoint {
+                transport: PeerTransport::Tcp,
+                host: "2001:db8::1".into(),
+                port: 11011
+            }
+        );
+        assert_eq!(
+            parse_peer_endpoint("udp://192.0.2.10:11010").unwrap(),
+            PeerEndpoint {
+                transport: PeerTransport::Udp,
+                host: "192.0.2.10".into(),
+                port: 11010
+            }
         );
         // A path component is ignored (host[:port] is what remains).
         assert_eq!(
-            parse_tcp_peer_uri("tcp://example.com:11010/some/path").unwrap(),
-            PeerEndpoint { host: "example.com".into(), port: 11010 }
+            parse_peer_endpoint("tcp://example.com:11010/some/path").unwrap(),
+            PeerEndpoint {
+                transport: PeerTransport::Tcp,
+                host: "example.com".into(),
+                port: 11010
+            }
         );
-        assert!(parse_tcp_peer_uri("udp://192.0.2.10:11010").is_err());
-        assert!(parse_tcp_peer_uri("quic://192.0.2.10").is_err());
-        assert!(parse_tcp_peer_uri("tcp://:11010").is_err());
-        assert!(parse_tcp_peer_uri("tcp://host:notaport").is_err());
-        assert!(parse_tcp_peer_uri("tcp://[::1:11010").is_err());
+        let err = parse_peer_endpoint("quic://192.0.2.10").unwrap_err().to_string();
+        assert!(err.contains("quic"), "{err}");
+        assert!(parse_peer_endpoint("tcp://:11010").is_err());
+        assert!(parse_peer_endpoint("tcp://host:notaport").is_err());
+        assert!(parse_peer_endpoint("tcp://[::1:11010").is_err());
     }
 
     // ------------------------------------------------- the handshake pair
@@ -5720,7 +7447,7 @@ mod tests {
                 write_frame(&mut stream, &pong).await.unwrap();
             }
         });
-        let endpoint = parse_tcp_peer_uri(&format!("tcp://{addr}")).unwrap();
+        let endpoint = parse_peer_endpoint(&format!("tcp://{addr}")).unwrap();
         let encryptor = create_encryptor("aes-gcm", true, &secret).unwrap();
         let node = connect_peer(&endpoint, network, &secret, encryptor)
             .await
@@ -5802,13 +7529,14 @@ mod tests {
         let peer_info = handshake_as_client(&mut stream, my_peer_id, network, &digest)
             .await
             .unwrap();
-        let node = spawn_connection(
+        let node = spawn_connection_halves(
             stream,
             my_peer_id,
             &peer_info,
             create_encryptor("aes-gcm", true, &secret).unwrap(),
         )
-        .await;
+        .await
+        .into_node(peer_info.network_name.clone());
         // The keepalive pings at t=1s (backoff 0 grows each success), a
         // missed pong costs 2s; five losses close well under 15s.
         tokio::time::timeout(Duration::from_secs(15), node.wait_closed())
@@ -6173,26 +7901,27 @@ mod tests {
                     underlay_task.fetch_add(1, Ordering::Relaxed);
                     tokio::spawn(async move {
                         let encryptor = create_encryptor("aes-gcm", true, &secret).unwrap();
-                        let Ok((node, _peer_info)) =
-                            serve_peer(stream, &network, &secret, encryptor).await
+                        let Ok((halves, _peer_info)) =
+                            serve_peer_as(stream, random_peer_id(), &network, &secret, encryptor)
+                                .await
                         else {
                             return;
                         };
                         // The responder side of the gossip: static
                         // address, never the initiator.
-                        let gossip = RouteGossip::new(
+                        let mut stack = EtStack::new(
+                            halves.state.my_peer_id,
                             &network,
-                            node.my_peer_id(),
-                            node.peer_id(),
                             "mimic",
+                            DEFAULT_MTU,
                             Some(overlay_ip),
                             prefix,
                             false,
                             vec![],
-                            false,
                         );
-                        let stack = EtStack::new(node, gossip, DEFAULT_MTU, Some(overlay_ip));
-                        run_mimic(stack, learned, accepted, 9041, 9042).await;
+                        let (events_tx, events_rx) = mpsc::channel::<PeerEvent>(64);
+                        stack.attach_session(halves, false, &events_tx);
+                        run_mimic(stack, events_rx, learned, accepted, 9041, 9042).await;
                     });
                 }
             });
@@ -6223,6 +7952,7 @@ mod tests {
     /// on the mimic's overlay address.
     async fn run_mimic(
         mut stack: EtStack,
+        mut events: mpsc::Receiver<PeerEvent>,
         learned: LearnedRoutes,
         accepted: Arc<AtomicU32>,
         echo_tcp_port: u16,
@@ -6274,8 +8004,10 @@ mod tests {
             {
                 let mut out = learned.lock().unwrap();
                 out.clear();
-                for (peer_id, info) in &stack.gossip.lsdb {
-                    out.insert(*peer_id, info.ipv4());
+                if let Some(session) = stack.peers.first() {
+                    for (peer_id, info) in &session.gossip.lsdb {
+                        out.insert(*peer_id, info.ipv4());
+                    }
                 }
             }
             // Accept: an Established listener becomes one echo socket,
@@ -6333,32 +8065,32 @@ mod tests {
                 let _ = udp_sock.send_slice(&pump[..n], meta);
             }
             enum Event {
-                Ctrl(PeerPacket),
-                Data(Vec<u8>),
+                Peer(Option<PeerEvent>),
                 Tick,
             }
             let event = tokio::select! {
                 biased;
-                ctrl = stack.node.recv_ctrl_packet() => match ctrl {
-                    Some(p) => Event::Ctrl(p),
-                    None => break,
-                },
-                frame = stack.node.recv_ip_frame() => match frame {
-                    Some(f) => Event::Data(f),
-                    None => break,
-                },
+                ev = events.recv() => Event::Peer(ev),
                 _ = tick.tick() => Event::Tick,
             };
             match event {
-                Event::Ctrl(p) => stack.on_ctrl(p).await,
-                Event::Data(f) => {
+                Event::Peer(Some(PeerEvent::Ctrl(_idx, p))) => stack.on_ctrl(0, p).await,
+                Event::Peer(Some(PeerEvent::Data(_idx, f))) => {
                     stack.shim.stage(&f);
                     stack.wake.notify_one();
                 }
+                Event::Peer(Some(PeerEvent::Closed(_idx))) => break,
+                Event::Peer(None) => break,
                 Event::Tick => {}
             }
-            if stack.node.is_closed() {
+            if stack.peers.first().is_none_or(|s| s.is_closed()) {
                 break;
+            }
+        }
+        // Tear the session tasks down like the driver loop does.
+        if let Some(session) = stack.peers.first_mut() {
+            for task in &session.tasks {
+                task.abort();
             }
         }
     }
@@ -6617,30 +8349,27 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let encryptor = create_encryptor("aes-gcm", true, &server_secret).unwrap();
-            let (node, _peer_info) =
-                serve_peer(stream, network, &server_secret, encryptor).await.unwrap();
-            let gossip = RouteGossip::new(
+            let (halves, _peer_info) =
+                serve_peer_as(stream, random_peer_id(), network, &server_secret, encryptor)
+                    .await
+                    .unwrap();
+            let mut stack = EtStack::new(
+                halves.state.my_peer_id,
                 network,
-                node.my_peer_id(),
-                node.peer_id(),
                 "mimic",
+                DEFAULT_MTU,
                 Some("10.200.0.1".parse().unwrap()),
                 24,
                 false,
                 vec![],
-                false,
             );
-            let stack = EtStack::new(
-                node,
-                gossip,
-                DEFAULT_MTU,
-                Some("10.200.0.1".parse().unwrap()),
-            );
-            run_mimic(stack, server_learned, server_accepted, 9051, 9052).await;
+            let (events_tx, events_rx) = mpsc::channel::<PeerEvent>(64);
+            stack.attach_session(halves, false, &events_tx);
+            run_mimic(stack, events_rx, server_learned, server_accepted, 9051, 9052).await;
         });
 
         // The client: a raw M1 node, hand-built gossip bytes.
-        let endpoint = parse_tcp_peer_uri(&format!("tcp://{addr}")).unwrap();
+        let endpoint = parse_peer_endpoint(&format!("tcp://{addr}")).unwrap();
         let encryptor = create_encryptor("aes-gcm", true, &secret).unwrap();
         let node = connect_peer(&endpoint, network, &secret, encryptor)
             .await
@@ -6821,7 +8550,7 @@ mod tests {
         // Debug path (EASYTIER_VERBOSE): one raw route sync against the
         // real node, printing what comes back.
         if verbose {
-            let endpoint = parse_tcp_peer_uri(&format!("tcp://127.0.0.1:{port}")).unwrap();
+            let endpoint = parse_peer_endpoint(&format!("tcp://127.0.0.1:{port}")).unwrap();
             let encryptor = create_encryptor("aes-gcm", true, &cfg.network_secret).unwrap();
             let node = connect_peer(&endpoint, &cfg.network_name, &cfg.network_secret, encryptor)
                 .await
@@ -6895,5 +8624,644 @@ mod tests {
         let mut greeting = [0u8; 2];
         stream.read_exact(&mut greeting).await.unwrap();
         assert_eq!(&greeting, &[0x05, 0x00], "socks5 greeting");
+    }
+
+    // ========================================================================
+    // M3: the UDP transport + the listener
+    // ========================================================================
+
+    #[test]
+    fn udp_tunnel_wire_format() {
+        // `UDPTunnelHeader` (packet_def.rs:51-58): packed little-endian
+        // { conn_id: U32, msg_type: u8, padding: u8, len: U16 }.
+        let header = UdpTunnelHeader {
+            conn_id: 0x1122_3344,
+            msg_type: udp_packet_type::SYN,
+            len: 8,
+        };
+        assert_eq!(
+            header.to_bytes(),
+            [0x44, 0x33, 0x22, 0x11, 0x01, 0x00, 0x08, 0x00]
+        );
+        assert_eq!(UdpTunnelHeader::from_bytes(&header.to_bytes()), Some(header));
+        assert_eq!(UDP_TUNNEL_HEADER_SIZE, 8);
+        // The SYN/SACK datagram: 8 header bytes + the magic, LE
+        // (`new_syn_packet`, tunnel/udp.rs:63-72).
+        let magic: u64 = 0x0102_0304_0506_0708;
+        let syn = UdpTunnelHeader::datagram(udp_packet_type::SYN, 7, &magic.to_le_bytes());
+        assert_eq!(syn.len(), 16);
+        assert_eq!(&syn[..8], &[0x07, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0x00]);
+        assert_eq!(&syn[8..], &magic.to_le_bytes());
+        // `get_zcpacket_from_buf`: the len field must match the body
+        // (tunnel/udp.rs:258-264) — a mismatched datagram is not tunnel
+        // traffic.
+        let (parsed, body) = parse_udp_datagram(&syn).unwrap();
+        assert_eq!(parsed.msg_type, udp_packet_type::SYN);
+        assert_eq!(parsed.conn_id, 7);
+        assert_eq!(body, &magic.to_le_bytes()[..]);
+        let mut bogus = syn.clone();
+        bogus[7] = 0x09; // len 9 vs the 8-byte body
+        assert!(parse_udp_datagram(&bogus).is_none());
+        assert!(parse_udp_datagram(&syn[..7]).is_none());
+    }
+
+    #[tokio::test]
+    async fn udp_tunnel_connect_accept_and_framed_round_trip() {
+        // The virtual circuit end to end: listener + connector, the
+        // SYN/SACK exchange, then framed peer packets in both directions
+        // (the `udp_pingpong` of tunnel/udp.rs:958-963, over the M1
+        // framing instead of raw bytes).
+        let mut listener = UdpVtListener::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = listener.local_addr();
+        let mut client = connect_udp_tunnel(addr).await.unwrap();
+        let mut server = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .expect("accept the syn")
+            .unwrap();
+        // Client -> server through the datagram circuit.
+        let out = PeerPacket::new(1, 2, packet_type::DATA, b"over-udp");
+        write_frame(&mut client, &out).await.unwrap();
+        let back = tokio::time::timeout(Duration::from_secs(3), read_frame(&mut server))
+            .await
+            .expect("server read")
+            .unwrap()
+            .expect("frame");
+        assert_eq!(back.hdr, out.hdr);
+        assert_eq!(back.payload, b"over-udp");
+        // Server -> client (the circuit's conn id is the client's; both
+        // directions share it, tunnel/udp.rs:289).
+        let reply = PeerPacket::new(2, 1, packet_type::PONG, &[9, 0, 0, 0]);
+        write_frame(&mut server, &reply).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(3), read_frame(&mut client))
+            .await
+            .expect("client read")
+            .unwrap()
+            .expect("frame");
+        assert_eq!(got.payload, reply.payload);
+    }
+
+    #[tokio::test]
+    async fn udp_wire_payload_is_pmh_framed() {
+        // The datagram payload on the wire is `[PeerManagerHeader]
+        // [payload]` with NO length prefix (packet_def.rs:393-400),
+        // found live against the real binary. A fake server socket
+        // answers the SYN/SACK and observes the actual datagrams.
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let client =
+            tokio::spawn(async move { connect_udp_tunnel(addr).await.unwrap() });
+        let mut buf = vec![0u8; 1600];
+        let (n, from) = sock.recv_from(&mut buf).await.unwrap();
+        let (syn, body) = parse_udp_datagram(&buf[..n]).unwrap();
+        assert_eq!(syn.msg_type, udp_packet_type::SYN);
+        assert_eq!(body.len(), 8);
+        sock.send_to(
+            &UdpTunnelHeader::datagram(udp_packet_type::SACK, syn.conn_id, body),
+            from,
+        )
+        .await
+        .unwrap();
+        let mut client = client.await.unwrap();
+        // One peer frame write → one datagram whose body is PMH+payload.
+        let frame =
+            PeerPacket::new(9, 8, packet_type::HANDSHAKE, b"pmh-only").to_tcp_frame().unwrap();
+        client.write_all(&frame).await.unwrap();
+        client.flush().await.unwrap();
+        let (n, _) = sock.recv_from(&mut buf).await.unwrap();
+        let (data_hdr, data_body) = parse_udp_datagram(&buf[..n]).unwrap();
+        assert_eq!(data_hdr.msg_type, udp_packet_type::DATA);
+        assert_eq!(data_hdr.conn_id, syn.conn_id);
+        assert_eq!(data_hdr.len as usize, data_body.len());
+        assert_eq!(
+            data_body.len(),
+            PEER_MANAGER_HEADER_SIZE + b"pmh-only".len(),
+            "no u32 length prefix on the wire"
+        );
+        assert_eq!(data_body[8], packet_type::HANDSHAKE);
+        assert_eq!(&data_body[PEER_MANAGER_HEADER_SIZE..], b"pmh-only");
+        // And the inverse: a [PMH][payload] datagram reads back as one
+        // framed peer packet.
+        let inbound =
+            PeerPacket::new(8, 9, packet_type::PONG, &[1, 0, 0, 0]).to_tcp_frame().unwrap();
+        let wire = udp_wire_datagram(&inbound).unwrap();
+        sock.send_to(
+            &UdpTunnelHeader::datagram(udp_packet_type::DATA, syn.conn_id, wire),
+            from,
+        )
+        .await
+        .unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(3), read_frame(&mut client))
+            .await
+            .expect("frame back")
+            .unwrap()
+            .expect("frame");
+        assert_eq!(got.hdr.packet_type, packet_type::PONG);
+        assert_eq!(got.payload, &[1, 0, 0, 0]);
+    }
+
+    impl MimicMesh {
+        /// The UDP flavour: a mimic mesh whose underlay is the UDP
+        /// tunnel listener (`UdpTunnelListener` + `add_tunnel_as_server`).
+        async fn spawn_udp(network: &str, secret: &str, overlay_ip: &str, prefix: u32) -> Self {
+            let mut listener = UdpVtListener::bind("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+            let underlay = listener.local_addr();
+            let overlay_ip: Ipv4Addr = overlay_ip.parse().unwrap();
+            let learned: LearnedRoutes = Arc::new(StdMutex::new(HashMap::new()));
+            let accepted = Arc::new(AtomicU32::new(0));
+            let underlay_conns = Arc::new(AtomicU32::new(0));
+            let network = network.to_owned();
+            let secret = secret.to_owned();
+            let learned_task = learned.clone();
+            let accepted_task = accepted.clone();
+            let underlay_task = underlay_conns.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok(stream) = listener.accept().await else { break };
+                    let network = network.clone();
+                    let secret = secret.clone();
+                    let learned = learned_task.clone();
+                    let accepted = accepted_task.clone();
+                    underlay_task.fetch_add(1, Ordering::Relaxed);
+                    tokio::spawn(async move {
+                        let encryptor = create_encryptor("aes-gcm", true, &secret).unwrap();
+                        let Ok((halves, _peer_info)) =
+                            serve_peer_as(stream, random_peer_id(), &network, &secret, encryptor)
+                                .await
+                        else {
+                            return;
+                        };
+                        let mut stack = EtStack::new(
+                            halves.state.my_peer_id,
+                            &network,
+                            "mimic",
+                            DEFAULT_MTU,
+                            Some(overlay_ip),
+                            prefix,
+                            false,
+                            vec![],
+                        );
+                        let (events_tx, events_rx) = mpsc::channel::<PeerEvent>(64);
+                        stack.attach_session(halves, false, &events_tx);
+                        run_mimic(stack, events_rx, learned, accepted, 9041, 9042).await;
+                    });
+                }
+            });
+            MimicMesh {
+                underlay,
+                overlay_ip,
+                learned,
+                accepted,
+                underlay_conns,
+                echo_tcp_port: 9041,
+                echo_udp_port: 9042,
+            }
+        }
+
+        fn config_udp(&self, network: &str, secret: &str, ipv4: Option<&str>) -> EasyTierConfig {
+            EasyTierConfig {
+                peers: vec![format!("udp://{}", self.underlay)],
+                network_secret: secret.to_owned(),
+                ipv4: ipv4.map(|s| s.to_owned()),
+                dhcp: ipv4.is_none(),
+                ..EasyTierConfig::new("et-m3-udp", network)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_peer_uri_drives_the_full_stack() {
+        // THE UDP proof: a `udp://` peer URI dials the datagram circuit,
+        // the plain handshake + gossip ride it, and overlay TCP relays
+        // through both smoltcp stacks — everything the TCP path does,
+        // over UDP.
+        let secret = format!("et-{}", rand::random::<u64>());
+        let mimic = MimicMesh::spawn_udp("udp-net", &secret, "10.144.30.1", 24).await;
+        let cfg = mimic.config_udp("udp-net", &secret, Some("10.144.30.2"));
+        let target = SocketAddr::V4(SocketAddrV4::new(mimic.overlay_ip, mimic.echo_tcp_port));
+        let mut stream = tokio::time::timeout(Duration::from_secs(15), connect_tcp(&cfg, &target))
+            .await
+            .expect("udp dial through the overlay")
+            .expect("connect_tcp over the udp transport");
+        stream.write_all(b"udp-carried").await.unwrap();
+        let mut buf = [0u8; 16];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"udp-carried");
+    }
+
+    /// One mesh node driven by THIS test suite as a client: dial the
+    /// given underlay, run the echo service of `run_mimic` behind the
+    /// client-side stack (the role the real easytier binary plays in the
+    /// listener interop test).
+    async fn spawn_mimic_client(
+        addr: SocketAddr,
+        network: &str,
+        secret: &str,
+        overlay_ip: &str,
+        prefix: u32,
+    ) -> (Ipv4Addr, u16) {
+        let overlay: Ipv4Addr = overlay_ip.parse().unwrap();
+        let network = network.to_owned();
+        let secret = secret.to_owned();
+        let learned: LearnedRoutes = Arc::new(StdMutex::new(HashMap::new()));
+        let accepted = Arc::new(AtomicU32::new(0));
+        tokio::spawn(async move {
+            let endpoint = PeerEndpoint {
+                transport: PeerTransport::Tcp,
+                host: "127.0.0.1".to_owned(),
+                port: addr.port(),
+            };
+            let encryptor = create_encryptor("aes-gcm", true, &secret).unwrap();
+            let Ok(halves) =
+                dial_session(&endpoint, random_peer_id(), &network, &secret, encryptor).await
+            else {
+                return;
+            };
+            let mut stack = EtStack::new(
+                halves.state.my_peer_id,
+                &network,
+                "mimic-client",
+                DEFAULT_MTU,
+                Some(overlay),
+                prefix,
+                false,
+                vec![],
+            );
+            let (events_tx, events_rx) = mpsc::channel::<PeerEvent>(64);
+            stack.attach_session(halves, true, &events_tx);
+            run_mimic(stack, events_rx, learned, accepted, 9061, 9062).await;
+        });
+        (overlay, 9061)
+    }
+
+    #[tokio::test]
+    async fn serve_accepts_inbound_peer_and_relays_overlay_tcp() {
+        // THE listener proof: `serve` binds, our own client (the binary's
+        // stand-in) dials in, joins the node through the same handshake,
+        // gossip converges both ways, and overlay traffic relays through
+        // the INBOUND session.
+        let secret = format!("et-{}", rand::random::<u64>());
+        let network = "srv-net";
+        let port = 31000 + rand::random::<u16>() % 20000;
+        let cfg = EasyTierConfig {
+            listeners: vec![format!("tcp://127.0.0.1:{port}")],
+            network_secret: secret.clone(),
+            ipv4: Some("10.144.20.1/24".to_owned()),
+            dhcp: false,
+            hostname: Some("serve-node".to_owned()),
+            ..EasyTierConfig::new("et-m3-serve", network)
+        };
+        let server = serve(&cfg).await.unwrap();
+        assert_eq!(server.local_addrs()[0].port(), port);
+
+        let (mimic_ip, echo_port) = spawn_mimic_client(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
+            network,
+            &secret,
+            "10.144.20.2",
+            24,
+        )
+        .await;
+        // The inbound peer must join and sync before the node is ready.
+        tokio::time::timeout(Duration::from_secs(15), server.wait_ready())
+            .await
+            .expect("inbound peer did not sync in time")
+            .unwrap();
+        let nodes = server.overlay_nodes().await.unwrap();
+        assert!(
+            nodes.iter().any(|n| n.ipv4 == mimic_ip),
+            "node table {nodes:?} lacks the inbound peer {mimic_ip}"
+        );
+        // Route through the inbound session: the registry reuses the
+        // served node for the dial.
+        let target = SocketAddr::V4(SocketAddrV4::new(mimic_ip, echo_port));
+        let mut stream = tokio::time::timeout(Duration::from_secs(15), connect_tcp(&cfg, &target))
+            .await
+            .expect("dial through the inbound peer")
+            .expect("connect_tcp via the listener");
+        stream.write_all(b"through-the-listener").await.unwrap();
+        let mut buf = [0u8; 32];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"through-the-listener");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn serve_udp_listener_accepts_inbound_udp_peer() {
+        // The udp:// listener flavour end to end: the inbound peer rides
+        // the datagram circuit into the same node.
+        let secret = format!("et-{}", rand::random::<u64>());
+        let network = "srv-udp-net";
+        let port = 31000 + rand::random::<u16>() % 20000;
+        let cfg = EasyTierConfig {
+            listeners: vec![format!("udp://127.0.0.1:{port}")],
+            network_secret: secret.clone(),
+            ipv4: Some("10.144.40.1/24".to_owned()),
+            dhcp: false,
+            hostname: Some("serve-udp-node".to_owned()),
+            ..EasyTierConfig::new("et-m3-serve-udp", network)
+        };
+        let server = serve(&cfg).await.unwrap();
+        assert_eq!(server.local_addrs()[0].port(), port);
+        // The stand-in client over the UDP transport.
+        let (mimic_ip, echo_port) = {
+            let overlay: Ipv4Addr = "10.144.40.2".parse().unwrap();
+            let network = network.to_owned();
+            let secret = secret.clone();
+            let learned: LearnedRoutes = Arc::new(StdMutex::new(HashMap::new()));
+            let accepted = Arc::new(AtomicU32::new(0));
+            tokio::spawn(async move {
+                let endpoint = PeerEndpoint {
+                    transport: PeerTransport::Udp,
+                    host: "127.0.0.1".to_owned(),
+                    port,
+                };
+                let encryptor = create_encryptor("aes-gcm", true, &secret).unwrap();
+                let Ok(halves) =
+                    dial_session(&endpoint, random_peer_id(), &network, &secret, encryptor).await
+                else {
+                    return;
+                };
+                let mut stack = EtStack::new(
+                    halves.state.my_peer_id,
+                    &network,
+                    "mimic-udp-client",
+                    DEFAULT_MTU,
+                    Some(overlay),
+                    24,
+                    false,
+                    vec![],
+                );
+                let (events_tx, events_rx) = mpsc::channel::<PeerEvent>(64);
+                stack.attach_session(halves, true, &events_tx);
+                run_mimic(stack, events_rx, learned, accepted, 9071, 9072).await;
+            });
+            (overlay, 9071)
+        };
+        tokio::time::timeout(Duration::from_secs(15), server.wait_ready())
+            .await
+            .expect("inbound udp peer did not sync in time")
+            .unwrap();
+        let target = SocketAddr::V4(SocketAddrV4::new(mimic_ip, echo_port));
+        let mut stream = tokio::time::timeout(Duration::from_secs(15), connect_tcp(&cfg, &target))
+            .await
+            .expect("dial through the inbound udp peer")
+            .expect("connect_tcp via the udp listener");
+        stream.write_all(b"udp-inbound").await.unwrap();
+        let mut buf = [0u8; 16];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"udp-inbound");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn serve_config_errors() {
+        // no-listener refuses to serve (a peer must be present or the
+        // TOML validation fires first).
+        let cfg = EasyTierConfig {
+            peers: vec!["tcp://127.0.0.1:1".into()],
+            no_listener: Some(true),
+            ..EasyTierConfig::new("et-m3-none", "net")
+        };
+        let err = serve(&cfg).await.unwrap_err().to_string();
+        assert!(err.contains("nothing to accept on"), "{err}");
+        // Secure mode is the staged map.
+        let cfg = EasyTierConfig {
+            listeners: vec!["tcp://127.0.0.1:0".into()],
+            secure_mode: Some(true),
+            ..EasyTierConfig::new("et-m3-secure", "net")
+        };
+        let err = serve(&cfg).await.unwrap_err().to_string();
+        assert!(err.contains("PeerConnNoiseMsg1/2/3"), "{err}");
+        // An unhandled listener scheme names the missing transports.
+        let cfg = EasyTierConfig {
+            listeners: vec!["quic://127.0.0.1:0".into()],
+            ..EasyTierConfig::new("et-m3-quic", "net")
+        };
+        let err = serve(&cfg).await.unwrap_err().to_string();
+        assert!(err.contains("quic"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn secure_mode_noise_first_packet_is_named() {
+        // A secure-mode client opens with NoiseHandshakeMsg1; the server
+        // handshake cites the staged map instead of a generic type error
+        // (`do_noise_handshake_as_server`, peer_conn.rs:1252-1255).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let noise = PeerPacket::new(1, 0, packet_type::NOISE_HANDSHAKE_MSG1, &[0u8; 48]);
+            write_frame(&mut stream, &noise).await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut stream)).await;
+        });
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let digest = network_secret_digest("net", "secret");
+        let err = handshake_as_server(&mut stream, 7, "net", &digest)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("secure mode"), "{err}");
+        assert!(err.contains("Noise_XX"), "{err}");
+    }
+
+    /// Run the real binary with the common interop flags; returns the
+    /// child (killed on drop).
+    fn spawn_real_binary(
+        bin: &str,
+        network: &str,
+        secret: &str,
+        extra: &[&str],
+    ) -> KillChild {
+        let mut command = std::process::Command::new(bin);
+        command.args(["--network-name", network, "--network-secret", secret]);
+        for arg in extra {
+            command.arg(arg);
+        }
+        if std::env::var("EASYTIER_VERBOSE").is_ok() {
+            command
+                .arg("--console-log-level")
+                .arg("trace")
+                .stderr(std::process::Stdio::inherit());
+        } else {
+            command.stderr(std::process::Stdio::null());
+        }
+        KillChild(command.spawn().expect("spawn easytier-core"))
+    }
+
+    /// The SOCKS5-greeting proof used by every real-binary test: dial
+    /// the binary's socks5 port through the overlay and read the
+    /// no-auth method selection.
+    async fn assert_socks5_through_overlay(cfg: &EasyTierConfig) {
+        let socks5: SocketAddr = "10.126.126.1:1080".parse().unwrap();
+        let mut stream =
+            tokio::time::timeout(Duration::from_secs(25), connect_tcp(cfg, &socks5))
+                .await
+                .expect("dial through the real node timed out")
+                .expect("dial through the real node");
+        stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut greeting = [0u8; 2];
+        stream.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(&greeting, &[0x05, 0x00], "socks5 greeting");
+    }
+
+    /// A local non-loopback IPv4 the real binary can dial. Its v2.6.4
+    /// connector binds one socket per local interface IP
+    /// (`set_bind_addrs`, connector/mod.rs:70-77) and races them —
+    /// loopback targets never answer from those LAN sources, so the
+    /// inbound interop listens on 0.0.0.0 and is dialed on the LAN
+    /// address (the UDP-connect routing trick; no packet leaves).
+    fn dialable_lan_ip() -> Option<Ipv4Addr> {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        socket.connect("8.8.8.8:80").ok()?;
+        match socket.local_addr().ok()? {
+            SocketAddr::V4(v4) if !v4.ip().is_loopback() => Some(*v4.ip()),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a real easytier-core binary; set EASYTIER_BIN to enable"]
+    async fn real_easytier_binary_dials_our_listener() {
+        // THE M3 interop: the real binary connects to OUR listener as an
+        // inbound peer, joins our node, gossips routes, and we relay
+        // overlay TCP through it.
+        let Ok(bin) = std::env::var("EASYTIER_BIN") else {
+            eprintln!("skipping: EASYTIER_BIN is not set");
+            return;
+        };
+        let Some(lan_ip) = dialable_lan_ip() else {
+            eprintln!("skipping: no dialable non-loopback local IP");
+            return;
+        };
+        let network = format!("itnet-{}", rand::random::<u32>());
+        let secret = format!("itsec-{}", rand::random::<u64>());
+        let port = 31000 + rand::random::<u16>() % 20000;
+        let _child = spawn_real_binary(
+            &bin,
+            &network,
+            &secret,
+            &[
+                "-p",
+                &format!("tcp://{lan_ip}:{port}"),
+                "--no-listener",
+                "--no-tun",
+                "-i",
+                "10.126.126.1",
+                "--hostname",
+                "real-node",
+                "--socks5",
+                "1080",
+            ],
+        );
+        let cfg = EasyTierConfig {
+            listeners: vec![format!("tcp://0.0.0.0:{port}")],
+            network_secret: secret,
+            ipv4: Some("10.126.126.2/24".to_owned()),
+            dhcp: false,
+            hostname: Some("rustcrash-m3".to_owned()),
+            ..EasyTierConfig::new("et-real-listener", &network)
+        };
+        let server = serve(&cfg).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(25), server.wait_ready())
+            .await
+            .expect("the real node did not sync in time")
+            .unwrap();
+        assert_socks5_through_overlay(&cfg).await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a real easytier-core binary; set EASYTIER_BIN to enable"]
+    async fn real_easytier_binary_serving_udp() {
+        // The real binary's UDP listener: our `udp://` peer dial rides
+        // the datagram circuit into the real core.
+        let Ok(bin) = std::env::var("EASYTIER_BIN") else {
+            eprintln!("skipping: EASYTIER_BIN is not set");
+            return;
+        };
+        let network = format!("itnet-{}", rand::random::<u32>());
+        let secret = format!("itsec-{}", rand::random::<u64>());
+        let port = 31000 + rand::random::<u16>() % 20000;
+        let _child = spawn_real_binary(
+            &bin,
+            &network,
+            &secret,
+            &[
+                "-l",
+                &format!("udp://127.0.0.1:{port}"),
+                "--no-tun",
+                "-i",
+                "10.126.126.1",
+                "--hostname",
+                "real-udp-node",
+                "--socks5",
+                "1080",
+            ],
+        );
+        // Give the node time to bind its listener.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let cfg = EasyTierConfig {
+            peers: vec![format!("udp://127.0.0.1:{port}")],
+            network_secret: secret,
+            ipv4: Some("10.126.126.2/24".to_owned()),
+            dhcp: false,
+            hostname: Some("rustcrash-m3-udp".to_owned()),
+            ..EasyTierConfig::new("et-real-udp", &network)
+        };
+        assert_socks5_through_overlay(&cfg).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a real easytier-core binary; set EASYTIER_BIN to enable"]
+    async fn real_easytier_binary_dials_our_udp_listener() {
+        // The reverse: the real binary connects INTO our udp:// listener
+        // (dialed on the LAN address — see `dialable_lan_ip`).
+        let Ok(bin) = std::env::var("EASYTIER_BIN") else {
+            eprintln!("skipping: EASYTIER_BIN is not set");
+            return;
+        };
+        let Some(lan_ip) = dialable_lan_ip() else {
+            eprintln!("skipping: no dialable non-loopback local IP");
+            return;
+        };
+        let network = format!("itnet-{}", rand::random::<u32>());
+        let secret = format!("itsec-{}", rand::random::<u64>());
+        let port = 31000 + rand::random::<u16>() % 20000;
+        let _child = spawn_real_binary(
+            &bin,
+            &network,
+            &secret,
+            &[
+                "-p",
+                &format!("udp://{lan_ip}:{port}"),
+                "--no-listener",
+                "--no-tun",
+                "-i",
+                "10.126.126.1",
+                "--hostname",
+                "real-node",
+                "--socks5",
+                "1080",
+            ],
+        );
+        let cfg = EasyTierConfig {
+            listeners: vec![format!("udp://0.0.0.0:{port}")],
+            network_secret: secret,
+            ipv4: Some("10.126.126.2/24".to_owned()),
+            dhcp: false,
+            hostname: Some("rustcrash-m3".to_owned()),
+            ..EasyTierConfig::new("et-real-udp-listener", &network)
+        };
+        let server = serve(&cfg).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(25), server.wait_ready())
+            .await
+            .expect("the real node did not sync in time")
+            .unwrap();
+        assert_socks5_through_overlay(&cfg).await;
+        server.shutdown().await;
     }
 }

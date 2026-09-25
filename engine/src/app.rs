@@ -37,6 +37,10 @@ pub struct Engine {
     geo: GeoLookups,
     dns: Option<Arc<DnsEngine>>,
     stats: Arc<Stats>,
+    /// Runtime rule mode — the one genuinely hot-reloadable config knob,
+    /// read per-connection in route_with. This is the seam PATCH/PUT
+    /// /configs {"mode": ...} writes (mihomo patchConfigs' mode swap);
+    /// everything listener-bound (ports, allow-lan) is NOT hot: see run().
     mode: tokio::sync::RwLock<RuleMode>,
     /// Whether any rule needs PROCESS lookups (avoids /proc scans otherwise).
     needs_process: bool,
@@ -167,7 +171,11 @@ impl Engine {
 
     /// Start everything and serve until shutdown.
     pub async fn run(self: &Arc<Self>) -> Result<()> {
-        // Listeners.
+        // Listeners. HOT-RELOAD BOUNDARY: sockets bind exactly once here
+        // and the engine holds `cfg` immutably, so any config change that
+        // moves a port, bind address, or allow-lan (i.e. re-spawns an
+        // inbound) has no runtime path — PUT /configs rejects those fields
+        // with a restart reason instead of pretending to apply them.
         let bound =
             crate::inbound::spawn_all(&self.cfg.listeners, self.clone() as Arc<dyn RelayHandler>)
                 .await?;
@@ -391,7 +399,7 @@ impl Engine {
         if outbound.is_reject() {
             return;
         }
-        let (id, counters) = self.stats.open(&meta.inbound, "tcp", &target, meta.source);
+        let (id, counters, cancel) = self.stats.open(&meta.inbound, "tcp", &target, meta.source);
         self.stats.annotate(id, &rule, &outbound_name);
         tracing::debug!(target: "engine",
             "tcp {} -> {} via {} ({})", meta.source, target, outbound_name, rule);
@@ -405,8 +413,21 @@ impl Engine {
                 let client_side = CountingStream::new(client, counters.clone());
                 let remote_side = CountingStream::new(remote, counters.clone());
                 let (mut a, mut b) = (client_side, remote_side);
-                let result = tokio::io::copy_bidirectional(&mut a, &mut b).await;
-                if let Err(e) = &result {
+                // The API's DELETE /connections handlers cancel this
+                // connection's stats token mid-copy (mihomo connections.go
+                // closeConnection/closeAllConnections): winning the select
+                // drops the copy future, and the counting streams (and the
+                // sockets they wrap) drop at scope end — the client sees
+                // EOF while stats.close below folds the counters.
+                let result = tokio::select! {
+                    r = tokio::io::copy_bidirectional(&mut a, &mut b) => Some(r),
+                    _ = cancel.cancelled() => {
+                        tracing::debug!(target: "engine",
+                            "relay {} via {}: closed by api", target, outbound_name);
+                        None
+                    }
+                };
+                if let Some(Err(e)) = &result {
                     tracing::warn!(target: "engine",
                         "relay {} via {}: {e}", target, outbound_name);
                 }
@@ -523,7 +544,7 @@ impl Engine {
         };
         tracing::debug!(target: "engine",
             "udp {} -> {} via {} ({})", source, effective, outbound_name, rule);
-        let (id, counters) = self.stats.open(&inbound, "udp", &effective, source);
+        let (id, counters, cancel) = self.stats.open(&inbound, "udp", &effective, source);
         self.stats.annotate(id, &rule, &outbound_name);
 
         let mut last_active = tokio::time::Instant::now();
@@ -538,6 +559,13 @@ impl Engine {
             let timeout = tokio::time::sleep_until(last_active + Duration::from_secs(60));
             tokio::select! {
                 _ = timeout => break,
+                // API force-close (DELETE /connections[/id]): unwind the
+                // session; stats.close below folds the counters.
+                _ = cancel.cancelled() => {
+                    tracing::debug!(target: "engine",
+                        "udp {effective} via {outbound_name}: closed by api");
+                    break;
+                }
                 up = uplink.recv() => {
                     match up {
                         Some((target, data)) => {

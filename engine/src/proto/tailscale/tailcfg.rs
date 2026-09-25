@@ -138,9 +138,10 @@ pub fn node_private_from_text(s: &str) -> Option<NodePrivateKey> {
     Some(NodePrivateKey::from_bytes(raw))
 }
 
-/// `discokey:` — `key.DiscoPublic`'s text form (disco.go:23); parsed for
-/// display parity, unused by this port's data plane (no disco; see the
-/// gap list in `super`'s module docs).
+/// `discokey:` — `key.DiscoPublic`'s text form (disco.go:23): the wire
+/// form of [`Node.DiscoKey`](Node::disco_key) in the map and of
+/// [`MapRequest::disco_key`] (see [`super::disco`] for the data plane
+/// that consumes it).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DiscoKeyText(pub [u8; 32]);
 
@@ -556,7 +557,8 @@ pub struct MapRequest {
     pub keep_alive: bool,
     #[serde(rename = "NodeKey", default)]
     pub node_key: NodeKey,
-    /// The disco public key; this port has no disco, so the zero key.
+    /// Our disco public key — how peers learn which disco key speaks
+    /// for this node (wave 13; the zero key when disco is not in play).
     #[serde(rename = "DiscoKey", default)]
     pub disco_key: DiscoKeyText,
     /// "whether the client wants to receive multiple MapResponses over

@@ -3456,6 +3456,14 @@ impl Client {
             let gone = sock.state() == tcp::State::Closed;
             if gone {
                 g.read_eof = true;
+                // Closed without our own graceful FIN = the peer reset (or
+                // we aborted): writers must fail now instead of queuing
+                // into a dead socket forever (wave-13: the wave-12A
+                // wireguard.rs fix, 1762-1771, mirrored here — a
+                // mid-burst RST hung write_all on a full to_stack queue).
+                if !c.fin_sent && !g.write_closed {
+                    g.aborted = true;
+                }
             }
             if (!g.to_proxy.is_empty() || g.read_eof) && g.read_waker.is_some() {
                 if let Some(w) = g.read_waker.take() {
@@ -4527,6 +4535,14 @@ impl AsyncRead for OvpnStream {
                 buf.put_slice(&back[..n - take_front]);
             }
             g.to_proxy.drain(..n);
+            drop(g);
+            // Freed queue space is stack input: the socket behind it may
+            // hold data the service loop could not move (and a peer
+            // waiting on the window this drain just re-opened). Wake the
+            // tunnel task instead of letting the connection idle until
+            // the driver's 1s tick (wave-13: the wave-12A wireguard.rs
+            // fix, 1075-1079, mirrored here).
+            self.shared.wake.notify_one();
             return Poll::Ready(Ok(()));
         }
         if g.read_eof {
@@ -4893,6 +4909,10 @@ mod tests {
         key_direction: String,
         tls_crypt: Option<[u8; 256]>,
         tls_crypt_v2: Option<([u8; 256], Vec<u8>)>,
+        /// Testing knob: abort (RST) the first echo connection once this
+        /// many payload bytes have been received in total — the wave-13
+        /// mid-burst reset repro.
+        reset_after_bytes: Option<usize>,
     }
 
     impl MimicOpts {
@@ -4908,6 +4928,7 @@ mod tests {
                 key_direction: String::new(),
                 tls_crypt: None,
                 tls_crypt_v2: None,
+                reset_after_bytes: None,
             }
         }
 
@@ -5013,17 +5034,40 @@ mod tests {
         }
     }
 
-    /// The mimic's own smoltcp stack (wireguard.rs test parity): an echo
-    /// TCP listener plus a UDP echo socket.
+    /// Minimal IPv4 TCP SYN classifier for the mimic's spare-listener
+    /// arming (no IP options on the paths the client's stack emits):
+    /// protocol TCP (offset 9), destination port (offset 22), SYN set
+    /// and ACK clear (flag byte at offset 33).
+    fn is_syn_to_port(pkt: &[u8], port: u16) -> bool {
+        if pkt.len() < 40 || pkt[0] >> 4 != 4 || pkt[9] != 6 {
+            return false;
+        }
+        let dst = u16::from_be_bytes([pkt[22], pkt[23]]);
+        let flags = pkt[33];
+        dst == port && (flags & 0x02) != 0 && (flags & 0x10) == 0
+    }
+
+    /// The mimic's own smoltcp stack (wireguard.rs test parity): echo
+    /// TCP listeners plus a UDP echo socket. The listener shape mirrors
+    /// the production endpoint's wave-12A fix: a smoltcp listener is
+    /// consumed by the first handshake, so a SPARE Listen-state socket
+    /// is kept armed for concurrent SYNs (arm-before-stage, exactly the
+    /// endpoint's stage_packet/needs_listener pair).
     struct ServerStack {
         iface: Interface,
         sockets: SocketSet<'static>,
         shim: Shim,
-        listener: SocketHandle,
+        /// Every armed listener on ECHO_TCP_PORT.
+        listeners: Vec<SocketHandle>,
         conns: Vec<SocketHandle>,
         udp_sock: SocketHandle,
         start: Instant,
         pump: Vec<u8>,
+        /// Testing knob: abort (RST) a connection once this many payload
+        /// bytes have been received in total (the wave-13 mid-burst
+        /// reset repro).
+        reset_after_bytes: Option<usize>,
+        seen_bytes: usize,
     }
 
     impl ServerStack {
@@ -5041,7 +5085,7 @@ mod tests {
                 .unwrap();
 
             let mut sockets = SocketSet::new(Vec::new());
-            let listener = Self::add_listener(&mut sockets);
+            let listeners = vec![Self::add_listener(&mut sockets)];
 
             let mut udp_sock = udp::Socket::new(
                 udp::PacketBuffer::new(
@@ -5062,14 +5106,18 @@ mod tests {
                 iface,
                 sockets,
                 shim,
-                listener,
+                listeners,
                 conns: Vec::new(),
                 udp_sock,
                 start: Instant::now(),
                 pump: vec![0u8; 32 * 1024],
+                reset_after_bytes: None,
+                seen_bytes: 0,
             }
         }
 
+        /// One more listening socket on the echo port (both families: the
+        /// listen endpoint is address-agnostic).
         fn add_listener(sockets: &mut SocketSet<'static>) -> SocketHandle {
             let mut tcp_sock = tcp::Socket::new(
                 tcp::SocketBuffer::new(vec![0; 64 * 1024]),
@@ -5081,6 +5129,30 @@ mod tests {
             sockets.add(tcp_sock)
         }
 
+        /// A port needs a fresh listener exactly when no LISTEN-state
+        /// socket covers it anymore: the moment a SYN takes the existing
+        /// listener into SynReceived, that socket only matches its own
+        /// 4-tuple, so any further concurrent SYN to the same port would
+        /// otherwise fall through to smoltcp's RST reply (the wave-12A
+        /// endpoint fix — wireguard.rs:3164-3174 needs_listener — applied
+        /// to this mimic's accept path).
+        fn needs_listener(&self) -> bool {
+            !self.listeners.iter().any(|h| {
+                self.sockets.get::<tcp::Socket>(*h).state() == tcp::State::Listen
+            })
+        }
+
+        /// Stage one decrypted inner IP packet, arming a spare
+        /// Listen-state listener FIRST when the packet is a fresh SYN to
+        /// the echo port (the endpoint's stage_packet order: arm, then
+        /// stage — wireguard.rs:3131-3137).
+        fn stage_inner(&mut self, pkt: &[u8]) {
+            if is_syn_to_port(pkt, ECHO_TCP_PORT) && self.needs_listener() {
+                self.listeners.push(Self::add_listener(&mut self.sockets));
+            }
+            self.shim.stage(pkt);
+        }
+
         fn now(&self) -> SmolInstant {
             SmolInstant::from_micros(self.start.elapsed().as_micros() as i64)
         }
@@ -5090,11 +5162,30 @@ mod tests {
             let now = self.now();
             self.iface.poll(now, &mut self.shim, &mut self.sockets);
 
-            if self.sockets.get::<tcp::Socket>(self.listener).state() == tcp::State::Established {
-                self.conns.push(self.listener);
-                self.listener = Self::add_listener(&mut self.sockets);
-            }
+            // Promote listeners that left Listen (the socket became an
+            // accepted connection — or died); each was already replaced
+            // at stage time, so concurrent SYNs never found a missing
+            // listener. Re-arm on leaving Listen, not only once
+            // Established: a SYN racing the first handshake must find a
+            // listening socket, or smoltcp answers it with an RST — the
+            // same race fixed in the endpoint's needs_listener (and in
+            // wireguard.rs's own test harness, 4293-4309).
+            self.listeners.retain(|h| {
+                match self.sockets.get::<tcp::Socket>(*h).state() {
+                    tcp::State::Listen => true,
+                    tcp::State::Closed => {
+                        self.sockets.remove(*h);
+                        false
+                    }
+                    _ => {
+                        self.conns.push(*h);
+                        false
+                    }
+                }
+            });
 
+            // TCP echo: whatever arrived on any connection goes straight
+            // back — unless the reset knob fires: abort (RST) mid-burst.
             let mut closed = Vec::new();
             for &handle in &self.conns {
                 let sock = self.sockets.get_mut::<tcp::Socket>(handle);
@@ -5103,6 +5194,14 @@ mod tests {
                         Ok(n) => n,
                         Err(_) => break,
                     };
+                    self.seen_bytes += n;
+                    if self.reset_after_bytes.is_some_and(|limit| self.seen_bytes >= limit) {
+                        // Mid-burst abort: the server resets the connection
+                        // while the client writer is still pushing (the
+                        // wave-12A reset_mid_burst shape).
+                        sock.abort();
+                        break;
+                    }
                     let mut off = 0;
                     while off < n {
                         match sock.send_slice(&self.pump[off..n]) {
@@ -5210,6 +5309,8 @@ mod tests {
             let crypt = opts.server_crypt();
             let mut local = [0u8; SESSION_ID_SIZE];
             rand::rngs::OsRng.fill_bytes(&mut local);
+            let mut stack = ServerStack::new();
+            stack.reset_after_bytes = opts.reset_after_bytes;
             Mimic {
                 server_config,
                 crypt,
@@ -5222,7 +5323,7 @@ mod tests {
                 recv_next: 0,
                 acks: Vec::new(),
                 data: None,
-                stack: ServerStack::new(),
+                stack,
                 opts,
             }
         }
@@ -5568,7 +5669,7 @@ mod tests {
                         if plain == OPENVPN_PING_PACKET {
                             continue;
                         }
-                        self.stack.shim.stage(&plain);
+                        self.stack.stage_inner(&plain);
                     }
                     Ok(Err(_)) => return Ok(()),
                     Err(_) => {}
@@ -5608,6 +5709,7 @@ mod tests {
             key_direction: opts.key_direction.clone(),
             tls_crypt: opts.tls_crypt,
             tls_crypt_v2: opts.tls_crypt_v2.clone(),
+            reset_after_bytes: opts.reset_after_bytes,
         }
     }
 
@@ -6229,6 +6331,207 @@ mod tests {
             cfg.data_ciphers = vec!["AES-128-GCM".into(), "AES-256-GCM".into()];
         })
         .await;
+    }
+
+    // ------------------------------------------------- wave-13 stall repros
+    //
+    // Mirrors of the wave-12A wireguard.rs repros against THIS module's
+    // `service_conns` + `OvpnStream`: the mid-burst reset, the
+    // concurrent-dials listener race (in the mimic's accept path — the
+    // production stack here is client-only, so the re-arm lives in the
+    // test server exactly as wireguard.rs's harness re-arms its echo
+    // listener), and the slow-reader window close/reopen pair.
+
+    /// REPRO (wave-13, mirrors wireguard.rs's wave-12A
+    /// `reset_mid_burst_fails_the_writer_not_hangs`): the mimic resets
+    /// the connection (RST) after the first data segment while the
+    /// client writer is still pushing a burst far bigger than every
+    /// buffer. The writer must fail with BrokenPipe promptly, not hang
+    /// on a `to_stack` queue nobody drains.
+    #[tokio::test]
+    async fn reset_mid_burst_fails_the_writer_not_hangs() {
+        let ca = test_ca();
+        let mut opts = MimicOpts::plain("udp");
+        opts.reset_after_bytes = Some(16);
+        let addr = spawn_mimic_udp(opts, &ca).await;
+        let mut cfg = test_cfg(addr, "udp");
+        cfg.ca = ca.cert_pem.clone();
+
+        let target = NetAddr::ip(IpAddr::V4(SERVER_TUNNEL_IP), ECHO_TCP_PORT);
+        let mut stream = tokio::time::timeout(Duration::from_secs(20), connect(&cfg, &target))
+            .await
+            .expect("dial timeout")
+            .expect("dial through the tunnel");
+        let payload = vec![7u8; 512 * 1024];
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(15), stream.write_all(&payload)).await;
+        match outcome {
+            Err(_elapsed) => panic!("writer hung on a reset connection (stall)"),
+            // The write may complete into local queues before the RST
+            // lands; then the failure must surface on the read side.
+            Ok(Ok(())) => {
+                let mut more = vec![0u8; 16];
+                let read = tokio::time::timeout(Duration::from_secs(15), stream.read(&mut more))
+                    .await
+                    .expect("read side must terminate after a reset");
+                assert!(
+                    matches!(read, Ok(0) | Err(_)),
+                    "connection was reset: read must error or EOF, not data"
+                );
+            }
+            Ok(Err(e)) => {
+                assert!(
+                    matches!(e.kind(), io::ErrorKind::BrokenPipe),
+                    "writer must see BrokenPipe on reset, got {e:?}"
+                );
+            }
+        }
+    }
+
+    /// REPRO (wave-13, mirrors wireguard.rs's wave-12A
+    /// `endpoint_accepts_concurrent_dials_to_one_port`): several dials
+    /// to one port through one tunnel — the browser shape. The mimic's
+    /// single smoltcp listener is consumed by the first handshake, so a
+    /// second SYN racing it while the listener is still mid-handshake
+    /// (SynReceived — the mimic steps between datagrams, so the dials
+    /// must be concurrent, not sequential) draws an RST ("dial failed
+    /// (state Closed)") until the spare-listener re-arm.
+    #[tokio::test]
+    async fn tunnel_accepts_concurrent_dials_to_one_port() {
+        let ca = test_ca();
+        let addr = spawn_mimic_udp(MimicOpts::plain("udp"), &ca).await;
+        let mut cfg = test_cfg(addr, "udp");
+        cfg.ca = ca.cert_pem.clone();
+
+        let target = NetAddr::ip(IpAddr::V4(SERVER_TUNNEL_IP), ECHO_TCP_PORT);
+        let mut dials = Vec::new();
+        for _ in 0..4 {
+            let cfg = cfg.clone();
+            let target = target.clone();
+            dials.push(tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(30), connect(&cfg, &target))
+                    .await
+                    .expect("concurrent dial must not be RST by a mid-handshake listener")
+            }));
+        }
+        let mut streams = Vec::new();
+        for dial in dials {
+            streams.push(dial.await.unwrap().expect("dial through the tunnel"));
+        }
+        // Every stream echoes multi-segment bursts, interleaved.
+        for round in 0..4u32 {
+            for (i, stream) in streams.iter_mut().enumerate() {
+                let chunk: Vec<u8> =
+                    (0..8 * 1024).map(|k| (k as u32 + round + i as u32) as u8).collect();
+                tokio::time::timeout(Duration::from_secs(30), stream.write_all(&chunk))
+                    .await
+                    .expect("concurrent stream write must not stall")
+                    .unwrap();
+                let mut back = vec![0u8; chunk.len()];
+                tokio::time::timeout(Duration::from_secs(30), stream.read_exact(&mut back))
+                    .await
+                    .expect("concurrent stream echo must not stall")
+                    .unwrap();
+                assert_eq!(back, chunk);
+            }
+        }
+        for mut s in streams {
+            let _ = s.shutdown().await;
+        }
+    }
+
+    /// REPRO (wave-13, mirrors wireguard.rs's wave-12A
+    /// `tcp_echo_slow_reader_closes_and_reopens_window`): a deliberately
+    /// slow reader — 1 KiB reads with yields — forces the receive window
+    /// to close and reopen (zero-window probing) while the write side
+    /// keeps producing.
+    #[tokio::test]
+    async fn tcp_echo_slow_reader_closes_and_reopens_window() {
+        let ca = test_ca();
+        let addr = spawn_mimic_udp(MimicOpts::plain("udp"), &ca).await;
+        let mut cfg = test_cfg(addr, "udp");
+        cfg.ca = ca.cert_pem.clone();
+
+        let target = NetAddr::ip(IpAddr::V4(SERVER_TUNNEL_IP), ECHO_TCP_PORT);
+        let stream = tokio::time::timeout(Duration::from_secs(20), connect(&cfg, &target))
+            .await
+            .expect("dial timeout")
+            .expect("dial through the tunnel");
+
+        const TOTAL: usize = 256 * 1024;
+        let payload: Vec<u8> = (0..TOTAL).map(|i| (i % 249) as u8).collect();
+
+        let (mut r, mut w) = tokio::io::split(stream);
+        let tx_payload = payload.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(60), w.write_all(&tx_payload))
+                .await
+                .expect("write side must survive a zero-window peer")
+                .unwrap();
+        });
+        let mut echoed = Vec::with_capacity(TOTAL);
+        let mut chunk = vec![0u8; 1024];
+        while echoed.len() < TOTAL {
+            let n = tokio::time::timeout(Duration::from_secs(60), r.read(&mut chunk))
+                .await
+                .expect("slow reader must not stall behind a closed window")
+                .unwrap();
+            assert!(n > 0, "premature EOF at {}", echoed.len());
+            echoed.extend_from_slice(&chunk[..n]);
+            tokio::task::yield_now().await;
+        }
+        writer.await.unwrap();
+        assert_eq!(echoed, payload);
+    }
+
+    /// GUARD (wave-13, mirrors wireguard.rs's wave-12A
+    /// `zero_window_reopens_promptly_after_drain`): the zero-window
+    /// stall-recovery shape. The reader drains in 16 KiB chunks with
+    /// pauses, so the peer repeatedly hits our closed window; every
+    /// drain must promptly re-open it — poll_read pings the tunnel task
+    /// the moment queue space frees, instead of idling until the
+    /// driver's 1s tick or the peer's next probe. Bound is generous
+    /// (healthy: ~2s).
+    #[tokio::test]
+    async fn zero_window_reopens_promptly_after_drain() {
+        let ca = test_ca();
+        let addr = spawn_mimic_udp(MimicOpts::plain("udp"), &ca).await;
+        let mut cfg = test_cfg(addr, "udp");
+        cfg.ca = ca.cert_pem.clone();
+
+        let target = NetAddr::ip(IpAddr::V4(SERVER_TUNNEL_IP), ECHO_TCP_PORT);
+        let stream = tokio::time::timeout(Duration::from_secs(20), connect(&cfg, &target))
+            .await
+            .expect("dial timeout")
+            .expect("dial through the tunnel");
+
+        const TOTAL: usize = 256 * 1024;
+        let payload: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
+
+        let (mut r, mut w) = tokio::io::split(stream);
+        let tx_payload = payload.clone();
+        let writer = tokio::spawn(async move {
+            w.write_all(&tx_payload).await.unwrap();
+        });
+        let started = Instant::now();
+        let mut echoed = Vec::with_capacity(TOTAL);
+        let mut chunk = vec![0u8; 16 * 1024];
+        while echoed.len() < TOTAL {
+            let n = tokio::time::timeout(Duration::from_secs(10), r.read(&mut chunk))
+                .await
+                .expect("a drained window must re-open without the 1s tick")
+                .unwrap();
+            assert!(n > 0, "premature EOF at {}", echoed.len());
+            echoed.extend_from_slice(&chunk[..n]);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let elapsed = started.elapsed();
+        writer.await.unwrap();
+        assert_eq!(echoed, payload);
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "window re-opening dragged: {elapsed:?} for 256 KiB — read drain not waking the tunnel task"
+        );
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 //! The tailscale overlay outbound: config surface, the ipn control
 //! session (login + map poll), and the data plane.
 //!
-//! # Status after wave 12
+//! # Status after wave 13
 //!
 //! The full control path of a tsnet node now exists in this module:
 //!
@@ -31,6 +31,18 @@
 //!     capped);
 //!   * UDP through the overlay ([`TsUdpSocket`], routed per
 //!     destination).
+//! * wave 13 (sources cached at `/tmp/wave13-upstream/`):
+//!   * [`disco`] — the disco overlay codec (magic + key + nacl box,
+//!     Ping/Pong/CallMeMaybe, disco/disco.go) and the data plane's
+//!     bounded disco loop ([`wg`]'s tunnel: ping on handshake, pong
+//!     confirms the direct path, CallMeMaybe via DERP opens one);
+//!   * **key-expiry renewal** — the poll task watches the self node's
+//!     `KeyExpiry` (ipnlocal.go:1906), and on expiry re-registers
+//!     with a freshly generated node key under
+//!     `RegisterRequest{NodeKey: fresh, OldNodeKey: current}`
+//!     (direct.go:706-713, 761), resets the map session and drops the
+//!     peer tunnels so the next dial re-keys under the new identity
+//!     ([`TailscaleOverlay::node_public`] tracks the rotation).
 //!
 //! [`start_overlay`] runs that whole path and returns a
 //! [`TailscaleOverlay`] whose dials reach peers: directly through the
@@ -64,8 +76,14 @@
 //!   surfaced as [`control::RegisterOutcome::NeedsBrowserAuth`] instead
 //!   of parking a `LoginGoal{url}` (auto.go:386-405); a headless proxy
 //!   cannot visit the URL.
-//! * No disco: peers that require the disco overlay before accepting
-//!   transport will not come up (see [`wg`]'s module docs).
+//! * Disco is the bounded core (see [`wg`]'s module docs for the full
+//!   simplification list vs magicsock: no heartbeat, first-pong-wins,
+//!   no MTU probes / UDP-relay messages / DERP-carried pings).
+//! * The key-expiry renewal re-registers with the configured auth key
+//!   (upstream's expired-key relogin is interactive — NeedsLogin,
+//!   ipnlocal.go:6938-6940 — while an auth-key proxy can rotate
+//!   headlessly); rotation is one round per detected expiry, not
+//!   upstream's unbounded regen loop.
 //! * The auto exit-node pick is lowest-Node-ID of the reachable
 //!   advertising peers, not lowest DERP latency — a headless proxy has
 //!   no netcheck measurements (upstream `suggestExitNodeUsingDERP`
@@ -92,6 +110,7 @@
 mod control;
 mod controlhttp;
 mod derp;
+mod disco;
 mod noise;
 mod state;
 mod tailcfg;
@@ -109,17 +128,22 @@ pub use derp::{
     derp_connect, derp_upgrade_over, DerpClient, DerpClientOptions, DerpHttpOptions, DerpMessage,
     NodePrivateKey, NodePublicKey, ServerInfo, ServerInfoMessage, DERP_PATH,
 };
+pub use disco::{
+    looks_like_disco, DiscoMessage, DiscoPrivateKey, DiscoPublicKey, MAGIC as DISCO_MAGIC,
+};
 pub use noise::{
     client_deferred, client_handshake, server_handshake, MachinePrivateKey, MachinePublicKey,
     NoiseConn, CURRENT_PROTOCOL_VERSION,
 };
-pub use state::{FileStore, NodeIdentity, Persist, STATE_FILE_NAME};
+pub use state::{
+    persist_rotated_node_key, FileStore, NodeIdentity, Persist, STATE_FILE_NAME,
+};
 pub use tailcfg::{
     AddrPort, DerpMap, DerpNode, DerpRegion, DiscoKeyText, DnsConfig, Hostinfo, MachineKeyText,
     MapRequest, MapResponse, Node, NodeKey, OverTlsPublicKeyResponse, PeerChange, Prefix,
     RegisterRequest, RegisterResponse, RegisterResponseAuth, UserProfile, CURRENT_CAPABILITY_VERSION,
 };
-pub use wg::{DerpRoute, TsTcpStream, TsTunnel, TsTunnelConfig, TsUdp};
+pub use wg::{DerpRoute, DiscoKeys, TsTcpStream, TsTunnel, TsTunnelConfig, TsUdp};
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -262,20 +286,21 @@ fn parse_auto_exit_node_str(s: &str) -> Option<&str> {
     s.strip_prefix("auto:").filter(|expr| !expr.is_empty())
 }
 
-/// The error `connect` still ends with after wave 12. Everything up
+/// The error `connect` still ends with after wave 13. Everything up
 /// through the data plane is ported (login, the reconnecting netmap
-/// poll, direct-UDP + DERP peer paths, MagicDNS, route enforcement,
-/// UDP) and [`dial_tcp`]/[`dial_udp`] hand the integrator real streams;
-/// what remains is enumerated precisely in the constant below.
+/// poll, direct-UDP + DERP peer paths with the disco overlay informing
+/// carrier selection, MagicDNS, route enforcement, UDP, key-expiry
+/// renewal) and [`dial_tcp`]/[`dial_udp`] hand the integrator real
+/// streams; the two remaining gaps are enumerated precisely in the
+/// constant below.
 pub const NOT_IMPLEMENTED: &str = concat!(
     "tailscale: login, the netmap poll (with reconnect/backoff), the peer ",
-    "data plane (direct UDP + DERP relay), MagicDNS, subnet-route and ",
-    "exit-node enforcement and UDP are ported, and dial_tcp/dial_udp ",
-    "return live streams — still missing: the disco overlay peers may ",
-    "require before accepting transport (ping/pong/call-me-maybe), ",
-    "key-expiry renewal / node key rotation, the tailnet packet filter ",
-    "(inbound ACLs; outbound dials are unaffected), and interactive ",
-    "(browser) login — P3 continuation"
+    "data plane (direct UDP + DERP relay, disco-informed: ping/pong path ",
+    "confirmation and call-me-maybe), MagicDNS, subnet-route and ",
+    "exit-node enforcement, UDP and key-expiry renewal are ported, and ",
+    "dial_tcp/dial_udp return live streams — still missing: the tailnet ",
+    "packet filter (inbound ACLs; outbound dials are unaffected) and ",
+    "interactive (browser) login — P3 continuation"
 );
 
 // ---------------------------------------------------------------------------
@@ -358,7 +383,13 @@ impl PollRetry {
 /// running (reconnecting with backoff), and dials route through the
 /// netmap under the config's prefs.
 pub struct TailscaleOverlay {
-    node_key: NodePrivateKey,
+    /// The current node private key — swapped by the key-expiry
+    /// renewal (the poll task rotates it; dials read it fresh).
+    node_key: Arc<Mutex<NodePrivateKey>>,
+    /// This overlay's disco keypair (magicsock.Conn's per-start key,
+    /// `RotateDiscoKey`); peers learn the public half from
+    /// `MapRequest.DiscoKey`.
+    disco_key: DiscoPrivateKey,
     /// The latest netmap, fed by the map-poll task.
     netmap: Arc<Mutex<Option<NetMap>>>,
     netmap_changed: Arc<Notify>,
@@ -369,13 +400,39 @@ pub struct TailscaleOverlay {
     prefs: OverlayPrefs,
     /// The poll task's terminal state, once it gives up (netmap stays).
     poll_error: Arc<Mutex<Option<String>>>,
-    /// One tunnel per routed peer (by node key hex).
-    tunnels: tokio::sync::Mutex<HashMap<String, TsTunnel>>,
+    /// Why key-expiry renewal failed, when it did (the overlay keeps
+    /// serving off the old identity; see [`Self::renewal_error`]).
+    renewal_error: Arc<Mutex<Option<String>>>,
+    /// One tunnel per routed peer (by node key hex) — cleared when the
+    /// node key rotates so tunnels respawn under the new identity.
+    tunnels: Arc<tokio::sync::Mutex<HashMap<String, TsTunnel>>>,
     /// The host:port authority for control requests.
     control_authority: String,
 }
 
 impl TailscaleOverlay {
+    /// Our CURRENT node public key (rotates on key-expiry renewal —
+    /// the peers' WireGuard sessions re-key against it).
+    pub fn node_public(&self) -> [u8; 32] {
+        *self
+            .node_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .public()
+            .as_bytes()
+    }
+
+    /// Why the last key-expiry renewal failed, when it did. The old
+    /// identity keeps serving dials off the last netmap until its
+    /// sessions die; upstream surfaces the same condition as the
+    /// NeedsLogin state (ipnlocal.go:6938-6940, "The node key expired,
+    /// need to relogin").
+    pub fn renewal_error(&self) -> Option<String> {
+        self.renewal_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
     /// The latest netmap (the last one the poll delivered).
     pub fn netmap(&self) -> Option<NetMap> {
         self.netmap.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -503,11 +560,16 @@ impl TailscaleOverlay {
             std::net::IpAddr::V6(v6) => Some(v6),
             _ => None,
         });
+        let node_key = self
+            .node_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let b64 = base64::engine::general_purpose::STANDARD;
         let cfg = crate::proto::wireguard::WgOut {
             server: endpoint.ip().to_string(),
             port: endpoint.port(),
-            private_key: b64.encode(self.node_key.secret()),
+            private_key: b64.encode(node_key.secret()),
             peer_public_key: b64.encode(peer.key.as_bytes()),
             pre_shared_key: None,
             local_ip: local_ipv4,
@@ -564,8 +626,23 @@ impl TailscaleOverlay {
             std::net::IpAddr::V6(v6) => Some(v6),
             _ => None,
         });
+        // The peer's disco key (Node.DiscoKey): non-zero means the peer
+        // speaks disco and the tunnel pings/confirms the direct path
+        // (updateFromNode's key handling, endpoint.go:1706-1721).
+        let disco = peer
+            .disco_key
+            .as_ref()
+            .filter(|dk| dk.0 != [0u8; 32])
+            .map(|dk| DiscoKeys {
+                our_private: self.disco_key.clone(),
+                peer_public: dk.0,
+            });
         let cfg = TsTunnelConfig {
-            private_key: *self.node_key.secret(),
+            private_key: *self
+                .node_key
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .secret(),
             peer_public: *peer.key.as_bytes(),
             local_ipv4,
             local_ipv6,
@@ -573,6 +650,7 @@ impl TailscaleOverlay {
             endpoint,
             derp,
             udp_enabled: self.prefs.udp,
+            disco,
         };
         let tunnel = TsTunnel::spawn(cfg).await?;
         tunnels.insert(peer_hex, tunnel.clone());
@@ -710,6 +788,21 @@ impl TsUdpSocket {
     }
 }
 
+/// One register round over a fresh noise connection — TryLogin's
+/// single-exchange shape (one connection per request; see control's
+/// module docs).
+async fn register_round(
+    control_url: &str,
+    machine_key: &MachinePrivateKey,
+    control_key: &MachinePublicKey,
+    authority: &str,
+    request: &RegisterRequest,
+) -> Result<RegisterOutcome> {
+    let dialer = ControlHttpDialer::from_url(control_url, machine_key.clone(), control_key.clone())?;
+    let mut session = ControlSession::dial(&dialer).await?;
+    register(&mut session, authority, request).await
+}
+
 /// Bring the overlay up: state keys, the control `/key` bootstrap, the
 /// auth-key register, then the map long-poll (spawned; it feeds
 /// [`TailscaleOverlay::netmap`] and reconnects with backoff until it
@@ -748,21 +841,13 @@ pub async fn start_overlay_with(
         .map(PathBuf::from);
     let identity = NodeIdentity::load_or_generate(state_dir.as_deref(), config.ephemeral)
         .map_err(|e| Error::config(format!("tailscale: state: {e}")))?;
-    let node_key_pub = *identity.node_key.public().as_bytes();
+    let mut node_key = identity.node_key;
 
     // 2. The control server's noise key (loadServerPubKeys) + the
     //    host:port authority requests are addressed to.
     let control_key = fetch_control_key(&control_url).await?;
     let control_authority = format!("{}:{}", host_of(&control_url), port_of(&control_url));
 
-    // 3. Register (TryLogin's auth-key leg). One noise connection per
-    //    request (see control's module docs).
-    let dialer = ControlHttpDialer::from_url(
-        &control_url,
-        identity.machine_key.clone(),
-        control_key.clone(),
-    )?;
-    let mut session = ControlSession::dial(&dialer).await?;
     let hostinfo = Hostinfo {
         backend_log_id: backend_log_id(),
         os: std::env::consts::OS.to_string(),
@@ -775,45 +860,122 @@ pub async fn start_overlay_with(
         userspace_router: Some(true),
         ..Default::default()
     };
-    let request = build_register_request(
-        &NodeKey(node_key_pub),
-        None,
-        &auth_key,
-        hostinfo.clone(),
-        config.ephemeral,
-    );
-    match register(&mut session, &control_authority, &request).await? {
-        RegisterOutcome::Registered(_) => {}
-        RegisterOutcome::NeedsBrowserAuth(url) => {
-            return Err(Error::config(format!(
-                "tailscale: interactive login required (visit {url}); browser auth is staged"
-            )))
+
+    // 3. Register (TryLogin's auth-key leg), rotating the node key once
+    //    if the server reports the current one expired — doLoginOrRegen's
+    //    regen loop (direct.go:697-713 + 861-866: "Generating a new
+    //    nodekey", OldPrivateNodeKey = PrivateNodeKey), bounded at one
+    //    regen like upstream's regen flag (a second expired answer after
+    //    a rotation is the "weird" hard error, direct.go:863).
+    let mut old_node_key: Option<NodePrivateKey> = None;
+    let mut registered = false;
+    for round in 0..2 {
+        let request = build_register_request(
+            &NodeKey(*node_key.public().as_bytes()),
+            old_node_key
+                .as_ref()
+                .map(|k| NodeKey(*k.public().as_bytes()))
+                .as_ref(),
+            &auth_key,
+            hostinfo.clone(),
+            config.ephemeral,
+        );
+        match register_round(
+            &control_url,
+            &identity.machine_key,
+            &control_key,
+            &control_authority,
+            &request,
+        )
+        .await?
+        {
+            RegisterOutcome::Registered(_) => {
+                if round > 0 {
+                    // "key rotation is complete" (direct.go:876-879):
+                    // commit the new key to the state store.
+                    persist_rotated_node_key(
+                        state_dir.as_deref(),
+                        &node_key,
+                        old_node_key.as_ref(),
+                    )
+                    .map_err(|e| {
+                        Error::config(format!("tailscale: state: persist rotated key: {e}"))
+                    })?;
+                }
+                registered = true;
+                break;
+            }
+            RegisterOutcome::NeedsBrowserAuth(url) => {
+                return Err(Error::config(format!(
+                    "tailscale: interactive login required (visit {url}); browser auth is staged"
+                )))
+            }
+            RegisterOutcome::NodeKeyExpired => {
+                if round > 0 {
+                    return Err(Error::protocol(
+                        "register request: weird: regen=true but server says NodeKeyExpired",
+                    ));
+                }
+                old_node_key = Some(node_key.clone());
+                node_key = NodePrivateKey::generate();
+            }
         }
     }
-    drop(session);
+    if !registered {
+        return Err(Error::protocol(
+            "register request: node key expired twice (rotation refused by control)",
+        ));
+    }
+    let node_key_pub = *node_key.public().as_bytes();
+    // The overlay's disco keypair (magicsock.Conn's per-start key).
+    let disco_key = DiscoPrivateKey::generate();
+    let disco_wire = DiscoKeyText(*disco_key.public().as_bytes());
 
     // 4. The map long-poll (StreamMap) as auto.go's mapRoutine runs it
     //    (controlclient_auto.go:582-650): one poll at a time, a fresh
     //    noise connection each, backoff between failures reset by every
-    //    delivered netmap — capped (see PollRetry's deltas).
+    //    delivered netmap — capped (see PollRetry's deltas). The same
+    //    task owns the key-expiry renewal: when a netmap reports the
+    //    self key expired (ipnlocal.go:1906's check), the stream is
+    //    interrupted, the node key rotates through the OldNodeKey
+    //    register round, and the poll restarts under the new identity
+    //    (auto.go's restartMap-after-relogin shape).
     let netmap_slot: Arc<Mutex<Option<NetMap>>> = Arc::new(Mutex::new(None));
     let changed = Arc::new(Notify::new());
     let selected_exit: Arc<Mutex<Option<NodeKey>>> = Arc::new(Mutex::new(None));
     let poll_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let renewal_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let shared_node_key: Arc<Mutex<NodePrivateKey>> = Arc::new(Mutex::new(node_key.clone()));
+    let tunnels: Arc<tokio::sync::Mutex<HashMap<String, TsTunnel>>> =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     {
         let slot = netmap_slot.clone();
         let changed = changed.clone();
         let selected_exit = selected_exit.clone();
         let poll_error = poll_error.clone();
+        let renewal_error = renewal_error.clone();
+        let shared_node_key = shared_node_key.clone();
+        let tunnels = tunnels.clone();
         let authority = control_authority.clone();
         let machine_key = identity.machine_key.clone();
         let prefs = OverlayPrefs::from_config(config);
+        let auth_key = auth_key.clone();
+        let state_dir = state_dir.clone();
+        let disco_wire = disco_wire.clone();
+        let ephemeral = config.ephemeral;
+        // The renewal interrupt: a netmap that reports an expired self
+        // key bumps the generation, and the select! below drops the
+        // held-open stream so the rotation can run promptly.
+        let (interrupt_tx, mut interrupt_rx) = tokio::sync::watch::channel(0u64);
+        let expired_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         tokio::spawn(async move {
             let mut attempt: u32 = 0;
             // One MapSession across reconnects: deltas accumulate, and a
             // full Peers list (what a fresh stream starts with) replaces
-            // the set (map.go:556-570).
+            // the set (map.go:556-570). A rotation REPLACES it: the new
+            // identity's map starts fresh (upstream's restartMap).
             let mut map_session = MapSession::new(NodeKey(node_key_pub));
+            let mut node_key = node_key;
             loop {
                 let map_dialer = match ControlHttpDialer::from_url(
                     &control_url,
@@ -838,21 +1000,114 @@ pub async fn start_overlay_with(
                     tokio::time::sleep(poll_retry.delay(attempt - 1)).await;
                     continue;
                 };
-                let req = build_map_request(&NodeKey(node_key_pub), hostinfo.clone(), true);
-                let mut delivered = false;
-                let res = stream_map(&mut s, &authority, &req, &mut map_session, |nm| {
-                    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(nm.clone());
-                    // Re-resolve the exit node against the fresh map
-                    // (the "old and new exit node when the selection
-                    // changes" reconfiguration, ipnlocal.go:6145-6152).
-                    *selected_exit.lock().unwrap_or_else(|e| e.into_inner()) = nm
-                        .select_exit_node(prefs.exit_node.as_deref())
-                        .map(|p| p.key.clone());
-                    delivered = true;
-                    changed.notify_one();
-                })
-                .await;
-                if delivered {
+                let req = build_map_request(
+                    &NodeKey(*node_key.public().as_bytes()),
+                    hostinfo.clone(),
+                    true,
+                    &disco_wire,
+                );
+                let delivered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let on_map = {
+                    let slot = slot.clone();
+                    let selected_exit = selected_exit.clone();
+                    let changed = changed.clone();
+                    let interrupt = interrupt_tx.clone();
+                    let expired_flag = expired_flag.clone();
+                    let delivered = delivered.clone();
+                    let prefs = prefs.clone();
+                    move |nm: &NetMap| {
+                        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(nm.clone());
+                        // Re-resolve the exit node against the fresh map
+                        // (the "old and new exit node when the selection
+                        // changes" reconfiguration, ipnlocal.go:6145-6152).
+                        *selected_exit.lock().unwrap_or_else(|e| e.into_inner()) = nm
+                            .select_exit_node(prefs.exit_node.as_deref())
+                            .map(|p| p.key.clone());
+                        delivered.store(true, std::sync::atomic::Ordering::SeqCst);
+                        changed.notify_one();
+                        // ipnlocal.go:1906: isExpired = !SelfKeyExpiry()
+                        // .IsZero() && SelfKeyExpiry().Before(now).
+                        if nm.self_key_expired(control::unix_now()) {
+                            expired_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                            let next = interrupt.borrow().wrapping_add(1);
+                            let _ = interrupt.send(next);
+                        }
+                    }
+                };
+                let res = tokio::select! {
+                    r = stream_map(&mut s, &authority, &req, &mut map_session, on_map) => r,
+                    _ = interrupt_rx.changed() => {
+                        Err(Error::network("self node key expired; rotating"))
+                    }
+                };
+                // Key-expiry renewal (direct.go:697-713, 861-879): one
+                // rotation per detected expiry, with the OldNodeKey flow.
+                if expired_flag.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    let old_pub = *node_key.public().as_bytes();
+                    let new_key = NodePrivateKey::generate();
+                    let request = build_register_request(
+                        &NodeKey(*new_key.public().as_bytes()),
+                        Some(&NodeKey(old_pub)),
+                        &auth_key,
+                        hostinfo.clone(),
+                        ephemeral,
+                    );
+                    match register_round(
+                        &control_url,
+                        &machine_key,
+                        &control_key,
+                        &authority,
+                        &request,
+                    )
+                    .await
+                    {
+                        Ok(RegisterOutcome::Registered(_)) => {
+                            if let Err(e) = persist_rotated_node_key(
+                                state_dir.as_deref(),
+                                &new_key,
+                                Some(&node_key),
+                            ) {
+                                tracing::warn!(target: "engine",
+                                    "tailscale: persisting the rotated node key failed: {e}");
+                            }
+                            tracing::info!(target: "engine",
+                                "tailscale: node key renewed (OldNodeKey rotation accepted)");
+                            *renewal_error
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = None;
+                            node_key = new_key.clone();
+                            *shared_node_key.lock().unwrap_or_else(|e| e.into_inner()) = new_key;
+                            // Fresh map session under the new identity
+                            // (restartMap after relogin), and the peer
+                            // tunnels must re-key against the new node
+                            // key — drop the cache so the next dial
+                            // respawns them.
+                            map_session = MapSession::new(NodeKey(*node_key.public().as_bytes()));
+                            tunnels.lock().await.clear();
+                            attempt = 0;
+                            tokio::time::sleep(poll_retry.initial).await;
+                            continue;
+                        }
+                        Ok(RegisterOutcome::NodeKeyExpired) => {
+                            *renewal_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(
+                                "weird: regen=true but server says NodeKeyExpired".into(),
+                            );
+                        }
+                        Ok(RegisterOutcome::NeedsBrowserAuth(url)) => {
+                            *renewal_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(format!("renewal needs interactive login ({url})"));
+                        }
+                        Err(e) => {
+                            *renewal_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(format!("renewal register failed: {e}"));
+                        }
+                    }
+                    // The rotation failed: keep serving under the old
+                    // identity (the last netmap stays) and let the poll's
+                    // ordinary backoff retry the stream; the next netmap
+                    // that still reports expiry bumps the interrupt again.
+                }
+                if delivered.load(std::sync::atomic::Ordering::SeqCst) {
                     // "Reset the backoff timer if we got a netmap"
                     // (auto.go:482-486). A cleanly closed stream re-polls
                     // after a floor pause (upstream goes through its
@@ -880,13 +1135,15 @@ pub async fn start_overlay_with(
     }
 
     let overlay = TailscaleOverlay {
-        node_key: identity.node_key,
+        node_key: shared_node_key,
+        disco_key,
         netmap: netmap_slot,
         netmap_changed: changed,
         selected_exit_node: selected_exit,
         prefs: OverlayPrefs::from_config(config),
         poll_error,
-        tunnels: tokio::sync::Mutex::new(HashMap::new()),
+        renewal_error,
+        tunnels,
         control_authority,
     };
 
@@ -1051,11 +1308,12 @@ fn backend_log_id() -> String {
 
 /// Bring up the overlay and prove it is dial-ready — the counterpart
 /// of upstream `NewTailscale` + `start`/`ensureStarted` (cached lines
-/// 114-211). Wave 12 runs the real control path (login + netmap +
-/// peer reachability + the routing prefs) and then stops with the
-/// precise remaining-gap error: the outbound wiring itself is
-/// [`dial_tcp`]/[`dial_udp`] (real streams — the integrator's step to
-/// splice into the relay), and the enumerated gaps stand.
+/// 114-211). Wave 13 runs the real control path (login + netmap +
+/// peer reachability + the routing prefs + the disco-informed data
+/// plane) and then stops with the precise remaining-gap error: the
+/// outbound wiring itself is [`dial_tcp`]/[`dial_udp`] (real streams —
+/// the integrator's step to splice into the relay), and the two
+/// enumerated gaps stand.
 pub async fn connect(config: &TailscaleConfig) -> Result<()> {
     // Everything that can be brought up, is (and fails loudly).
     let overlay = start_overlay(config).await?;
@@ -1426,6 +1684,24 @@ mod tests {
         map_close_after_deliver: bool,
         /// Answer HTTP 500 for map connections whose round is >= this.
         map_fail_from_round: Option<usize>,
+        /// The peer's disco key (hex) — `Node.DiscoKey` in the map.
+        peer_disco_hex: Option<String>,
+        /// Where the mimic captures the client's `MapRequest.DiscoKey`
+        /// (the in-test peer fronts learn our disco public from it).
+        disco_capture: Option<Arc<Mutex<Option<[u8; 32]>>>>,
+        /// Where the mimic records the register rounds: the first node
+        /// key seen, and the (old, new) pair of the OldNodeKey renewal.
+        register_capture: Option<Arc<RegisterCapture>>,
+    }
+
+    /// The register-round ledger a renewal test asserts on.
+    #[derive(Default)]
+    struct RegisterCapture {
+        /// The node key of the FIRST register.
+        first: Mutex<Option<[u8; 32]>>,
+        /// (OldNodeKey, NodeKey) of the register that carried a
+        /// non-zero OldNodeKey — the key-expiry renewal round.
+        renewal: Mutex<Option<([u8; 32], [u8; 32])>>,
     }
 
     impl ControlFixture {
@@ -1443,6 +1719,9 @@ mod tests {
                 map_tweak: self.map_tweak.clone(),
                 map_close_after_deliver: self.map_close_after_deliver,
                 map_fail_from_round: self.map_fail_from_round,
+                peer_disco_hex: self.peer_disco_hex.clone(),
+                disco_capture: self.disco_capture.clone(),
+                register_capture: self.register_capture.clone(),
             }
         }
 
@@ -1464,6 +1743,9 @@ mod tests {
                 map_tweak: None,
                 map_close_after_deliver: false,
                 map_fail_from_round: None,
+                peer_disco_hex: None,
+                disco_capture: None,
+                register_capture: None,
             }
         }
     }
@@ -1584,6 +1866,18 @@ mod tests {
                         req.ephemeral, fx.ephemeral,
                         "the ephemeral login flag (direct.go:766) round-trips"
                     );
+                    // The register ledger: the first round's key, and the
+                    // OldNodeKey renewal round (direct.go:761).
+                    if let Some(cap) = &fx.register_capture {
+                        let nk = *req.node_key.as_bytes();
+                        let old = *req.old_node_key.as_bytes();
+                        let mut first = cap.first.lock().unwrap_or_else(|e| e.into_inner());
+                        if first.is_none() {
+                            *first = Some(nk);
+                        } else if old != [0u8; 32] {
+                            *cap.renewal.lock().unwrap_or_else(|e| e.into_inner()) = Some((old, nk));
+                        }
+                    }
                     let resp = br#"{"MachineAuthorized":true}"#.to_vec();
                     let head = format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1597,6 +1891,9 @@ mod tests {
                     let req: MapRequest = serde_json::from_slice(&body).unwrap();
                     assert!(req.stream);
                     assert!(req.keep_alive);
+                    if let Some(slot) = &fx.disco_capture {
+                        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(req.disco_key.0);
+                    }
                     let round = map_round
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
                         + 1;
@@ -1635,6 +1932,9 @@ mod tests {
                     });
                     if let Some(ep) = fx.peer_endpoint {
                         peer["Endpoints"] = serde_json::json!([ep.to_string()]);
+                    }
+                    if let Some(dk) = &fx.peer_disco_hex {
+                        peer["DiscoKey"] = serde_json::json!(format!("discokey:{dk}"));
                     }
                     let mut msg = serde_json::json!({
                         "Node": {
@@ -1787,6 +2087,260 @@ mod tests {
             }
         }
     }
+
+    /// What one in-test disco peer front observed.
+    #[derive(Default)]
+    struct DiscoFrontCounters {
+        /// Disco pings answered with a Pong.
+        pings: std::sync::atomic::AtomicUsize,
+        /// WireGuard datagrams relayed toward the peer's WG endpoint
+        /// (the direct path carrying data).
+        wg_relays: std::sync::atomic::AtomicUsize,
+    }
+
+    /// An in-test disco-capable peer front: one UDP socket speaking
+    /// BOTH protocols the way a real tailscale peer's magicsock does —
+    /// disco Pings are answered with Pongs (sealed under the peer's
+    /// disco key, handlePingLocked's reply), and WireGuard datagrams
+    /// are relayed to/from the engine's WG endpoint (magicsock's
+    /// socket feeding wireguard-go). `our_disco_pub` is the CLIENT's
+    /// disco public, captured from its MapRequest.DiscoKey by the
+    /// control mimic. Returns the front's socket address.
+    async fn disco_peer_front(
+        wg_addr: SocketAddr,
+        disco: super::disco::DiscoPrivateKey,
+        our_disco_pub: Arc<Mutex<Option<[u8; 32]>>>,
+        counters: Arc<DiscoFrontCounters>,
+    ) -> SocketAddr {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65_536];
+            // The most recent direct sender (where WG responses go).
+            let mut last_client: Option<SocketAddr> = None;
+            loop {
+                let (n, from) = match sock.recv_from(&mut buf).await {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let pkt = &buf[..n];
+                if from == wg_addr {
+                    // A WG response from the peer's endpoint: relay it
+                    // to the last direct sender.
+                    if let Some(client) = last_client {
+                        let _ = sock.send_to(pkt, client).await;
+                    }
+                    continue;
+                }
+                if super::disco::looks_like_disco(pkt) {
+                    let captured = *our_disco_pub.lock().unwrap_or_else(|e| e.into_inner());
+                    let Some(our_pub) = captured else {
+                        continue;
+                    };
+                    let Ok((_sender, msg)) =
+                        super::disco::open(&disco, pkt)
+                    else {
+                        continue;
+                    };
+                    if let super::disco::DiscoMessage::Ping(ping) = msg {
+                        let pong = super::disco::Pong {
+                            txid: ping.txid,
+                            src: from,
+                        };
+                        if let Ok(reply) = super::disco::seal(
+                            &disco,
+                            &super::disco::DiscoPublicKey::from_bytes(our_pub),
+                            &super::disco::DiscoMessage::Pong(pong),
+                        ) {
+                            let _ = sock.send_to(&reply, from).await;
+                            counters
+                                .pings
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                    continue;
+                }
+                // WireGuard from the client: relay to the peer's WG
+                // endpoint (and remember the direct sender).
+                last_client = Some(from);
+                counters
+                    .wg_relays
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = sock.send_to(pkt, wg_addr).await;
+            }
+        });
+        addr
+    }
+
+    /// [`derp_bridge`] counting the WireGuard frames it relays toward
+    /// the peer (the client's DERP-carried WG traffic).
+    async fn derp_bridge_counting(
+        listener: tokio::net::TcpListener,
+        peer_endpoint: SocketAddr,
+        wg_via_derp: Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use super::derp::{
+            box_open, box_seal, read_frame, write_frame, NodePrivateKey as _NodePriv,
+            FRAME_CLIENT_INFO, FRAME_RECV_PACKET, FRAME_SEND_PACKET, FRAME_SERVER_INFO,
+            FRAME_SERVER_KEY, KEY_LEN, MAGIC,
+        };
+        let (mut sock, _) = listener.accept().await.expect("derp accept");
+        let mut head = Vec::new();
+        let mut b = [0u8; 1];
+        loop {
+            sock.read_exact(&mut b).await.unwrap();
+            head.push(b[0]);
+            if head.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        assert!(head.starts_with(b"GET /derp HTTP/1.1"));
+        sock.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\r\n")
+            .await
+            .unwrap();
+
+        let server_key = _NodePriv::generate();
+        let mut greeting = MAGIC.to_vec();
+        greeting.extend_from_slice(server_key.public().as_bytes());
+        write_frame(&mut sock, FRAME_SERVER_KEY, &greeting).await.unwrap();
+        let (t, payload) = read_frame(&mut sock).await.unwrap();
+        assert_eq!(t, FRAME_CLIENT_INFO);
+        let mut peer = [0u8; 32];
+        peer.copy_from_slice(&payload[..KEY_LEN]);
+        let boxed = box_seal(server_key.secret(), &peer, br#"{"version":2}"#).unwrap();
+        write_frame(&mut sock, FRAME_SERVER_INFO, &boxed).await.unwrap();
+        let _ = box_open(server_key.secret(), &peer, &payload[KEY_LEN..]).unwrap();
+
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp.connect(peer_endpoint).await.unwrap();
+        let mut buf = vec![0u8; 65_536];
+        loop {
+            tokio::select! {
+                frame = read_frame(&mut sock) => {
+                    match frame {
+                        // FRAME_SEND_PACKET: dst key (32) + packet.
+                        Ok((t, payload)) if t == FRAME_SEND_PACKET => {
+                            let data = &payload[KEY_LEN..];
+                            if !super::disco::looks_like_disco(data) {
+                                wg_via_derp.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            let _ = udp.send(data).await;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+                r = udp.recv(&mut buf) => {
+                    match r {
+                        Ok(n) => {
+                            let mut out = Vec::with_capacity(KEY_LEN + n);
+                            out.extend_from_slice(&peer);
+                            out.extend_from_slice(&buf[..n]);
+                            if write_frame(&mut sock, FRAME_RECV_PACKET, &out)
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+    }
+
+    /// The CallMeMaybe DERP leg: a one-connection DERP mimic that NEVER
+    /// relays WireGuard frames (the peer's WG leg is the direct front),
+    /// and answers the client's first WG SendPacket with a
+    /// CallMeMaybe carrying `my_number` — "the peer has already sent to
+    /// us via UDP, so their stateful firewall should be open"
+    /// (disco.go:191-199). Proves the direct path opens through
+    /// disco rather than the relay.
+    async fn derp_call_me_maybe(
+        listener: tokio::net::TcpListener,
+        peer_disco: super::disco::DiscoPrivateKey,
+        our_disco_pub: Arc<Mutex<Option<[u8; 32]>>>,
+        our_node_pub: [u8; 32],
+        my_number: SocketAddr,
+    ) {
+        use super::derp::{
+            box_open, box_seal, read_frame, write_frame, NodePrivateKey as _NodePriv,
+            FRAME_CLIENT_INFO, FRAME_RECV_PACKET, FRAME_SEND_PACKET, FRAME_SERVER_INFO,
+            FRAME_SERVER_KEY, KEY_LEN, MAGIC,
+        };
+        let (mut sock, _) = listener.accept().await.expect("derp accept");
+        let mut head = Vec::new();
+        let mut b = [0u8; 1];
+        loop {
+            sock.read_exact(&mut b).await.unwrap();
+            head.push(b[0]);
+            if head.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        assert!(head.starts_with(b"GET /derp HTTP/1.1"));
+        sock.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\r\n")
+            .await
+            .unwrap();
+        let server_key = _NodePriv::generate();
+        let mut greeting = MAGIC.to_vec();
+        greeting.extend_from_slice(server_key.public().as_bytes());
+        write_frame(&mut sock, FRAME_SERVER_KEY, &greeting).await.unwrap();
+        let (t, payload) = read_frame(&mut sock).await.unwrap();
+        assert_eq!(t, FRAME_CLIENT_INFO);
+        let mut client = [0u8; 32];
+        client.copy_from_slice(&payload[..KEY_LEN]);
+        assert_eq!(client, our_node_pub, "the DERP registration is our node key");
+        let boxed = box_seal(server_key.secret(), &client, br#"{"version":2}"#).unwrap();
+        write_frame(&mut sock, FRAME_SERVER_INFO, &boxed).await.unwrap();
+        let _ = box_open(server_key.secret(), &client, &payload[KEY_LEN..]).unwrap();
+
+        loop {
+            match read_frame(&mut sock).await {
+                Ok((t, payload)) if t == FRAME_SEND_PACKET => {
+                    let data = &payload[KEY_LEN..];
+                    if super::disco::looks_like_disco(data) || data.first() == Some(&4) {
+                        // The client's disco ping or WG initiation via
+                        // DERP: dropped — the CallMeMaybe path is the
+                        // ONLY way this peer comes up. (A real peer
+                        // would bridge; this mimic isolates the
+                        // mechanism under test.)
+                    } else if data.first() == Some(&1) {
+                        // The first WG initiation triggers the
+                        // CallMeMaybe (upstream: a peer receiving
+                        // DERP-relayed traffic answers with one when it
+                        // wants the direct path, endpoint.go:2138+).
+                        let our_pub = (*our_disco_pub
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()))
+                        .expect("the client's disco key was captured");
+                        let cmm = super::disco::CallMeMaybe {
+                            my_number: vec![my_number],
+                        };
+                        let pkt = super::disco::seal(
+                            &peer_disco,
+                            &super::disco::DiscoPublicKey::from_bytes(our_pub),
+                            &super::disco::DiscoMessage::CallMeMaybe(cmm),
+                        )
+                        .unwrap();
+                        // RECV_PACKET: source key + payload (the frame
+                        // the client's DerpClient yields as
+                        // ReceivedPacket).
+                        let mut frame = Vec::with_capacity(KEY_LEN + pkt.len());
+                        frame.extend_from_slice(&our_node_pub);
+                        frame.extend_from_slice(&pkt);
+                        write_frame(&mut sock, FRAME_RECV_PACKET, &frame)
+                            .await
+                            .unwrap();
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    }
+
 
     fn b64(bytes: &[u8]) -> String {
         base64::engine::general_purpose::STANDARD.encode(bytes)
@@ -1978,6 +2532,408 @@ mod tests {
         assert_eq!(rest, payload[n..]);
     }
 
+    // -------------------------------------------------------------------
+    // Wave 13: the disco overlay (ping/pong path confirmation,
+    // call-me-maybe) and the key-expiry renewal.
+    // -------------------------------------------------------------------
+
+    fn hex32(bytes: &[u8; 32]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[tokio::test]
+    async fn disco_pong_confirms_the_direct_path() {
+        // A disco-capable peer (front answering pings with pongs, WG
+        // relayed to the engine's endpoint) with a home DERP. The Pong
+        // for our Ping confirms the direct address; the established
+        // session then carries data direct-only — a peer that never
+        // ponged would stay on DERP (next test).
+        let dir = tempfile::tempdir().unwrap();
+        let identity = NodeIdentity::load_or_generate(Some(dir.path()), false).unwrap();
+        let our_node_pub = *identity.node_key.public().as_bytes();
+        let (wg_addr, peer_key_hex) = spawn_peer_wg_endpoint(our_node_pub).await;
+
+        let peer_disco = super::disco::DiscoPrivateKey::generate();
+        let our_disco = Arc::new(Mutex::new(None::<[u8; 32]>));
+        let counters = Arc::new(DiscoFrontCounters::default());
+        let front = disco_peer_front(
+            wg_addr,
+            peer_disco.clone(),
+            our_disco.clone(),
+            counters.clone(),
+        )
+        .await;
+
+        let derp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let derp_addr = derp_listener.local_addr().unwrap();
+        let wg_via_derp = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(derp_bridge_counting(
+            derp_listener,
+            wg_addr,
+            wg_via_derp.clone(),
+        ));
+
+        let control_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_addr = control_listener.local_addr().unwrap();
+        let auth_key = generated_auth_key();
+        let mut fx = ControlFixture::new(
+            MachinePrivateKey::generate(),
+            peer_key_hex,
+            Some(front),
+            Some(format!("http://{derp_addr}")),
+            auth_key.clone(),
+        );
+        fx.peer_disco_hex = Some(hex32(peer_disco.public().as_bytes()));
+        fx.disco_capture = Some(our_disco.clone());
+        tokio::spawn(control_server(control_listener, fx));
+
+        let cfg = TailscaleConfig {
+            auth_key: Some(auth_key),
+            control_url: Some(format!("http://{control_addr}")),
+            state_dir: Some(dir.path().to_string_lossy().into_owned()),
+            ..TailscaleConfig::new("ts-disco")
+        };
+        let overlay = Arc::new(start_overlay(&cfg).await.unwrap());
+        // The map carried the peer's disco key — the tunnel speaks disco.
+        assert!(overlay.netmap().unwrap().peers[0].disco_key.is_some());
+
+        // Echo through the tailscale-side session.
+        let mut stream = overlay
+            .dial_relay("100.64.0.2:8082".parse().unwrap())
+            .await
+            .unwrap_or_else(|e| panic!("disco dial: {e}"));
+        stream.write_all(b"disco-probe").await.unwrap();
+        let mut got = [0u8; 11];
+        stream.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"disco-probe");
+
+        // The front answered at least one Ping with a Pong and relayed
+        // WireGuard datagrams: the direct path exists AND carried data.
+        assert!(
+            counters.pings.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the peer ponged our ping"
+        );
+        assert!(
+            counters.wg_relays.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the direct path carried WireGuard"
+        );
+
+        // Disco-informed carrier selection: once pong-confirmed (the
+        // 6.5s trustUDPAddrDuration window), an established session
+        // sends direct-only — a second echo round must not grow the
+        // DERP relay's WG counter at all.
+        let via_derp_before = wg_via_derp.load(std::sync::atomic::Ordering::SeqCst);
+        stream.write_all(b"second-round").await.unwrap();
+        let mut got2 = [0u8; 12];
+        stream.read_exact(&mut got2).await.unwrap();
+        assert_eq!(&got2, b"second-round");
+        assert_eq!(
+            wg_via_derp.load(std::sync::atomic::Ordering::SeqCst),
+            via_derp_before,
+            "the pong-confirmed direct path carries the session exclusively"
+        );
+    }
+
+    #[tokio::test]
+    async fn disco_ignored_falls_back_to_derp() {
+        // The peer advertises a disco key and an endpoint that DROPS
+        // everything (the pings go unanswered): no Pong ever confirms a
+        // direct path, so the session falls back to — and stays on —
+        // the DERP relay. The wave-11 behavior, preserved exactly.
+        let dir = tempfile::tempdir().unwrap();
+        let identity = NodeIdentity::load_or_generate(Some(dir.path()), false).unwrap();
+        let our_node_pub = *identity.node_key.public().as_bytes();
+        let (wg_addr, peer_key_hex) = spawn_peer_wg_endpoint(our_node_pub).await;
+
+        // The dead direct path: binds, counts, drops.
+        let dead = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let dropped = dropped.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65_536];
+                while dead.recv_from(&mut buf).await.is_ok() {
+                    dropped.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+        }
+
+        let derp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let derp_addr = derp_listener.local_addr().unwrap();
+        let wg_via_derp = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(derp_bridge_counting(
+            derp_listener,
+            wg_addr,
+            wg_via_derp.clone(),
+        ));
+
+        let control_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_addr = control_listener.local_addr().unwrap();
+        let auth_key = generated_auth_key();
+        let mut fx = ControlFixture::new(
+            MachinePrivateKey::generate(),
+            peer_key_hex,
+            Some(dead_addr),
+            Some(format!("http://{derp_addr}")),
+            auth_key.clone(),
+        );
+        let peer_disco = super::disco::DiscoPrivateKey::generate();
+        fx.peer_disco_hex = Some(hex32(peer_disco.public().as_bytes()));
+        fx.disco_capture = Some(Arc::new(Mutex::new(None::<[u8; 32]>)));
+        tokio::spawn(control_server(control_listener, fx));
+
+        let cfg = TailscaleConfig {
+            auth_key: Some(auth_key),
+            control_url: Some(format!("http://{control_addr}")),
+            state_dir: Some(dir.path().to_string_lossy().into_owned()),
+            ..TailscaleConfig::new("ts-disco-dead")
+        };
+        let overlay = Arc::new(start_overlay(&cfg).await.unwrap());
+        assert!(overlay.netmap().unwrap().peers[0].disco_key.is_some());
+
+        // The echo still works — over DERP.
+        let mut stream = overlay
+            .dial_relay("100.64.0.2:8083".parse().unwrap())
+            .await
+            .unwrap_or_else(|e| panic!("derp-fallback dial: {e}"));
+        stream.write_all(b"via-derp").await.unwrap();
+        let mut got = [0u8; 8];
+        stream.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"via-derp");
+
+        // The pings WERE sent (the dead endpoint saw them) and ignored;
+        // the WG session rode the relay.
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the disco pings were sent to the advertised endpoint"
+        );
+        assert!(
+            wg_via_derp.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the never-ponged peer fell back to DERP"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_me_maybe_opens_the_direct_path() {
+        // A DERP-ONLY peer (no advertised endpoints) whose relay answers
+        // our first WG frame with a CallMeMaybe instead of relaying it:
+        // the only way the session can come up is the direct path the
+        // CallMeMaybe requested — we ping the advertised number, the
+        // Pong confirms it, and the handshake + data flow direct.
+        let dir = tempfile::tempdir().unwrap();
+        let identity = NodeIdentity::load_or_generate(Some(dir.path()), false).unwrap();
+        let our_node_pub = *identity.node_key.public().as_bytes();
+        let (wg_addr, peer_key_hex) = spawn_peer_wg_endpoint(our_node_pub).await;
+
+        let peer_disco = super::disco::DiscoPrivateKey::generate();
+        let our_disco = Arc::new(Mutex::new(None::<[u8; 32]>));
+        let counters = Arc::new(DiscoFrontCounters::default());
+        let front = disco_peer_front(
+            wg_addr,
+            peer_disco.clone(),
+            our_disco.clone(),
+            counters.clone(),
+        )
+        .await;
+
+        let derp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let derp_addr = derp_listener.local_addr().unwrap();
+        tokio::spawn(derp_call_me_maybe(
+            derp_listener,
+            peer_disco.clone(),
+            our_disco.clone(),
+            our_node_pub,
+            front,
+        ));
+
+        let control_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_addr = control_listener.local_addr().unwrap();
+        let auth_key = generated_auth_key();
+        let mut fx = ControlFixture::new(
+            MachinePrivateKey::generate(),
+            peer_key_hex,
+            // NO endpoints: the peer is only reachable through its home
+            // DERP relay — and the direct path the CallMeMaybe opens.
+            None,
+            Some(format!("http://{derp_addr}")),
+            auth_key.clone(),
+        );
+        fx.peer_disco_hex = Some(hex32(peer_disco.public().as_bytes()));
+        fx.disco_capture = Some(our_disco.clone());
+        tokio::spawn(control_server(control_listener, fx));
+
+        let cfg = TailscaleConfig {
+            auth_key: Some(auth_key),
+            control_url: Some(format!("http://{control_addr}")),
+            state_dir: Some(dir.path().to_string_lossy().into_owned()),
+            ..TailscaleConfig::new("ts-cmm")
+        };
+        let overlay = Arc::new(start_overlay(&cfg).await.unwrap());
+        assert!(overlay.netmap().unwrap().peers[0].endpoints.is_empty());
+
+        // The echo comes up through the direct path the CallMeMaybe
+        // opened (the relay refused to carry WG at all).
+        let mut stream = overlay
+            .dial_relay("100.64.0.2:8084".parse().unwrap())
+            .await
+            .unwrap_or_else(|e| panic!("call-me-maybe dial: {e}"));
+        stream.write_all(b"cmm-probe").await.unwrap();
+        let mut got = [0u8; 9];
+        stream.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"cmm-probe");
+
+        // We pinged the advertised number and the WG datagrams flowed
+        // through the front — the direct path, opened by disco.
+        assert!(
+            counters.pings.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the CallMeMaybe numbers were pinged"
+        );
+        assert!(
+            counters.wg_relays.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the WireGuard session came up over the direct path"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_node_key_rotates_via_old_node_key_and_dials_keep_working() {
+        // Round 1's netmap carries a past-dated self KeyExpiry: the
+        // poll detects it (ipnlocal.go:1906), interrupts the stream,
+        // and re-registers with a FRESH node key under
+        // RegisterRequest{NodeKey: fresh, OldNodeKey: current}
+        // (direct.go:697-713). The mimic asserts the OldNodeKey flow;
+        // the next netmap carries the new self key; and a dial under
+        // the rotated identity re-keys (a peer allowing the NEW key
+        // takes over the map entry).
+        let dir = tempfile::tempdir().unwrap();
+        let identity = NodeIdentity::load_or_generate(Some(dir.path()), false).unwrap();
+        let initial_pub = *identity.node_key.public().as_bytes();
+        let (wg_addr, peer_key_hex) = spawn_peer_wg_endpoint(initial_pub).await;
+
+        let capture = Arc::new(RegisterCapture::default());
+        // The post-rotation peer, swapped into the map by the test once
+        // the rotated key is known: (endpoint, peer node key hex).
+        let peer2: Arc<Mutex<Option<(SocketAddr, String)>>> = Arc::new(Mutex::new(None));
+        let tweak_peer2 = peer2.clone();
+        let tweak = std::sync::Arc::new(move |round: usize, msg: &mut serde_json::Value| {
+            if round == 1 {
+                // ipnlocal's expiry check reads exactly this field.
+                msg["Node"]["KeyExpiry"] = serde_json::json!("2020-01-01T00:00:00Z");
+            } else {
+                // Post-rotation rounds carry no expiry; and the swapped
+                // peer (allowing the rotated key) once the test sets it.
+                if let Some((ep, hex)) =
+                    (*tweak_peer2.lock().unwrap_or_else(|e| e.into_inner())).clone()
+                {
+                    msg["Peers"][0]["Key"] = serde_json::json!(format!("nodekey:{hex}"));
+                    msg["Peers"][0]["Endpoints"] = serde_json::json!([ep.to_string()]);
+                }
+            }
+        });
+        let control_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_addr = control_listener.local_addr().unwrap();
+        let auth_key = generated_auth_key();
+        let mut fx = ControlFixture::new(
+            MachinePrivateKey::generate(),
+            peer_key_hex,
+            Some(wg_addr),
+            None,
+            auth_key.clone(),
+        );
+        fx.map_close_after_deliver = true;
+        fx.map_tweak = Some(tweak);
+        fx.register_capture = Some(capture.clone());
+        tokio::spawn(control_server(control_listener, fx));
+
+        let cfg = TailscaleConfig {
+            auth_key: Some(auth_key),
+            control_url: Some(format!("http://{control_addr}")),
+            state_dir: Some(dir.path().to_string_lossy().into_owned()),
+            ..TailscaleConfig::new("ts-renew")
+        };
+        let overlay = Arc::new(start_overlay_with(
+            &cfg,
+            PollRetry {
+                initial: std::time::Duration::from_millis(20),
+                max: std::time::Duration::from_millis(50),
+                max_attempts: 500,
+            },
+        )
+        .await
+        .unwrap());
+
+        // The rotation lands: our node public changes...
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while overlay.node_public() == initial_pub {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the expired key was never renewed: {:?}",
+                overlay.renewal_error()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let rotated_pub = overlay.node_public();
+        assert_ne!(rotated_pub, initial_pub);
+        assert!(overlay.renewal_error().is_none());
+
+        // ...the mimic saw the OldNodeKey register round exactly
+        // (direct.go:761: OldNodeKey = the current key, NodeKey = fresh).
+        let renewal = *capture
+            .renewal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(renewal, Some((initial_pub, rotated_pub)), "the OldNodeKey flow");
+
+        // ...and the next netmap carries the rotated self key with the
+        // expiry gone.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let nm = overlay.netmap().unwrap();
+            if *nm.self_node.key.as_bytes() == rotated_pub {
+                assert!(
+                    nm.self_node.key_expiry.is_none(),
+                    "the renewed map carries no expiry"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the renewed netmap never landed: self={}",
+                hex32(nm.self_node.key.as_bytes())
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // Dials keep working under the rotated identity: the WG
+        // sessions re-key on next use — a peer allowing the NEW node
+        // key takes over the map entry, and the tunnel cache was
+        // cleared so the dial spawns a fresh session.
+        let (wg2, peer2_hex) = spawn_peer_wg_endpoint(rotated_pub).await;
+        *peer2.lock().unwrap_or_else(|e| e.into_inner()) = Some((wg2, peer2_hex.clone()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let nm = overlay.netmap().unwrap();
+            let got_hex = hex32(nm.peers[0].key.as_bytes());
+            if got_hex == peer2_hex {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the rotated peer never landed in the map: {got_hex}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let mut stream = overlay
+            .dial_relay("100.64.0.2:8085".parse().unwrap())
+            .await
+            .unwrap_or_else(|e| panic!("post-rotation dial: {e}"));
+        stream.write_all(b"after-rotation").await.unwrap();
+        let mut got = [0u8; 14];
+        stream.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"after-rotation");
+    }
+
     #[tokio::test]
     async fn connect_reaches_logged_in_netmap_peer_and_stops_at_the_gap_error() {
         // connect() drives the whole control path against the mimic and
@@ -2008,8 +2964,6 @@ mod tests {
         };
         let err = connect(&cfg).await.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("disco"), "{msg}");
-        assert!(msg.contains("key-expiry"), "{msg}");
         assert!(msg.contains("packet filter"), "{msg}");
         assert!(msg.contains("browser"), "{msg}");
         assert!(msg.contains("P3 continuation"), "{msg}");
@@ -2017,6 +2971,9 @@ mod tests {
         // (the preamble names them as ported; the "still missing" list
         // must not).
         let missing = msg.split("still missing:").nth(1).unwrap_or_default();
+        assert!(!missing.contains("disco"), "{missing}");
+        assert!(!missing.contains("key-expiry"), "{missing}");
+        assert!(!missing.contains("renewal"), "{missing}");
         assert!(!missing.contains("MagicDNS"), "{msg}");
         assert!(!missing.contains("reconnect"), "{missing}");
         assert!(!missing.contains("subnet-route"), "{missing}");

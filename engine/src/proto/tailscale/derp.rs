@@ -290,7 +290,10 @@ pub(crate) fn poly1305(key: &[u8; 32], msg: &[u8]) -> [u8; 16] {
 /// HSalsa20(key, nonce[0..16]); stream = Salsa20(subkey, nonce[16..24]);
 /// bytes 0..16 discarded, 16..32 are the Poly1305 key, the rest XORs
 /// the message.
-fn xsalsa20_xor(key: &[u8; 32], nonce: &[u8; 24], m: &[u8], out: &mut [u8]) -> [u8; 32] {
+///
+/// pub(crate) for [`super::disco`]: the disco box uses the same
+/// primitive with a different framing (MAC appended, not prefixed).
+pub(crate) fn xsalsa20_xor(key: &[u8; 32], nonce: &[u8; 24], m: &[u8], out: &mut [u8]) -> [u8; 32] {
     debug_assert_eq!(m.len(), out.len());
     let mut nonce16 = [0u8; 16];
     nonce16.copy_from_slice(&nonce[..16]);
@@ -337,8 +340,10 @@ fn xsalsa20_xor(key: &[u8; 32], nonce: &[u8; 24], m: &[u8], out: &mut [u8]) -> [
 }
 
 /// `crypto_box_beforenm`: the NaCl shared key = HSalsa20(X25519(my
-/// secret, peer public), zeros).
-fn box_shared(my_secret: &[u8; 32], peer_public: &[u8; 32]) -> Result<[u8; 32]> {
+/// secret, peer public), zeros). pub(crate) for [`super::disco`] —
+/// `DiscoPrivate.Shared` is the same precomputation (types/key/disco.go:
+/// 77-84 `box.Precompute`).
+pub(crate) fn box_shared(my_secret: &[u8; 32], peer_public: &[u8; 32]) -> Result<[u8; 32]> {
     let shared = curve25519_dalek::montgomery::MontgomeryPoint(*peer_public)
         .mul_clamped(*my_secret)
         .0;

@@ -9,6 +9,65 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::addr::NetAddr;
 use crate::stream::ByteCounters;
 
+/// The relay-side view of one connection's cancellation state: parks in
+/// a `select!` until the connection is force-closed from the API.
+///
+/// Hand-rolled instead of tokio_util's CancellationToken (tokio-util is
+/// only a transitive dep here — via quinn — and not declared for direct
+/// use). Built on a `watch` channel because its borrow-then-`changed()`
+/// cycle is race-free: a `cancel()` that fires after the flag check
+/// still wakes the parked waiter (a bare AtomicBool+Notify pair has a
+/// missed-wakeup window between check and registration).
+pub struct CancelHandle {
+    rx: tokio::sync::watch::Receiver<bool>,
+}
+
+impl CancelHandle {
+    pub fn is_cancelled(&self) -> bool {
+        *self.rx.borrow()
+    }
+
+    /// Resolves once the token fires (or the token is dropped with the
+    /// connection table entry it lives in). Works on `&self` by cloning
+    /// the watch receiver — cheap, and keeps select! call sites simple.
+    pub async fn cancelled(&self) {
+        let mut rx = self.rx.clone();
+        loop {
+            if *rx.borrow_and_update() {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// The controller half kept inside a `ConnEntry` — the seam the API's
+/// DELETE /connections handlers use to tear live relays down (mihomo's
+/// equivalent is `trackerConn.Close()` from hub/route/connections.go
+/// closeConnection/closeAllConnections).
+struct CancelToken {
+    tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl CancelToken {
+    fn new() -> Self {
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        CancelToken { tx }
+    }
+
+    fn cancel(&self) {
+        let _ = self.tx.send(true);
+    }
+
+    fn handle(&self) -> CancelHandle {
+        CancelHandle {
+            rx: self.tx.subscribe(),
+        }
+    }
+}
+
 /// One tracked connection.
 #[derive(Clone)]
 pub struct ConnSnapshot {
@@ -30,6 +89,8 @@ struct ConnEntry {
     counters: Arc<ByteCounters>,
     outbound: Mutex<String>,
     rule: Mutex<String>,
+    /// Set by force_close/force_close_all; observed by the relay loops.
+    cancel: CancelToken,
 }
 
 struct ConnMeta {
@@ -65,16 +126,19 @@ impl Stats {
         self.traffic_tx.subscribe()
     }
 
-    /// Register a connection; returns its id and counter handle.
+    /// Register a connection; returns its id, counter handle, and the
+    /// cancellation handle the relay selects on.
     pub fn open(
         &self,
         inbound: &str,
         network: &'static str,
         target: &NetAddr,
         source: SocketAddr,
-    ) -> (u64, Arc<ByteCounters>) {
+    ) -> (u64, Arc<ByteCounters>, CancelHandle) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let counters = Arc::new(ByteCounters::default());
+        let cancel = CancelToken::new();
+        let handle = cancel.handle();
         self.conns.lock().unwrap().insert(
             id,
             ConnEntry {
@@ -92,9 +156,10 @@ impl Stats {
                 counters: counters.clone(),
                 outbound: Mutex::new(String::new()),
                 rule: Mutex::new(String::new()),
+                cancel,
             },
         );
-        (id, counters)
+        (id, counters, handle)
     }
 
     /// Record which outbound/rule served a connection.
@@ -111,6 +176,32 @@ impl Stats {
         let (rx, tx) = counters.snapshot();
         self.down.fetch_add(rx, Ordering::Relaxed);
         self.up.fetch_add(tx, Ordering::Relaxed);
+    }
+
+    /// mihomo hub/route/connections.go closeConnection(): signal one
+    /// tracked relay to unwind (the entry leaves the table when the
+    /// relay itself observes the token and calls `close`). Returns
+    /// whether the id was tracked.
+    pub fn force_close(&self, id: u64) -> bool {
+        match self.conns.lock().unwrap().get(&id) {
+            Some(entry) => {
+                entry.cancel.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// mihomo hub/route/connections.go closeAllConnections(): signal
+    /// every tracked relay. Returns how many were signalled.
+    pub fn force_close_all(&self) -> usize {
+        let conns = self.conns.lock().unwrap();
+        let mut n = 0;
+        for entry in conns.values() {
+            entry.cancel.cancel();
+            n += 1;
+        }
+        n
     }
 
     pub fn totals(&self) -> (u64, u64) {
@@ -165,7 +256,8 @@ mod tests {
         let stats = Stats::new();
         let target = NetAddr::new(Host::Domain("x.test".into()), 443);
         let source = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5555));
-        let (id, counters) = stats.open("mixed", "tcp", &target, source);
+        let (id, counters, cancel) = stats.open("mixed", "tcp", &target, source);
+        assert!(!cancel.is_cancelled());
         stats.annotate(id, "MATCH,Auto", "Auto");
         counters.rx.store(100, Ordering::Relaxed);
         counters.tx.store(50, Ordering::Relaxed);
@@ -183,7 +275,7 @@ mod tests {
     fn totals_and_publish() {
         let stats = Stats::new();
         let mut rx = stats.subscribe_traffic();
-        let (id, counters) = stats.open(
+        let (id, counters, _cancel) = stats.open(
             "t",
             "tcp",
             &NetAddr::ip(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
@@ -193,5 +285,49 @@ mod tests {
         stats.close(id, &counters);
         stats.publish();
         assert_eq!(*rx.borrow_and_update(), (0, 7));
+    }
+
+    #[tokio::test]
+    async fn force_close_fires_the_relay_handle() {
+        let stats = Stats::new();
+        let target = NetAddr::new(Host::Domain("x.test".into()), 443);
+        let source = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5555));
+        let (id, _, cancel) = stats.open("mixed", "tcp", &target, source);
+        // Unknown ids are not tracked (mihomo still answers 204).
+        assert!(!stats.force_close(999));
+        assert!(stats.force_close(id));
+        assert!(cancel.is_cancelled());
+        // The parked relay waiter resolves (race-free: cancel-before-
+        // park is covered by the flag, cancel-after by watch::changed).
+        tokio::time::timeout(std::time::Duration::from_secs(1), cancel.cancelled())
+            .await
+            .expect("cancelled resolves");
+    }
+
+    #[tokio::test]
+    async fn force_close_before_and_after_parking_both_wake() {
+        let stats = Stats::new();
+        let target = NetAddr::new(Host::Domain("y.test".into()), 443);
+        let source = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5556));
+        // Cancel BEFORE the relay parks: the flag check catches it.
+        let (a, _, h1) = stats.open("mixed", "tcp", &target, source);
+        stats.force_close(a);
+        h1.cancelled().await;
+
+        // Cancel AFTER the relay parks: watch::changed wakes it.
+        let (_, _, h2) = stats.open("mixed", "tcp", &target, source);
+        let parked =
+            tokio::task::spawn(async move {
+                h2.cancelled().await;
+            });
+        // Give the waiter a beat to actually park on the watch.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!parked.is_finished());
+        let n = stats.force_close_all();
+        assert!(n >= 1);
+        tokio::time::timeout(std::time::Duration::from_secs(1), parked)
+            .await
+            .expect("parked waiter woken")
+            .unwrap();
     }
 }

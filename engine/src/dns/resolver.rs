@@ -288,6 +288,13 @@ impl DnsEngine {
     fn next_id(&self) -> u16 {
         (self.query_id.fetch_add(1, Ordering::Relaxed) & 0xFFFF) as u16
     }
+
+    /// mihomo hub/route/cache.go flushDnsCache() →
+    /// resolver.ClearCache(): drop every cached answer so the next
+    /// query goes back to the upstream.
+    pub fn clear_cache(&self) {
+        self.cache.lock().unwrap().clear();
+    }
 }
 
 fn rdata_ip(rdata: &[u8]) -> Option<IpAddr> {
@@ -317,9 +324,50 @@ pub fn parse_nameserver(ns: &str) -> Option<SocketAddr> {
     }
 }
 
+/// Shared in-test DNS harness (used by this module's tests and the
+/// Clash-API cache-flush tests).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// An in-test UDP DNS server that answers every A query with one
+    /// record (203.0.113.7, ttl 60) and counts the exchanges it served
+    /// — the observable for cache-flush semantics.
+    pub async fn counting_upstream() -> (SocketAddr, Arc<AtomicUsize>) {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let hits = count.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 512];
+            loop {
+                let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
+                    continue;
+                };
+                hits.fetch_add(1, Ordering::Relaxed);
+                let q = &buf[..n];
+                let mut resp = Vec::with_capacity(n + 16);
+                resp.extend_from_slice(&q[..2]); // id echo
+                resp.extend_from_slice(&[0x81, 0x80]); // QR|RD|RA
+                resp.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 0]); // qd=1 an=1
+                resp.extend_from_slice(&q[12..]); // question verbatim
+                resp.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0, 1]); // name ptr, A, IN
+                resp.extend_from_slice(&60u32.to_be_bytes());
+                resp.extend_from_slice(&4u16.to_be_bytes());
+                resp.extend_from_slice(&[203, 0, 113, 7]);
+                let _ = sock.send_to(&resp, peer).await;
+            }
+        });
+        (addr, count)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     fn dns_config() -> DnsConfig {
         DnsConfig {
@@ -429,5 +477,37 @@ mod tests {
         );
         assert_eq!(parse_nameserver("https://dns.test/dns-query"), None);
         assert_eq!(parse_nameserver("tcp://1.1.1.1"), None);
+    }
+
+    /// mihomo hub/route/cache.go flushDnsCache(): priming caches, so
+    /// the second resolve is a cache hit; clear_cache() drops it and
+    /// the third resolve re-hits the upstream.
+    #[tokio::test]
+    async fn clear_cache_forces_upstream_requery() {
+        let (up, count) = super::test_support::counting_upstream().await;
+        let engine = DnsEngine::new(
+            DnsConfig {
+                enhanced_mode: crate::config::EnhancedMode::RedirHost,
+                nameservers: vec![format!("udp://{up}")],
+                ..dns_config()
+            },
+            DomainMatcher::default(),
+        )
+        .unwrap();
+        let addrs = engine.resolve("flush.test", wire::TYPE_A).await.unwrap();
+        assert_eq!(addrs[0].to_string(), "203.0.113.7");
+        assert_eq!(count.load(Ordering::Relaxed), 1, "first query hit the upstream");
+
+        let again = engine.resolve("flush.test", wire::TYPE_A).await.unwrap();
+        assert_eq!(again, addrs);
+        assert_eq!(count.load(Ordering::Relaxed), 1, "second query served from cache");
+
+        engine.clear_cache();
+        let _ = engine.resolve("flush.test", wire::TYPE_A).await.unwrap();
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            2,
+            "after the flush the next query re-hits the upstream"
+        );
     }
 }

@@ -1,7 +1,7 @@
 //! Clash RESTful API subset, endpoint-by-endpoint against mihomo's
 //! `hub/route` (Alpha): version/hello, traffic (websocket), memory,
 //! proxies (detail/select/delay), groups (list/detail/group delay),
-//! connections (list/close, websocket), rules, configs (GET/PATCH),
+//! connections (list/close, websocket), rules, configs (GET/PUT/PATCH),
 //! logs, dns query, cache flushes and the providers surface.
 //! Hand-rolled HTTP/1.1 + minimal websocket, mirroring core::api's
 //! zero-dependency approach.
@@ -233,13 +233,11 @@ async fn dispatch(stream: &mut TcpStream, req: &Request, engine: &Arc<Engine>) -
             }
         }
         ("DELETE", "/connections") => {
-            // mihomo connections.go closeAllConnections(): iterates the
-            // tracked conns and Close()s each. The engine's Stats table
-            // carries no per-connection cancellation handle yet, so the
-            // relays cannot be signalled from here — wiring needed:
-            // a cancel token inside stats::ConnEntry plus a
-            // force-close the relay select() observes; until then the
-            // 204 matches mihomo's status without the teardown.
+            // mihomo connections.go closeAllConnections(): signal every
+            // tracked relay through its cancel token; each connection
+            // then leaves the table as its own relay unwinds and folds
+            // its counters via stats::close.
+            engine.stats().force_close_all();
             write_json(stream, 204, "").await
         }
         // mihomo hub/route/dns.go queryDNS(): resolve through the
@@ -266,15 +264,13 @@ async fn dispatch(stream: &mut TcpStream, req: &Request, engine: &Arc<Engine>) -
             }
         }
         ("POST", "/cache/dns/flush") => {
-            // resolver.rs owns the DNS cache and exposes no clear()
-            // yet; fail loudly instead of pretending the cache was
-            // dropped (a one-line `pub fn clear_cache` wires this).
-            write_json(
-                stream,
-                503,
-                r#"{"message":"DNS cache flush is not wired into the engine resolver"}"#,
-            )
-            .await
+            // mihomo hub/route/cache.go flushDnsCache(): ClearCache() on
+            // the resolver when one exists, 204 either way (a nil
+            // resolver has nothing cached to drop).
+            if let Some(dns) = engine.dns() {
+                dns.clear_cache();
+            }
+            write_json(stream, 204, "").await
         }
         ("GET", "/configs") => {
             write_json(
@@ -289,15 +285,24 @@ async fn dispatch(stream: &mut TcpStream, req: &Request, engine: &Arc<Engine>) -
             )
             .await
         }
-        ("PATCH", "/configs") => {
-            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) {
-                if let Some(mode) = v["mode"].as_str() {
-                    if let Ok(mode) = RuleMode::parse(mode) {
-                        engine.set_mode(mode).await;
-                    }
-                }
+        // mihomo hub/route/configs.go updateConfigs() (PUT) and
+        // patchConfigs() (PATCH): the runtime-config re-apply surface.
+        // Upstream re-applies the general config (mode, ports,
+        // allow-lan); the engine can only hot-swap `mode` (Engine::mode
+        // is an RwLock read per relay) — listener-bound fields are
+        // rejected with the restart reason rather than silently
+        // ignored, and a bad body / bad mode is a 400 like upstream's
+        // bind failure.
+        ("PUT", "/configs") | ("PATCH", "/configs") => {
+            match apply_configs_patch(engine, &req.body).await {
+                Ok(()) => write_json(stream, 204, "").await,
+                Err(msg) => write_json(
+                    stream,
+                    400,
+                    &serde_json::json!({ "message": msg }).to_string(),
+                )
+                .await,
             }
-            write_json(stream, 204, "").await
         }
         // The engine defines no proxy providers (only rule providers),
         // so the honest list is empty.
@@ -318,11 +323,19 @@ async fn dispatch(stream: &mut TcpStream, req: &Request, engine: &Arc<Engine>) -
                 proxy_subroute(stream, req, engine, name).await
             } else if let Some(id) = path.strip_prefix("/connections/") {
                 if method == "DELETE" {
-                    // mihomo connections.go closeConnection(): looks the
-                    // tracker up by id and Close()s it. Same gap as the
-                    // close-all arm above: no cancellation seam yet.
-                    let _ = id;
-                    write_json(stream, 204, "").await
+                    // mihomo connections.go closeConnection(): look the
+                    // tracker up by id and Close() it — here, fire the
+                    // entry's cancel token so the relay select unwinds
+                    // (client sees EOF). Upstream's router only matches
+                    // numeric ids ([0-9]+) and answers 204 whether or
+                    // not the id was tracked.
+                    match id.parse::<u64>() {
+                        Ok(id) => {
+                            engine.stats().force_close(id);
+                            write_json(stream, 204, "").await
+                        }
+                        Err(_) => write_json(stream, 404, r#"{"message":"Not Found"}"#).await,
+                    }
                 } else {
                     write_json(stream, 404, r#"{"message":"Not Found"}"#).await
                 }
@@ -456,6 +469,44 @@ fn query_param(query: &str, key: &str) -> Option<String> {
         .split('&')
         .find_map(|kv| kv.strip_prefix(&format!("{key}=")))
         .map(percent_decode)
+}
+
+/// The mihomo-real subset of hub/route/configs.go updateConfigs /
+/// patchConfigs: patch the RUNTIME config. `mode` is the only field the
+/// engine can hot-apply — `Engine::mode` is an `RwLock` re-read by
+/// every relay's route decision, so a write re-routes the next
+/// connection. Everything listener-bound needs a socket re-bind that
+/// `Engine::run` performs exactly once at startup (the engine holds its
+/// config immutably); requesting those fields fails the whole request
+/// with the restart reason instead of half-applying.
+async fn apply_configs_patch(engine: &Arc<Engine>, body: &[u8]) -> std::result::Result<(), String> {
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| "Bad body".to_string())?;
+    let obj = v.as_object().ok_or_else(|| "Bad body".to_string())?;
+    for field in [
+        "port",
+        "socks-port",
+        "mixed-port",
+        "redir-port",
+        "allow-lan",
+        "bind-address",
+    ] {
+        if obj.contains_key(field) {
+            return Err(format!(
+                "{field} requires a restart: inbound sockets bind once at engine \
+                 start and the runtime has no re-bind path — only \"mode\" is \
+                 hot-swappable"
+            ));
+        }
+    }
+    if let Some(mode) = obj.get("mode").and_then(|m| m.as_str()) {
+        let mode = RuleMode::parse(mode)
+            .map_err(|_| format!("invalid mode {mode:?} (expected rule|global|direct)"))?;
+        engine.set_mode(mode).await;
+    }
+    // Other general fields (log-level, ipv6, tun, ...) are ignored like
+    // upstream's unmarshal-what-applies behavior.
+    Ok(())
 }
 
 /// The DNS qtype table mihomo's `/dns/query` accepts (a subset of
@@ -1230,8 +1281,9 @@ mod tests {
 
     // ---- live endpoint tests (loopback api + in-process engine) ----
 
+    use crate::addr::NetAddr;
     use crate::config::{DnsConfig, EngineConfig, EnhancedMode};
-    use crate::inbound::{ListenerConfig, ListenerKind};
+    use crate::inbound::{ListenerConfig, ListenerKind, RelayHandler as _};
 
     fn base_cfg() -> EngineConfig {
         EngineConfig {
@@ -1269,6 +1321,12 @@ mod tests {
     }
 
     async fn start_api(cfg: EngineConfig) -> std::net::SocketAddr {
+        start_api_with_engine(cfg).await.0
+    }
+
+    /// Like start_api, but hands the engine back so tests can drive the
+    /// relay handlers directly while querying the API.
+    async fn start_api_with_engine(cfg: EngineConfig) -> (std::net::SocketAddr, Arc<Engine>) {
         let engine = crate::app::Engine::build(cfg).unwrap();
         // Reserve a free port, then serve on it (serve() does not
         // report the bound address when port 0 is used).
@@ -1281,11 +1339,11 @@ mod tests {
                 port: addr.port(),
                 secret: Some("sekrit".into()),
             },
-            engine,
+            engine.clone(),
         )
         .await
         .unwrap();
-        addr
+        (addr, engine)
     }
 
     /// One request/response roundtrip; the client half-closes after
@@ -1422,12 +1480,283 @@ mod tests {
         let (status, body) = request(addr, "GET", "/connections", b"").await;
         assert_eq!(status, 200);
         assert!(body.contains("\"downloadTotal\"") && body.contains("\"connections\""));
-        // Close-all and per-id return mihomo's 204 (the relay-side
-        // cancel seam is the documented follow-up).
+        // Close-all and per-id return mihomo's 204 — including for ids
+        // that were never tracked (the live-relay teardown is covered by
+        // connections_close_kills_live_relay below).
         let (status, _) = request(addr, "DELETE", "/connections", b"").await;
         assert_eq!(status, 204);
         let (status, _) = request(addr, "DELETE", "/connections/42", b"").await;
         assert_eq!(status, 204);
+        // Upstream's router only matches numeric ids.
+        let (status, _) = request(addr, "DELETE", "/connections/notanid", b"").await;
+        assert_eq!(status, 404);
+    }
+
+    // ---- live-relay tests (real sockets through the engine relay) ----
+
+    /// A target that dribbles a few bytes forever and never EOFs: a
+    /// relay to it can only end by force-close (or its client hanging
+    /// up), which is exactly what DELETE /connections must do.
+    async fn dribble_server() -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    continue;
+                };
+                tokio::spawn(async move {
+                    loop {
+                        if sock.write_all(b"drib").await.is_err() {
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// Drive the engine's TCP relay the way an inbound would: a local
+    /// socket pair whose engine-side end is handed to handle_tcp as the
+    /// client stream. Returns the client's reader end (EOF observable).
+    async fn spawn_relay(
+        engine: &Arc<Engine>,
+        target: std::net::SocketAddr,
+    ) -> tokio::net::TcpStream {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (reader, _) = listener.accept().await.unwrap();
+        engine.clone().handle_tcp(
+            crate::inbound::TcpMeta {
+                target: NetAddr::ip(target.ip(), target.port()),
+                source: client.local_addr().unwrap(),
+                inbound: "test".into(),
+                inbound_port: None,
+                inbound_kind: "mixed",
+            },
+            Box::new(client),
+        );
+        reader
+    }
+
+    /// Tracked connection ids, via GET /connections.
+    async fn conn_ids(addr: std::net::SocketAddr) -> Vec<u64> {
+        let (_, body) = request(addr, "GET", "/connections", b"").await;
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["connections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap().parse::<u64>().unwrap())
+            .collect()
+    }
+
+    /// Poll GET /connections (5s budget) until the predicate holds.
+    async fn wait_for_conns<F>(addr: std::net::SocketAddr, pred: F) -> Vec<u64>
+    where
+        F: Fn(&[u64]) -> bool,
+    {
+        for _ in 0..100 {
+            let ids = conn_ids(addr).await;
+            if pred(&ids) {
+                return ids;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("connection table condition not met within 5s");
+    }
+
+    fn chains_of(body: &str, id: u64) -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(body).unwrap()["connections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == serde_json::json!(id.to_string()))
+            .map(|c| c["chains"].clone())
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    #[tokio::test]
+    async fn connections_close_kills_live_relay() {
+        let (addr, engine) = start_api_with_engine(base_cfg()).await;
+        let target = dribble_server().await;
+        let mut reader = spawn_relay(&engine, target).await;
+
+        // Mid-flight proof: dribble bytes flow through the engine relay.
+        let mut buf = [0u8; 8];
+        tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_exact(&mut buf))
+            .await
+            .expect("relay delivered dribble bytes")
+            .unwrap();
+        assert_eq!(&buf, b"dribdrib");
+
+        let id = wait_for_conns(addr, |ids| !ids.is_empty()).await[0];
+
+        // Per-id close (mihomo closeConnection) → 204.
+        let (status, _) = request(addr, "DELETE", &format!("/connections/{id}"), b"").await;
+        assert_eq!(status, 204);
+
+        // The client sees EOF: the relay observed the cancel token and
+        // dropped its end of the socket pair.
+        let mut sink = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_to_end(&mut sink))
+            .await
+            .expect("client saw EOF within 5s of the api close")
+            .unwrap();
+
+        // And the entry leaves the table once the relay folds its counters.
+        wait_for_conns(addr, |ids| !ids.contains(&id)).await;
+    }
+
+    #[tokio::test]
+    async fn connections_close_all_kills_udp_session() {
+        let (addr, engine) = start_api_with_engine(base_cfg()).await;
+        // A silent (bound, non-answering) UDP target: the session parks
+        // in the relay select until the 60s idle timeout — or the api
+        // force-close.
+        let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = sink.local_addr().unwrap();
+
+        let (up_tx, up_rx) = tokio::sync::mpsc::channel::<(NetAddr, Vec<u8>)>(4);
+        let (down_tx, _down_rx) = tokio::sync::mpsc::channel::<(NetAddr, Vec<u8>)>(4);
+        engine.clone().handle_udp(
+            "127.0.0.1:56000".parse().unwrap(),
+            "test".into(),
+            up_rx,
+            down_tx,
+        );
+        up_tx
+            .send((NetAddr::ip(target.ip(), target.port()), b"ping".to_vec()))
+            .await
+            .unwrap();
+
+        let id = wait_for_conns(addr, |ids| !ids.is_empty()).await[0];
+
+        // Close-all (mihomo closeAllConnections) → 204, session unwinds.
+        let (status, _) = request(addr, "DELETE", "/connections", b"").await;
+        assert_eq!(status, 204);
+        wait_for_conns(addr, |ids| !ids.contains(&id)).await;
+    }
+
+    #[tokio::test]
+    async fn dns_cache_flush_requeries_upstream() {
+        let (up, count) = crate::dns::resolver::test_support::counting_upstream().await;
+        let mut cfg = base_cfg();
+        cfg.dns = Some(DnsConfig {
+            enable: true,
+            listen: None,
+            enhanced_mode: EnhancedMode::RedirHost,
+            nameservers: vec![format!("udp://{up}")],
+            ..fakeip_cfg()
+        });
+        let addr = start_api(cfg).await;
+
+        // Prime the cache: one upstream exchange.
+        let (status, body) =
+            request(addr, "GET", "/dns/query?name=flush.test&type=A", b"").await;
+        assert_eq!(status, 200, "body: {body}");
+        assert!(body.contains("203.0.113.7"), "answer rendered: {body}");
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        // Cache hit: still one exchange.
+        let (status, _) = request(addr, "GET", "/dns/query?name=flush.test&type=A", b"").await;
+        assert_eq!(status, 200);
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        // mihomo cache.go flushDnsCache(): 204, cache dropped.
+        let (status, _) = request(addr, "POST", "/cache/dns/flush", b"").await;
+        assert_eq!(status, 204);
+        let (status, _) = request(addr, "GET", "/dns/query?name=flush.test&type=A", b"").await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "flush dropped the cache; the next query re-hits the upstream"
+        );
+
+        // DNS section disabled: nothing cached to drop — mihomo 204s
+        // unconditionally (nil resolver check).
+        let addr_nodns = start_api(base_cfg()).await;
+        let (status, _) = request(addr_nodns, "POST", "/cache/dns/flush", b"").await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn put_configs_swaps_mode_and_rejects_listener_fields() {
+        let mut cfg = base_cfg();
+        cfg.groups = vec![crate::outbound::GroupConfig {
+            name: "Auto".into(),
+            members: vec!["DIRECT".into()],
+            policy: crate::outbound::GroupPolicy::Select,
+            url: None,
+            interval: 0,
+            tolerance: 0,
+        }];
+        let (addr, engine) = start_api_with_engine(cfg).await;
+        let target = dribble_server().await;
+
+        // Rule mode: MATCH,DIRECT → chains [DIRECT]. (Waiting for the
+        // entry pins this relay's routing decision before the PUT.)
+        let _r1 = spawn_relay(&engine, target).await;
+        let ids = wait_for_conns(addr, |ids| !ids.is_empty()).await;
+        let id1 = ids[0];
+        let (_, body) = request(addr, "GET", "/connections", b"").await;
+        assert_eq!(
+            chains_of(&body, id1),
+            serde_json::json!(["DIRECT"]),
+            "rule mode routed via DIRECT"
+        );
+
+        // PUT /configs (mihomo updateConfigs' runtime-patch subset).
+        let (status, _) = request(addr, "PUT", "/configs", br#"{"mode":"global"}"#).await;
+        assert_eq!(status, 204);
+        let (_, body) = request(addr, "GET", "/configs", b"").await;
+        assert!(body.contains("\"mode\":\"global\""), "body: {body}");
+
+        // The NEXT relay uses the global outbound (the first group).
+        let _r2 = spawn_relay(&engine, target).await;
+        let ids = wait_for_conns(addr, |ids| ids.iter().any(|&i| i != id1)).await;
+        let id2 = ids.into_iter().find(|&i| i != id1).unwrap();
+        let (_, body) = request(addr, "GET", "/connections", b"").await;
+        assert_eq!(
+            chains_of(&body, id2),
+            serde_json::json!(["Auto"]),
+            "global mode routed via the first group"
+        );
+
+        // Listener-bound fields: rejected with the restart reason, and
+        // nothing was applied.
+        for field_body in [
+            br#"{"port": 7899}"#.as_slice(),
+            br#"{"socks-port": 7899}"#.as_slice(),
+            br#"{"allow-lan": true}"#.as_slice(),
+            br#"{"bind-address": "0.0.0.0"}"#.as_slice(),
+        ] {
+            let (status, body) = request(addr, "PUT", "/configs", field_body).await;
+            assert_eq!(status, 400, "body: {body}");
+            assert!(body.contains("restart"), "reason given: {body}");
+        }
+        let (_, body) = request(addr, "GET", "/configs", b"").await;
+        assert!(body.contains("\"mode\":\"global\""), "mode untouched");
+
+        // Bad body / bad mode mirror upstream's parse failure (400).
+        let (status, _) = request(addr, "PUT", "/configs", b"not json").await;
+        assert_eq!(status, 400);
+        let (status, body) = request(addr, "PUT", "/configs", br#"{"mode":"bogus"}"#).await;
+        assert_eq!(status, 400);
+        assert!(body.contains("invalid mode"), "body: {body}");
+
+        // PATCH shares the same runtime-patch surface (patchConfigs).
+        let (status, _) = request(addr, "PATCH", "/configs", br#"{"mode":"rule"}"#).await;
+        assert_eq!(status, 204);
+        let (_, body) = request(addr, "GET", "/configs", b"").await;
+        assert!(body.contains("\"mode\":\"rule\""), "body: {body}");
+        let (status, body) = request(addr, "PATCH", "/configs", br#"{"port": 1}"#).await;
+        assert_eq!(status, 400);
+        assert!(body.contains("restart"), "body: {body}");
     }
 
     #[tokio::test]

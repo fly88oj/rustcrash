@@ -11,6 +11,56 @@
 //! the peer's endpoint, or the wave-10 [`super::derp`] client relaying
 //! frames by node key, or both at once while the path is being learned.
 //!
+//! # Disco (wave 13)
+//!
+//! When the netmap gives the peer a disco key (`Node.DiscoKey` — every
+//! modern tailscale peer has one), the tunnel speaks the disco overlay
+//! over the same carriers before/alongside the WireGuard handshake: it
+//! sends a disco Ping with each handshake attempt, and the peer's Pong
+//! for a ping WE sent confirms the direct path ([`super::disco`] is the
+//! codec; the flow is magicsock's `sendDiscoMessage` /
+//! `handleDiscoMessage` / `handlePongConnLocked`, cached at
+//! `/tmp/wave13-upstream/ms_*.go`). A CallMeMaybe received via DERP
+//! adds the peer's advertised endpoints as candidates and pings them
+//! ("the peer has already punched its firewall", endpoint.go:2134-2218)
+//! — the direct path the peer requested. Carrier selection is then
+//! disco-informed: a pong-confirmed address is trusted for
+//! `trustUDPAddrDuration` (6.5s, magicsock.go:4012-4014) and carries
+//! the traffic exclusively (upstream `addrForSendLocked` returns the
+//! bestAddr alone while trusted, endpoint.go:632-649); a peer that
+//! never ponged falls back to the DERP relay (the wave-11 behavior,
+//! preserved exactly).
+//!
+//! The port of magicsock's disco loop is deliberately the bounded core;
+//! what is simplified vs upstream (magicsock.go / endpoint.go unless
+//! cited):
+//!
+//! * No heartbeat: upstream re-pings the best address every 3s
+//!   (`heartbeatInterval`) to keep NAT mappings alive; this port pings
+//!   only while a handshake is being (re)tried (one round per
+//!   REKEY_TIMEOUT attempt) — a proxy re-handshakes on demand rather
+//!   than holding idle paths open.
+//! * One confirmed path, first pong wins: upstream ranks endpoints by
+//!   pong latency with IPv6/private-IP bonuses (`betterAddr`,
+//!   endpoint.go:2046-2132) and keeps per-endpoint pong history; this
+//!   port keeps a single confirmed address per tunnel.
+//! * No MTU probing (pings carry no padding), no pingCLI, no
+//!   UDP-lifetime probes, no UDP-relay (Geneve/udprelay) messages, and
+//!   none of magicsock's path debugging (lan-assertion/breakTCP).
+//! * No disco pings over DERP: upstream's CLI ping can ride DERP; this
+//!   port pings only direct candidates, so a DERP-only peer stays on
+//!   DERP until IT sends a CallMeMaybe (which matches how upstream
+//!   peers open direct paths — the peer that received traffic via DERP
+//!   is the one that discovers the return path).
+//! * Pings received via DERP are dropped instead of ponged back (this
+//!   port is the initiator side of an outbound; the responder half of
+//!   disco belongs to a server-side port). Pings received over UDP ARE
+//!   ponged (handlePingLocked's reply, magicsock.go:2603-2608).
+//! * The peer map is the tunnel itself: upstream's peerMap /
+//!   `unambiguousNodeKeyOfPingLocked` (magicsock.go:2478-2508) resolve
+//!   a disco key to node keys across a whole netmap; a tunnel here is
+//!   bound to exactly one peer, so the sender-key check suffices.
+//!
 //! # Why a session lives here (and not in `proto::wireguard`)
 //!
 //! The engine's WireGuard client (`proto/wireguard.rs`) binds its own
@@ -38,18 +88,17 @@
 //!
 //! # Deltas vs upstream
 //!
-//! * No disco: modern tailscale peers speak the `disco` overlay (ping/
-//!   call-me-maybe) inside the same WireGuard datagrams; a peer that
-//!   requires disco before accepting transport will not come up
-//!   (disco is on the gap list). Peers marked `IsWireGuardOnly` (and
-//!   the engine's own endpoint) interoperate fully.
+//! * Disco is the bounded core above; peers marked `IsWireGuardOnly`
+//!   (and the engine's own endpoint, which carries no disco key) skip
+//!   it entirely and interoperate as before.
 //! * No cookie retry: a responder under initiation load replies with a
 //!   cookie request which this port drops (wireguard.rs:834-869 has the
 //!   consume half; tests never trip the 64/s load threshold). MAC1 is
 //!   always computed and MAC2 left zero, the unloaded-responder shape.
-//! * Path learning is first-response-wins: handshakes go out on every
-//!   configured carrier; the carrier that answers carries the session
-//!   (magicsock maintains full endpoint state instead).
+//! * Path learning is first-response-wins except where disco confirms a
+//!   path: handshakes go out on every configured carrier; the carrier
+//!   that answers carries the session unless a Pong later proves a
+//!   direct path (magicsock maintains full endpoint state instead).
 //! * Rekey timers mirror wireguard-go (REKEY_AFTER_TIME 120s,
 //!   REJECT_AFTER_TIME 180s, REKEY_TIMEOUT 5s, KEEPALIVE 10s — the
 //!   constants cross-checked in `proto/wireguard.rs:180-207`).
@@ -95,6 +144,18 @@ const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HANDSHAKE_ATTEMPTS: u32 = 18;
 const PADDING_MULTIPLE: usize = 16;
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+// Disco timing constants (magicsock.go:4010-4036, values from
+// /tmp/wave13-upstream/tsconst_ping.go):
+/// `pingTimeoutDuration = tsconst.DefaultPingTimeout` (5s): how long a
+/// sent ping waits for its pong before it is forgotten.
+const DISCO_PING_TIMEOUT: Duration = Duration::from_secs(5);
+/// `discoPingInterval = tsconst.DefaultPingInterval` (5s): the minimum
+/// time between pings to one endpoint.
+const DISCO_PING_INTERVAL: Duration = Duration::from_secs(5);
+/// `trustUDPAddrDuration` (6.5s, magicsock.go:4012-4014): how long a
+/// pong-confirmed UDP address is trusted as the exclusive path.
+const TRUST_UDP_ADDR_DURATION: Duration = Duration::from_millis(6500);
 
 const MSG_INITIATION_LEN: usize = 148;
 const MSG_RESPONSE_LEN: usize = 92;
@@ -502,6 +563,70 @@ impl DerpCarrier {
 }
 
 // ---------------------------------------------------------------------------
+// The disco endpoint state (magicsock's per-peer disco bookkeeping,
+// bounded — see the module docs' simplification list)
+// ---------------------------------------------------------------------------
+
+/// A ping we sent and are waiting on (`endpoint.sentPing`,
+/// endpoint.go:1398-1405): where it went and when, so the Pong's TxID
+/// resolves to the path it proves.
+struct SentPing {
+    to: SocketAddr,
+    at: Instant,
+}
+
+/// The per-tunnel disco state: our key, the peer's key, the pings in
+/// flight, and the pong-confirmed path (upstream's `bestAddr` +
+/// `trustBestAddrUntil`, endpoint.go:138-206).
+struct DiscoState {
+    our: super::disco::DiscoPrivateKey,
+    peer: super::disco::DiscoPublicKey,
+    /// Our node public, carried in Ping.NodeKey (sendDiscoPing,
+    /// endpoint.go:1307).
+    node_pub: [u8; 32],
+    /// Pings awaiting their Pong, by TxID.
+    sent: HashMap<[u8; 12], SentPing>,
+    /// The pong-confirmed direct address and the instant its trust
+    /// expires (None/elapsed = untrusted).
+    confirmed: Option<(SocketAddr, Instant)>,
+    /// Endpoints a CallMeMaybe supplied (in addition to the netmap's).
+    call_me_numbers: Vec<SocketAddr>,
+    /// Per-endpoint ping rate limit (discoPingInterval).
+    last_ping: HashMap<SocketAddr, Instant>,
+}
+
+impl DiscoState {
+    /// The trusted direct address, if a Pong confirmed one and its
+    /// trust window (`trustUDPAddrDuration`) has not lapsed.
+    fn trusted_direct(&self) -> Option<SocketAddr> {
+        let (addr, until) = self.confirmed?;
+        (Instant::now() < until).then_some(addr)
+    }
+
+    /// Forget pings whose pong can no longer arrive
+    /// (`discoPingTimeout`, endpoint.go:1236-1252).
+    fn expire_sent(&mut self) {
+        let now = Instant::now();
+        self.sent.retain(|_, sp| now.duration_since(sp.at) < DISCO_PING_TIMEOUT);
+    }
+
+    /// Every direct candidate to ping: the configured/learned endpoint
+    /// plus the CallMeMaybe numbers (deduplicated, family order kept).
+    fn candidates(&self, configured: Option<SocketAddr>) -> Vec<SocketAddr> {
+        let mut out = Vec::with_capacity(1 + self.call_me_numbers.len());
+        if let Some(ep) = configured {
+            out.push(ep);
+        }
+        for ep in &self.call_me_numbers {
+            if !out.contains(ep) {
+                out.push(*ep);
+            }
+        }
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Configuration + public API
 // ---------------------------------------------------------------------------
 
@@ -527,6 +652,19 @@ pub struct TsTunnelConfig {
     /// Whether UDP may traverse this tunnel (the config's `udp:` flag;
     /// wireguard.rs's WgOut.udp gates UdpOpen the same way).
     pub udp_enabled: bool,
+    /// The disco keys (ours + the peer's `Node.DiscoKey`); None when
+    /// the peer has no disco (pre-1.16 or `IsWireGuardOnly`).
+    pub disco: Option<DiscoKeys>,
+}
+
+/// The disco key pair a tunnel speaks under: our private key (one per
+/// overlay) and the peer's public key from the netmap.
+#[derive(Debug, Clone)]
+pub struct DiscoKeys {
+    /// Our overlay's disco private key.
+    pub our_private: super::disco::DiscoPrivateKey,
+    /// The peer's `Node.DiscoKey`.
+    pub peer_public: [u8; 32],
 }
 
 impl TsTunnelConfig {
@@ -569,10 +707,12 @@ pub struct TsTunnel {
 
 impl TsTunnel {
     /// Bring the tunnel up: bind the UDP socket when a direct endpoint
-    /// is configured, register with the peer's home DERP when routed
-    /// via relay, then run the handshake + netstack task. The first
-    /// handshake happens lazily on the first dial (like wireguard.rs's
-    /// pre-session queue) so an unused tunnel costs nothing.
+    /// is configured OR disco is in play (a CallMeMaybe can open a
+    /// direct path for an otherwise DERP-only peer), register with the
+    /// peer's home DERP when routed via relay, then run the handshake +
+    /// netstack task. The first handshake happens lazily on the first
+    /// dial (like wireguard.rs's pre-session queue) so an unused tunnel
+    /// costs nothing.
     pub async fn spawn(cfg: TsTunnelConfig) -> Result<Self> {
         if cfg.endpoint.is_none() && cfg.derp.is_none() {
             return Err(Error::config(
@@ -581,12 +721,27 @@ impl TsTunnel {
         }
         let node_key = super::derp::NodePrivateKey::from_bytes(cfg.private_key);
 
-        let udp = match cfg.endpoint {
-            Some(ep) => {
+        // The disco state, when the peer has a disco key.
+        let disco = cfg.disco.as_ref().map(|keys| DiscoState {
+            our: keys.our_private.clone(),
+            peer: super::disco::DiscoPublicKey::from_bytes(keys.peer_public),
+            node_pub: x25519_pub(&cfg.private_key),
+            sent: HashMap::new(),
+            confirmed: None,
+            call_me_numbers: Vec::new(),
+            last_ping: HashMap::new(),
+        });
+
+        let udp_sock = match (&cfg.endpoint, &disco) {
+            (Some(ep), _) => {
                 let bind = if ep.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
-                Some((Arc::new(UdpSocket::bind(bind).await?), ep))
+                Some(Arc::new(UdpSocket::bind(bind).await?))
             }
-            None => None,
+            // A disco tunnel with no advertised endpoint still binds: a
+            // CallMeMaybe may open the direct path later (the socket is
+            // where the peer's return traffic must land).
+            (None, Some(_)) => Some(Arc::new(UdpSocket::bind("0.0.0.0:0").await?)),
+            (None, None) => None,
         };
         let derp = match &cfg.derp {
             Some(route) => Some(DerpCarrier::spawn(route, &node_key).await?),
@@ -595,7 +750,7 @@ impl TsTunnel {
 
         let (tx, rx) = mpsc::channel::<TsCmd>(64);
         let wake = Arc::new(Notify::new());
-        let stack = Tunnel::new(cfg, udp, derp, wake.clone())?;
+        let stack = Tunnel::new(cfg, udp_sock, derp, disco, wake.clone())?;
         tokio::spawn(run_tunnel(stack, rx, wake));
         Ok(TsTunnel { cmd: tx })
     }
@@ -748,6 +903,14 @@ impl tokio::io::AsyncRead for TsTcpStream {
                 buf.put_slice(&back[..n - take_front]);
             }
             g.to_proxy.drain(..n);
+            drop(g);
+            // Freed queue space is stack input: the socket behind it may
+            // hold data the service loop could not move (and a peer
+            // waiting on the window this drain just re-opened). Wake the
+            // tunnel task instead of letting the connection idle until
+            // the driver's 1s tick (wave-13: the wave-12A wireguard.rs
+            // fix, 1075-1079, mirrored here).
+            self.shared.wake.notify_one();
             return Poll::Ready(Ok(()));
         }
         if g.read_eof {
@@ -947,8 +1110,14 @@ struct Tunnel {
     peer_pub: [u8; 32],
     local_ipv4: Ipv4Addr,
     local_ipv6: Option<Ipv6Addr>,
-    udp: Option<(Arc<UdpSocket>, SocketAddr)>,
+    /// The direct-path socket (bound whenever an endpoint is configured
+    /// or disco is in play).
+    udp_sock: Option<Arc<UdpSocket>>,
+    /// Where direct datagrams go: the configured endpoint, superseded by
+    /// a pong-confirmed address.
+    direct_dst: Option<SocketAddr>,
     derp: Option<DerpCarrier>,
+    disco: Option<DiscoState>,
     udp_enabled: bool,
     udp_socks: HashMap<u32, UdpSock>,
     used_ports: HashSet<u16>,
@@ -962,7 +1131,8 @@ struct Tunnel {
     wake: Arc<Notify>,
     start: Instant,
     /// Which carrier answered — set on the first authenticated packet
-    /// (magicsock's learned path, first-response-wins).
+    /// (magicsock's learned path, first-response-wins). A pong-confirmed
+    /// direct path overrides it for as long as the pong is trusted.
     learned_derp: bool,
     pump: Vec<u8>,
 }
@@ -970,8 +1140,9 @@ struct Tunnel {
 impl Tunnel {
     fn new(
         cfg: TsTunnelConfig,
-        udp: Option<(Arc<UdpSocket>, SocketAddr)>,
+        udp_sock: Option<Arc<UdpSocket>>,
         derp: Option<DerpCarrier>,
+        disco: Option<DiscoState>,
         wake: Arc<Notify>,
     ) -> Result<Self> {
         let mtu = cfg.mtu();
@@ -995,6 +1166,7 @@ impl Tunnel {
                 .add_default_ipv6_route(v6)
                 .map_err(|_| Error::network("tailscale: route table full"))?;
         }
+        let direct_dst = cfg.endpoint;
         Ok(Tunnel {
             iface,
             sockets: SocketSet::new(Vec::new()),
@@ -1003,8 +1175,10 @@ impl Tunnel {
             peer_pub: cfg.peer_public,
             local_ipv4: cfg.local_ipv4,
             local_ipv6: cfg.local_ipv6,
-            udp,
+            udp_sock,
+            direct_dst,
             derp,
+            disco,
             udp_enabled: cfg.udp_enabled,
             udp_socks: HashMap::new(),
             used_ports: HashSet::new(),
@@ -1111,6 +1285,14 @@ impl Tunnel {
             let gone = sock.state() == tcp::State::Closed;
             if gone {
                 g.read_eof = true;
+                // Closed without our own graceful FIN = the peer reset (or
+                // we aborted): writers must fail now instead of queuing
+                // into a dead socket forever (wave-13: the wave-12A
+                // wireguard.rs fix, 1762-1771, mirrored here — a mid-burst
+                // RST hung write_all on a full to_stack queue).
+                if !c.fin_sent && !g.write_closed {
+                    g.aborted = true;
+                }
             }
             if (!g.to_proxy.is_empty() || g.read_eof) && g.read_waker.is_some() {
                 if let Some(w) = g.read_waker.take() {
@@ -1155,14 +1337,24 @@ impl Tunnel {
         }
     }
 
-    /// Send one WireGuard datagram on the active path(s): the learned
-    /// carrier when a session exists, every carrier while handshaking
-    /// (magicsock's parallel probing, simplified — see module deltas).
+    /// Send one WireGuard datagram on the active path(s) — the
+    /// disco-informed form of magicsock's `addrForSendLocked` +
+    /// `sendUDPBatch`/`sendDatagramsViaDERP` (endpoint.go:632-649,
+    /// magicsock.go:1137-1198): while a pong-confirmed direct path is
+    /// trusted, it alone carries the traffic (even if the session first
+    /// came up over DERP — the responder roams); without a confirmation,
+    /// the learned carrier carries established sessions and every
+    /// carrier is tried while handshaking (parallel probing).
     async fn send_wg(&mut self, msg: &[u8]) -> Result<()> {
-        let via_derp_only = self.learned_derp || self.udp.is_none();
-        if let Some((sock, ep)) = &self.udp {
+        let confirmed = self.disco.as_ref().and_then(|d| d.trusted_direct());
+        let via_derp_only =
+            self.direct_dst.is_none() || (self.learned_derp && confirmed.is_none());
+        if let Some(dst) = confirmed.or(self.direct_dst) {
             if !via_derp_only {
-                sock.send_to(msg, ep)
+                let sock = self.udp_sock.as_ref().ok_or_else(|| {
+                    Error::network("tailscale: disco path with no bound UDP socket")
+                })?;
+                sock.send_to(msg, dst)
                     .await
                     .map_err(|e| Error::network(format!("tailscale: udp send: {e}")))?;
             }
@@ -1176,6 +1368,132 @@ impl Tunnel {
             }
         }
         Ok(())
+    }
+
+    /// Send one disco Ping to every direct candidate, rate-limited per
+    /// endpoint by DISCO_PING_INTERVAL — `sendDiscoPingsLocked`
+    /// (endpoint.go:1415-1451) minus the heartbeat/MTU/relay legs. Each
+    /// handshake attempt calls this, so REKEY_TIMEOUT bounds the retry
+    /// cadence (see the module docs: no independent heartbeat).
+    async fn send_disco_pings(&mut self) {
+        let Some(d) = self.disco.as_mut() else {
+            return;
+        };
+        d.expire_sent();
+        let now = Instant::now();
+        for ep in d.candidates(self.direct_dst) {
+            // "the minimum time between pings to an endpoint"
+            // (discoPingInterval; upstream resets this on CallMeMaybe).
+            if d.last_ping.get(&ep).is_some_and(|at| now.duration_since(*at) < DISCO_PING_INTERVAL)
+            {
+                continue;
+            }
+            let ping = super::disco::Ping {
+                txid: super::disco::new_txid(),
+                node_key: Some(d.node_pub),
+                padding: 0,
+            };
+            let Ok(pkt) = super::disco::seal(&d.our, &d.peer, &super::disco::DiscoMessage::Ping(ping.clone()))
+            else {
+                continue;
+            };
+            d.sent.insert(ping.txid, SentPing { to: ep, at: now });
+            d.last_ping.insert(ep, now);
+            tracing::debug!(target: "engine", "tailscale: disco: ping {} ({})", ep, super::disco::DiscoMessage::Ping(ping).summary());
+            if let Some(sock) = &self.udp_sock {
+                let _ = sock.send_to(&pkt, ep).await;
+            }
+        }
+    }
+
+    /// Handle one inbound disco frame — the bounded
+    /// `handleDiscoMessage` (magicsock.go:2163-2469). `via_derp` tells
+    /// which carrier delivered it; `from_udp` is the direct source
+    /// address when it arrived over UDP (a Pong's proof and a Ping's
+    /// reply address).
+    async fn handle_disco(&mut self, via_derp: bool, from_udp: Option<SocketAddr>, data: &[u8]) {
+        let Some(d) = self.disco.as_mut() else {
+            return;
+        };
+        // The MAC check inside open() is the authentication; the sender
+        // must then be the peer this tunnel belongs to (our stand-in
+        // for peerMap.knownPeerDiscoKey, magicsock.go:2191-2199 — one
+        // tunnel is one peer).
+        let Ok((sender, msg)) = super::disco::open(&d.our, data) else {
+            tracing::debug!(target: "engine", "tailscale: disco: unopenable frame dropped");
+            return;
+        };
+        if sender != d.peer {
+            return;
+        }
+        match msg {
+            super::disco::DiscoMessage::Ping(ping) => {
+                // handlePingLocked (magicsock.go:2512-2609): reply Pong
+                // with the sender's view of its own source ("It includes
+                // the sender's source IP + port, so it's effectively a
+                // STUN response", disco.go:249-255). Only the UDP leg —
+                // a DERP-carried ping has no source to echo and belongs
+                // to the responder half we do not port (module deltas).
+                let Some(from) = from_udp else {
+                    return;
+                };
+                let pong = super::disco::Pong {
+                    txid: ping.txid,
+                    src: from,
+                };
+                tracing::debug!(
+                    target: "engine",
+                    "tailscale: disco: got ping tx={:02x?} -> ponging {}",
+                    &ping.txid[..4],
+                    from
+                );
+                if let Some(sock) = &self.udp_sock {
+                    if let Ok(pkt) =
+                        super::disco::seal(&d.our, &d.peer, &super::disco::DiscoMessage::Pong(pong))
+                    {
+                        let _ = sock.send_to(&pkt, from).await;
+                    }
+                }
+            }
+            super::disco::DiscoMessage::Pong(pong) => {
+                // handlePongConnLocked (endpoint.go:1917-2010): a pong
+                // for a ping we sent confirms the path it was sent to,
+                // trusted for trustUDPAddrDuration.
+                if let Some(sp) = d.sent.remove(&pong.txid) {
+                    tracing::debug!(
+                        target: "engine",
+                        "tailscale: disco: pong confirmed {} (pong src {})",
+                        sp.to,
+                        pong.src
+                    );
+                    d.confirmed = Some((sp.to, Instant::now() + TRUST_UDP_ADDR_DURATION));
+                    // The confirmed address becomes the direct
+                    // destination (setBestAddrLocked).
+                    self.direct_dst = Some(sp.to);
+                }
+            }
+            super::disco::DiscoMessage::CallMeMaybe(cmm) => {
+                // endpoint.go:2138-2218: "The contract for use of this
+                // message is that the peer has already sent to us via
+                // UDP, so their stateful firewall should be open. Now we
+                // can Ping back and make it through." Only via DERP
+                // (magicsock.go:2312-2315).
+                if !via_derp {
+                    return;
+                }
+                tracing::debug!(
+                    target: "engine",
+                    "tailscale: disco: call-me-maybe, {} endpoints",
+                    cmm.my_number.len()
+                );
+                d.call_me_numbers = cmm.my_number;
+                // "Zero out all the lastPing times to force
+                // sendPingsLocked to send new ones" — then ping them.
+                d.last_ping.clear();
+                self.send_disco_pings().await;
+                self.wake.notify_one();
+            }
+        }
     }
 
     /// Encrypt an inner IP packet (queueing pre-handshake).
@@ -1193,7 +1511,9 @@ impl Tunnel {
     }
 
     /// Start or retransmit the handshake (wireguard.rs::Stack::initiate,
-    /// 1407-1450).
+    /// 1407-1450). A disco-configured tunnel probes its direct
+    /// candidates first (upstream pings when sending without a trusted
+    /// path, endpoint.send → sendDiscoPingsLocked, endpoint.go:1115-1120).
     async fn initiate(&mut self) -> Result<()> {
         if let Some(p) = &mut self.pending_hs {
             if p.attempts >= MAX_HANDSHAKE_ATTEMPTS {
@@ -1201,6 +1521,7 @@ impl Tunnel {
             }
             p.attempts += 1;
         }
+        self.send_disco_pings().await;
         let (msg, pending) = build_initiation(&self.private_key, &self.peer_pub, self.local_index)?;
         self.pending_hs = Some(pending);
         self.hs_retry_at = Some(Instant::now() + REKEY_TIMEOUT);
@@ -1471,8 +1792,9 @@ async fn run_tunnel(mut t: Tunnel, mut cmd_rx: mpsc::Receiver<TsCmd>, wake: Arc<
 
         let deadline = t.next_deadline();
         let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
-        let has_udp = t.udp.is_some();
+        let has_udp = t.udp_sock.is_some();
         let has_derp = t.derp.is_some();
+        let has_disco = t.disco.is_some();
         tokio::select! {
             biased;
             cmd = cmd_rx.recv() => {
@@ -1484,14 +1806,20 @@ async fn run_tunnel(mut t: Tunnel, mut cmd_rx: mpsc::Receiver<TsCmd>, wake: Arc<
             _ = wake.notified() => {}
             r = async {
                 if has_udp {
-                    let (sock, _) = t.udp.as_ref().expect("has_udp checked");
+                    let sock = t.udp_sock.as_ref().expect("has_udp checked");
                     sock.recv_from(&mut udp_buf).await
                 } else {
                     std::future::pending::<std::io::Result<(usize, SocketAddr)>>().await
                 }
             } => {
-                if let Ok((n, _)) = r {
-                    t.on_datagram(false, &udp_buf[..n]).await;
+                if let Ok((n, from)) = r {
+                    // packetLooksLike (magicsock.go:2093-2141): disco
+                    // frames and WireGuard datagrams share the socket.
+                    if has_disco && super::disco::looks_like_disco(&udp_buf[..n]) {
+                        t.handle_disco(false, Some(from), &udp_buf[..n]).await;
+                    } else {
+                        t.on_datagram(false, &udp_buf[..n]).await;
+                    }
                 }
             }
             evt = async {
@@ -1502,7 +1830,13 @@ async fn run_tunnel(mut t: Tunnel, mut cmd_rx: mpsc::Receiver<TsCmd>, wake: Arc<
                 }
             } => {
                 match evt {
-                    Some(DerpEvent::Packet(pkt)) => t.on_datagram(true, &pkt).await,
+                    Some(DerpEvent::Packet(pkt)) => {
+                        if has_disco && super::disco::looks_like_disco(&pkt) {
+                            t.handle_disco(true, None, &pkt).await;
+                        } else {
+                            t.on_datagram(true, &pkt).await;
+                        }
+                    }
                     _ => t.derp = None,
                 }
             }
@@ -1587,6 +1921,310 @@ mod tests {
         )
         .unwrap_err();
         assert!(v6.to_string().contains("no inner IPv6 address"), "{v6}");
+    }
+
+    // -------------------------------------------------------------------
+    // The wave-13 netstack stall repros: the engine's own WireGuard
+    // endpoint (`proto::wireguard.rs::serve_endpoint`) is the routed
+    // peer, reached over the direct UDP carrier — the same hermetic
+    // shape tailscale.rs's e2e tests use for the overlay. They mirror
+    // the wave-12A wireguard.rs repros
+    // (`reset_mid_burst_fails_the_writer_not_hangs`,
+    // `endpoint_accepts_concurrent_dials_to_one_port`,
+    // `tcp_echo_slow_reader_closes_and_reopens_window` and its
+    // `zero_window_reopens_promptly_after_drain` guard) against THIS
+    // module's `pump_conns` + `TsTcpStream`.
+    // -------------------------------------------------------------------
+
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use crate::inbound::RelayHandler;
+
+    const PEER_TUNNEL_IP: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 2);
+    const OUR_TUNNEL_IP: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
+    const EP_TCP_PORT: u16 = 9041;
+
+    fn b64(bytes: &[u8]) -> String {
+        STANDARD.encode(bytes)
+    }
+
+    /// The peer's relay: echo TCP both ways, loop UDP back (the same
+    /// shape as tailscale.rs's EchoRelay).
+    struct EchoRelay;
+    impl RelayHandler for EchoRelay {
+        fn handle_tcp(
+            self: Arc<Self>,
+            _meta: crate::inbound::TcpMeta,
+            mut client: crate::stream::BoxProxyStream,
+        ) {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    match client.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if client.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        fn handle_udp(
+            self: Arc<Self>,
+            _source: SocketAddr,
+            _inbound: String,
+            mut uplink: mpsc::Receiver<(NetAddr, Vec<u8>)>,
+            downlink: mpsc::Sender<(NetAddr, Vec<u8>)>,
+        ) {
+            tokio::spawn(async move {
+                while let Some((target, data)) = uplink.recv().await {
+                    let _ = downlink.send((target, data)).await;
+                }
+            });
+        }
+    }
+
+    /// A relay that drops the stream after the first read — the peer
+    /// aborts its socket (RST) while the writer is still pushing.
+    struct DropAfterFirstRead;
+    impl RelayHandler for DropAfterFirstRead {
+        fn handle_tcp(
+            self: Arc<Self>,
+            _meta: crate::inbound::TcpMeta,
+            mut client: crate::stream::BoxProxyStream,
+        ) {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16];
+                let _ = client.read(&mut buf).await;
+                // Drop: the endpoint aborts the connection (RST).
+            });
+        }
+        fn handle_udp(
+            self: Arc<Self>,
+            _source: SocketAddr,
+            _inbound: String,
+            _uplink: mpsc::Receiver<(NetAddr, Vec<u8>)>,
+            _downlink: mpsc::Sender<(NetAddr, Vec<u8>)>,
+        ) {
+        }
+    }
+
+    /// Spawn the production WireGuard endpoint as the routed peer and
+    /// bring up a [`TsTunnel`] to it over the direct UDP carrier. All
+    /// key material is generated in-test; nothing leaves loopback.
+    async fn spawn_peer_tunnel(relay: Arc<dyn RelayHandler>) -> TsTunnel {
+        let mut our_sk = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut our_sk);
+        let mut peer_sk = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut peer_sk);
+        let cfg = crate::proto::wireguard::WgEndpointCfg {
+            tag: "ts-wg13-peer".into(),
+            private_key: b64(&peer_sk),
+            listen_port: 0,
+            mtu: 0,
+            address: Some((PEER_TUNNEL_IP, 24)),
+            inet6_address: None,
+            udp_timeout: None,
+            peers: vec![crate::proto::wireguard::WgEndpointPeer {
+                public_key: b64(&x25519_pub(&our_sk)),
+                pre_shared_key: None,
+                allowed_ips: vec![(IpAddr::V4(OUR_TUNNEL_IP), 32)],
+                persistent_keepalive: None,
+            }],
+        };
+        let sa = crate::proto::wireguard::serve_endpoint(&cfg, relay)
+            .await
+            .expect("peer endpoint starts");
+        // The endpoint binds [::] dual-stack and reports the v6 wildcard;
+        // address it over v4 loopback (tailscale.rs rewrites the same way).
+        let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), sa.port());
+        TsTunnel::spawn(TsTunnelConfig {
+            private_key: our_sk,
+            peer_public: x25519_pub(&peer_sk),
+            local_ipv4: OUR_TUNNEL_IP,
+            local_ipv6: None,
+            mtu: 1280,
+            endpoint: Some(endpoint),
+            derp: None,
+            udp_enabled: true,
+            // The endpoint peer carries no disco key (IsWireGuardOnly
+            // shape), so this harness stays on the plain WireGuard path.
+            disco: None,
+        })
+        .await
+        .expect("tunnel spawns")
+    }
+
+    fn peer_target() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(PEER_TUNNEL_IP), EP_TCP_PORT)
+    }
+
+    /// REPRO (wave-13, mirrors wireguard.rs's wave-12A repro): a relay
+    /// that drops the stream after the first read — the peer aborts the
+    /// socket (RST) while the client writer is still pushing a burst far
+    /// bigger than every buffer. The writer must fail with BrokenPipe
+    /// promptly, not hang on a `to_stack` queue nobody drains.
+    #[tokio::test]
+    async fn reset_mid_burst_fails_the_writer_not_hangs() {
+        let tunnel = spawn_peer_tunnel(Arc::new(DropAfterFirstRead)).await;
+        let mut stream =
+            tokio::time::timeout(Duration::from_secs(30), tunnel.connect_tcp(peer_target()))
+                .await
+                .expect("dial must not stall")
+                .expect("dial through the tunnel");
+        let payload = vec![7u8; 512 * 1024];
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(15), stream.write_all(&payload)).await;
+        match outcome {
+            Err(_elapsed) => panic!("writer hung on a reset connection (stall)"),
+            // The write may complete into local queues before the RST
+            // lands; then the failure must surface on the next read.
+            Ok(Ok(())) => {
+                let mut more = vec![0u8; 16];
+                let read = tokio::time::timeout(Duration::from_secs(15), stream.read(&mut more))
+                    .await
+                    .expect("read side must terminate after a reset");
+                assert!(
+                    matches!(read, Ok(0) | Err(_)),
+                    "connection was reset: read must error or EOF, not data"
+                );
+            }
+            Ok(Err(e)) => {
+                assert!(
+                    matches!(e.kind(), io::ErrorKind::BrokenPipe),
+                    "writer must see BrokenPipe on reset, got {e:?}"
+                );
+            }
+        }
+    }
+
+    /// REPRO (wave-13, mirrors wireguard.rs's wave-12A
+    /// `endpoint_accepts_concurrent_dials_to_one_port`): several dials
+    /// to one port over one tunnel session, each echoing interleaved
+    /// bursts. The tailscale netstack is initiator-only — the listener
+    /// re-arm race cannot exist on this side (the wave-12A
+    /// spare-listener fix lives in the peer's endpoint) — so this pins
+    /// the client-side half of the shape: every concurrent dial must
+    /// establish and echo.
+    #[tokio::test]
+    async fn tunnel_accepts_concurrent_dials_to_one_port() {
+        let tunnel = spawn_peer_tunnel(Arc::new(EchoRelay)).await;
+        let mut streams = Vec::new();
+        for _ in 0..4 {
+            streams.push(
+                tokio::time::timeout(Duration::from_secs(30), tunnel.connect_tcp(peer_target()))
+                    .await
+                    .expect("concurrent dial must not stall")
+                    .expect("dial through the tunnel"),
+            );
+        }
+        // Every stream echoes multi-segment bursts, interleaved.
+        for round in 0..4u32 {
+            for (i, stream) in streams.iter_mut().enumerate() {
+                let chunk: Vec<u8> =
+                    (0..8 * 1024).map(|k| (k as u32 + round + i as u32) as u8).collect();
+                tokio::time::timeout(Duration::from_secs(30), stream.write_all(&chunk))
+                    .await
+                    .expect("concurrent stream write must not stall")
+                    .unwrap();
+                let mut back = vec![0u8; chunk.len()];
+                tokio::time::timeout(Duration::from_secs(30), stream.read_exact(&mut back))
+                    .await
+                    .expect("concurrent stream echo must not stall")
+                    .unwrap();
+                assert_eq!(back, chunk);
+            }
+        }
+        for mut s in streams {
+            s.shutdown().await.unwrap();
+        }
+    }
+
+    /// REPRO (wave-13, mirrors wireguard.rs's wave-12A repro): a
+    /// deliberately slow reader — 1 KiB reads with yields — forces the
+    /// receive window to close and reopen (zero-window probing) while
+    /// the write side keeps producing.
+    #[tokio::test]
+    async fn tcp_echo_slow_reader_closes_and_reopens_window() {
+        let tunnel = spawn_peer_tunnel(Arc::new(EchoRelay)).await;
+        let stream =
+            tokio::time::timeout(Duration::from_secs(30), tunnel.connect_tcp(peer_target()))
+                .await
+                .expect("dial must not stall")
+                .expect("dial through the tunnel");
+
+        const TOTAL: usize = 256 * 1024;
+        let payload: Vec<u8> = (0..TOTAL).map(|i| (i % 249) as u8).collect();
+
+        let (mut r, mut w) = tokio::io::split(stream);
+        let tx_payload = payload.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(60), w.write_all(&tx_payload))
+                .await
+                .expect("write side must survive a zero-window peer")
+                .unwrap();
+        });
+        let mut echoed = Vec::with_capacity(TOTAL);
+        let mut chunk = vec![0u8; 1024];
+        while echoed.len() < TOTAL {
+            let n = tokio::time::timeout(Duration::from_secs(60), r.read(&mut chunk))
+                .await
+                .expect("slow reader must not stall behind a closed window")
+                .unwrap();
+            assert!(n > 0, "premature EOF at {}", echoed.len());
+            echoed.extend_from_slice(&chunk[..n]);
+            tokio::task::yield_now().await;
+        }
+        writer.await.unwrap();
+        assert_eq!(echoed, payload);
+    }
+
+    /// GUARD (wave-13, mirrors wireguard.rs's wave-12A guard): the
+    /// zero-window stall-recovery shape. The reader drains in 16 KiB
+    /// chunks with pauses, so the peer repeatedly hits our closed
+    /// window; every drain must promptly re-open it — poll_read pings
+    /// the tunnel task the moment queue space frees, instead of idling
+    /// until the driver's 1s tick or the peer's next probe. Bound is
+    /// generous (healthy: ~2s).
+    #[tokio::test]
+    async fn zero_window_reopens_promptly_after_drain() {
+        let tunnel = spawn_peer_tunnel(Arc::new(EchoRelay)).await;
+        let stream =
+            tokio::time::timeout(Duration::from_secs(30), tunnel.connect_tcp(peer_target()))
+                .await
+                .expect("dial must not stall")
+                .expect("dial through the tunnel");
+
+        const TOTAL: usize = 256 * 1024;
+        let payload: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
+
+        let (mut r, mut w) = tokio::io::split(stream);
+        let tx_payload = payload.clone();
+        let writer = tokio::spawn(async move {
+            w.write_all(&tx_payload).await.unwrap();
+        });
+        let started = Instant::now();
+        let mut echoed = Vec::with_capacity(TOTAL);
+        let mut chunk = vec![0u8; 16 * 1024];
+        while echoed.len() < TOTAL {
+            let n = tokio::time::timeout(Duration::from_secs(10), r.read(&mut chunk))
+                .await
+                .expect("a drained window must re-open without the 1s tick")
+                .unwrap();
+            assert!(n > 0, "premature EOF at {}", echoed.len());
+            echoed.extend_from_slice(&chunk[..n]);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let elapsed = started.elapsed();
+        writer.await.unwrap();
+        assert_eq!(echoed, payload);
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "window re-opening dragged: {elapsed:?} for 256 KiB — read drain not waking the tunnel task"
+        );
     }
 
     // The full data-plane proofs (direct UDP + DERP relay against the

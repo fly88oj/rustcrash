@@ -259,11 +259,39 @@ impl NodeIdentity {
             }
         };
 
-        Ok(NodeIdentity {
-            machine_key,
-            node_key,
-        })
-    }
+    Ok(NodeIdentity {
+        machine_key,
+        node_key,
+    })
+}
+}
+
+/// Commit a rotated node key to the state store — the persist half of
+/// the key-expiry renewal: "key rotation is complete:
+/// `persist.PrivateNodeKey = tryingNewKey`" (direct.go:876-879), with
+/// `OldPrivateNodeKey` kept ("needed to request key rotation",
+/// persist.go:24-25) so a FUTURE rotation can present this one as the
+/// old key. Ephemeral nodes and missing state dirs are a no-op (there
+/// is nothing to persist).
+pub fn persist_rotated_node_key(
+    state_dir: Option<&Path>,
+    new: &NodePrivateKey,
+    old: Option<&NodePrivateKey>,
+) -> std::io::Result<()> {
+    let Some(dir) = state_dir else {
+        return Ok(());
+    };
+    let mut store = FileStore::open(dir.join(STATE_FILE_NAME))?;
+    // Preserve whatever else the Persist blob carried (read-modify-write).
+    let mut persist = match store.read_state(LEGACY_GLOBAL_DAEMON_STATE_KEY) {
+        Some(raw) => serde_json::from_slice::<Persist>(raw)
+            .map_err(|e| std::io::Error::other(format!("invalid Persist state: {e}")))?,
+        None => Persist::default(),
+    };
+    persist.old_private_node_key = old.map(node_private_text).unwrap_or_default();
+    persist.private_node_key = node_private_text(new);
+    let raw = serde_json::to_vec(&persist).map_err(std::io::Error::other)?;
+    store.write_state(LEGACY_GLOBAL_DAEMON_STATE_KEY, Some(raw.as_slice()))
 }
 
 #[cfg(test)]
@@ -360,5 +388,30 @@ mod tests {
         }
         let err = NodeIdentity::load_or_generate(Some(dir.path()), false).unwrap_err();
         assert!(err.to_string().contains("invalid key"));
+    }
+
+    #[test]
+    fn rotated_node_key_persists_and_reloads() {
+        // The renewal's state half (direct.go:876-879 + persist.go:24-25):
+        // the new key lands in PrivateNodeKey, the old one moves to
+        // OldPrivateNodeKey, and a restart loads the NEW identity.
+        let dir = tempfile::tempdir().unwrap();
+        let first = NodeIdentity::load_or_generate(Some(dir.path()), false).unwrap();
+        let fresh = NodePrivateKey::generate();
+        persist_rotated_node_key(Some(dir.path()), &fresh, Some(&first.node_key)).unwrap();
+
+        let store = FileStore::open(dir.path().join(STATE_FILE_NAME)).unwrap();
+        let persist: Persist =
+            serde_json::from_slice(store.read_state(LEGACY_GLOBAL_DAEMON_STATE_KEY).unwrap())
+                .unwrap();
+        assert_eq!(persist.private_node_key, node_private_text(&fresh));
+        assert_eq!(persist.old_private_node_key, node_private_text(&first.node_key));
+
+        let reloaded = NodeIdentity::load_or_generate(Some(dir.path()), false).unwrap();
+        assert_eq!(reloaded.node_key.public(), fresh.public());
+        assert_eq!(reloaded.machine_key.to_hex(), first.machine_key.to_hex());
+
+        // No state dir: a no-op, never an error, nothing written.
+        persist_rotated_node_key(None, &fresh, None).unwrap();
     }
 }
