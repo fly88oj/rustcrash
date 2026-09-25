@@ -553,11 +553,15 @@ fn parse_proxy_servers(
                     version,
                     obfs_mode: yaml_str(entry, "obfs-mode").unwrap_or_default(),
                     obfs_host: yaml_str(entry, "obfs-host").unwrap_or_default(),
+                    shadow_tls: None,
+                    res_tls: None,
+                    jls: None,
                 }
             }
             "anytls" => ServerProtocol::AnyTls {
                 password: yaml_str(entry, "password").unwrap_or_default(),
                 users: parse_user_list(entry, "users"),
+                tls,
             },
             other => {
                 return Err(Error::config(format!(

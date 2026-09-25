@@ -213,7 +213,9 @@ pub enum ServerProtocol {
         rate_limit: u32,
     },
     /// Snell server listener (mihomo `listeners` type `snell`):
-    /// the snell wire server (v2/v3/v4) with optional http-obfs.
+    /// the snell wire server (v2/v3/v4) with optional http-obfs and a
+    /// mutually-exclusive security fronting (shadow-tls / res-tls /
+    /// jls — upstream `security modes are mutually exclusive`).
     Snell {
         psk: String,
         version: u8,
@@ -221,6 +223,12 @@ pub enum ServerProtocol {
         /// precise error at serve).
         obfs_mode: String,
         obfs_host: String,
+        /// shadow-tls fronting: (password, sni, skip-verify).
+        shadow_tls: Option<(String, String, bool)>,
+        /// res-tls fronting: the restls server config (dest host).
+        res_tls: Option<crate::proto::restls::RestlsServerConfig>,
+        /// jls fronting: (sni, dest, users, alpn, rate-limit).
+        jls: Option<(String, String, Vec<(String, String)>, Vec<String>, u32)>,
     },
     /// AnyTLS server listener (mihomo `listeners` type `anytls`):
     /// the anytls session server, optionally multi-user.
@@ -228,6 +236,10 @@ pub enum ServerProtocol {
         password: String,
         /// (user, password) pairs; empty = single-password mode.
         users: Vec<(String, String)>,
+        /// TLS fronting (upstream refuses plaintext listeners unless a
+        /// stacking/allow-insecure is set; `None` serves plain for
+        /// tests and trusted transports, like trojan).
+        tls: Option<ServerTls>,
     },
 }
 

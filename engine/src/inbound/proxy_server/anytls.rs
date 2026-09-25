@@ -54,7 +54,7 @@ pub const TLS_REQUIRED_NOTE: &str = concat!(
 
 /// Serve an anytls listener; returns the bound address.
 pub async fn serve(cfg: &ServerConfig, relay: SharedRelay) -> Result<SocketAddr> {
-    let ServerProtocol::AnyTls { password, users } = &cfg.protocol else {
+    let ServerProtocol::AnyTls { password, users, .. } = &cfg.protocol else {
         return Err(Error::config(
             "anytls::serve called with a non-anytls protocol",
         ));

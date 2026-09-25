@@ -81,6 +81,7 @@ pub async fn serve(cfg: &ServerConfig, relay: SharedRelay) -> Result<SocketAddr>
         version,
         obfs_mode,
         obfs_host: _,
+        ..
     } = &cfg.protocol
     else {
         return Err(Error::config("snell::serve called with a non-snell protocol"));

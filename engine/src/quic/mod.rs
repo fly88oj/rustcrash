@@ -16,6 +16,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use crate::error::{Error, Result};
 use crate::transport::{tls_client_config, TlsSettings};
 
+pub mod tls13;
+
 /// Settings for one outbound QUIC connection.
 #[derive(Debug, Clone)]
 pub struct QuicDial {
