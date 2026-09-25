@@ -77,8 +77,11 @@
 //!   spec-conformant peers (mihomo/sing-box) and the engine's own client
 //!   are both served.
 
+pub mod anytls;
 pub mod hysteria2;
+pub mod jls;
 pub mod restls;
+pub mod snell;
 pub mod ss;
 pub mod tlsmirror;
 pub mod trojan;
@@ -197,6 +200,35 @@ pub enum ServerProtocol {
         /// The carrier destination the hidden session relays to.
         dest: String,
     },
+    /// JLS server listener (mihomo `listeners` type `jls`): multi-user
+    /// JLS termination over every accepted TCP conn; non-JLS traffic
+    /// falls back to a relay toward `dest` (the camouflage site).
+    Jls {
+        sni: String,
+        dest: String,
+        /// (username, password) pairs; the authenticated user is
+        /// recoverable from the conn for rules (UserFromConn).
+        users: Vec<(String, String)>,
+        alpn: Vec<String>,
+        rate_limit: u32,
+    },
+    /// Snell server listener (mihomo `listeners` type `snell`):
+    /// the snell wire server (v2/v3/v4) with optional http-obfs.
+    Snell {
+        psk: String,
+        version: u8,
+        /// `obfs-mode`: "" | http (tls-mode unsupported server-side →
+        /// precise error at serve).
+        obfs_mode: String,
+        obfs_host: String,
+    },
+    /// AnyTLS server listener (mihomo `listeners` type `anytls`):
+    /// the anytls session server, optionally multi-user.
+    AnyTls {
+        password: String,
+        /// (user, password) pairs; empty = single-password mode.
+        users: Vec<(String, String)>,
+    },
 }
 
 impl ServerProtocol {
@@ -212,6 +244,9 @@ impl ServerProtocol {
             ServerProtocol::Tuic { .. } => "tuic",
             ServerProtocol::Restls { .. } => "restls",
             ServerProtocol::TlsMirror { .. } => "tlsmirror",
+            ServerProtocol::Jls { .. } => "jls",
+            ServerProtocol::Snell { .. } => "snell",
+            ServerProtocol::AnyTls { .. } => "anytls",
         }
     }
 
@@ -226,7 +261,14 @@ impl ServerProtocol {
     ///   datagrams, and TUIC uni streams in `quic` mode).
     /// * RestLS / TLSMirror: camouflage TCP relays — TCP only.
     pub fn supports_udp(&self) -> bool {
-        !matches!(self, ServerProtocol::Restls { .. } | ServerProtocol::TlsMirror { .. })
+        !matches!(
+            self,
+            ServerProtocol::Restls { .. }
+                | ServerProtocol::TlsMirror { .. }
+                | ServerProtocol::Jls { .. }
+                | ServerProtocol::Snell { .. }
+                | ServerProtocol::AnyTls { .. }
+        )
     }
 }
 
@@ -254,6 +296,9 @@ pub async fn serve(cfg: &ServerConfig, relay: SharedRelay) -> Result<SocketAddr>
         ServerProtocol::Tuic { .. } => tuic::serve(cfg, relay).await,
         ServerProtocol::Restls { .. } => restls::serve(cfg, relay).await,
         ServerProtocol::TlsMirror { .. } => tlsmirror::serve(cfg, relay).await,
+        ServerProtocol::Jls { .. } => jls::serve(cfg, relay).await,
+        ServerProtocol::Snell { .. } => snell::serve(cfg, relay).await,
+        ServerProtocol::AnyTls { .. } => anytls::serve(cfg, relay).await,
     }
 }
 
