@@ -239,6 +239,7 @@ mod tests {
             protocol: ServerProtocol::AnyTls {
                 password: password.into(),
                 users,
+                tls: None,
             },
         }
     }

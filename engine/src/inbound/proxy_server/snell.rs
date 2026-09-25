@@ -279,6 +279,9 @@ mod tests {
                 version,
                 obfs_mode: obfs_mode.into(),
                 obfs_host: "cdn.example".into(),
+                shadow_tls: None,
+                res_tls: None,
+                jls: None,
             },
         }
     }
