@@ -404,6 +404,14 @@ pub(crate) fn box_open(
 #[derive(Clone)]
 pub struct NodePrivateKey([u8; 32]);
 
+impl std::fmt::Debug for NodePrivateKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the secret half (the machine-key precedent in
+        // noise.rs).
+        f.write_str("NodePrivateKey([redacted])")
+    }
+}
+
 impl NodePrivateKey {
     /// `key.NewNode()` — fresh random key.
     pub fn generate() -> Self {

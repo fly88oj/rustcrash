@@ -71,10 +71,10 @@ use bytes::{Buf, BytesMut};
 use rand::Rng;
 use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tracing::debug;
 
 use crate::addr::{Host, NetAddr};
 use crate::error::{Error, Result};
+use tracing::debug;
 use crate::proto::aead::{Aead, AeadKind, SsNonce};
 use crate::stream::BoxProxyStream;
 
@@ -113,11 +113,47 @@ const V4_INITIAL_PADDING_SPAN: u16 = 0x100;
 /// Idle gap after which the v4 chunk ramp resets (v4.go:296).
 const V4_IDLE_RESET: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Client-side security fronting (adapter/outbound/snell.go:183-240):
+/// `obfs-mode: shadow-tls | res-tls | jls` stacks a cover protocol
+/// under the snell wire, exactly like the server side composes them.
+#[derive(Debug, Clone)]
+pub enum SnellFronting {
+    /// `obfs-mode: shadow-tls` + `obfs-opts: {password, host}`.
+    ShadowTls { password: String, host: String },
+    /// `obfs-mode: res-tls` + the restls client options.
+    ResTls(crate::proto::restls::RestlsOut),
+    /// `obfs-mode: jls` + `obfs-opts: {host, username, password, alpn}`.
+    Jls(crate::proto::jls::JlsOut),
+}
+
+/// Dial + fronting handshake: the client stack's `streamConnContext`
+/// (outbound snell.go:44-67).
+pub async fn fronting_connect(front: &SnellFronting, server: &str, port: u16) -> Result<BoxProxyStream> {
+    let tcp = dial_tcp_transport(server, port).await?;
+    match front {
+        SnellFronting::ShadowTls { password, host } => {
+            let cfg = crate::proto::shadowtls::ShadowTlsOut {
+                server: server.to_string(),
+                port,
+                password: password.clone(),
+                sni: host.clone(),
+                skip_verify: true,
+            };
+            crate::proto::shadowtls::connect(&cfg, tcp).await
+        }
+        SnellFronting::ResTls(cfg) => crate::proto::restls::connect(cfg, tcp).await,
+        SnellFronting::Jls(cfg) => crate::proto::jls::connect(cfg, tcp).await,
+    }
+}
+
 /// Outbound Snell endpoint (mihomo `proxies: type: snell`).
 #[derive(Debug, Clone)]
 pub struct SnellOut {
     pub server: String,
     pub port: u16,
+    /// `obfs-mode: shadow-tls|res-tls|jls` client fronting (None =
+    /// plain / http-obfs as before).
+    pub fronting: Option<SnellFronting>,
     /// Pre-shared key (`psk`).
     pub psk: String,
     /// Protocol version. Raw config accepts `0..=5` — [`parse_version`]
@@ -1576,7 +1612,11 @@ pub async fn handshake(
         return Err(Error::config("snell: psk is required"));
     }
     let version = parse_version(cfg.version)?;
-    let cfg = SnellOut { version, ..cfg.clone() };
+    let cfg = SnellOut {
+        fronting: cfg.fronting.clone(),
+        version,
+        ..cfg.clone()
+    };
     if is_udp && version < 3 {
         // WriteUDPHeader (snell.go:129-131) refuses below v3.
         return Err(Error::config("snell: unsupport UDP version"));
@@ -1950,7 +1990,11 @@ pub async fn udp_session(cfg: &SnellOut, transport: BoxProxyStream) -> Result<Sn
         return Err(Error::config("snell: psk is required"));
     }
     let version = parse_version(cfg.version)?;
-    let cfg = SnellOut { version, ..cfg.clone() };
+    let cfg = SnellOut {
+        fronting: cfg.fronting.clone(),
+        version,
+        ..cfg.clone()
+    };
     if version < 3 {
         // WriteUDPHeader (snell.go:129-131), verbatim; the adapter
         // config check is "snell version %d not support UDP"
@@ -3379,6 +3423,7 @@ mod tests {
     async fn v3_loopback_echo() {
         let psk = test_psk();
         let cfg = SnellOut {
+            fronting: None,
             server: "127.0.0.1".into(),
             port: 0,
             psk: psk.clone(),
@@ -3412,6 +3457,7 @@ mod tests {
     async fn v3_wrong_psk_fails() {
         let psk = test_psk();
         let cfg = SnellOut {
+            fronting: None,
             server: "127.0.0.1".into(),
             port: 0,
             psk: format!("wrong-{psk}"),
@@ -3554,6 +3600,7 @@ mod tests {
     async fn v4_loopback_echo() {
         let psk = test_psk();
         let cfg = SnellOut {
+            fronting: None,
             server: "127.0.0.1".into(),
             port: 0,
             psk: psk.clone(),
@@ -3592,6 +3639,7 @@ mod tests {
         let psk = test_psk();
         let (client, mut server) = tokio::io::duplex(16 * 1024);
         let cfg = SnellOut {
+            fronting: None,
             server: "127.0.0.1".into(),
             port: 0,
             psk: psk.clone(),
@@ -3647,6 +3695,7 @@ mod tests {
     async fn v4_udp_handshake_and_packet_roundtrip() {
         let psk = test_psk();
         let cfg = SnellOut {
+            fronting: None,
             server: "127.0.0.1".into(),
             port: 0,
             psk: psk.clone(),
@@ -3785,6 +3834,7 @@ mod tests {
     async fn v4_udp_session_roundtrip_and_edges() {
         let psk = test_psk();
         let cfg = SnellOut {
+            fronting: None,
             server: "127.0.0.1".into(),
             port: 0,
             psk: psk.clone(),
@@ -3843,6 +3893,7 @@ mod tests {
     async fn v3_udp_session_lazy_reply_roundtrip() {
         let psk = test_psk();
         let cfg = SnellOut {
+            fronting: None,
             server: "127.0.0.1".into(),
             port: 0,
             psk: psk.clone(),
@@ -3868,6 +3919,7 @@ mod tests {
     #[tokio::test]
     async fn udp_session_rejects_bad_version_and_empty_psk() {
         let mut cfg = SnellOut {
+            fronting: None,
             server: "127.0.0.1".into(),
             port: 0,
             psk: String::new(),
@@ -3892,6 +3944,7 @@ mod tests {
     async fn v4_wrong_psk_fails() {
         let psk = test_psk();
         let cfg = SnellOut {
+            fronting: None,
             server: "127.0.0.1".into(),
             port: 0,
             psk: format!("wrong-{psk}"),
@@ -3913,6 +3966,7 @@ mod tests {
         // Raw version 6 is past every upstream constant
         // (adapter/outbound/snell.go:259-260).
         let cfg = SnellOut {
+            fronting: None,
             server: "x".into(),
             port: 1,
             psk: "p".into(),
@@ -3932,6 +3986,7 @@ mod tests {
         // WriteUDPHeader's verbatim error (snell.go:129-131).
         for version in [1u8, 2] {
             let cfg = SnellOut {
+            fronting: None,
                 server: "x".into(),
                 port: 1,
                 psk: "p".into(),
@@ -4020,6 +4075,7 @@ mod tests {
         // snell.go:160-167; cipher.go:50-56).
         let psk = test_psk();
         let cfg = SnellOut {
+            fronting: None,
             server: "127.0.0.1".into(),
             port: 0,
             psk: psk.clone(),
@@ -4053,6 +4109,7 @@ mod tests {
         // even on a plain (unpooled) handshake.
         let psk = test_psk();
         let cfg = SnellOut {
+            fronting: None,
             server: "127.0.0.1".into(),
             port: 0,
             psk: psk.clone(),
@@ -4090,6 +4147,7 @@ mod tests {
         // so a v5 config handshakes and relays against a v4 server.
         let psk = test_psk();
         let cfg = SnellOut {
+            fronting: None,
             server: "127.0.0.1".into(),
             port: 0,
             psk: psk.clone(),
@@ -4187,6 +4245,7 @@ mod tests {
         let counter2 = counter.clone();
         let pool = SnellPool::with_dialer(
             SnellOut {
+                fronting: None,
                 server: "127.0.0.1".into(),
                 port: 0,
                 psk: psk.clone(),
@@ -4290,6 +4349,7 @@ mod tests {
         let counter2 = counter.clone();
         let pool = SnellPool::with_dialer(
             SnellOut {
+                fronting: None,
                 server: "127.0.0.1".into(),
                 port: 0,
                 psk,
@@ -4384,6 +4444,7 @@ mod tests {
         assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
         for version in [1u8, 3] {
             let err = match SnellPool::new(SnellOut {
+                fronting: None,
                 server: "127.0.0.1".into(),
                 port: 0,
                 psk: psk.clone(),
@@ -4397,6 +4458,7 @@ mod tests {
         }
         // v5 normalizes to 4 → pools fine (adapter snell.go:248-252).
         assert!(SnellPool::new(SnellOut {
+            fronting: None,
             server: "127.0.0.1".into(),
             port: 0,
             psk: psk.clone(),
@@ -4506,6 +4568,7 @@ mod tests {
             let psk = test_psk();
             let transport = spawn_server(version, &psk).await;
             let cfg = SnellOut {
+            fronting: None,
                 server: "127.0.0.1".into(),
                 port: 0,
                 psk: psk.clone(),
@@ -4531,6 +4594,7 @@ mod tests {
         let psk = test_psk();
         let transport = spawn_server(5, &psk).await;
         let cfg = SnellOut {
+            fronting: None,
             server: "127.0.0.1".into(),
             port: 0,
             psk: psk.clone(),
@@ -4565,6 +4629,7 @@ mod tests {
         let client = std::sync::Mutex::new(Some(client));
         let pool = SnellPool::with_dialer(
             SnellOut {
+                fronting: None,
                 server: "127.0.0.1".into(),
                 port: 0,
                 psk,
@@ -4604,6 +4669,7 @@ mod tests {
         let psk = test_psk();
         let transport = spawn_server(4, &psk).await;
         let cfg = SnellOut {
+            fronting: None,
             server: "127.0.0.1".into(),
             port: 0,
             psk: format!("wrong-{psk}"),
@@ -4630,6 +4696,7 @@ mod tests {
             let psk = test_psk();
             let transport = spawn_server(version, &psk).await;
             let cfg = SnellOut {
+            fronting: None,
                 server: "127.0.0.1".into(),
                 port: 0,
                 psk: psk.clone(),
@@ -4659,6 +4726,7 @@ mod tests {
         let psk = test_psk();
         let transport = spawn_server(4, &psk).await;
         let cfg = SnellOut {
+            fronting: None,
             server: "127.0.0.1".into(),
             port: 0,
             psk: psk.clone(),
@@ -4751,6 +4819,7 @@ mod tests {
             }
         });
         let cfg = SnellOut {
+            fronting: None,
             server: "127.0.0.1".into(),
             port: 0,
             psk,

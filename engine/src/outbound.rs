@@ -754,7 +754,6 @@ async fn vless_front(
                 tlsmirror,
                 ech,
             } => {
-                Self::ech_refusal(ech)?;
                 let cfg = VmessOut {
                     server: server.clone(),
                     port: *port,
@@ -794,7 +793,6 @@ async fn vless_front(
                 jls,
                 ech,
             } => {
-                Self::ech_refusal(ech)?;
                 let cfg = VlessOut {
                     server: server.clone(),
                     port: *port,
@@ -904,7 +902,6 @@ async fn vless_front(
                 jls,
                 ech,
             } => {
-                Self::ech_refusal(ech)?;
                 let cfg = TrojanOut {
                     server: server.clone(),
                     port: *port,
@@ -927,7 +924,6 @@ async fn vless_front(
                 obfs,
                 ech,
             } => {
-                Self::ech_refusal(ech)?;
                 let cfg = crate::proto::hysteria2::Hysteria2Cfg {
                     server: server.clone(),
                     port: *port,
@@ -936,9 +932,18 @@ async fn vless_front(
                     skip_verify: *skip_verify,
                     obfs: obfs.clone(),
                 };
-                let conn = self
-                    .quic_conn(|| async { crate::proto::hysteria2::connect(&cfg).await })
-                    .await?;
+                // ECH rides the engine's own TLS 1.3 QUIC crypto layer
+                // (quic::dial_ech); without it, the standard rustls dial.
+                let conn = if let Some(opts) = ech.as_ref().filter(|o| o.enable) {
+                    let opts = opts.clone();
+                    self.quic_conn(|| async {
+                        crate::proto::hysteria2::connect_ech(&cfg, &opts).await
+                    })
+                    .await?
+                } else {
+                    self.quic_conn(|| async { crate::proto::hysteria2::connect(&cfg).await })
+                        .await?
+                };
                 crate::proto::hysteria2::tcp_stream(&conn, target).await
             }
             OutboundKind::Tuic {
@@ -951,7 +956,6 @@ async fn vless_front(
                 ech,
                 ..
             } => {
-                Self::ech_refusal(ech)?;
                 let cfg = crate::proto::tuic::TuicCfg {
                     server: server.clone(),
                     port: *port,
@@ -961,9 +965,16 @@ async fn vless_front(
                     skip_verify: *skip_verify,
                     udp_relay_mode: crate::proto::tuic::UdpRelayMode::default(),
                 };
-                let conn = self
-                    .quic_conn(|| async { crate::proto::tuic::connect(&cfg).await })
-                    .await?;
+                let conn = if let Some(opts) = ech.as_ref().filter(|o| o.enable) {
+                    let opts = opts.clone();
+                    self.quic_conn(|| async {
+                        crate::proto::tuic::connect_ech(&cfg, &opts).await
+                    })
+                    .await?
+                } else {
+                    self.quic_conn(|| async { crate::proto::tuic::connect(&cfg).await })
+                        .await?
+                };
                 crate::proto::tuic::tcp_stream(&conn, target).await
             }
             OutboundKind::Ssh {
@@ -1022,6 +1033,17 @@ async fn vless_front(
                 crate::proto::wireguard::connect(cfg, target).await
             }
             OutboundKind::Snell(cfg) => {
+                // Security fronting (shadow-tls/res-tls/jls): the cover
+                // handshake under the snell wire, then the normal path
+                // over the wrapped stream (one-shot; the pool's reuse
+                // applies to the plain/obfs wire like upstream's).
+                if let Some(front) = &cfg.fronting {
+                    let stream =
+                        crate::proto::snell::fronting_connect(front, &cfg.server, cfg.port)
+                            .await?;
+                    let s = crate::proto::snell::handshake(stream, cfg, target, false).await?;
+                    return Ok(s);
+                }
                 if let Some(pool) = self.snell_pool(cfg).await {
                     let conn = pool.dial(target).await?;
                     return Ok(Box::new(conn));
@@ -1060,7 +1082,11 @@ async fn vless_front(
                 crate::proto::gost_relay::connect(cfg, tcp, target).await
             }
             OutboundKind::TrustTunnel(cfg) => {
-                Self::ech_refusal(&cfg.ech)?;
+                // ECH works on the quic arm (quic_dial honors the field);
+                // the plain-h2 arm still has no rustls ECH hook.
+                if !cfg.quic {
+                    Self::ech_refusal(&cfg.ech)?;
+                }
                 let pool = self.trusttunnel_pool(cfg).await?;
                 pool.dial(target, None).await
             }
@@ -1414,7 +1440,11 @@ async fn vless_front(
                 })
             }
             OutboundKind::TrustTunnel(cfg) => {
-                Self::ech_refusal(&cfg.ech)?;
+                // ECH works on the quic arm (quic_dial honors the field);
+                // the plain-h2 arm still has no rustls ECH hook.
+                if !cfg.quic {
+                    Self::ech_refusal(&cfg.ech)?;
+                }
                 let pool = self.trusttunnel_pool(cfg).await?;
                 let s = pool.listen_packet(None).await?;
                 Ok(UdpChannel::TrustTunnel(tokio::sync::Mutex::new(s)))

@@ -4743,6 +4743,7 @@ dependencies = [
  "maxminddb",
  "md-5",
  "quinn",
+ "quinn-proto",
  "rand 0.8.5",
  "rcgen",
  "regex",

@@ -69,8 +69,44 @@ pub async fn connect(cfg: &Hysteria2Cfg) -> Result<quinn::Connection> {
         congestion_brutal_bps: None,
     };
     let conn = match cfg.obfs.as_deref() {
-        Some(key) if !key.is_empty() => dial_obfs(&dial, key.as_bytes()).await?,
+        Some(key) if !key.is_empty() => dial_obfs(&dial, key.as_bytes(), None).await?,
         _ => quic::dial(&dial).await?,
+    };
+    authenticate(&conn, cfg).await?;
+    Ok(conn)
+}
+
+/// [`connect`] with ECH (mihomo `ech-opts` on a hysteria2 outbound): the
+/// QUIC dial runs on the engine's own TLS 1.3 stack
+/// ([`crate::quic::tls13`]) with the ECH cover — the inner hello carries
+/// the real SNI and ALPN `h3`, HPKE-sealed inside the outer. The HTTP/3
+/// auth exchange that follows is unchanged. A server that rejects ECH
+/// surfaces the upstream `"tls: server rejected ECH"` (with one retry on
+/// the server's retry configs, `quic::dial_ech`).
+pub async fn connect_ech(
+    cfg: &Hysteria2Cfg,
+    opts: &crate::proto::ech::EchOptions,
+) -> Result<quinn::Connection> {
+    let selection = quic::ech_selection(opts)?;
+    let dial = QuicDial {
+        server: cfg.server.clone(),
+        port: cfg.port,
+        sni: cfg.sni.clone(),
+        alpn: vec!["h3".to_string()],
+        skip_verify: cfg.skip_verify,
+        udp_relay: true,
+        congestion_brutal_bps: None,
+    };
+    let conn = match cfg.obfs.as_deref() {
+        Some(key) if !key.is_empty() => {
+            dial_obfs(
+                &dial,
+                key.as_bytes(),
+                Some(quic::QuicTlsCover::Ech(selection)),
+            )
+            .await?
+        }
+        _ => quic::dial_ech(&dial, selection).await?,
     };
     authenticate(&conn, cfg).await?;
     Ok(conn)
@@ -78,7 +114,13 @@ pub async fn connect(cfg: &Hysteria2Cfg) -> Result<quinn::Connection> {
 
 /// QUIC dial through a salamander-obfuscated UDP socket: quinn drives a
 /// custom [`quinn::AsyncUdpSocket`] that pads/xors every datagram.
-async fn dial_obfs(cfg: &QuicDial, password: &[u8]) -> Result<quinn::Connection> {
+/// `cover` swaps the rustls handshake for the engine's own TLS 1.3
+/// stack (ECH).
+async fn dial_obfs(
+    cfg: &QuicDial,
+    password: &[u8],
+    cover: Option<quic::QuicTlsCover>,
+) -> Result<quinn::Connection> {
     let remote = quic::resolve_remote(&cfg.server, cfg.port).await?;
     let socket = tokio::net::UdpSocket::bind(quic::family_bind_addr(remote))
         .await
@@ -90,7 +132,20 @@ async fn dial_obfs(cfg: &QuicDial, password: &[u8]) -> Result<quinn::Connection>
         Arc::new(quinn::TokioRuntime),
     )
     .map_err(|e| Error::network(format!("salamander endpoint: {e}")))?;
-    endpoint.set_default_client_config(quic::client_config(cfg)?);
+    let client_cfg = match &cover {
+        Some(cover) => {
+            let mut quic = quic::client_config_custom(cfg, cover)?;
+            let mut transport = quinn::TransportConfig::default();
+            transport.max_concurrent_uni_streams(1024u32.into());
+            if cfg.udp_relay {
+                transport.datagram_receive_buffer_size(Some(64 * 1024));
+            }
+            quic.transport_config(Arc::new(transport));
+            quic
+        }
+        None => quic::client_config(cfg)?,
+    };
+    endpoint.set_default_client_config(client_cfg);
     let conn = endpoint
         .connect(remote, &cfg.sni)
         .map_err(|e| Error::config(format!("quic connect to {remote}: {e}")))?
@@ -1091,6 +1146,155 @@ mod tests {
     use super::*;
     use crate::addr::Host;
     use std::net::IpAddr;
+
+    // ---------------------------------------------------- ECH over QUIC
+
+    /// The hysteria2 HTTP/3 auth answer: one HEADERS frame whose QPACK
+    /// block carries the literal `:status 233` (the shape the client's
+    /// `read_auth_response` decodes; see `qpack_decode_static_and_
+    /// literals`).
+    fn auth_ok_response() -> Vec<u8> {
+        let mut block = vec![0x00, 0x00]; // prefix: ric 0, base 0
+        // Literal with static name idx 24 (:status), value "233" — the
+        // exact construction of `qpack_decode_static_and_literals`
+        // (multi-byte 4-bit index: 0x4f, 24-15).
+        quic::put_prefixed_int(&mut block, 0x40, 4, 24);
+        quic::put_prefixed_int(&mut block, 0x00, 7, 3);
+        block.extend_from_slice(b"233");
+        let mut out = Vec::new();
+        quic::write_varint(&mut out, 1); // HEADERS
+        quic::write_varint(&mut out, block.len() as u64);
+        out.extend_from_slice(&block);
+        out
+    }
+
+    /// `connect_ech`: the dial rides the engine's own TLS 1.3 stack with
+    /// the ECH cover (inner SNI/ALPN `h3`), an ECH-terminating quinn
+    /// server accepts, and the HTTP/3 auth exchange answers 233.
+    #[tokio::test]
+    async fn ech_connect_authenticates_over_h3() {
+        let (sk_r, list) = crate::quic::tls13::test_server::ech_server_key(
+            &[13u8; 32],
+            0x66,
+            b"hy2-public.example",
+        );
+        let endpoint = crate::quic::tls13::test_server::start_quinn_server(
+            crate::quic::tls13::ServerMode::EchAccept {
+                sk_r,
+                config_list: list.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let response = auth_ok_response();
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                let Ok(conn) = incoming.await else { continue };
+                let response = response.clone();
+                tokio::spawn(async move {
+                    // Drain the client's uni control/QPACK streams and
+                    // answer the auth request on the first bi stream;
+                    // keep serving streams so the connection (and its
+                    // handle) stays alive for the client's reads.
+                    let uni_conn = conn.clone();
+                    tokio::spawn(async move {
+                        while uni_conn.accept_uni().await.is_ok() {}
+                    });
+                    if let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                        let mut buf = [0u8; 1024];
+                        // Wait for the request HEADERS to arrive.
+                        let _ = recv.read(&mut buf).await;
+                        let _ = send.write_all(&response).await;
+                        let _ = send.finish();
+                    }
+                    while conn.accept_bi().await.is_ok() {}
+                });
+            }
+        });
+
+        let cfg = Hysteria2Cfg {
+            server: "127.0.0.1".to_string(),
+            port: addr.port(),
+            password: "ech-pass".to_string(),
+            sni: "hy2-inner.example".to_string(),
+            skip_verify: true,
+            obfs: None,
+        };
+        use base64::Engine as _;
+        let opts = crate::proto::ech::EchOptions {
+            enable: true,
+            config: base64::engine::general_purpose::STANDARD.encode(&list),
+            query_server_name: String::new(),
+        };
+
+        let conn = crate::proto::hysteria2::connect_ech(&cfg, &opts)
+            .await
+            .expect("ech dial + h3 auth");
+        // ALPN negotiated through the ECH inner hello.
+        let data = conn
+            .handshake_data()
+            .unwrap()
+            .downcast::<quinn::crypto::rustls::HandshakeData>()
+            .unwrap();
+        assert_eq!(data.protocol.as_deref(), Some(&b"h3"[..]));
+    }
+
+    /// A server that rejects ECH surfaces the upstream sentinel through
+    /// `connect_ech` (precise error, no silent fallback).
+    #[tokio::test]
+    async fn ech_rejection_is_the_precise_error() {
+        let (_other_sk, other) = crate::quic::tls13::test_server::ech_server_key(
+            &[14u8; 32],
+            0x77,
+            b"rejector.example",
+        );
+        let endpoint = crate::quic::tls13::test_server::start_quinn_server(
+            crate::quic::tls13::ServerMode::EchReject {
+                retry_configs: Some(other.clone()),
+            },
+        )
+        .await
+        .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                let _ = incoming.await;
+            }
+        });
+
+        let cfg = Hysteria2Cfg {
+            server: "127.0.0.1".to_string(),
+            port: addr.port(),
+            password: "ech-pass".to_string(),
+            sni: "hy2-inner.example".to_string(),
+            skip_verify: true,
+            obfs: None,
+        };
+        let (_sk, client_list) = crate::quic::tls13::test_server::ech_server_key(
+            &[15u8; 32],
+            0x12,
+            b"unrelated.example",
+        );
+        use base64::Engine as _;
+        let opts = crate::proto::ech::EchOptions {
+            enable: true,
+            config: base64::engine::general_purpose::STANDARD.encode(&client_list),
+            query_server_name: String::new(),
+        };
+
+        let err = crate::proto::hysteria2::connect_ech(&cfg, &opts)
+            .await
+            .expect_err("rejection must fail");
+        // dial_ech already consumed the one retry (with the rejector's
+        // list, which names the rejector's own key — the second attempt
+        // is rejected again and surfaces the sentinel).
+        assert!(
+            err.to_string().contains(crate::quic::tls13::ERR_ECH_REJECTED),
+            "{err}"
+        );
+    }
+
 
     fn hex(b: &[u8]) -> String {
         b.iter().map(|x| format!("{x:02x}")).collect()

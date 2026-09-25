@@ -55,6 +55,13 @@ regex = "1"
 
 serde_yaml = { workspace = true, optional = true }
 quinn = { version = "0.11.12", features = ["rustls-ring", "runtime-tokio"] }
+# quinn-proto is already in the graph via quinn (same 0.11.18 as the
+# lockfile pins for quinn itself); promoted to a direct dependency because
+# quinn 0.11's facade does not re-export the `TransportParameters` /
+# `TransportError` types that appear in the `quinn::crypto` trait
+# signatures (quinn-proto src/crypto.rs:63-68,74) — implementing a custom
+# QUIC TLS stack (engine/src/quic/tls13.rs) needs them nameable.
+quinn-proto = { version = "0.11.18", default-features = false }
 flate2 = { workspace = true, features = ["rust_backend"] }
 ruzstd = "0.9.0"
 hkdf = "0.12"

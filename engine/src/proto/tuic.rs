@@ -97,6 +97,31 @@ pub async fn connect(cfg: &TuicCfg) -> Result<quinn::Connection> {
     Ok(conn)
 }
 
+/// [`connect`] with ECH (mihomo `ech-opts` on a TUIC outbound): the QUIC
+/// dial runs on the engine's own TLS 1.3 stack
+/// ([`crate::quic::tls13`]) with the ECH cover — the inner hello carries
+/// the real SNI and ALPN `tuic`. The `Authenticate` token (TLS exporter)
+/// is computed by the same RFC 8446 §7.5 exporter the custom session
+/// implements, so the protocol above the handshake is unchanged.
+pub async fn connect_ech(
+    cfg: &TuicCfg,
+    opts: &crate::proto::ech::EchOptions,
+) -> Result<quinn::Connection> {
+    let selection = quic::ech_selection(opts)?;
+    let dial = QuicDial {
+        server: cfg.server.clone(),
+        port: cfg.port,
+        sni: cfg.sni.clone(),
+        alpn: vec![ALPN.to_string()],
+        skip_verify: cfg.skip_verify,
+        udp_relay: true,
+        congestion_brutal_bps: None,
+    };
+    let conn = quic::dial_ech(&dial, selection).await?;
+    authenticate(&conn, cfg).await?;
+    Ok(conn)
+}
+
 /// Send the Authenticate command on a unidirectional stream:
 /// `VER(5) || TYPE(0) || UUID(16) || TOKEN(32)` where TOKEN is
 /// TLS-Exporter(label = raw UUID, context = raw password, 32 bytes).
@@ -535,6 +560,117 @@ mod tests {
         assert_eq!(one.len(), 1);
         let f = decode_packet_frame(&one[0]).unwrap();
         assert_eq!((f.frag_id, f.frag_total, f.addr.as_ref(), f.data), (0, 1, Some(&target), &b"tiny"[..]));
+    }
+
+    // ---------------------------------------------------- ECH over QUIC
+
+    /// `connect_ech`: the dial rides the engine's own TLS 1.3 stack with
+    /// the ECH cover (inner SNI/ALPN `tuic`), an ECH-terminating quinn
+    /// server accepts, and the Authenticate token — an RFC 8446 §7.5
+    /// exporter over the ECH handshake — verifies server-side. Then a
+    /// TCP relay stream echoes.
+    #[tokio::test]
+    async fn ech_connect_authenticates_and_relays() {
+        let (sk_r, list) = crate::quic::tls13::test_server::ech_server_key(
+            &[11u8; 32],
+            0x55,
+            b"tuic-public.example",
+        );
+        let endpoint = crate::quic::tls13::test_server::start_quinn_server(
+            crate::quic::tls13::ServerMode::EchAccept {
+                sk_r,
+                config_list: list.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+
+        let uuid = uuid::Uuid::new_v4();
+        let password = format!("pass-{:016x}", rand::random::<u64>());
+        let seen_uuid = uuid;
+        let seen_password = password.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                let Ok(conn) = incoming.await else { continue };
+                let seen_uuid = seen_uuid;
+                let seen_password = seen_password.clone();
+                tokio::spawn(async move {
+                    // Authenticate: one uni stream, VER||TYPE||UUID||TOKEN.
+                    if let Ok(mut uni) = conn.accept_uni().await {
+                        let mut head = [0u8; 2 + 16 + 32];
+                        if uni.read_exact(&mut head).await.is_ok() {
+                            assert_eq!(&head[..2], &[VERSION, CMD_AUTHENTICATE]);
+                            assert_eq!(&head[2..18], seen_uuid.as_bytes());
+                            let mut expect = [0u8; 32];
+                            conn.export_keying_material(
+                                &mut expect,
+                                seen_uuid.as_bytes(),
+                                seen_password.as_bytes(),
+                            )
+                            .unwrap();
+                            assert_eq!(&head[18..50], &expect, "exporter token mismatch");
+                        }
+                    }
+                    // Echo every bi stream (the relay); keep the
+                    // connection handle alive — dropping it would close
+                    // the connection under the client.
+                    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                        tokio::spawn(async move {
+                            let mut buf = [0u8; 4096];
+                            while let Ok(Some(n)) = recv.read(&mut buf).await {
+                                if send.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                            let _ = send.finish();
+                        });
+                    }
+                });
+            }
+        });
+
+        let cfg = TuicCfg {
+            server: "127.0.0.1".to_string(),
+            port: addr.port(),
+            uuid,
+            password,
+            sni: "tuic-inner.example".to_string(),
+            skip_verify: true,
+            udp_relay_mode: UdpRelayMode::Native,
+        };
+        use base64::Engine as _;
+        let opts = crate::proto::ech::EchOptions {
+            enable: true,
+            config: base64::engine::general_purpose::STANDARD.encode(&list),
+            query_server_name: String::new(),
+        };
+
+        let conn = crate::proto::tuic::connect_ech(&cfg, &opts)
+            .await
+            .expect("ech dial + authenticate");
+        // ALPN negotiated through the ECH inner hello.
+        let data = conn
+            .handshake_data()
+            .unwrap()
+            .downcast::<quinn::crypto::rustls::HandshakeData>()
+            .unwrap();
+        assert_eq!(data.protocol.as_deref(), Some(&b"tuic"[..]));
+
+        let target = NetAddr::domain("ech.example", 443).unwrap();
+        let mut stream = crate::proto::tuic::tcp_stream(&conn, &target)
+            .await
+            .unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        stream.write_all(b"tuic ech relay").await.unwrap();
+        // The echo returns the whole stream (command header included);
+        // one bounded read must carry the payload as the tail (avoid
+        // read_to_end: neither side FINs first).
+        let mut echoed = [0u8; 256];
+        let n = stream.read(&mut echoed).await.unwrap();
+        assert!(n > 0, "no echo");
+        let echoed = &echoed[..n];
+        assert!(echoed.ends_with(b"tuic ech relay"), "{echoed:?}");
     }
 
     #[test]
