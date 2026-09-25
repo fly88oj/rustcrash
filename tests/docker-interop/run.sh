@@ -354,6 +354,7 @@ check_tcp() { # <node> <label> [expected-fail-symptom-regex]
         esac
     fi
     log_fail "TCP via $label: got '${out:0:70}'"
+    sub sh -c "grep -aE 'WARN|ERROR' /tmp/interop/logs/engine-client.log 2>/dev/null | tail -3" | tr -d '\r' | sed 's/\x1b\[[0-9;]*m//g'
 }
 echo "=== TCP matrix: engine client -> real mihomo listeners ==="
 check_tcp node-ss           "ss aes-256-gcm (legacy AEAD)"
