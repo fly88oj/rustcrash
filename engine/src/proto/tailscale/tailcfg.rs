@@ -597,6 +597,22 @@ pub struct PeerChange {
     pub key_expiry: Option<String>,
 }
 
+/// `tailcfg.DNSConfig` (tailcfg.go:1787-1853) — "the DNS configuration".
+/// Only the fields MagicDNS resolution consumes are carried (see the
+/// module scope note): `Domains` ("the search domains to use. Search
+/// domains must be FQDNs, but *without* the trailing dot", tailcfg.go:
+/// 1810-1811) and `Proxied` ("turns on automatic resolution of hostnames
+/// for devices in the network map, aka MagicDNS", tailcfg.go:1812-1815).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DnsConfig {
+    /// Search domains, FQDNs WITHOUT the trailing dot.
+    #[serde(rename = "Domains", default, skip_serializing_if = "Vec::is_empty")]
+    pub domains: Vec<String>,
+    /// MagicDNS on/off.
+    #[serde(rename = "Proxied", default)]
+    pub proxied: bool,
+}
+
 /// `tailcfg.MapResponse` (tailcfg.go:2006-2200) — the fields the session
 /// applies; everything else ignored on decode.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -642,6 +658,12 @@ pub struct MapResponse {
     /// "the name of the network that this node is in".
     #[serde(rename = "Domain", default, skip_serializing_if = "String::is_empty")]
     pub domain: String,
+    /// "DNSConfig contains the DNS settings for the client to use"
+    /// (tailcfg.go:2081-2083). nil means unchanged, exactly like the
+    /// other whole-map fields (capability 15: "client treats nil
+    /// MapResponse.DNSConfig as meaning unchanged", tailcfg.go:66).
+    #[serde(rename = "DNSConfig", default, skip_serializing_if = "Option::is_none")]
+    pub dns_config: Option<DnsConfig>,
     /// "the firewall rules" — carried for a future filter port, not
     /// enforced (see the gap list).
     #[serde(rename = "PacketFilter", default, skip_serializing_if = "Option::is_none")]

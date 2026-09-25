@@ -21,6 +21,8 @@ use crate::transport::TlsSettings;
 #[derive(Debug, Deserialize)]
 struct RawConfig {
     #[serde(default)]
+    profile: Option<ProfileRaw>,
+    #[serde(default)]
     port: Option<u16>,
     #[serde(default, rename = "socks-port")]
     socks_port_alt: Option<u16>,
@@ -113,13 +115,27 @@ struct RawProvider {
     path: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct ProfileRaw {
+    #[serde(default)]
+    store_fake_ip: Option<bool>,
+}
+
 /// Load from YAML text.
 pub fn load(text: &str) -> Result<EngineConfig> {
     let raw: RawConfig = serde_yaml::from_str(text)
         .map_err(|e| Error::config(format!("mihomo config: {e}")))?;
 
-    if raw.proxies.is_empty() && raw.proxy_groups.is_empty() {
-        return Err(Error::config("mihomo config has no proxies"));
+    if raw.proxies.is_empty()
+        && raw.proxy_groups.is_empty()
+        && raw.listeners.as_deref().is_none_or(|l| l.is_empty())
+        && raw.tun.is_none()
+        && raw.port.is_none()
+        && raw.mixed_port.is_none()
+    {
+        return Err(Error::config(
+            "mihomo config has no proxies, listeners, inbounds or tun",
+        ));
     }
 
     let bind = if raw.allow_lan {
@@ -209,9 +225,10 @@ pub fn load(text: &str) -> Result<EngineConfig> {
         }
     }
 
+    let fakeip_store = raw_profile_store_fakeip(&raw);
     let dns = raw
         .dns
-        .map(|d| -> Result<DnsConfig> {
+        .map(move |d| -> Result<DnsConfig> {
             Ok(DnsConfig {
                 enable: d.enable,
                 listen: d.listen.clone(),
@@ -231,6 +248,7 @@ pub fn load(text: &str) -> Result<EngineConfig> {
                     .fake_ip_range
                     .clone()
                     .unwrap_or_else(|| "198.18.0.1/15".to_string()),
+                fakeip_store,
                 fakeip_filter: d.fake_ip_filter.clone().unwrap_or_default(),
                 hosts: parse_hosts(d.hosts.as_ref()),
                 nameserver_policy: parse_nameserver_policy(d.nameserver_policy.as_ref()),
@@ -915,6 +933,43 @@ fn plugin_opt(entry: &BTreeMap<String, Yaml>, key: &str) -> Option<String> {
         })
 }
 
+/// mihomo `obfs-opts:` sub-mapping accessors (the snell fronting
+/// options live here, not in plugin-opts — live-interop finding).
+fn obfs_opt(entry: &BTreeMap<String, Yaml>, key: &str) -> Option<String> {
+    entry
+        .get("obfs-opts")
+        .and_then(Yaml::as_mapping)
+        .and_then(|m| m.get(Yaml::String(key.into())))
+        .and_then(|v| match v {
+            Yaml::String(s) => Some(s.clone()),
+            Yaml::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
+}
+
+fn obfs_bool(entry: &BTreeMap<String, Yaml>, key: &str) -> bool {
+    entry
+        .get("obfs-opts")
+        .and_then(Yaml::as_mapping)
+        .and_then(|m| m.get(Yaml::String(key.into())))
+        .and_then(Yaml::as_bool)
+        .unwrap_or(false)
+}
+
+fn obfs_str_list(entry: &BTreeMap<String, Yaml>, key: &str) -> Vec<String> {
+    entry
+        .get("obfs-opts")
+        .and_then(Yaml::as_mapping)
+        .and_then(|m| m.get(Yaml::String(key.into())))
+        .and_then(Yaml::as_sequence)
+        .map(|l| {
+            l.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn plugin_bool(entry: &BTreeMap<String, Yaml>, key: &str) -> bool {
     entry
         .get("plugin-opts")
@@ -1548,35 +1603,36 @@ fn parse_proxy(
                 .map_err(|e| Error::config(format!("proxy {name:?}: {e}")))?;
             // obfs-mode: http keeps the legacy in-band obfs; the
             // security modes (shadow-tls|res-tls|jls) front the wire
-            // (outbound snell.go:183-240, obfs-opts carries their
-            // fields).
+            // (outbound snell.go:183-240) — their options live in
+            // `obfs-opts:` (live-interop finding: plugin-opts is the
+            // ss plugin block, not snell's).
             let fronting = match yaml_str(entry, "obfs-mode").as_deref() {
                 Some("shadow-tls") => {
-                    let password = plugin_opt(entry, "password").unwrap_or_default();
+                    let password = obfs_opt(entry, "password").unwrap_or_default();
                     Some(crate::proto::snell::SnellFronting::ShadowTls {
                         password,
-                        host: plugin_opt(entry, "host").unwrap_or_default(),
+                        host: obfs_opt(entry, "host").unwrap_or_default(),
                     })
                 }
                 Some("res-tls") => {
-                    let version_hint = plugin_opt(entry, "version-hint")
-                        .or_else(|| plugin_opt(entry, "version"))
+                    let version_hint = obfs_opt(entry, "version-hint")
+                        .or_else(|| obfs_opt(entry, "version"))
                         .unwrap_or_else(|| "tls13".into());
                     Some(crate::proto::snell::SnellFronting::ResTls(
                         crate::proto::restls::RestlsOut {
-                            password: plugin_opt(entry, "password").unwrap_or_default(),
-                            sni: plugin_opt(entry, "host").unwrap_or_default(),
+                            password: obfs_opt(entry, "password").unwrap_or_default(),
+                            sni: obfs_opt(entry, "host").unwrap_or_default(),
                             version: version_hint,
-                            restls_script: plugin_opt(entry, "restls-script")
+                            restls_script: obfs_opt(entry, "restls-script")
                                 .filter(|s| !s.is_empty()),
-                            skip_cert_verify: plugin_bool(entry, "skip-cert-verify"),
+                            skip_cert_verify: obfs_bool(entry, "skip-cert-verify"),
                             udp: false,
                         },
                     ))
                 }
                 Some("jls") => {
-                    let username = plugin_opt(entry, "username").unwrap_or_default();
-                    let password = plugin_opt(entry, "password").unwrap_or_default();
+                    let username = obfs_opt(entry, "username").unwrap_or_default();
+                    let password = obfs_opt(entry, "password").unwrap_or_default();
                     if username.is_empty() || password.is_empty() {
                         return Err(Error::config(format!(
                             "proxy {name:?}: snell jls fronting requires obfs-opts \
@@ -1587,23 +1643,9 @@ fn parse_proxy(
                         crate::proto::jls::JlsOut {
                             username,
                             password,
-                            sni: plugin_opt(entry, "host").unwrap_or_default(),
-                            alpn: {
-                                let mut v = Vec::new();
-                                if let Some(Yaml::Sequence(l)) = entry
-                                    .get("obfs-opts")
-                                    .and_then(Yaml::as_mapping)
-                                    .and_then(|m| m.get(Yaml::String("alpn".into())))
-                                {
-                                    for a in l {
-                                        if let Yaml::String(x) = a {
-                                            v.push(x.clone());
-                                        }
-                                    }
-                                }
-                                v
-                            },
-                            skip_cert_verify: plugin_bool(entry, "skip-cert-verify"),
+                            sni: obfs_opt(entry, "host").unwrap_or_default(),
+                            alpn: obfs_str_list(entry, "alpn"),
+                            skip_cert_verify: obfs_bool(entry, "skip-cert-verify"),
                             fingerprint: None,
                         },
                     ))
@@ -1917,6 +1959,7 @@ fn parse_proxy(
                 dns: yaml_str_list(entry, "dns"),
             })
         }
+        "dns" => OutboundKind::Dns,
         "tailscale" => {
             OutboundKind::Tailscale(crate::proto::tailscale::TailscaleConfig {
                 name: name.clone(),
@@ -2168,6 +2211,16 @@ fn parse_sniffer(raw: Option<&BTreeMap<String, Yaml>>) -> crate::sniffer::SniffC
         tls_ports: ports_of("TLS"),
         http_ports: ports_of("HTTP"),
         quic_ports: ports_of("QUIC"),
+    }
+}
+
+/// mihomo `profile.store-fake-ip: true` → a JSON store beside the
+/// config's cache location (the engine's own cache dir convention).
+fn raw_profile_store_fakeip(raw: &RawConfig) -> Option<std::path::PathBuf> {
+    if raw.profile.as_ref().and_then(|p| p.store_fake_ip).unwrap_or(false) {
+        Some(std::path::PathBuf::from("/tmp/rustcrash-fakeip-store.json"))
+    } else {
+        None
     }
 }
 

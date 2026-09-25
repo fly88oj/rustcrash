@@ -113,7 +113,11 @@ impl Engine {
             _ => None,
         };
 
-        let registry = Arc::new(Registry::build(cfg.outbounds.clone(), cfg.groups.clone())?);
+        let registry = Arc::new(Registry::build(
+            cfg.outbounds.clone(),
+            cfg.groups.clone(),
+            dns.as_ref(),
+        )?);
         let mode = tokio::sync::RwLock::new(cfg.mode);
         let needs_process = crate::rule::needs_process(&rules);
         let needs_ip = rules.iter().any(|r| r.needs_ip());
@@ -957,6 +961,7 @@ mod tests {
             rules: vec!["MATCH,DIRECT".into()],
             sniff: Default::default(),
             dns: Some(DnsConfig {
+            fakeip_store: None,
                 enable: true,
                 listen: Some("127.0.0.1:0".into()),
                 ..Default::default()

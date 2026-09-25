@@ -535,6 +535,7 @@ pub fn load(text: &str) -> Result<EngineConfig> {
             nameservers,
             fallback: Vec::new(),
             fakeip_range: fakeip.inet4_range.unwrap_or_else(|| "198.18.0.1/15".into()),
+            fakeip_store: None,
             fakeip_filter: Vec::new(),
             hosts: parse_json_hosts(d.hosts.as_ref()),
             nameserver_policy: Vec::new(),

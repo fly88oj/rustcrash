@@ -51,8 +51,8 @@ use crate::transport::{tls_connect, TlsSettings};
 use super::controlhttp::ControlHttpDialer;
 use super::noise::{MachinePublicKey, NoiseConn};
 use super::tailcfg::{
-    DerpMap, Hostinfo, MapRequest, MapResponse, Node, NodeKey, RegisterRequest, RegisterResponse,
-    RegisterResponseAuth, UserProfile,
+    DerpMap, DnsConfig, Hostinfo, MapRequest, MapResponse, Node, NodeKey, Prefix, RegisterRequest,
+    RegisterResponse, RegisterResponseAuth, UserProfile,
 };
 
 /// The early-payload magic (control/ts2021/conn.go:90).
@@ -701,10 +701,50 @@ pub struct NetMap {
     /// All peers, sorted by Node ID (map.go:993-1005 sortedPeers).
     pub peers: Vec<Node>,
     pub derp_map: DerpMap,
+    /// The DNS configuration (`ms.lastDNSConfig`; cc_map.go:482-483 keeps
+    /// it per session, map.go's `netmap()` carries it as `DNS`, cc_map.go:
+    /// 1032).
+    pub dns_config: DnsConfig,
     /// The profiles of every user among self+peers (map.go:1051-1055).
     pub user_profiles: BTreeMap<i64, UserProfile>,
     /// The tailnet domain (`MapResponse.Domain`).
     pub domain: String,
+}
+
+/// The default routes an exit node advertises in AllowedIPs —
+/// `tsaddr.ContainsExitRoutes`' definition ("the two /0 routes"): a
+/// peer is an exit-node candidate iff its AllowedIPs contain either
+/// (ipnlocal.go's `suggestExitNodeUsingDERP` filters candidates with
+/// `tsaddr.ContainsExitRoutes(peer.AllowedIPs())`, fetched main 2026-09).
+fn is_exit_route(prefix: &Prefix) -> bool {
+    match prefix.addr {
+        std::net::IpAddr::V4(v4) => prefix.bits == 0 && v4.is_unspecified(),
+        std::net::IpAddr::V6(v6) => prefix.bits == 0 && v6.is_unspecified(),
+    }
+}
+
+/// The LAN/multicast ranges upstream never routes through an exit node —
+/// `removeFromDefaultRoute` (ipnlocal.go:3574-3594): RFC1918, IPv4
+/// link-local + multicast, the CGNAT (tailnet) range, and the IPv6
+/// link-local/multicast/tailnet ranges. Only consulted while an exit
+/// node is selected without `exit-node-allow-lan-access`.
+fn is_lan_range(ip: std::net::IpAddr) -> bool {
+    const V4_LAN: &[(&str, u8)] = &[
+        ("192.168.0.0", 16),
+        ("172.16.0.0", 12),
+        ("10.0.0.0", 8),
+        ("169.254.0.0", 16),
+        ("224.0.0.0", 4),
+        ("100.64.0.0", 10),
+    ];
+    const V6_LAN: &[(&str, u8)] = &[("fe80::", 10), ("ff00::", 8), ("fd7a:115c:a1e0::", 48)];
+    let table: &[(&str, u8)] = if ip.is_ipv4() { V4_LAN } else { V6_LAN };
+    table.iter().any(|&(net, bits)| {
+        let Ok(net) = net.parse::<std::net::IpAddr>() else {
+            return false;
+        };
+        Prefix::new(net, bits).contains(&ip)
+    })
 }
 
 impl NetMap {
@@ -728,10 +768,270 @@ impl NetMap {
         best.map(|(_, peer)| peer)
     }
 
+    /// The routing decision the overlay actually applies — the
+    /// AllowSubnetRoutes enforcement of `NetMap.WGCfg` (netmap.go:
+    /// 496-503: `WGConfigFlags`' only flag `AllowSubnetRoutes` gates the
+    /// peers' non-tailnet routes) as ipnlocal sets it from prefs
+    /// (ipnlocal.go:6111-6114 `if prefs.RouteAll() { flags |=
+    /// netmap.AllowSubnetRoutes }`):
+    ///
+    /// * prefixes covering one of the peer's own tailnet addresses always
+    ///   route (tailnet IPs are never gated);
+    /// * other advertised prefixes (subnet routes) only when
+    ///   `accept_routes`;
+    /// * the default routes only for the selected exit node
+    ///   (`selected_exit_node`, keyed by node key) — the "old and new
+    ///   exit node when the selection changes" reconfiguration of
+    ///   ipnlocal.go:6145-6152.
+    ///
+    /// While an exit node is selected, LAN/multicast destinations are
+    /// refused unless `allow_lan_access` — upstream shrinks the exit
+    /// node's /0 route by `removeFromDefaultRoute` (ipnlocal.go:3574-3594:
+    /// RFC1918 + link-local + multicast + the tailnet ranges never enter
+    /// the default route) and `ExitNodeAllowLANAccess` opts back in.
+    ///
+    /// Returns the routed peer, or `Err` with the precise reason a
+    /// routable-looking IP was refused.
+    pub fn route_peer_enforced(
+        &self,
+        ip: std::net::IpAddr,
+        accept_routes: bool,
+        selected_exit_node: Option<&NodeKey>,
+        allow_lan_access: bool,
+    ) -> std::result::Result<Option<&Node>, String> {
+        // Pass 1: everything except default routes — tailnet addresses
+        // (never gated) and advertised subnet routes (gated by
+        // accept_routes). A more specific match here beats the exit
+        // node's /0 exactly like upstream's route table (the
+        // tailnet/subnet routes stay more specific than the shrunk
+        // default route). Default routes never participate: an
+        // unselected peer's /0 must not grab traffic, and the selected
+        // exit node's is pass 2 (a /0 trivially covers the peer's own
+        // addresses, so it cannot be classified like a subnet route).
+        let mut best: Option<(u8, &Node)> = None;
+        for peer in &self.peers {
+            for prefix in &peer.allowed_ips {
+                if !prefix.contains(&ip) || is_exit_route(prefix) {
+                    continue;
+                }
+                if !peer.addresses.iter().any(|a| prefix.contains(&a.addr)) {
+                    // An advertised subnet route, not a tailnet address.
+                    if !accept_routes {
+                        continue;
+                    }
+                }
+                let better = best
+                    .as_ref()
+                    .map(|(bits, _)| prefix.bits > *bits)
+                    .unwrap_or(true);
+                if better {
+                    best = Some((prefix.bits, peer));
+                }
+            }
+        }
+        if let Some((_, peer)) = best {
+            return Ok(Some(peer));
+        }
+        // Pass 2: the selected exit node's default routes — the /0 the
+        // exit node advertises, shrunk by removeFromDefaultRoute
+        // (ipnlocal.go:3574-3594) unless ExitNodeAllowLANAccess opts
+        // back in.
+        if let Some(key) = selected_exit_node {
+            if let Some(peer) = self.peer_by_key(key.as_bytes()) {
+                if peer.allowed_ips.iter().any(is_exit_route) {
+                    if is_lan_range(ip) && !allow_lan_access {
+                        return Err(format!(
+                            "{ip} is a LAN/multicast address and exit-node-allow-lan-access \
+                             is off (removeFromDefaultRoute never carries LAN traffic through \
+                             an exit node)"
+                        ));
+                    }
+                    return Ok(Some(peer));
+                }
+            }
+        }
+        // Nothing matched under the prefs. Distinguish the refusals
+        // worth telling the integrator about: an unselected exit node's
+        // default route vs an advertised subnet behind accept-routes.
+        let ungated = self.route_peer(ip);
+        if let Some(peer) = ungated {
+            if peer.allowed_ips.iter().any(|p| is_exit_route(p) && p.contains(&ip)) {
+                return Err(format!(
+                    "{ip} would route through the exit node {} but no exit node is selected \
+                     (exit-node)",
+                    peer.name
+                ));
+            }
+            return Err(format!(
+                "{ip} is an advertised subnet route but accept-routes is off"
+            ));
+        }
+        Ok(None)
+    }
+
     /// A peer by its node key.
     pub fn peer_by_key(&self, key: &[u8; 32]) -> Option<&Node> {
         self.peers.iter().find(|p| p.key.as_bytes() == key)
     }
+
+    /// Port of `netmap.MagicDNSSuffixOfNodeName` (netmap.go:256-262):
+    /// the self node's FQDN minus its first label, dots trimmed —
+    /// `"host.tail-scale.ts.net."` → `"tail-scale.ts.net"`.
+    pub fn magic_dns_suffix(&self) -> String {
+        let name = self.self_node.name.trim_matches('.');
+        match name.split_once('.') {
+            Some((_, rest)) => rest.to_string(),
+            None => name.to_string(),
+        }
+    }
+
+    /// The search domains DNS queries expand bare names with: the
+    /// map's `DNSConfig.Domains` (tailcfg.go:1810-1811, FQDNs without
+    /// the trailing dot) with the MagicDNS suffix deduplicated in
+    /// (ipnlocal's resolver always knows its own tailnet suffix,
+    /// netmap.go:264-270 `MagicDNSSuffix`).
+    pub fn search_domains(&self) -> Vec<String> {
+        let mut out = Vec::with_capacity(self.dns_config.domains.len() + 1);
+        let suffix = self.magic_dns_suffix();
+        if !suffix.is_empty() {
+            out.push(suffix);
+        }
+        for d in &self.dns_config.domains {
+            let d = d.trim_end_matches('.');
+            if !d.is_empty() && !out.iter().any(|x| x.eq_ignore_ascii_case(d)) {
+                out.push(d.to_string());
+            }
+        }
+        out
+    }
+
+    /// The first tailnet address of a node, IPv4 preferred (the address
+    /// a MagicDNS A/AAAA record resolves to).
+    fn node_ip(node: &Node) -> Option<std::net::IpAddr> {
+        node.addresses
+            .iter()
+            .find(|p| p.addr.is_ipv4())
+            .or_else(|| node.addresses.first())
+            .map(|p| p.addr)
+    }
+
+    /// A node (self or peer) by its MagicDNS FQDN, trailing dot optional,
+    /// case-insensitive — `Node.Name` is "the FQDN of the node. It is
+    /// also the MagicDNS name for the node. It has a trailing dot"
+    /// (tailcfg.go:374-377).
+    fn node_by_name(&self, name: &str) -> Option<&Node> {
+        let want = normalize_dns_name(name)?;
+        let mut nodes = std::iter::once(&self.self_node).chain(self.peers.iter());
+        nodes.find(|n| normalize_dns_name(&n.name).is_some_and(|fq| fq == want))
+    }
+
+    /// MagicDNS resolution — the answer `100.100.100.100` would give a
+    /// tailnet client, from the netmap alone (ipnlocal feeds its resolver
+    /// exactly this map of peer names → addresses; a tsnet proxy has no
+    /// OS resolver, so [`super::TailscaleOverlay`] consults this directly):
+    ///
+    /// 1. the FQDN verbatim (trailing dot optional, case-insensitive),
+    ///    against the self node and every peer's `Name`;
+    /// 2. bare-name expansion through the search domains in order
+    ///    (`DNSConfig.Domains`, tailcfg.go:1810-1811, plus the MagicDNS
+    ///    suffix) — `<name>.<domain>` for each.
+    ///
+    /// Only names that resolve inside the tailnet map are answered;
+    /// everything else is `None` (upstream forwards those to the
+    /// configured upstream resolvers, which a proxy dial does not need).
+    pub fn resolve(&self, name: &str) -> Option<std::net::IpAddr> {
+        if let Some(node) = self.node_by_name(name) {
+            return Self::node_ip(node);
+        }
+        // A dotted non-FQDN (e.g. "peer.tail-scale") still expands; a
+        // name already ending in the magic suffix does not double-expand.
+        let want = name.trim_end_matches('.');
+        if want.is_empty() || want.ends_with(&self.magic_dns_suffix()) {
+            return None;
+        }
+        for domain in self.search_domains() {
+            if let Some(node) = self.node_by_name(&format!("{want}.{domain}")) {
+                return Self::node_ip(node);
+            }
+        }
+        None
+    }
+
+    /// The peers advertising exit routes (AllowedIPs with a /0), lowest
+    /// Node ID first — the candidate set of `suggestExitNodeUsingDERP`
+    /// (its `tsaddr.ContainsExitRoutes(peer.AllowedIPs())` filter,
+    /// ipnlocal.go:8895).
+    pub fn exit_node_peers(&self) -> Vec<&Node> {
+        self.peers
+            .iter()
+            .filter(|p| p.allowed_ips.iter().any(is_exit_route))
+            .collect()
+    }
+
+    /// The auto exit-node pick: the first reachable (Online != false)
+    /// exit-node peer by Node ID. Upstream ranks candidates by measured
+    /// DERP latency (`suggestExitNodeUsingDERP`, ipnlocal.go:8866-8889);
+    /// a headless proxy has no netcheck latencies, so the lowest-ID
+    /// reachable peer stands in — a documented delta, stable across
+    /// map polls like upstream's `prevSuggestion` stickiness.
+    pub fn pick_auto_exit_node(&self) -> Option<&Node> {
+        self.exit_node_peers()
+            .into_iter()
+            .find(|p| p.online != Some(false))
+    }
+
+    /// Resolve an `exit-node:` config value (an IP, a MagicDNS name, or
+    /// an `auto:<expr>` pick) to the peer to route non-tailnet traffic
+    /// through — the Status()-lookup half of mihomo's
+    /// `tailscaleExitNodeNeedsStatus` (cached tailscale.go:341-347),
+    /// served from the live netmap instead of `LocalClient.Status()`.
+    /// Only peers advertising exit routes can be selected; a name that
+    /// resolves to a non-exit peer is `None`.
+    pub fn select_exit_node(&self, exit_node: Option<&str>) -> Option<&Node> {
+        let value = exit_node?.trim();
+        if value.is_empty() {
+            return None;
+        }
+        if let Some(expr) = value.strip_prefix("auto:") {
+            if expr.is_empty() {
+                return None; // "auto:" alone is not a valid expression (prefs.go:1187-1192)
+            }
+            return self.pick_auto_exit_node();
+        }
+        if let Ok(ip) = value.parse::<std::net::IpAddr>() {
+            return self.peers.iter().find(|p| {
+                p.allowed_ips.iter().any(is_exit_route)
+                    && (p.addresses.iter().any(|a| a.addr == ip)
+                        || p.allowed_ips.iter().any(|aip| aip.addr == ip))
+            });
+        }
+        // A MagicDNS name (FQDN or bare), or the IP it resolves to.
+        let by_name = |n: &Node| {
+            normalize_dns_name(&n.name)
+                .is_some_and(|fq| fq == normalize_dns_name(value).expect("checked non-empty"))
+                && n.allowed_ips.iter().any(is_exit_route)
+        };
+        if let Some(p) = self.peers.iter().find(|p| by_name(p)) {
+            return Some(p);
+        }
+        let ip = self.resolve(value)?;
+        self.peers
+            .iter()
+            .find(|p| p.allowed_ips.iter().any(is_exit_route) && p.addresses.iter().any(|a| a.addr == ip))
+    }
+}
+
+/// Lowercase + ensure exactly one trailing dot; `None` for the empty
+/// name. DNS names are case-insensitive (RFC 1035 §2.3.3) and Go's
+/// fqdn type keeps the trailing dot.
+fn normalize_dns_name(name: &str) -> Option<String> {
+    let trimmed = name.trim_matches('.');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut out = trimmed.to_ascii_lowercase();
+    out.push('.');
+    Some(out)
 }
 
 /// The stateful session over one long-poll (map.go:52-134 mapSession):
@@ -742,6 +1042,7 @@ pub struct MapSession {
     peers: BTreeMap<i64, Node>,
     last_node: Option<Node>,
     last_derp_map: Option<DerpMap>,
+    last_dns_config: Option<DnsConfig>,
     last_user_profiles: BTreeMap<i64, UserProfile>,
     last_domain: String,
     node_key: NodeKey,
@@ -878,6 +1179,12 @@ impl MapSession {
             }
             self.last_derp_map = Some(dm);
         }
+        // DNSConfig, last-write-wins like DERPMap (cc_map.go:482-483
+        // keeps `lastDNSConfig`; "client treats nil MapResponse.DNSConfig
+        // as meaning unchanged", tailcfg.go:66).
+        if let Some(dns) = resp.dns_config.clone() {
+            self.last_dns_config = Some(dns);
+        }
         if !resp.domain.is_empty() {
             self.last_domain = resp.domain.clone();
         }
@@ -892,6 +1199,7 @@ impl MapSession {
             node_key: self.node_key.clone(),
             peers: self.peers.values().cloned().collect(),
             derp_map: self.last_derp_map.clone().unwrap_or_default(),
+            dns_config: self.last_dns_config.clone().unwrap_or_default(),
             user_profiles: self.last_user_profiles.clone(),
             domain: self.last_domain.clone(),
         }
@@ -1043,6 +1351,217 @@ mod tests {
     }
 
     // -- pure pieces -------------------------------------------------------
+
+    #[test]
+    fn map_session_applies_dns_config_like_the_go_session() {
+        // cc_map.go:482-483 keeps lastDNSConfig per session; a nil
+        // DNSConfig means unchanged (tailcfg.go:66, capability 15).
+        let self_key = NodeKey(gen_pub());
+        let mut ms = MapSession::new(self_key);
+        assert_eq!(ms.netmap().dns_config, DnsConfig::default());
+        ms.handle_response(&MapResponse {
+            domain: "d.example".into(),
+            dns_config: Some(DnsConfig {
+                domains: vec!["corp.example".into(), "tail-scale.ts.net".into()],
+                proxied: true,
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        let nm = ms.netmap();
+        assert_eq!(
+            nm.dns_config.domains,
+            vec!["corp.example".to_string(), "tail-scale.ts.net".to_string()]
+        );
+        assert!(nm.dns_config.proxied);
+        // A delta with no DNSConfig keeps the last one.
+        ms.handle_response(&MapResponse {
+            peers_removed: vec![1],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(ms.netmap().dns_config.domains.len(), 2);
+        // A new DNSConfig replaces it (last-write-wins).
+        ms.handle_response(&MapResponse {
+            dns_config: Some(DnsConfig { domains: vec![], proxied: false }),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(ms.netmap().dns_config, DnsConfig::default());
+    }
+
+    #[test]
+    fn magic_dns_resolution_over_the_netmap() {
+        // The resolver ipnlocal feeds tsdns: peer Name FQDNs (trailing
+        // dot, tailcfg.go:374-377) + search domains (tailcfg.go:1810-1811).
+        let self_key = NodeKey(gen_pub());
+        let mut ms = MapSession::new(self_key.clone());
+        ms.handle_response(&MapResponse {
+            node: Some(Node {
+                id: 1,
+                name: "self-node.tail-scale.ts.net.".into(),
+                key: self_key,
+                addresses: vec![Prefix::new("100.64.0.1".parse().unwrap(), 32)],
+                allowed_ips: vec![Prefix::new("100.64.0.1".parse().unwrap(), 32)],
+                ..Default::default()
+            }),
+            peers: vec![
+                Node {
+                    id: 2,
+                    name: "peer.tail-scale.ts.net.".into(),
+                    key: NodeKey(gen_pub()),
+                    addresses: vec![Prefix::new("100.64.0.2".parse().unwrap(), 32)],
+                    allowed_ips: vec![Prefix::new("100.64.0.2".parse().unwrap(), 32)],
+                    ..Default::default()
+                },
+                // A shared-in style peer under a DNSConfig domain.
+                Node {
+                    id: 3,
+                    name: "db.corp.example.".into(),
+                    key: NodeKey(gen_pub()),
+                    addresses: vec![Prefix::new("100.64.0.3".parse().unwrap(), 32)],
+                    allowed_ips: vec![Prefix::new("100.64.0.3".parse().unwrap(), 32)],
+                    ..Default::default()
+                },
+            ],
+            dns_config: Some(DnsConfig {
+                domains: vec!["corp.example".into()],
+                proxied: true,
+            }),
+            domain: "tail-scale.ts.net".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let nm = ms.netmap();
+        // netmap.MagicDNSSuffixOfNodeName (netmap.go:256-262).
+        assert_eq!(nm.magic_dns_suffix(), "tail-scale.ts.net");
+        assert_eq!(
+            nm.search_domains(),
+            vec!["tail-scale.ts.net".to_string(), "corp.example".to_string()]
+        );
+        let v4 = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        // FQDN forms.
+        assert_eq!(nm.resolve("peer.tail-scale.ts.net."), Some(v4("100.64.0.2")));
+        assert_eq!(nm.resolve("peer.tail-scale.ts.net"), Some(v4("100.64.0.2")));
+        assert_eq!(nm.resolve("PEER.TAIL-SCALE.TS.NET"), Some(v4("100.64.0.2")));
+        assert_eq!(nm.resolve("self-node.tail-scale.ts.net"), Some(v4("100.64.0.1")));
+        // Bare-name expansion through the search domains, in order:
+        // "peer" hits the MagicDNS suffix, "db" only corp.example.
+        assert_eq!(nm.resolve("peer"), Some(v4("100.64.0.2")));
+        assert_eq!(nm.resolve("db"), Some(v4("100.64.0.3")));
+        // Outside the tailnet map: not ours to answer.
+        assert_eq!(nm.resolve("nope.tail-scale.ts.net"), None);
+        assert_eq!(nm.resolve(""), None);
+        assert_eq!(nm.resolve("nope"), None);
+    }
+
+    #[test]
+    fn enforced_routing_matrix_over_subnet_routes_and_exit_nodes() {
+        // Peers: plain (tailnet only), subnet (advertises 10.0.0.0/24),
+        // exit (advertises both default routes). The prefs gating is
+        // ipnlocal's AllowSubnetRoutes (netmap.go:496-503) + exit-node
+        // selection + removeFromDefaultRoute (ipnlocal.go:3574).
+        let self_key = NodeKey(gen_pub());
+        let plain = NodeKey(gen_pub());
+        let subnet = NodeKey(gen_pub());
+        let exit = NodeKey(gen_pub());
+        let v4 = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        let mk = |id: i64, name: &str, key: NodeKey, extra: Vec<(&str, u8)>| {
+            let mut n = Node {
+                id,
+                name: format!("{name}.tail-scale.ts.net."),
+                key: key.clone(),
+                addresses: vec![Prefix::new(v4(&format!("100.64.0.{id}")), 32)],
+                ..Default::default()
+            };
+            n.allowed_ips = n.addresses.clone();
+            for (net, bits) in extra {
+                n.allowed_ips.push(Prefix::new(v4(net), bits));
+            }
+            n
+        };
+        let mut exit_node = mk(4, "exit", exit.clone(), vec![("0.0.0.0", 0)]);
+        exit_node.allowed_ips.push(Prefix::new("::".parse().unwrap(), 0));
+        exit_node.online = Some(true);
+        let mut nm = NetMap {
+            self_node: mk(1, "self", self_key.clone(), vec![]),
+            node_key: self_key,
+            peers: vec![
+                mk(2, "plain", plain, vec![]),
+                mk(3, "subnet", subnet, vec![("10.0.0.0", 24)]),
+                exit_node,
+            ],
+            domain: "tail-scale.ts.net".into(),
+            ..Default::default()
+        };
+        nm.self_node.name = "self.tail-scale.ts.net.".into();
+
+        let id_of = |r: std::result::Result<Option<&Node>, String>| {
+            r.unwrap().map(|n| n.id)
+        };
+        // Tailnet IPs always route, whatever the prefs.
+        assert_eq!(id_of(nm.route_peer_enforced(v4("100.64.0.2"), false, None, false)), Some(2));
+        // Subnet routes: refused without accept-routes, routed with.
+        let refused = nm.route_peer_enforced(v4("10.0.0.7"), false, None, false).unwrap_err();
+        assert!(refused.contains("accept-routes"), "{refused}");
+        assert_eq!(
+            id_of(nm.route_peer_enforced(v4("10.0.0.7"), true, None, false)),
+            Some(3)
+        );
+        // Internet: nobody without an exit node, even with accept-routes
+        // (another peer's /0 never routes) — with the precise reason.
+        let unselected = nm
+            .route_peer_enforced(v4("8.8.8.8"), true, None, false)
+            .unwrap_err();
+        assert!(unselected.contains("no exit node is selected"), "{unselected}");
+        assert!(nm.route_peer(v4("8.8.8.8")).is_some(), "ungated /0 exists");
+        // The selected exit node carries it.
+        assert_eq!(
+            id_of(nm.route_peer_enforced(v4("8.8.8.8"), true, Some(&exit), false)),
+            Some(4)
+        );
+        assert_eq!(
+            id_of(nm.route_peer_enforced(v4("8.8.8.8"), false, Some(&exit), false)),
+            Some(4),
+            "the exit node needs no accept-routes"
+        );
+        // LAN through the exit node: refused without allow-lan-access,
+        // routed with.
+        let lan = nm
+            .route_peer_enforced(v4("192.168.1.5"), true, Some(&exit), false)
+            .unwrap_err();
+        assert!(lan.contains("exit-node-allow-lan-access"), "{lan}");
+        assert_eq!(
+            id_of(nm.route_peer_enforced(v4("192.168.1.5"), true, Some(&exit), true)),
+            Some(4)
+        );
+        // Tailnet traffic still routes to the owning peer while an exit
+        // node is selected (the CGNAT range never enters the /0).
+        assert_eq!(
+            id_of(nm.route_peer_enforced(v4("100.64.0.2"), false, Some(&exit), false)),
+            Some(2)
+        );
+
+        // Exit-node selection itself.
+        assert_eq!(nm.select_exit_node(Some("auto:any")).map(|n| n.id), Some(4));
+        assert_eq!(
+            nm.select_exit_node(Some("exit.tail-scale.ts.net")).map(|n| n.id),
+            Some(4)
+        );
+        assert_eq!(nm.select_exit_node(Some("exit")).map(|n| n.id), Some(4));
+        assert_eq!(nm.select_exit_node(Some("100.64.0.4")).map(|n| n.id), Some(4));
+        assert_eq!(nm.select_exit_node(Some("auto:")).map(|n| n.id), None);
+        assert_eq!(nm.select_exit_node(Some("plain")).map(|n| n.id), None);
+        assert_eq!(nm.select_exit_node(None).map(|n| n.id), None);
+
+        // The auto pick skips offline exit peers: a second exit peer (id
+        // 5) is the only reachable one when the first goes offline.
+        let mut second = mk(5, "exit2", NodeKey(gen_pub()), vec![("0.0.0.0", 0)]);
+        second.online = Some(true);
+        nm.peers[2].online = Some(false);
+        nm.peers.push(second);
+        assert_eq!(nm.pick_auto_exit_node().map(|n| n.id), Some(5));
+    }
 
     #[test]
     fn map_message_decoding_accepts_plain_and_keepalive() {
