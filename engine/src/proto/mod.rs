@@ -29,3 +29,5 @@ pub mod trusttunnel;
 pub mod masque;
 pub mod ech;
 pub mod openvpn;
+pub mod sip003;
+pub mod tailscale;
