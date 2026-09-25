@@ -1,4 +1,5 @@
-//! Binary rule-set readers: sing-box `.srs` and mihomo `.mrs`.
+//! Binary rule-set readers and the mihomo `.mrs` writer: sing-box `.srs`
+//! and mihomo `.mrs`.
 //!
 //! Both formats (mirrored from the upstream sources, byte for byte):
 //!
@@ -18,6 +19,15 @@
 //!   same LOUDS trie with int64-BE array counts (keys reversed, trailing
 //!   `+` marking suffix entries), the ipcidr payload is int64-BE range
 //!   count + per-range 16-byte v4-mapped `from`/`to` addresses.
+//!
+//! [`write_mrs`] produces `.mrs` files with the same payload layout as
+//! mihomo's `rules/provider/mrs_converter.go` (domain and ipcidr
+//! behaviors; classical stays read-only, exactly like upstream which never
+//! writes it). The one intentional byte-level difference: the zstd framing
+//! is a hand-rolled store frame (raw blocks, see [`zstd_store_frame`]) —
+//! the engine's zstd dependency is decode-only `ruzstd`, and a C encoder
+//! is not an option under the musl-static/no-C constraint. The
+//! *decompressed* stream is byte-identical to upstream's writer.
 //!
 //! Decoded subset (everything else is consumed and discarded or rejected):
 //! srs keeps domain/suffix/keyword/regex entries, flattens logical rules'
@@ -327,7 +337,12 @@ fn ip_range_to_cidrs(from: IpAddr, to: IpAddr) -> Result<Vec<String>> {
     while cur <= hi {
         let span = hi - cur;
         // Largest block aligned at `cur` that still fits under `hi`.
-        let mut k = if span == 0 {
+        // `span + 1` cannot be formed when the range covers the whole
+        // 128-bit space (`::/0`), so that case is the explicit `k ==
+        // bits` below instead of an overflowing add.
+        let mut k = if span == u128::MAX {
+            128
+        } else if span == 0 {
             0
         } else {
             127u32 - (span + 1).leading_zeros()
@@ -340,7 +355,15 @@ fn ip_range_to_cidrs(from: IpAddr, to: IpAddr) -> Result<Vec<String>> {
             _ => IpAddr::V6(Ipv6Addr::from(cur)),
         };
         out.push(format!("{addr}/{plen}"));
-        cur += 1u128 << k;
+        // A `k == 128` block consumed the entire remaining space (and any
+        // final step off the top of the range must not overflow `cur`).
+        if k >= 128 {
+            return Ok(out);
+        }
+        match cur.checked_add(1u128 << k) {
+            Some(next) => cur = next,
+            None => return Ok(out),
+        }
     }
     Ok(out)
 }
@@ -808,6 +831,410 @@ fn read_mrs_ipcidr_payload(cur: &mut Cursor<'_>) -> Result<MrsRuleSet> {
 }
 
 // ---------------------------------------------------------------------------
+// mihomo .mrs writer (port of rules/provider/mrs_converter.go +
+// trie.DomainSetBuilder/WriteBin + cidr.IpCidrSet::WriteBin)
+// ---------------------------------------------------------------------------
+
+/// Which payload layout [`write_mrs`] serializes. Mirrors
+/// `P.RuleBehavior` for the two behaviors upstream ever writes
+/// (`rules/provider/mrs_converter.go`: classical is read-only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MrsWriteBehavior {
+    /// `behavior: domain` — rules are domain patterns (`a.b` exact,
+    /// `+.b` / `.b` subdomain-suffix, `*.b` single-label wildcard).
+    Domain,
+    /// `behavior: ipcidr` — rules are CIDR strings (`a.b.c.d/pl`).
+    IpCidr,
+}
+
+/// Serialize a rule set as a mihomo `.mrs` file, the Rust mirror of
+/// `ConvertToMrs` (`rules/provider/mrs_converter.go:17-87`).
+///
+/// Invalid rules are skipped with a warning and do not count (upstream's
+/// provider `Insert` semantics, `rules/provider/domain_strategy.go:40-51`
+/// and `ipcidr_strategy.go:44-52`); if nothing valid remains the function
+/// fails with upstream's "empty rule" error. The returned bytes decompress
+/// to exactly the stream mihomo writes: `MRS\1` magic, behavior byte,
+/// int64-BE count of valid rules, int64-BE extra length (always 0), then
+/// the behavior payload. The zstd framing itself is a store frame
+/// ([`zstd_store_frame`]); mihomo's `klauspost/compress` writer emits
+/// Huffman-compressed blocks, so the compressed bytes differ while the
+/// payload is byte-identical.
+pub fn write_mrs(behavior: MrsWriteBehavior, rules: &[&str]) -> Result<Vec<u8>> {
+    let mut count: i64 = 0;
+    let payload = match behavior {
+        MrsWriteBehavior::Domain => {
+            // domainStrategy.Insert: a slash can never appear in a domain;
+            // anything else goes through ValidAndSplitDomain.
+            let mut keys: Vec<Vec<u8>> = Vec::new();
+            for rule in rules {
+                if rule.contains('/') {
+                    tracing::warn!("mrs writer: skip invalid domain {rule:?}: slash is not allowed");
+                    continue;
+                }
+                match domain_set_keys(rule) {
+                    Ok(mut derived) => {
+                        keys.append(&mut derived);
+                        count += 1;
+                    }
+                    Err(e) => tracing::warn!("mrs writer: skip invalid domain {rule:?}: {e}"),
+                }
+            }
+            if count == 0 {
+                return Err(Error::config("empty rule"));
+            }
+            mrs_domain_payload_from_keys(keys)
+        }
+        MrsWriteBehavior::IpCidr => {
+            let mut ranges: Vec<IpRange> = Vec::new();
+            for rule in rules {
+                match parse_cidr_range(rule) {
+                    Ok(r) => {
+                        ranges.push(r);
+                        count += 1;
+                    }
+                    Err(e) => tracing::warn!("mrs writer: invalid ipcidr {rule:?}: {e}"),
+                }
+            }
+            if count == 0 {
+                return Err(Error::config("empty rule"));
+            }
+            mrs_ipcidr_payload_from_ranges(merge_ranges(ranges))
+        }
+    };
+
+    let mut raw = Vec::with_capacity(payload.len() + 24);
+    raw.extend_from_slice(&MRS_MAGIC);
+    raw.push(match behavior {
+        MrsWriteBehavior::Domain => MRS_BEHAVIOR_DOMAIN,
+        MrsWriteBehavior::IpCidr => MRS_BEHAVIOR_IPCIDR,
+    });
+    raw.extend_from_slice(&count.to_be_bytes());
+    // extra: reserved for future use, always empty (mrs_converter.go:53-61).
+    raw.extend_from_slice(&0i64.to_be_bytes());
+    raw.extend_from_slice(&payload);
+    Ok(zstd_store_frame(&raw))
+}
+
+// --- domain payload (component/trie) ---
+
+/// Port of `trie.ValidAndSplitDomain` (`component/trie/domain.go:27-92`):
+/// lower-case, split on `.`, reject trailing dot / leading or trailing
+/// whitespace / empty labels / misplaced `+`- and `*`-wildcards. Go checks
+/// `unicode.IsSpace`; Rust's `char::is_whitespace` is the equivalent set
+/// for every practically relevant codepoint.
+fn valid_and_split_domain(domain: &str) -> Result<Vec<String>> {
+    let invalid = |why: &str| Error::config(format!("invalid domain {domain:?}: {why}"));
+    if domain.is_empty() {
+        return Err(invalid("domain is empty"));
+    }
+    if domain.ends_with('.') {
+        return Err(invalid("trailing dot is not allowed"));
+    }
+    if domain
+        .chars()
+        .next()
+        .is_some_and(char::is_whitespace)
+    {
+        return Err(invalid("leading whitespace is not allowed"));
+    }
+    if domain
+        .chars()
+        .next_back()
+        .is_some_and(char::is_whitespace)
+    {
+        return Err(invalid("trailing whitespace is not allowed"));
+    }
+    let parts: Vec<String> = domain.to_lowercase().split('.').map(str::to_string).collect();
+    if parts.len() == 1 {
+        if parts[0].is_empty() {
+            return Err(invalid("domain is empty"));
+        }
+    } else {
+        for (i, part) in parts[1..].iter().enumerate() {
+            if part.is_empty() {
+                return Err(invalid(&format!("label {} is empty", i + 2)));
+            }
+        }
+    }
+    for (i, part) in parts.iter().enumerate() {
+        if part.contains('+') {
+            if part != "+" {
+                return Err(invalid(&format!(
+                    "\"+\" wildcard must occupy the entire label {}",
+                    i + 1
+                )));
+            }
+            if i != 0 {
+                return Err(invalid("\"+\" wildcard is only allowed in the first label"));
+            }
+            if parts.len() == 1 {
+                return Err(invalid("\"+\" wildcard must be followed by another label"));
+            }
+        }
+        if part.contains('*') && part != "*" {
+            return Err(invalid(&format!(
+                "\"*\" wildcard must occupy the entire label {}",
+                i + 1
+            )));
+        }
+    }
+    Ok(parts)
+}
+
+/// Port of `DomainSetBuilder::Insert` + `insert`
+/// (`component/trie/domain_set.go:38-58`): `+.x` inserts both `x` and
+/// `+.x` (exact plus subdomain-suffix); `.x` becomes `+.x`; keys are the
+/// rune-wise-reversed joined domain (`common/utils.Reverse`).
+fn domain_set_keys(rule: &str) -> Result<Vec<Vec<u8>>> {
+    let parts = valid_and_split_domain(rule)?;
+    let mut keys = Vec::with_capacity(2);
+    if parts[0] == "+" {
+        let mut rest = parts[1..].to_vec();
+        domain_set_push_key(&mut keys, &mut rest);
+        let mut whole = parts;
+        domain_set_push_key(&mut keys, &mut whole);
+    } else {
+        let mut whole = parts;
+        domain_set_push_key(&mut keys, &mut whole);
+    }
+    Ok(keys)
+}
+
+/// `DomainSetBuilder::insert`: an empty first label (the `.x` dot-wildcard
+/// splits to `["", "x"]`) becomes `+`, then the joined domain is reversed
+/// rune-wise and stored.
+fn domain_set_push_key(keys: &mut Vec<Vec<u8>>, parts: &mut [String]) {
+    if parts[0].is_empty() {
+        parts[0] = "+".to_string();
+    }
+    let joined = parts.join(".");
+    keys.push(joined.chars().rev().collect::<String>().into_bytes());
+}
+
+/// Production sibling of the reader's LOUDS structure: port of
+/// `buildDomainSet` (`component/trie/domain_set.go:96-143`). Keys are
+/// sorted (Go `sort.Strings` is byte order), deduplicated (`Compact`), then
+/// consumed level by level: one node per queue frame, a terminal bit when
+/// the frame's first key ends at this column, one 0-bit + label byte per
+/// run of equal next-bytes, and a terminating 1-bit per node.
+fn build_domain_set(mut keys: Vec<Vec<u8>>) -> (Vec<u64>, Vec<u64>, Vec<u8>) {
+    keys.sort_unstable();
+    keys.dedup();
+    let mut leaves: Vec<u64> = Vec::new();
+    let mut label_bitmap: Vec<u64> = Vec::new();
+    let mut labels: Vec<u8> = Vec::new();
+    let mut l_idx = 0usize;
+    let mut node_id = 0usize;
+    let mut queue: Vec<(usize, usize)> = vec![(0, keys.len())];
+    let mut col = 0usize;
+    while !queue.is_empty() {
+        let mut next: Vec<(usize, usize)> = Vec::new();
+        for &(s0, e) in &queue {
+            let mut s = s0;
+            if keys[s].len() == col {
+                s += 1;
+                set_bit(&mut leaves, node_id);
+            }
+            let mut j = s;
+            while j < e {
+                let frm = j;
+                while j < e && keys[j][col] == keys[frm][col] {
+                    j += 1;
+                }
+                next.push((frm, j));
+                labels.push(keys[frm][col]);
+                // Edge bits stay 0 (Go setBit(.., 0)); only the node
+                // terminator below writes a 1.
+                l_idx += 1;
+            }
+            set_bit(&mut label_bitmap, l_idx);
+            l_idx += 1;
+            node_id += 1;
+        }
+        queue = next;
+        col += 1;
+    }
+    (leaves, label_bitmap, labels)
+}
+
+/// `setBit(bm, i, v)` from `component/trie/domain_set.go:300-305`: grow
+/// with zero words, then set bit `i`.
+fn set_bit(words: &mut Vec<u64>, i: usize) {
+    while i >> 6 >= words.len() {
+        words.push(0);
+    }
+    words[i >> 6] |= 1u64 << (i & 63);
+}
+
+/// Port of `DomainSet::WriteBin` (`component/trie/domain_set_bin.go:9-51`):
+/// version byte 1, int64-BE count + u64-BE words for leaves and
+/// labelBitmap, int64-BE count + raw bytes for labels.
+fn mrs_domain_payload_from_keys(keys: Vec<Vec<u8>>) -> Vec<u8> {
+    let (leaves, label_bitmap, labels) = build_domain_set(keys);
+    let mut out = Vec::with_capacity(labels.len() + 24 + 16 * (leaves.len() + label_bitmap.len()));
+    out.push(1u8);
+    out.extend_from_slice(&(leaves.len() as i64).to_be_bytes());
+    for w in &leaves {
+        out.extend_from_slice(&w.to_be_bytes());
+    }
+    out.extend_from_slice(&(label_bitmap.len() as i64).to_be_bytes());
+    for w in &label_bitmap {
+        out.extend_from_slice(&w.to_be_bytes());
+    }
+    out.extend_from_slice(&(labels.len() as i64).to_be_bytes());
+    out.extend_from_slice(&labels);
+    out
+}
+
+// --- ipcidr payload (component/cidr) ---
+
+/// One parsed CIDR as an inclusive numeric range within its address
+/// family (the Rust form of `netipx.RangeOfPrefix`; host bits masked).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IpRange {
+    v6: bool,
+    lo: u128,
+    hi: u128,
+}
+
+/// Parse `a.b.c.d/pl` (or v6) masking the host bits, like
+/// `cidr.IpCidrSet::AddIpCidrForString` → `netipx.RangeOfPrefix`.
+fn parse_cidr_range(rule: &str) -> Result<IpRange> {
+    let (addr, plen) = rule
+        .split_once('/')
+        .ok_or_else(|| Error::config(format!("missing /prefix length in {rule:?}")))?;
+    let plen: u32 = plen
+        .parse()
+        .map_err(|_| Error::config(format!("bad prefix length {plen:?}")))?;
+    match addr.parse::<IpAddr>() {
+        Ok(IpAddr::V4(a)) => {
+            if plen > 32 {
+                return Err(Error::config(format!("prefix length {plen} exceeds 32 for v4")));
+            }
+            let mask = if plen == 0 { 0 } else { u32::MAX << (32 - plen) };
+            let lo = u32::from(a) & mask;
+            Ok(IpRange {
+                v6: false,
+                lo: lo as u128,
+                hi: (lo | !mask) as u128,
+            })
+        }
+        Ok(IpAddr::V6(a)) => {
+            if plen > 128 {
+                return Err(Error::config(format!("prefix length {plen} exceeds 128 for v6")));
+            }
+            let mask = if plen == 0 { 0 } else { u128::MAX << (128 - plen) };
+            let lo = u128::from(a) & mask;
+            Ok(IpRange {
+                v6: true,
+                lo,
+                hi: lo | !mask,
+            })
+        }
+        Err(_) => Err(Error::config(format!("bad address {addr:?}"))),
+    }
+}
+
+/// Port of `ipcidrStrategy::FinishInsert` → `IpCidrSet::Merge` →
+/// `netipx.IPSetBuilder` normalize/`mergeIPRanges` (`go4.org/netipx`
+/// `ipset.go`): sort by family then range, then coalesce every pair that
+/// overlaps or is exactly adjacent (`to + 1 >= next.from`), keeping the
+/// wider `to`. v4 and v6 ranges never merge.
+fn merge_ranges(mut ranges: Vec<IpRange>) -> Vec<IpRange> {
+    ranges.sort_by_key(|r| (r.v6, r.lo, r.hi));
+    let mut out: Vec<IpRange> = Vec::new();
+    for r in ranges {
+        match out.last_mut() {
+            Some(last) if last.v6 == r.v6 && r.lo <= last.hi.saturating_add(1) => {
+                last.hi = last.hi.max(r.hi);
+            }
+            _ => out.push(r),
+        }
+    }
+    out
+}
+
+/// Port of `IpCidrSet::WriteBin` (`component/cidr/ipcidr_set_bin.go:12-36`):
+/// version byte 1, int64-BE range count, then per range the 16-byte
+/// big-endian `From().As16()` and `To().As16()` — v4 ranges stored in
+/// v4-mapped form.
+fn mrs_ipcidr_payload_from_ranges(ranges: Vec<IpRange>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(9 + ranges.len() * 32);
+    out.push(1u8);
+    out.extend_from_slice(&(ranges.len() as i64).to_be_bytes());
+    for r in ranges {
+        out.extend_from_slice(&addr_as_16_prod(r.lo, r.v6));
+        out.extend_from_slice(&addr_as_16_prod(r.hi, r.v6));
+    }
+    out
+}
+
+/// `netip.Addr.As16` for an inclusive range endpoint: v6 in full, v4
+/// embedded as `::ffff:a.b.c.d`.
+fn addr_as_16_prod(v: u128, v6: bool) -> [u8; 16] {
+    if v6 {
+        v.to_be_bytes()
+    } else {
+        let mut out = [0u8; 16];
+        out[10] = 0xff;
+        out[11] = 0xff;
+        out[12..].copy_from_slice(&(v as u32).to_be_bytes());
+        out
+    }
+}
+
+// --- zstd store-frame encoder ---
+//
+// The engine's zstd dependency is ruzstd (decode-only), so .mrs writing
+// needs a minimal encoder. A frame of Raw_Block stores (RFC 8878 / the
+// upstream zstd spec §3.1, "Compressed Block format") is a valid zstd
+// stream every decoder accepts: frame header, then every block verbatim
+// with a 3-byte header. No XXH64 content checksum is written — it is
+// optional (descriptor bit 2 stays 0) and mihomo's reader does not require
+// one.
+
+/// Maximum bytes per block. The spec caps `Block_Size` at
+/// `min(Window_Size, 128 KiB)`; 64 KiB sits well inside the 1 MiB window
+/// declared below and matches the block size the reader's test fixtures
+/// already exercise.
+const MRS_ZSTD_BLOCK_MAX: usize = 64 * 1024;
+
+/// Frame_Content_Size field: always the full 8-byte form (descriptor flag
+/// `0b11`), little-endian per the spec ("Frame_Content_Size ... uses
+/// little-endian convention"; this is also exactly how ruzstd's reader at
+/// `decoding/frame.rs:75-83` and klauspost/compress decode it).
+fn zstd_store_frame(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len() + 3 * (payload.len() / MRS_ZSTD_BLOCK_MAX + 1) + 18);
+    // Magic_Number 0xFD2FB528, little-endian (spec §3.1.1.1).
+    out.extend_from_slice(&[0x28, 0xB5, 0x2F, 0xFD]);
+    // Frame_Header_Descriptor (spec §3.1.1.1.1): FCS_Field_Size flag
+    // 0b11 (8 bytes), Single_Segment 0, Content_Checksum 0, Dictionary_ID
+    // flag 0.
+    out.push(0b1100_0000);
+    // Window_Descriptor (spec §3.1.1.1.2): Exponent 10, Mantissa 0 →
+    // windowLog 20 → 1 MiB window.
+    out.push(0x50);
+    out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    let mut chunks = payload.chunks(MRS_ZSTD_BLOCK_MAX).peekable();
+    if payload.is_empty() {
+        // A frame must contain at least one block; an empty last Raw
+        // block (Block_Size 0) is the minimal legal encoding.
+        out.extend_from_slice(&1u32.to_le_bytes()[..3]);
+        return out;
+    }
+    while let Some(chunk) = chunks.next() {
+        let last = chunks.peek().is_none() as u32;
+        // Block_Header (spec §3.1.1.4): bit 0 Last_Block, bits 1-2
+        // Block_Type (0 = Raw_Block), bits 3-23 Block_Size.
+        let header = ((chunk.len() as u32) << 3) | last;
+        out.extend_from_slice(&header.to_le_bytes()[..3]);
+        out.extend_from_slice(chunk);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Tests — fixtures are synthesized in-test by porting the upstream writers
 // (sing-box `binary.go` + sing `domain.Matcher` for .srs, mihomo
 // `mrs_converter.go` + `trie/cidr` for .mrs), so nothing is downloaded.
@@ -862,13 +1289,6 @@ mod tests {
     fn put_i64_counted_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
         out.extend_from_slice(&(bytes.len() as i64).to_be_bytes());
         out.extend_from_slice(bytes);
-    }
-
-    fn set_bit(bm: &mut Vec<u64>, i: usize) {
-        while i >> 6 >= bm.len() {
-            bm.push(0);
-        }
-        bm[i >> 6] |= 1u64 << (i & 63);
     }
 
     /// Rune-wise reversal, like `utils.Reverse` / `reverseDomain`.
@@ -1433,5 +1853,303 @@ mod tests {
             recovered.sort();
             assert_eq!(recovered, expected);
         }
+    }
+
+    // --- .mrs writer tests ---
+
+    /// Decompress a store frame exactly like `parse_mrs` does, so the raw
+    /// payload bytes can be pinned against the hand-built fixtures.
+    fn decompress(frame: &[u8]) -> Vec<u8> {
+        let mut dec = ruzstd::decoding::StreamingDecoder::new(frame).unwrap();
+        let mut raw = Vec::new();
+        dec.read_to_end(&mut raw).unwrap();
+        raw
+    }
+
+    /// (frame body byte offset, is_last, block_size) for every block after
+    /// the fixed-size header (4 magic + 1 descriptor + 1 window + 8 FCS).
+    fn frame_blocks(frame: &[u8]) -> Vec<(usize, bool, usize)> {
+        assert_eq!(&frame[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
+        assert_eq!(frame[4], 0b1100_0000);
+        assert_eq!(frame[5], 0x50);
+        assert_eq!(
+            u64::from_le_bytes(frame[6..14].try_into().unwrap()) as usize,
+            decompress(frame).len()
+        );
+        let mut out = Vec::new();
+        let mut pos = 14usize;
+        loop {
+            let h = u32::from_le_bytes([
+                frame[pos],
+                frame[pos + 1],
+                frame[pos + 2],
+                0,
+            ]);
+            let last = h & 1 == 1;
+            let btype = (h >> 1) & 0b11;
+            let size = (h >> 3) as usize;
+            assert_eq!(btype, 0, "store frame must only contain Raw blocks");
+            pos += 3;
+            out.push((pos, last, size));
+            pos += size;
+            if last {
+                assert_eq!(pos, frame.len());
+                break;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn mrs_write_domain_payload_matches_upstream_layout() {
+        let patterns = [
+            "example.com",
+            "+.google.com",
+            ".dot.org",
+            "*.wild.net",
+            "sub.google.com",
+        ];
+        let file = write_mrs(MrsWriteBehavior::Domain, &patterns).unwrap();
+
+        // Byte-level pin: the decompressed stream must equal the
+        // hand-assembled mrs_converter.go + WriteBin layout exactly.
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&MRS_MAGIC);
+        expected.push(MRS_BEHAVIOR_DOMAIN);
+        expected.extend_from_slice(&(patterns.len() as i64).to_be_bytes());
+        expected.extend_from_slice(&0i64.to_be_bytes());
+        expected.extend_from_slice(&mrs_domain_payload(&patterns));
+        assert_eq!(decompress(&file), expected);
+
+        // And it must read back through the unchanged reader.
+        let set = parse_mrs(&file).unwrap();
+        assert_eq!(
+            set.exacts,
+            vec![
+                "example.com".to_string(),
+                "google.com".to_string(),
+                "sub.google.com".to_string(),
+            ]
+        );
+        assert_eq!(
+            set.suffixes,
+            vec![
+                "dot.org".to_string(),
+                "google.com".to_string(),
+                "wild.net".to_string(),
+            ]
+        );
+        assert!(set.ip_cidrs.is_empty());
+    }
+
+    #[test]
+    fn mrs_write_count_counts_valid_rules_not_trie_keys() {
+        // "+.a.com" derives two trie keys ("a.com" and "+.a.com") but is
+        // ONE inserted rule: the header count is 1 (domain_strategy.go
+        // increments count once per successful Insert).
+        let file = write_mrs(MrsWriteBehavior::Domain, &["+.a.com"]).unwrap();
+        let raw = decompress(&file);
+        let count = i64::from_be_bytes(raw[5..13].try_into().unwrap());
+        assert_eq!(count, 1);
+        let set = parse_mrs(&file).unwrap();
+        assert_eq!(set.exacts, vec!["a.com".to_string()]);
+        assert_eq!(set.suffixes, vec!["a.com".to_string()]);
+    }
+
+    #[test]
+    fn mrs_write_ipcidr_payload_matches_upstream_layout() {
+        // Non-overlapping input so the hand fixture (which sorts but does
+        // not merge) matches the writer's merged output byte for byte.
+        let cidrs = ["192.168.0.0/16", "10.0.0.0/8", "2001:db8::/32"];
+        let file = write_mrs(MrsWriteBehavior::IpCidr, &cidrs).unwrap();
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&MRS_MAGIC);
+        expected.push(MRS_BEHAVIOR_IPCIDR);
+        expected.extend_from_slice(&(cidrs.len() as i64).to_be_bytes());
+        expected.extend_from_slice(&0i64.to_be_bytes());
+        expected.extend_from_slice(&mrs_ipcidr_payload(&cidrs));
+        assert_eq!(decompress(&file), expected);
+
+        let set = parse_mrs(&file).unwrap();
+        assert_eq!(
+            set.ip_cidrs,
+            vec![
+                "10.0.0.0/8".to_string(),
+                "192.168.0.0/16".to_string(),
+                "2001:db8::/32".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn mrs_write_ipcidr_merges_overlapping_adjacent_and_keeps_families() {
+        // Overlapping: 10.1.0.0/16 is inside 10.0.0.0/8.
+        let file = write_mrs(MrsWriteBehavior::IpCidr, &["10.1.0.0/16", "10.0.0.0/8"]).unwrap();
+        let set = parse_mrs(&file).unwrap();
+        assert_eq!(set.ip_cidrs, vec!["10.0.0.0/8".to_string()]);
+
+        // Adjacent: two /25s coalesce into the covering /24.
+        let file = write_mrs(MrsWriteBehavior::IpCidr, &["10.0.0.128/25", "10.0.0.0/25"]).unwrap();
+        let set = parse_mrs(&file).unwrap();
+        assert_eq!(set.ip_cidrs, vec!["10.0.0.0/24".to_string()]);
+
+        // v4 and v6 never merge, even at the edges of their spaces (the
+        // v6 /0 exercises the reader's whole-space range path too).
+        let file = write_mrs(MrsWriteBehavior::IpCidr, &["::/0", "255.255.255.255/32"]).unwrap();
+        let set = parse_mrs(&file).unwrap();
+        assert_eq!(
+            set.ip_cidrs,
+            vec!["255.255.255.255/32".to_string(), "::/0".to_string()]
+        );
+
+        // Host bits are masked like RangeOfPrefix.
+        let file = write_mrs(MrsWriteBehavior::IpCidr, &["10.1.2.99/24"]).unwrap();
+        let set = parse_mrs(&file).unwrap();
+        assert_eq!(set.ip_cidrs, vec!["10.1.2.0/24".to_string()]);
+    }
+
+    #[test]
+    fn mrs_write_large_domain_set_spans_multiple_raw_blocks() {
+        // 30k hosts over 97 shared suffixes: the trie shares almost every
+        // label, yet the payload still crosses the 64 KiB single-block
+        // budget several times over.
+        let owned: Vec<String> = (0..30000)
+            .map(|i| format!("host{}.example{}.com", i, i % 97))
+            .collect();
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let file = write_mrs(MrsWriteBehavior::Domain, &refs).unwrap();
+
+        let blocks = frame_blocks(&file);
+        assert!(blocks.len() > 1, "expected a multi-block frame");
+        assert!(blocks.iter().all(|(_, _, size)| *size <= 128 * 1024));
+        assert!(blocks[..blocks.len() - 1].iter().all(|(_, _, size)| *size > 0));
+
+        let set = parse_mrs(&file).unwrap();
+        assert_eq!(set.exacts.len(), owned.len());
+        assert!(set.exacts.contains(&"host29999.example26.com".to_string()));
+    }
+
+    #[test]
+    fn mrs_write_skips_invalid_rules_and_rejects_empty_sets() {
+        // Mixed: valid rules counted, invalid ones skipped with the same
+        // semantics as the provider Insert path.
+        let file = write_mrs(
+            MrsWriteBehavior::Domain,
+            &["ok.com", "bad..com", "trail.com/", "no+plus.x", "par*t.x", " lead.com"],
+        )
+        .unwrap();
+        let raw = decompress(&file);
+        assert_eq!(i64::from_be_bytes(raw[5..13].try_into().unwrap()), 1);
+        let set = parse_mrs(&file).unwrap();
+        assert_eq!(set.exacts, vec!["ok.com".to_string()]);
+
+        let file = write_mrs(MrsWriteBehavior::IpCidr, &["10.0.0.0/8", "bogus", "10.0.0.300/24", ":::/32"]).unwrap();
+        let set = parse_mrs(&file).unwrap();
+        assert_eq!(set.ip_cidrs, vec!["10.0.0.0/8".to_string()]);
+
+        // Upstream's "empty rule" (mrs_converter.go) when nothing is valid.
+        let err = write_mrs(MrsWriteBehavior::Domain, &["/"]).unwrap_err();
+        assert!(err.to_string().contains("empty rule"), "{err}");
+        let err = write_mrs(MrsWriteBehavior::IpCidr, &[]).unwrap_err();
+        assert!(err.to_string().contains("empty rule"), "{err}");
+    }
+
+    #[test]
+    fn mrs_write_domain_validation_mirrors_valid_and_split_domain() {
+        // Direct unit pins for the ported validator.
+        assert!(valid_and_split_domain("a.b.c").unwrap() == vec!["a", "b", "c"]);
+        assert_eq!(
+            valid_and_split_domain("ExAmPlE.COM").unwrap(),
+            vec!["example", "com"],
+            "domains are lower-cased before splitting"
+        );
+        // ".example.com" splits with an empty first label (dot-wildcard).
+        assert_eq!(
+            valid_and_split_domain(".example.com").unwrap(),
+            vec!["", "example", "com"]
+        );
+        for bad in [
+            "", "a.com.", " a.com", "a.com ", "..", "a..b", "+", "+.a+x.com", "a+.com", "*a.com",
+            "a.*b.com", "+a.com",
+        ] {
+            assert!(valid_and_split_domain(bad).is_err(), "{bad:?} must be rejected");
+        }
+        // Whole-label wildcards are accepted (DomainSet::Has interprets them).
+        assert_eq!(
+            valid_and_split_domain("*.a.com").unwrap(),
+            vec!["*", "a", "com"]
+        );
+        assert_eq!(
+            valid_and_split_domain("+.a.com").unwrap(),
+            vec!["+", "a", "com"]
+        );
+    }
+
+    #[test]
+    fn mrs_write_key_derivation_matches_builder_insert() {
+        // "+.x" -> {x, +.x}; ".x" -> {+.x}; "*.x" -> {*.x}; plain -> itself.
+        // (reversed encodings compared as recovered strings).
+        let recover = |keys: Vec<Vec<u8>>| -> Vec<String> {
+            let mut out: Vec<String> = keys
+                .iter()
+                .map(|k| String::from_utf8(k.clone()).unwrap().chars().rev().collect())
+                .collect();
+            out.sort();
+            out
+        };
+        let mut expected_plus: Vec<String> = vec!["x.com".into(), "+.x.com".into()];
+        expected_plus.sort();
+        assert_eq!(recover(domain_set_keys("+.x.com").unwrap()), expected_plus);
+        assert_eq!(
+            recover(domain_set_keys(".x.com").unwrap()),
+            vec!["+.x.com".to_string()]
+        );
+        assert_eq!(
+            recover(domain_set_keys("*.x.com").unwrap()),
+            vec!["*.x.com".to_string()]
+        );
+        assert_eq!(
+            recover(domain_set_keys("x.com").unwrap()),
+            vec!["x.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn zstd_store_frame_layout_is_pinned() {
+        // Empty payload: exactly one last Raw block of size 0.
+        let empty = zstd_store_frame(&[]);
+        assert_eq!(
+            &empty,
+            &[0x28, 0xB5, 0x2F, 0xFD, 0xC0, 0x50, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0]
+        );
+        assert_eq!(decompress(&empty), Vec::<u8>::new());
+
+        // Small payload: single last block carrying the bytes verbatim.
+        let payload = b"mrs-payload-bytes".to_vec();
+        let frame = zstd_store_frame(&payload);
+        assert_eq!(&frame[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
+        assert_eq!(frame[4], 0b1100_0000, "FCS flag 0b11, nothing else set");
+        assert_eq!(frame[5], 0x50, "1 MiB window (Exponent 10)");
+        assert_eq!(
+            u64::from_le_bytes(frame[6..14].try_into().unwrap()),
+            payload.len() as u64,
+            "FCS is little-endian"
+        );
+        let block_header = (1u32 | (payload.len() as u32) << 3).to_le_bytes();
+        assert_eq!(&frame[14..17], &block_header[..3]);
+        assert_eq!(&frame[17..], &payload[..]);
+        assert_eq!(decompress(&frame), payload);
+
+        // Exactly one block at the cap, two one byte past it.
+        let cap = vec![0xAB; MRS_ZSTD_BLOCK_MAX];
+        assert_eq!(frame_blocks(&zstd_store_frame(&cap)).len(), 1);
+        let over = vec![0xCD; MRS_ZSTD_BLOCK_MAX + 1];
+        let blocks = frame_blocks(&zstd_store_frame(&over));
+        assert_eq!(blocks.len(), 2);
+        assert!(!blocks[0].1);
+        assert_eq!(blocks[0].2, MRS_ZSTD_BLOCK_MAX);
+        assert!(blocks[1].1);
+        assert_eq!(blocks[1].2, 1);
     }
 }

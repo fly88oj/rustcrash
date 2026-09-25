@@ -1,14 +1,20 @@
-//! Snell v3/v4 outbound, ported from mihomo's `transport/snell`
-//! (`snell.go`, `v4.go`, `cipher.go`) and the Shadowsocks-AEAD framing it
-//! reuses for v3 (`transport/shadowsocks/shadowaead/stream.go`).
+//! Snell v1..v4 outbound, ported from mihomo's `transport/snell`
+//! (`snell.go`, `cipher.go`, `v4.go`, `pool.go`, plus
+//! `adapter/outbound/snell.go` for the version/pool wiring) and the
+//! Shadowsocks-AEAD framing v1..v3 reuse
+//! (`transport/shadowsocks/shadowaead/stream.go`).
 //!
 //! Wire behaviour as the snell server sees it:
 //!
-//! * **v3** is the Shadowsocks AEAD stream with a snell-specific KDF: a
-//!   random 16-byte salt prefixes each direction, subkey =
-//!   `argon2id(psk, salt, t=3, m=8KiB, p=1, len=32)[:16]`
+//! * **v1/v2/v3** are the Shadowsocks AEAD stream with a snell-specific
+//!   KDF: a random 16-byte salt prefixes each direction, subkey =
+//!   `argon2id(psk, salt, t=3, m=8KiB, p=1, len=32)[:keySize]`
 //!   (cipher.go `snellKDF`), then `[enc(len be16)][enc(chunk)]` frames
-//!   under AES-128-GCM with a little-endian counter nonce per direction.
+//!   with a little-endian counter nonce per direction. The only v1..v3
+//!   delta is the cipher: v1 is Chacha20-Poly1305 (32-byte key), v2/v3
+//!   are AES-128-GCM (16-byte key) — `StreamConn` (snell.go:156-168)
+//!   routes `NewChacha20Poly1305` for Version1 and `NewAES128GCM`
+//!   otherwise, and cipher.go:42-56 fixes the key sizes.
 //! * **v4** (v4.go) drops the SS framing for its own: the first frame
 //!   carries a random 16-byte salt, then per frame a sealed 7-byte header
 //!   (`ver=4`, `be16 padding len`, `be16 payload len`), optional padding
@@ -17,9 +23,10 @@
 //!   payload; the payload chunk size ramps from ~MTU to 0x3FFF
 //!   (`nextPayloadLimit`).
 //! * The request header (`WriteHeaderWithReuse`): `0x01 || cmd || 0x00 ||
-//!   hostlen || host || port_be16` with cmd `0x01` (TCP connect; v2/reuse
-//!   would send `0x05`, out of scope). UDP opens with `0x01 0x06 0x00`
-//!   instead (v3+ only; v4 then also waits for the reply).
+//!   hostlen || host || port_be16` with cmd `0x01` (`CommandConnect`) or
+//!   `0x05` (`CommandConnectV2`) when the version is 2 or the caller asked
+//!   for a reusable pool conn (snell.go:103-126). UDP opens with
+//!   `0x01 0x06 0x00` instead (v3+ only; v4 then also waits for the reply).
 //! * The server's first decrypted byte is the reply: `0x00` tunnel,
 //!   `0x02` error (`code u8 || msglen u8 || msg`), anything else
 //!   "command not support" (snell.go `ReadReply`).
@@ -34,10 +41,6 @@
 //!
 //! ## Deferred (out of scope here)
 //!
-//! * **Connection reuse pool** (`pool.go`, v2 / v4 `reuse`): half-close
-//!   zero-chunks, `CommandConnectV2` and idle pooling are the outbound
-//!   layer's job; this module always sends `CommandConnect` (mihomo's
-//!   default without `reuse: true`).
 //! * **UDP relay**: one TCP transport carries every datagram
 //!   (adapter/outbound/snell.go `ListenPacketContext` →
 //!   `snell.PacketConn(c)`). The session opens with
@@ -51,10 +54,14 @@
 //!   `send_to`/`recv_from` channel shaped like `anytls::AnyTlsUdp`.
 //! * **obfs plugins** (`obfs-opts`: http/tls/shadow-tls/restls/jls):
 //!   `handshake` takes the post-dial stream, so the integrator wraps
-//!   before calling, exactly like mihomo's `streamConnContext`.
-//! * **v1/v2** (chacha20 v1, pooling v2) and v5 servers (mihomo maps v5
-//!   clients down to v4).
+//!   before calling, exactly like mihomo's `streamConnContext`. The
+//!   [`SnellPool`] accepts an injected transport dialer for the same
+//!   reason.
+//! * **v2 SYNACK liveness watchdog**: not sent by the snell wire (that is
+//!   an anytls concern); snell reuse is driven purely by the zero-chunk
+//!   half-close (pool.go `writeZeroChunk` / `HalfClose`).
 
+use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
@@ -75,6 +82,9 @@ use crate::stream::BoxProxyStream;
 const PROTOCOL_VERSION: u8 = 0x01;
 /// `CommandConnect` (snell.go:31) — plain TCP request.
 const CMD_CONNECT: u8 = 0x01;
+/// `CommandConnectV2` (snell.go:32) — sent when version is 2 or the conn
+/// is a pooled reuse (`WriteHeaderWithReuse`, snell.go:107-111).
+const CMD_CONNECT_V2: u8 = 0x05;
 /// `CommandUDP` (snell.go:33) — UDP session open (v3+).
 const CMD_UDP: u8 = 0x06;
 /// `CommandTunnel` (snell.go:36) — the successful reply byte.
@@ -86,6 +96,9 @@ const CMD_UDP_FORWARD: u8 = 0x01;
 
 /// `maxLength` (snell.go:26): largest snell payload / v3 chunk.
 const MAX_LENGTH: usize = 0x3FFF;
+/// `DefaultSnellVersion` (snell.go:23) — v1, the backward-compatible
+/// default when the config omits `version`.
+pub const DEFAULT_SNELL_VERSION: u8 = 1;
 /// v3 chunk cap, `payloadSizeMask` (shadowaead/stream.go:15).
 const V3_CHUNK: usize = MAX_LENGTH;
 /// AEAD tag size (AES-128-GCM overhead).
@@ -107,17 +120,52 @@ pub struct SnellOut {
     pub port: u16,
     /// Pre-shared key (`psk`).
     pub psk: String,
-    /// Protocol version, `3` or `4` (mihomo maps v5 servers down to v4).
+    /// Protocol version. Raw config accepts `0..=5` — [`parse_version`]
+    /// applies mihomo's defaults/mapping and returns the wire version
+    /// (`1..=4`).
     pub version: u8,
     /// Whether the outbound advertises UDP support.
     pub udp: bool,
 }
 
-/// The TCP request header, `WriteHeaderWithReuse` with `reuse=false`
-/// (snell.go:103-126): `version=1, CommandConnect, clientID len=0,
-/// host len u8, host, port be16`. The host is `metadata.String()` — the
-/// domain or IP text.
-fn request_header(target: &NetAddr) -> Result<Vec<u8>> {
+/// Normalise a configured snell version exactly like `NewSnell`
+/// (adapter/outbound/snell.go:244-261):
+///
+/// * `0` → [`DEFAULT_SNELL_VERSION`] (`1`) — the backward-compatible
+///   default;
+/// * `5` → `4` — "Snell v5 servers are backward-compatible with v4
+///   clients", so v5 is v4 framing verbatim (`StreamConn` routes every
+///   `version >= Version4` to `newV4Conn`, snell.go:157-158);
+/// * `1..=4` pass through; anything else is
+///   `snell version error: {v}` (adapter snell.go:260).
+pub fn parse_version(raw: u8) -> Result<u8> {
+    match raw {
+        0 => Ok(DEFAULT_SNELL_VERSION),
+        5 => Ok(4),
+        1..=4 => Ok(raw),
+        other => Err(Error::config(format!(
+            "snell version error: {other}"
+        ))),
+    }
+}
+
+/// Validate the `udp` flag against the version like `NewSnell`
+/// (adapter/outbound/snell.go:253-257): v1/v2 never support UDP.
+pub fn validate_udp(version: u8, udp: bool) -> Result<()> {
+    if udp && version < 3 {
+        return Err(Error::config(format!(
+            "snell version {version} not support UDP"
+        )));
+    }
+    Ok(())
+}
+
+/// The TCP request header, `WriteHeaderWithReuse` (snell.go:103-126):
+/// `version=1, cmd, clientID len=0, host len u8, host, port be16` with
+/// cmd `CommandConnectV2` when `version == Version2 || reuse`
+/// (snell.go:107-111), else `CommandConnect`. The host is
+/// `metadata.String()` — the domain or IP text.
+fn request_header(target: &NetAddr, version: u8, reuse: bool) -> Result<Vec<u8>> {
     let host = target.host.to_text();
     let bytes = host.as_bytes();
     if bytes.len() > 255 {
@@ -125,9 +173,14 @@ fn request_header(target: &NetAddr) -> Result<Vec<u8>> {
             "snell: target host exceeds 255 bytes: {host}"
         )));
     }
+    let cmd = if version == 2 || reuse {
+        CMD_CONNECT_V2
+    } else {
+        CMD_CONNECT
+    };
     let mut buf = Vec::with_capacity(4 + bytes.len());
     buf.push(PROTOCOL_VERSION);
-    buf.push(CMD_CONNECT);
+    buf.push(cmd);
     buf.push(0x00); // clientID length (snell.go:114)
     buf.push(bytes.len() as u8);
     buf.extend_from_slice(bytes);
@@ -588,8 +641,9 @@ mod argon2id {
 
 /// snell's KDF (cipher.go:29-32):
 /// `argon2.IDKey(psk, salt, 3, 8, 1, 32)[:keySize]` — Argon2id with
-/// t=3, m=8 KiB, p=1, truncated to the cipher key size (16 bytes for
-/// both v3 AES-128-GCM and v4).
+/// t=3, m=8 KiB, p=1, truncated to the cipher key size (cipher.go:29-32).
+/// `keySize` is 32 for v1's Chacha20-Poly1305 and 16 for v2/v3's
+/// AES-128-GCM / v4 (cipher.go:42-56).
 fn snell_kdf(psk: &[u8], salt: &[u8], key_size: usize) -> Result<Vec<u8>> {
     let full = argon2id::hash(psk, salt, &[], &[], 3, 8, 1, 32);
     if full.len() < key_size {
@@ -598,26 +652,46 @@ fn snell_kdf(psk: &[u8], salt: &[u8], key_size: usize) -> Result<Vec<u8>> {
     Ok(full[..key_size].to_vec())
 }
 
-fn snell_aead(psk: &[u8], salt: &[u8]) -> Result<Aead> {
-    Aead::new(AeadKind::Aes128Gcm, &snell_kdf(psk, salt, 16)?)
+/// `snellCipher.Encrypter/Decrypter` (cipher.go:21-27): one AEAD per
+/// direction, keyed by the KDF output for the direction's salt.
+fn snell_aead(kind: AeadKind, psk: &[u8], salt: &[u8]) -> Result<Aead> {
+    let key_size = kind.key_len();
+    Aead::new(kind, &snell_kdf(psk, salt, key_size)?)
+}
+
+/// The pre-v4 cipher suite (`StreamConn`, snell.go:160-167): v1 is
+/// Chacha20-Poly1305 with a 32-byte key; v2/v3 are AES-128-GCM with a
+/// 16-byte key. The salt is 16 bytes for both (cipher.go:20).
+fn v3_cipher_kind(version: u8) -> AeadKind {
+    if version == 1 {
+        AeadKind::Chacha20Poly1305
+    } else {
+        AeadKind::Aes128Gcm
+    }
 }
 
 // ---------------------------------------------------------------------------
 // v3 framing (shadowaead/stream.go)
 // ---------------------------------------------------------------------------
 
-/// v3 connection: SS-AEAD framing with the snell KDF.
+/// v1..v3 connection: SS-AEAD framing with the snell KDF (v1 rides
+/// Chacha20-Poly1305, v2/v3 AES-128-GCM — `StreamConn`, snell.go:156-168).
 ///
 /// Write (stream.go:252-266, 31-62): the first write emits a fresh random
 /// 16-byte salt, then per chunk `seal(len be16)` (2+16 bytes) and
 /// `seal(payload)`; the 12-byte nonce is a LE counter per direction
-/// (stream.go:200-207).
+/// (stream.go:200-207). An **empty** write is the snell half-close: one
+/// sealed `0x0000` length and nothing else ("compatible with snell",
+/// stream.go:38-45).
 /// Read (stream.go:219-237, 106-137): read the peer's salt once, then
 /// `[open(2+16)][open(len+16)]` chunks; a zero-length chunk is the
-/// half-close signal (ErrZeroChunk → clean EOF here).
+/// half-close signal (ErrZeroChunk, stream.go:122-125) — a framing
+/// boundary, not a terminal error: the next read continues with the next
+/// chunk (stream.go:140-161), which is what makes conn reuse work.
 struct V3Conn {
     inner: BoxProxyStream,
     psk: Vec<u8>,
+    kind: AeadKind,
     writer: Option<V3Crypto>,
     reader: Option<V3Crypto>,
     /// Read stage — like Go's blocking ReadFull sequence, no AEAD open
@@ -626,7 +700,9 @@ struct V3Conn {
     stage: V3Stage,
     rbuf: BytesMut,
     out: BytesMut,
-    eof: bool,
+    /// A zero chunk was decoded and is pending as the consumer's EOF
+    /// (Go returns ErrZeroChunk once per boundary, non-terminal).
+    pending_zero: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -641,33 +717,42 @@ struct V3Crypto {
 }
 
 impl V3Conn {
-    fn new(inner: BoxProxyStream, psk: &[u8]) -> Self {
+    fn new(inner: BoxProxyStream, psk: &[u8], kind: AeadKind) -> Self {
         V3Conn {
             inner,
             psk: psk.to_vec(),
+            kind,
             writer: None,
             reader: None,
             stage: V3Stage::Len,
             rbuf: BytesMut::with_capacity(16 * 1024),
             out: BytesMut::with_capacity(16 * 1024),
-            eof: false,
+            pending_zero: false,
         }
     }
 
     /// Append the wire form of `payload` to `wbuf` (chunks of 0x3FFF,
-    /// each `seal(len)` then `seal(chunk)`).
+    /// each `seal(len)` then `seal(chunk)`). An empty payload writes the
+    /// zero chunk — the sealed `0x0000` length alone (stream.go:38-45).
     fn frame(&mut self, payload: &[u8], wbuf: &mut BytesMut) -> Result<()> {
         if self.writer.is_none() {
             let mut salt = [0u8; 16];
             rand::rngs::OsRng.fill_bytes(&mut salt);
             wbuf.extend_from_slice(&salt);
             self.writer = Some(V3Crypto {
-                aead: snell_aead(&self.psk, &salt)?,
+                aead: snell_aead(self.kind, &self.psk, &salt)?,
                 nonce: SsNonce::new(),
             });
         }
         let w = self.writer.as_mut().expect("initialized above");
         let mut chunk_out = Vec::with_capacity(V3_CHUNK + TAG_SIZE + 2 + TAG_SIZE);
+        if payload.is_empty() {
+            // writeZeroChunk → Write([]) — one sealed 2-byte length.
+            let len_be = 0u16.to_be_bytes();
+            w.aead.seal(&w.nonce.advance(), b"", &len_be, &mut chunk_out)?;
+            wbuf.extend_from_slice(&chunk_out);
+            return Ok(());
+        }
         for chunk in payload.chunks(V3_CHUNK) {
             chunk_out.clear();
             let len_be = (chunk.len() as u16).to_be_bytes();
@@ -679,10 +764,13 @@ impl V3Conn {
     }
 
     /// Try to decrypt one chunk into `out`; `Ok(true)` when a chunk
-    /// landed, `Ok(false)` when more wire bytes are needed (or EOF).
-    /// The stage machine consumes bytes AND a nonce tick together, so an
-    /// open never happens twice for the same ciphertext; stage
-    /// transitions loop internally so no inner read is needed to advance.
+    /// landed, `Ok(false)` when more wire bytes are needed (or a zero
+    /// chunk is already pending). The stage machine consumes bytes AND a
+    /// nonce tick together, so an open never happens twice for the same
+    /// ciphertext; stage transitions loop internally so no inner read is
+    /// needed to advance. A decoded zero chunk sets [`Self::pending_zero`]
+    /// and the stage returns to `Len` — the stream stays readable, like
+    /// Go's non-terminal ErrZeroChunk.
     fn try_parse(&mut self) -> Result<bool> {
         if self.reader.is_none() {
             if self.rbuf.len() < 16 {
@@ -691,7 +779,7 @@ impl V3Conn {
             let salt = self.rbuf[..16].to_vec();
             self.rbuf.advance(16);
             self.reader = Some(V3Crypto {
-                aead: snell_aead(&self.psk, &salt)?,
+                aead: snell_aead(self.kind, &self.psk, &salt)?,
                 nonce: SsNonce::new(),
             });
             self.stage = V3Stage::Len;
@@ -707,7 +795,11 @@ impl V3Conn {
                     let len_pt = r.aead.open(&r.nonce.advance(), b"", &len_ct)?;
                     let size = (((len_pt[0] as usize) << 8) | len_pt[1] as usize) & MAX_LENGTH;
                     if size == 0 {
-                        self.eof = true; // ErrZeroChunk (stream.go:123-125)
+                        // ErrZeroChunk (stream.go:122-125) — a boundary,
+                        // not an error; buffered chunks still drain first.
+                        self.rbuf.advance(2 + TAG_SIZE);
+                        self.pending_zero = true;
+                        self.stage = V3Stage::Len;
                         return Ok(false);
                     }
                     self.rbuf.advance(2 + TAG_SIZE);
@@ -745,7 +837,9 @@ struct V4Conn {
     stage: V4Stage,
     rbuf: BytesMut,
     out: BytesMut,
-    eof: bool,
+    /// A zero chunk was decoded and is pending as the consumer's EOF
+    /// (v4.go:201-206 `ErrZeroChunk` — non-terminal, like v3).
+    pending_zero: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -776,7 +870,8 @@ impl V4Conn {
     fn new(inner: BoxProxyStream, psk: &[u8]) -> Result<Self> {
         let mut salt = [0u8; V4_SALT_SIZE];
         rand::rngs::OsRng.fill_bytes(&mut salt);
-        let aead = snell_aead(psk, &salt)?;
+        // v4AEAD (v4.go:155-157): AES-128-GCM over the snell KDF.
+        let aead = snell_aead(AeadKind::Aes128Gcm, psk, &salt)?;
         let padding_delta = rand::rngs::OsRng.gen_range(0..u64::from(V4_INITIAL_PADDING_SPAN)) as u16;
         Ok(V4Conn {
             inner,
@@ -794,7 +889,7 @@ impl V4Conn {
             stage: V4Stage::Header,
             rbuf: BytesMut::with_capacity(16 * 1024),
             out: BytesMut::with_capacity(16 * 1024),
-            eof: false,
+            pending_zero: false,
         })
     }
 
@@ -900,7 +995,7 @@ impl V4Conn {
             let salt = self.rbuf[..V4_SALT_SIZE].to_vec();
             self.rbuf.advance(V4_SALT_SIZE);
             self.reader = Some(V4Crypto {
-                aead: snell_aead(&self.psk, &salt)?,
+                aead: snell_aead(AeadKind::Aes128Gcm, &self.psk, &salt)?,
                 nonce: SsNonce::new(),
             });
             self.stage = V4Stage::Header;
@@ -923,7 +1018,11 @@ impl V4Conn {
                         if padding_len != 0 {
                             return Err(Error::protocol("snell v4: zero chunk with padding"));
                         }
-                        self.eof = true; // ErrZeroChunk (v4.go:201-206)
+                        // ErrZeroChunk (v4.go:201-206) — a boundary; the
+                        // reader continues with the next frame on reuse.
+                        self.rbuf.advance(V4_HEADER_CIPHER);
+                        self.pending_zero = true;
+                        self.stage = V4Stage::Header;
                         return Ok(false);
                     }
                     if payload_len > MAX_LENGTH || padding_len > MAX_LENGTH {
@@ -1121,8 +1220,28 @@ impl Conn {
         Ok(())
     }
 
-    /// Read + decrypt until at least one chunk lands in `out` (or EOF).
-    /// `Ok(true)` = progress, `Ok(false)` = stream at EOF.
+    /// The peer sent a zero chunk (its half-close) — pool.go's
+    /// `peerClosed` marker; distinct from a transport close.
+    fn peer_half_closed(&self) -> bool {
+        match self {
+            Conn::V3(c) => c.pending_zero,
+            Conn::V4(c) => c.pending_zero,
+        }
+    }
+
+    /// Clear the pending zero chunk for a pooled reuse (the snell server
+    /// loops to the next request header after its zero chunk —
+    /// listener/snell/server.go:166-171).
+    fn reset_zero(&mut self) {
+        match self {
+            Conn::V3(c) => c.pending_zero = false,
+            Conn::V4(c) => c.pending_zero = false,
+        }
+    }
+
+    /// Read + decrypt until at least one chunk lands in `out` (or the
+    /// peer half-closes / the transport closes).
+    /// `Ok(true)` = progress, `Ok(false)` = EOF.
     fn poll_fill(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
         loop {
             let parsed = match self {
@@ -1133,11 +1252,11 @@ impl Conn {
             if parsed {
                 return Poll::Ready(Ok(true));
             }
-            let (eof, rbuf, inner) = match self {
-                Conn::V3(c) => (c.eof, &mut c.rbuf, &mut c.inner),
-                Conn::V4(c) => (c.eof, &mut c.rbuf, &mut c.inner),
+            let (half_closed, rbuf, inner) = match self {
+                Conn::V3(c) => (c.pending_zero, &mut c.rbuf, &mut c.inner),
+                Conn::V4(c) => (c.pending_zero, &mut c.rbuf, &mut c.inner),
             };
-            if eof {
+            if half_closed {
                 return Poll::Ready(Ok(false));
             }
             let mut tmp = [0u8; 16 * 1024];
@@ -1174,12 +1293,15 @@ pub struct SnellStream {
 impl SnellStream {
     fn new(inner: BoxProxyStream, cfg: &SnellOut) -> Result<Self> {
         let psk = cfg.psk.as_bytes();
+        // StreamConn (snell.go:156-168): >= v4 uses the v4 codec; v1 is
+        // Chacha20-Poly1305; v2/v3 are AES-128-GCM over the SS framing.
         let conn = match cfg.version {
-            3 => Conn::V3(V3Conn::new(inner, psk)),
+            1..=3 => Conn::V3(V3Conn::new(inner, psk, v3_cipher_kind(cfg.version))),
             4 => Conn::V4(V4Conn::new(inner, psk)?),
             other => {
                 return Err(Error::config(format!(
-                    "snell: unsupported version {other} (mihomo supports 3 and 4)"
+                    "snell: unsupported version {other} (wire versions are 1..=4; \
+                     parse_version maps v5 down to 4)"
                 )))
             }
         };
@@ -1261,6 +1383,19 @@ impl SnellStream {
         self.frame_packet(packet)?;
         AsyncWriteExt::flush(self).await.map_err(Error::from)?;
         Ok(())
+    }
+
+    /// The peer sent its zero chunk (pool.go `peerClosed`).
+    fn peer_half_closed(&self) -> bool {
+        self.conn.peer_half_closed()
+    }
+
+    /// Prepare the conn for a pooled reuse: the next request must consume
+    /// a fresh reply byte and the pending zero chunk is spent
+    /// (`pc.Snell.reply = false` + put, pool.go:116-118).
+    fn reset_for_reuse(&mut self) {
+        self.reply = Reply::Pending;
+        self.conn.reset_zero();
     }
 
     /// Read exactly one decrypted AEAD frame payload — the packet view of
@@ -1420,15 +1555,17 @@ impl AsyncRead for SnellStream {
 
 /// Perform the snell handshake over an established transport.
 ///
-/// * TCP: writes the encrypted request header (`0x01 0x01 0x00 hostlen
-///   host port_be16`); the server's tunnel/error reply is consumed
-///   lazily on the first read, like mihomo's `Snell.Read`.
+/// * TCP: writes the encrypted request header (`0x01 cmd 0x00 hostlen
+///   host port_be16`, cmd = [`CMD_CONNECT`] or [`CMD_CONNECT_V2`] for
+///   v2/reuse); the server's tunnel/error reply is consumed lazily on
+///   the first read, like mihomo's `Snell.Read`.
 /// * UDP (v3+): writes `0x01 0x06 0x00`; v4 additionally waits for the
 ///   reply here (adapter/outbound/snell.go:88-95). Packet bodies use
 ///   [`snell_udp_frame`] / [`parse_snell_udp_response`].
 ///
-/// The dial sequence is the integrator's: TCP (plus any obfs plugin)
-/// → this handshake → relay.
+/// The version comes from [`parse_version`] (raw `0..=5` accepted; v5
+/// rides the v4 wire). The dial sequence is the integrator's: TCP (plus
+/// any obfs plugin) → this handshake → relay.
 pub async fn handshake(
     stream: BoxProxyStream,
     cfg: &SnellOut,
@@ -1438,18 +1575,18 @@ pub async fn handshake(
     if cfg.psk.is_empty() {
         return Err(Error::config("snell: psk is required"));
     }
-    if !matches!(cfg.version, 3 | 4) {
-        return Err(Error::config(format!(
-            "snell: unsupported version {} (expected 3 or 4)",
-            cfg.version
-        )));
+    let version = parse_version(cfg.version)?;
+    let cfg = SnellOut { version, ..cfg.clone() };
+    if is_udp && version < 3 {
+        // WriteUDPHeader (snell.go:129-131) refuses below v3.
+        return Err(Error::config("snell: unsupport UDP version"));
     }
     debug!(
         target: "engine",
         server = %cfg.server, port = cfg.port, version = cfg.version, udp = is_udp,
         "snell: starting handshake"
     );
-    let mut snell = SnellStream::new(stream, cfg)?;
+    let mut snell = SnellStream::new(stream, &cfg)?;
     if is_udp {
         snell.write_all(&udp_header()).await?;
         snell.flush().await?;
@@ -1457,11 +1594,305 @@ pub async fn handshake(
             snell.wait_reply().await?;
         }
     } else {
-        snell.write_all(&request_header(target)?).await?;
+        snell.write_all(&request_header(target, cfg.version, false)?).await?;
         snell.flush().await?;
     }
     debug!(target: "engine", "snell: request sent");
     Ok(Box::new(snell))
+}
+
+// ---------------------------------------------------------------------------
+// Connection reuse pool (transport/snell/pool.go + adapter/outbound/snell.go)
+// ---------------------------------------------------------------------------
+
+/// A factory producing the (optionally obfs-wrapped) transport a pooled
+/// snell conn rides on — `NewPool`'s factory closure
+/// (adapter/outbound/snell.go:288-301): dial TCP, wrap obfs, return.
+/// The default dials plain TCP to `(server, port)`.
+pub type SnellDialFuture =
+    Pin<Box<dyn std::future::Future<Output = Result<BoxProxyStream>> + Send>>;
+pub type SnellTransportDialer =
+    std::sync::Arc<dyn Fn() -> SnellDialFuture + Send + Sync>;
+
+/// `NewPool`'s options (pool.go:123-136): `WithAge(15000)`,
+/// `WithSize(10)`, evict = close.
+pub const SNELL_POOL_MAX_AGE: std::time::Duration = std::time::Duration::from_millis(15_000);
+pub const SNELL_POOL_MAX_IDLE: usize = 10;
+
+async fn dial_tcp_transport(server: &str, port: u16) -> Result<BoxProxyStream> {
+    let tcp = tokio::net::TcpStream::connect((server, port))
+        .await
+        .map_err(|e| Error::network(format!("dial {server}:{port}: {e}")))?;
+    Ok(Box::new(tcp))
+}
+
+/// Shared pool state ([`SnellPool`] clones and pooled conns both hold it).
+struct SnellPoolShared {
+    cfg: SnellOut,
+    dialer: SnellTransportDialer,
+    /// The idle conns with their put-time (common/pool entry.time,
+    /// pool.go:11-14). FIFO like the Go channel.
+    idle: tokio::sync::Mutex<VecDeque<(std::time::Instant, SnellStream)>>,
+    max_age: std::time::Duration,
+    max_idle: usize,
+}
+
+impl SnellPoolShared {
+    /// `pool.Put` (common/pool pool.go:75-91): non-blocking push; a full
+    /// pool evicts (closes) the conn instead.
+    async fn put(&self, conn: SnellStream) {
+        let mut idle = self.idle.lock().await;
+        if idle.len() >= self.max_idle {
+            drop(conn); // evict → WithEvict(item.Close())
+            return;
+        }
+        idle.push_back((std::time::Instant::now(), conn));
+    }
+
+    /// `pool.GetContext` (common/pool pool.go:51-69): pop entries until
+    /// one is younger than `maxAge`; expired entries are evicted on the
+    /// spot; an empty pool yields `None` (caller dials fresh).
+    async fn get(&self) -> Option<SnellStream> {
+        let mut idle = self.idle.lock().await;
+        loop {
+            let (put_at, conn) = idle.pop_front()?;
+            if put_at.elapsed() > self.max_age {
+                drop(conn); // expired → evict
+                continue;
+            }
+            return Some(conn);
+        }
+    }
+}
+
+/// The adapter-level snell connection pool — mihomo `snell.Pool`
+/// (transport/snell/pool.go) as wired by `NewSnell`
+/// (adapter/outbound/snell.go:287-301).
+///
+/// Upstream pools only when `reuse` is on: v2 always
+/// (`reuse := version == Version2 || (version == Version4 && Reuse)`,
+/// adapter snell.go:252) and v4 with the `reuse` flag — so this pool
+/// accepts versions 2 and 4 only.
+///
+/// * [`SnellPool::dial`] hands out a cached live conn (age-checked like
+///   `GetContext`) or dials a fresh transport via the injected dialer,
+///   then writes the request header with `reuse=true`
+///   (`CommandConnectV2`, adapter snell.go:97-116).
+/// * The returned [`PooledSnell`] recycles itself on drop exactly like
+///   `PoolConn.Close` (pool.go:98-121): only after BOTH sides half-closed
+///   (client `shutdown()` = `writeZeroChunk`, peer zero-chunk seen =
+///   `peerClosed`) does it reset the reply state (`reply = false`) and
+///   re-enter the pool; anything else closes the transport.
+#[derive(Clone)]
+pub struct SnellPool {
+    shared: std::sync::Arc<SnellPoolShared>,
+}
+
+impl SnellPool {
+    /// A pool dialing plain TCP to `cfg.server:cfg.port`.
+    pub fn new(cfg: SnellOut) -> Result<Self> {
+        let server = cfg.server.clone();
+        let port = cfg.port;
+        Self::with_dialer(cfg, move || {
+            let server = server.clone();
+            Box::pin(async move { dial_tcp_transport(&server, port).await })
+        })
+    }
+
+    /// A pool whose transports come from `dialer` — the hook for obfs
+    /// plugins (http/tls/shadow-tls/restls/jls wrap the TCP before the
+    /// snell codec, like `streamConnContext`).
+    pub fn with_dialer(
+        cfg: SnellOut,
+        dialer: impl Fn() -> SnellDialFuture + Send + Sync + 'static,
+    ) -> Result<Self> {
+        if cfg.psk.is_empty() {
+            return Err(Error::config("snell: psk is required"));
+        }
+        let version = parse_version(cfg.version)?;
+        if !matches!(version, 2 | 4) {
+            // adapter/outbound/snell.go:252 — reuse exists only for v2
+            // (always) and v4 (`reuse: true`); v5 already mapped to 4.
+            return Err(Error::config(format!(
+                "snell: connection reuse requires version 2 or 4, got {version}"
+            )));
+        }
+        Ok(SnellPool {
+            shared: std::sync::Arc::new(SnellPoolShared {
+                cfg: SnellOut { version, ..cfg },
+                dialer: std::sync::Arc::new(dialer),
+                idle: tokio::sync::Mutex::new(VecDeque::new()),
+                max_age: SNELL_POOL_MAX_AGE,
+                max_idle: SNELL_POOL_MAX_IDLE,
+            }),
+        })
+    }
+
+    /// Override the idle policy (`NewPool`'s `WithAge`/`WithSize`).
+    pub fn with_limits(
+        mut self,
+        max_age: std::time::Duration,
+        max_idle: usize,
+    ) -> Self {
+        let shared = std::sync::Arc::get_mut(&mut self.shared)
+            .expect("limits must be set before the pool is shared");
+        shared.max_age = max_age;
+        shared.max_idle = max_idle;
+        self
+    }
+
+    /// Number of idle pooled conns (observability).
+    pub async fn idle_len(&self) -> usize {
+        self.shared.idle.lock().await.len()
+    }
+
+    /// `Snell.DialContext` with reuse on (adapter/outbound/snell.go:102-117):
+    /// take a pooled conn (or make one), write the request header with
+    /// `reuse=true` — `CommandConnectV2` — and mark the conn reusable so
+    /// its later close returns it to this pool.
+    pub async fn dial(&self, target: &NetAddr) -> Result<PooledSnell> {
+        let mut snell = match self.shared.get().await {
+            Some(conn) => conn,
+            None => SnellStream::new((self.shared.dialer)().await?, &self.shared.cfg)?,
+        };
+        // WriteHeaderWithReuse(..., version, true) — the header write is
+        // the "MarkReusable" gate (adapter snell.go:97-116).
+        snell.write_all(&request_header(target, self.shared.cfg.version, true)?).await?;
+        snell.flush().await.map_err(Error::from)?;
+        Ok(PooledSnell {
+            stream: Some(snell),
+            shared: self.shared.clone(),
+            zero_framed: false,
+            half_closed: false,
+            failed: false,
+        })
+    }
+}
+
+/// A checked-out pooled snell conn — `snell.PoolConn` (pool.go:51-121).
+///
+/// * `Read` surfaces the peer's zero chunk as a clean EOF while noting
+///   `peerClosed` (pool.go:63-70).
+/// * `shutdown()` is `CloseWrite` (pool.go:81-96): the reusable path
+///   writes the zero-chunk half-close instead of closing.
+/// * Drop is `Close` (pool.go:98-121): return to the pool only when the
+///   request negotiated reuse AND both halves closed; otherwise the
+///   transport is dropped (closed).
+pub struct PooledSnell {
+    stream: Option<SnellStream>,
+    shared: std::sync::Arc<SnellPoolShared>,
+    /// The zero chunk has been framed into the write buffer
+    /// (`closeWriteOnce`'s once-guard).
+    zero_framed: bool,
+    /// The zero chunk was flushed to the transport
+    /// (`closeWriteReusable`).
+    half_closed: bool,
+    failed: bool,
+}
+
+impl PooledSnell {
+    /// Read access to the tunnel reply state for diagnostics.
+    pub fn peer_half_closed(&self) -> bool {
+        self.stream.as_ref().is_some_and(SnellStream::peer_half_closed)
+    }
+}
+
+impl AsyncWrite for PooledSnell {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let Some(stream) = this.stream.as_mut() else {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "snell: pooled conn already closed",
+            )));
+        };
+        Pin::new(stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match this.stream.as_mut() {
+            Some(stream) => Pin::new(stream).poll_flush(cx),
+            None => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "snell: pooled conn already closed",
+            ))),
+        }
+    }
+
+    /// `PoolConn.closeWrite` on the reusable path (pool.go:86-96):
+    /// `writeZeroChunk` — the half-close that lets the server finish
+    /// this request and wait for the next one. The zero chunk is framed
+    /// once into the stream's write buffer (an empty sealed chunk), and
+    /// `half_closed` latches only once the flush confirms it went out.
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let Some(stream) = this.stream.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        if !this.zero_framed {
+            if let Err(e) = stream.frame(&[]) {
+                this.failed = true;
+                return Poll::Ready(Err(io_invalid(e)));
+            }
+            this.zero_framed = true;
+        }
+        match Pin::new(stream).poll_flush(cx) {
+            Poll::Ready(Ok(())) => {
+                this.half_closed = true;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => {
+                this.failed = true;
+                Poll::Ready(Err(e))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncRead for PooledSnell {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let Some(stream) = this.stream.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        // pool.go:63-70 — peerClosed latches on the zero chunk (it may
+        // do so while buffered data is still draining, which is
+        // equivalent for the reuse decision); a transport error keeps it
+        // unlatched so Drop closes instead of recycling.
+        Pin::new(stream).poll_read(cx, buf)
+    }
+}
+
+impl Drop for PooledSnell {
+    /// `PoolConn.Close` (pool.go:98-121): reusable only when the request
+    /// negotiated reuse (always true for pool dials), the local half
+    /// closed via the zero chunk, AND the peer closed too; then reset
+    /// the reply state and put the conn back. Otherwise the transport is
+    /// dropped (closed).
+    fn drop(&mut self) {
+        let Some(mut stream) = self.stream.take() else { return };
+        let reusable = self.half_closed && !self.failed && stream.peer_half_closed();
+        if !reusable {
+            return;
+        }
+        stream.reset_for_reuse();
+        let shared = self.shared.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move { shared.put(stream).await });
+        }
+        // Without a runtime the conn is dropped → closed, like an
+        // evicted pool entry (WithEvict → Close).
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1518,18 +1949,20 @@ pub async fn udp_session(cfg: &SnellOut, transport: BoxProxyStream) -> Result<Sn
     if cfg.psk.is_empty() {
         return Err(Error::config("snell: psk is required"));
     }
-    if !matches!(cfg.version, 3 | 4) {
-        return Err(Error::config(format!(
-            "snell: UDP requires version 3 or 4, got {} (WriteUDPHeader refuses < v3)",
-            cfg.version
-        )));
+    let version = parse_version(cfg.version)?;
+    let cfg = SnellOut { version, ..cfg.clone() };
+    if version < 3 {
+        // WriteUDPHeader (snell.go:129-131), verbatim; the adapter
+        // config check is "snell version %d not support UDP"
+        // (adapter/outbound/snell.go:254-257) — see validate_udp.
+        return Err(Error::config("snell: unsupport UDP version"));
     }
     debug!(
         target: "engine",
         server = %cfg.server, port = cfg.port, version = cfg.version,
         "snell: starting UDP session"
     );
-    let mut snell = SnellStream::new(transport, cfg)?;
+    let mut snell = SnellStream::new(transport, &cfg)?;
     snell.write_all(&udp_header()).await?;
     snell.flush().await?;
     if cfg.version >= 4 {
@@ -1668,6 +2101,7 @@ fn parse_snell_udp_request(frame: &[u8]) -> Result<(NetAddr, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
@@ -1758,10 +2192,10 @@ mod tests {
     #[test]
     fn request_header_layout() {
         // WriteHeaderWithReuse (snell.go:103-126):
-        // 01 01 00 hostlen host port_be16
+        // 01 01 00 hostlen host port_be16 (v1/v3/v4, no reuse)
         let target = NetAddr::domain("example.com", 443).unwrap();
         assert_eq!(
-            request_header(&target).unwrap(),
+            request_header(&target, 3, false).unwrap(),
             vec![
                 0x01, 0x01, 0x00, 0x0b, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o',
                 b'm', 0x01, 0xbb
@@ -1769,16 +2203,50 @@ mod tests {
         );
         let target = NetAddr::ip("127.0.0.1".parse().unwrap(), 80);
         assert_eq!(
-            request_header(&target).unwrap(),
+            request_header(&target, 1, false).unwrap(),
             vec![
                 0x01, 0x01, 0x00, 9, b'1', b'2', b'7', b'.', b'0', b'.', b'0', b'.', b'1', 0x00,
                 0x50
             ]
         );
+        // v2 and any pooled reuse send CommandConnectV2 (snell.go:107-111).
+        assert_eq!(
+            request_header(&target, 2, false).unwrap(),
+            vec![
+                0x01, 0x05, 0x00, 9, b'1', b'2', b'7', b'.', b'0', b'.', b'0', b'.', b'1', 0x00,
+                0x50
+            ]
+        );
+        assert_eq!(
+            request_header(&target, 4, true).unwrap()[1],
+            CMD_CONNECT_V2
+        );
+        assert_eq!(request_header(&target, 4, false).unwrap()[1], CMD_CONNECT);
         // Hosts beyond a u8 length are refused (not silently truncated).
         let long = NetAddr::new(Host::Domain("a".repeat(256)), 80);
-        let err = request_header(&long).unwrap_err();
+        let err = request_header(&long, 3, false).unwrap_err();
         assert!(err.to_string().contains("255"), "{err}");
+    }
+
+    #[test]
+    fn version_parsing_matrix() {
+        // adapter/outbound/snell.go:244-261.
+        assert_eq!(parse_version(0).unwrap(), DEFAULT_SNELL_VERSION);
+        assert_eq!(parse_version(1).unwrap(), 1);
+        assert_eq!(parse_version(2).unwrap(), 2);
+        assert_eq!(parse_version(3).unwrap(), 3);
+        assert_eq!(parse_version(4).unwrap(), 4);
+        // v5 servers accept v4 clients (adapter snell.go:248-251).
+        assert_eq!(parse_version(5).unwrap(), 4);
+        let err = parse_version(6).unwrap_err();
+        assert!(err.to_string().contains("snell version error: 6"), "{err}");
+        // UDP gating (adapter snell.go:253-257).
+        assert!(validate_udp(1, true).is_err());
+        assert!(validate_udp(2, true).is_err());
+        let err = validate_udp(2, true).unwrap_err();
+        assert!(err.to_string().contains("snell version 2 not support UDP"), "{err}");
+        assert!(validate_udp(2, false).is_ok());
+        assert!(validate_udp(3, true).is_ok());
     }
 
     #[test]
@@ -1867,16 +2335,16 @@ mod tests {
         Ok(buf)
     }
 
-    /// Test-side v3 crypto half (mirrors shadowaead Reader/Writer).
+    /// Test-side v1..v3 crypto half (mirrors shadowaead Reader/Writer).
     struct V3Mimic {
         aead: Aead,
         nonce: SsNonce,
     }
 
     impl V3Mimic {
-        fn new(psk: &[u8], salt: &[u8]) -> Self {
+        fn new(kind: AeadKind, psk: &[u8], salt: &[u8]) -> Self {
             V3Mimic {
-                aead: snell_aead(psk, salt).unwrap(),
+                aead: snell_aead(kind, psk, salt).unwrap(),
                 nonce: SsNonce::new(),
             }
         }
@@ -1885,6 +2353,11 @@ mod tests {
             let len_ct = read_n(rd, 2 + TAG_SIZE).await?;
             let len_pt = self.aead.open(&self.nonce.advance(), b"", &len_ct).unwrap();
             let size = (((len_pt[0] as usize) << 8) | len_pt[1] as usize) & MAX_LENGTH;
+            if size == 0 {
+                // ErrZeroChunk — surfaced as the empty chunk (the
+                // half-close boundary, stream.go:122-125).
+                return Ok(Vec::new());
+            }
             let payload_ct = read_n(rd, size + TAG_SIZE).await?;
             Ok(self.aead.open(&self.nonce.advance(), b"", &payload_ct).unwrap())
         }
@@ -1900,13 +2373,21 @@ mod tests {
                 .unwrap();
             self.aead.seal(&self.nonce.advance(), b"", payload, out).unwrap();
         }
+
+        /// The zero chunk: the sealed `0x0000` length alone
+        /// (stream.go:38-45).
+        fn frame_zero_chunk(&mut self, out: &mut Vec<u8>) {
+            self.aead
+                .seal(&self.nonce.advance(), b"", &0u16.to_be_bytes(), out)
+                .unwrap();
+        }
     }
 
     /// v3 server mimic: verify the request header, reply tunnel, echo.
     async fn v3_server_mimic(io: DuplexStream, psk: Vec<u8>) -> Result<()> {
         let (mut rd, mut wr) = tokio::io::split(io);
         let salt = read_n(&mut rd, 16).await.map_err(Error::from)?;
-        let mut dec = V3Mimic::new(&psk, &salt);
+        let mut dec = V3Mimic::new(AeadKind::Aes128Gcm, &psk, &salt);
 
         let header = dec.read_chunk(&mut rd).await.map_err(Error::from)?;
         assert_eq!(&header[..3], &[PROTOCOL_VERSION, CMD_CONNECT, 0x00]);
@@ -1917,7 +2398,7 @@ mod tests {
 
         let mut out_salt = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut out_salt);
-        let mut enc = V3Mimic::new(&psk, &out_salt);
+        let mut enc = V3Mimic::new(AeadKind::Aes128Gcm, &psk, &out_salt);
         let mut wire = out_salt.to_vec();
         enc.frame_chunk(&[CMD_TUNNEL], &mut wire);
         wr.write_all(&wire).await.map_err(Error::from)?;
@@ -2008,7 +2489,7 @@ mod tests {
     impl V4Mimic {
         fn new(psk: &[u8], salt: &[u8]) -> Self {
             V4Mimic {
-                aead: snell_aead(psk, salt).unwrap(),
+                aead: snell_aead(AeadKind::Aes128Gcm, psk, salt).unwrap(),
                 nonce: SsNonce::new(),
             }
         }
@@ -2019,6 +2500,12 @@ mod tests {
             assert_eq!(header[0], 4);
             let padding_len = u16::from_be_bytes([header[3], header[4]]) as usize;
             let payload_len = u16::from_be_bytes([header[5], header[6]]) as usize;
+            if payload_len == 0 {
+                // The zero chunk is the header alone — no payload cipher
+                // follows (v4.go:201-206, 339-342).
+                assert_eq!(padding_len, 0);
+                return Ok(Vec::new());
+            }
             let mut frame = read_n(rd, padding_len + payload_len + TAG_SIZE).await?;
             if padding_len > 0 {
                 let (padding, payload_ct) = frame.split_at_mut(padding_len);
@@ -2031,12 +2518,17 @@ mod tests {
         }
 
         /// One frame without padding (the server's mirror of writeFrame).
+        /// An empty payload seals the header alone (the zero chunk,
+        /// v4.go:339-342).
         fn frame(&mut self, payload: &[u8], out: &mut Vec<u8>) {
             let mut header = [0u8; V4_HEADER_PLAIN];
             header[0] = 4;
+            header[3..5].copy_from_slice(&(0u16).to_be_bytes());
             header[5..7].copy_from_slice(&(payload.len() as u16).to_be_bytes());
             self.aead.seal(&self.nonce.advance(), b"", &header, out).unwrap();
-            self.aead.seal(&self.nonce.advance(), b"", payload, out).unwrap();
+            if !payload.is_empty() {
+                self.aead.seal(&self.nonce.advance(), b"", payload, out).unwrap();
+            }
         }
     }
 
@@ -2186,7 +2678,7 @@ mod tests {
         let (padding, payload_ct) = frame.split_at_mut(padding_len);
         swap_padding(padding, payload_ct);
         let payload = dec.aead.open(&dec.nonce.advance(), b"", payload_ct).unwrap();
-        assert_eq!(payload, request_header(&target).unwrap());
+        assert_eq!(payload, request_header(&target, 4, false).unwrap());
 
         // Frame 2: no padding, plain "tail".
         let header_ct = read_n(&mut server, V4_HEADER_CIPHER).await.unwrap();
@@ -2251,12 +2743,12 @@ mod tests {
         match version {
             3 => {
                 let salt = read_n(&mut rd, 16).await.map_err(Error::from)?;
-                let mut dec = V3Mimic::new(&psk, &salt);
+                let mut dec = V3Mimic::new(AeadKind::Aes128Gcm, &psk, &salt);
                 let header = dec.read_chunk(&mut rd).await.map_err(Error::from)?;
                 assert_eq!(header, vec![PROTOCOL_VERSION, CMD_UDP, 0x00]);
                 let mut out_salt = [0u8; 16];
                 rand::rngs::OsRng.fill_bytes(&mut out_salt);
-                let mut enc = V3Mimic::new(&psk, &out_salt);
+                let mut enc = V3Mimic::new(AeadKind::Aes128Gcm, &psk, &out_salt);
                 let mut wire = out_salt.to_vec();
                 enc.frame_chunk(&[CMD_TUNNEL], &mut wire);
                 wr.write_all(&wire).await.map_err(Error::from)?;
@@ -2468,19 +2960,500 @@ mod tests {
 
     #[tokio::test]
     async fn bad_version_rejected() {
+        // Raw version 6 is past every upstream constant
+        // (adapter/outbound/snell.go:259-260).
         let cfg = SnellOut {
             server: "x".into(),
             port: 1,
             psk: "p".into(),
-            version: 2,
+            version: 6,
             udp: false,
         };
         let target = NetAddr::domain("t.test", 80).unwrap();
         let err = match handshake(Box::new(tokio::io::duplex(16).0), &cfg, &target, false).await {
-            Ok(_) => panic!("version 2 must be rejected"),
+            Ok(_) => panic!("version 6 must be rejected"),
             Err(e) => e,
         };
         assert!(err.to_string().contains("version"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn udp_below_v3_rejected_with_upstream_message() {
+        // WriteUDPHeader's verbatim error (snell.go:129-131).
+        for version in [1u8, 2] {
+            let cfg = SnellOut {
+                server: "x".into(),
+                port: 1,
+                psk: "p".into(),
+                version,
+                udp: true,
+            };
+            let err = match udp_session(&cfg, Box::new(tokio::io::duplex(16).0)).await {
+                Ok(_) => panic!("version {version} UDP must be rejected"),
+                Err(e) => e,
+            };
+            assert!(err.to_string().contains("unsupport UDP version"), "{err}");
+        }
+    }
+
+    // ------------------------------------------------- v1/v2/v5 loopback
+
+    /// A v1/v2 server mimic: shadowaead framing with the version's
+    /// cipher, asserting the request header's command byte, replying
+    /// tunnel, echoing, and honouring the reuse loop (zero chunk →
+    /// server zero chunk → next request header).
+    async fn shadowaead_server_mimic(
+        io: DuplexStream,
+        psk: Vec<u8>,
+        version: u8,
+        expect_cmd: u8,
+        mut requests: impl FnMut(&str, u16),
+    ) -> Result<()> {
+        let (mut rd, mut wr) = tokio::io::split(io);
+        let salt = read_n(&mut rd, 16).await.map_err(Error::from)?;
+        let kind = if version == 1 {
+            AeadKind::Chacha20Poly1305
+        } else {
+            AeadKind::Aes128Gcm
+        };
+        let mut dec = V3Mimic::new(kind, &psk, &salt);
+        // One AEAD writer for the whole conn — the salt prefixes the
+        // first server write only (stream.go initWriter).
+        let mut out_salt = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut out_salt);
+        let mut enc = V3Mimic::new(kind, &psk, &out_salt);
+        let mut reply_wire = out_salt.to_vec();
+        enc.frame_chunk(&[CMD_TUNNEL], &mut reply_wire);
+        loop {
+            // request header
+            let header = match dec.read_chunk(&mut rd).await {
+                Ok(h) => h,
+                Err(_) => return Ok(()), // transport closed
+            };
+            if header.is_empty() {
+                return Ok(()); // stray zero chunk then close
+            }
+            assert_eq!(&header[..3], &[PROTOCOL_VERSION, expect_cmd, 0x00]);
+            let host_len = header[3] as usize;
+            let host = String::from_utf8(header[4..4 + host_len].to_vec()).unwrap();
+            let port = u16::from_be_bytes([header[4 + host_len], header[5 + host_len]]);
+            requests(&host, port);
+
+            wr.write_all(&reply_wire).await.map_err(Error::from)?;
+            // relay until the client's zero chunk, then half-close back
+            loop {
+                let data = match dec.read_chunk(&mut rd).await {
+                    Ok(d) => d,
+                    Err(_) => return Ok(()),
+                };
+                if data.is_empty() {
+                    break;
+                }
+                let mut echo = Vec::new();
+                enc.frame_chunk(&data, &mut echo);
+                wr.write_all(&echo).await.map_err(Error::from)?;
+            }
+            let mut zero = Vec::new();
+            enc.frame_zero_chunk(&mut zero);
+            wr.write_all(&zero).await.map_err(Error::from)?;
+            // reuse loop: the next request's tunnel reply reuses the
+            // already-salted writer
+            let mut next = Vec::new();
+            enc.frame_chunk(&[CMD_TUNNEL], &mut next);
+            reply_wire = next;
+        }
+    }
+
+    #[tokio::test]
+    async fn v1_loopback_echo() {
+        // v1 = Chacha20-Poly1305 over the SS framing (StreamConn,
+        // snell.go:160-167; cipher.go:50-56).
+        let psk = test_psk();
+        let cfg = SnellOut {
+            server: "127.0.0.1".into(),
+            port: 0,
+            psk: psk.clone(),
+            version: 1,
+            udp: false,
+        };
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let psk2 = psk.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                shadowaead_server_mimic(server, psk2.as_bytes().to_vec(), 1, CMD_CONNECT, |_, _| {})
+                    .await
+            {
+                panic!("v1 mimic failed: {e}");
+            }
+        });
+        let target = NetAddr::domain("echo.example", 443).unwrap();
+        let mut stream = handshake(Box::new(client), &cfg, &target, false)
+            .await
+            .unwrap();
+        stream.write_all(b"ping-v1").await.unwrap();
+        let mut buf = [0u8; 7];
+        timeout_read(&mut stream, &mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping-v1");
+    }
+
+    #[tokio::test]
+    async fn v2_header_sends_command_connect_v2() {
+        // v2 always negotiates reuse (adapter/outbound/snell.go:252), so
+        // WriteHeaderWithReuse emits CommandConnectV2 (snell.go:107-111)
+        // even on a plain (unpooled) handshake.
+        let psk = test_psk();
+        let cfg = SnellOut {
+            server: "127.0.0.1".into(),
+            port: 0,
+            psk: psk.clone(),
+            version: 2,
+            udp: false,
+        };
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let psk2 = psk.clone();
+        tokio::spawn(async move {
+            if let Err(e) = shadowaead_server_mimic(
+                server,
+                psk2.as_bytes().to_vec(),
+                2,
+                CMD_CONNECT_V2,
+                |_, _| {},
+            )
+            .await
+            {
+                panic!("v2 mimic failed: {e}");
+            }
+        });
+        let target = NetAddr::domain("echo.example", 443).unwrap();
+        let mut stream = handshake(Box::new(client), &cfg, &target, false)
+            .await
+            .unwrap();
+        stream.write_all(b"ping-v2").await.unwrap();
+        let mut buf = [0u8; 7];
+        timeout_read(&mut stream, &mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping-v2");
+    }
+
+    #[tokio::test]
+    async fn v5_rides_the_v4_wire() {
+        // parse_version maps v5 → 4 (adapter/outbound/snell.go:248-251),
+        // so a v5 config handshakes and relays against a v4 server.
+        let psk = test_psk();
+        let cfg = SnellOut {
+            server: "127.0.0.1".into(),
+            port: 0,
+            psk: psk.clone(),
+            version: 5,
+            udp: false,
+        };
+        let mut stream = connect_v4(&cfg, &psk, false).await.unwrap();
+        stream.write_all(b"ping-v5").await.unwrap();
+        let mut buf = [0u8; 7];
+        timeout_read(&mut stream, &mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping-v5");
+    }
+
+    // ------------------------------------------------------ snell pool
+
+    async fn pool_transport(psk: &str, version: u8) -> Result<BoxProxyStream> {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let psk = psk.as_bytes().to_vec();
+        tokio::spawn(async move {
+            let requests = |host: &str, port: u16| {
+                assert_eq!((host, port), ("echo.example", 443));
+            };
+            let res = match version {
+                2 => shadowaead_server_mimic(server, psk, 2, CMD_CONNECT_V2, requests).await,
+                _ => v4_server_reuse_mimic(server, psk, requests).await,
+            };
+            if let Err(e) = res {
+                panic!("pool mimic failed: {e}");
+            }
+        });
+        Ok(Box::new(client))
+    }
+
+    /// v4 server with the reuse loop (listener/snell/server.go:166-171):
+    /// every request opens with CommandConnectV2, echoes until the
+    /// client's zero chunk, half-closes back, waits for the next header.
+    async fn v4_server_reuse_mimic(
+        io: DuplexStream,
+        psk: Vec<u8>,
+        mut requests: impl FnMut(&str, u16),
+    ) -> Result<()> {
+        let (mut rd, mut wr) = tokio::io::split(io);
+        let salt = read_n(&mut rd, V4_SALT_SIZE).await.map_err(Error::from)?;
+        let mut dec = V4Mimic::new(&psk, &salt);
+        // One AEAD writer for the whole conn — the salt prefixes the
+        // first server frame only (v4.go initWriter).
+        let mut out_salt = [0u8; V4_SALT_SIZE];
+        rand::rngs::OsRng.fill_bytes(&mut out_salt);
+        let mut enc = V4Mimic::new(&psk, &out_salt);
+        let mut tunnel_wire = out_salt.to_vec();
+        enc.frame(&[CMD_TUNNEL], &mut tunnel_wire);
+        loop {
+            let header = match dec.read_frame(&mut rd).await {
+                Ok(h) => h,
+                Err(_) => return Ok(()),
+            };
+            if header.is_empty() {
+                return Ok(());
+            }
+            assert_eq!(&header[..3], &[PROTOCOL_VERSION, CMD_CONNECT_V2, 0x00]);
+            let host_len = header[3] as usize;
+            let host = String::from_utf8(header[4..4 + host_len].to_vec()).unwrap();
+            let port = u16::from_be_bytes([header[4 + host_len], header[5 + host_len]]);
+            requests(&host, port);
+
+            wr.write_all(&tunnel_wire).await.map_err(Error::from)?;
+            loop {
+                let data = match dec.read_frame(&mut rd).await {
+                    Ok(d) => d,
+                    Err(_) => return Ok(()),
+                };
+                if data.is_empty() {
+                    break;
+                }
+                let mut wire = Vec::new();
+                enc.frame(&data, &mut wire);
+                wr.write_all(&wire).await.map_err(Error::from)?;
+            }
+            let mut wire = Vec::new();
+            enc.frame(&[], &mut wire); // server zero chunk (reuse close)
+            wr.write_all(&wire).await.map_err(Error::from)?;
+            // the next request's tunnel reply reuses the salted writer
+            let mut next = Vec::new();
+            enc.frame(&[CMD_TUNNEL], &mut next);
+            tunnel_wire = next;
+        }
+    }
+
+    fn pool_with_dial_counter(
+        psk: &str,
+        version: u8,
+    ) -> (SnellPool, Arc<std::sync::atomic::AtomicUsize>) {
+        let psk = psk.to_string();
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter2 = counter.clone();
+        let pool = SnellPool::with_dialer(
+            SnellOut {
+                server: "127.0.0.1".into(),
+                port: 0,
+                psk: psk.clone(),
+                version,
+                udp: false,
+            },
+            move || {
+                let psk = psk.clone();
+                let counter = counter2.clone();
+                Box::pin(async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    pool_transport(&psk, version).await
+                })
+            },
+        )
+        .unwrap();
+        (pool, counter)
+    }
+
+    async fn pooled_request(conn: &mut PooledSnell, payload: &[u8]) -> Vec<u8> {
+        conn.write_all(payload).await.unwrap();
+        conn.flush().await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        tokio::time::timeout(Duration::from_secs(10), conn.read_exact(&mut got))
+            .await
+            .expect("pooled read timed out")
+            .unwrap();
+        got
+    }
+
+    /// Read from a pooled conn with a timeout; `Ok(0)` = clean EOF.
+    async fn pooled_read_timeout(conn: &mut PooledSnell, buf: &mut [u8]) -> io::Result<usize> {
+        tokio::time::timeout(Duration::from_secs(10), conn.read(buf))
+            .await
+            .expect("pooled read timed out")
+    }
+
+    #[tokio::test]
+    async fn pool_reuses_one_conn_across_dials() {
+        // Dial → relay → half-close both ways → drop: the conn returns to
+        // the pool (PoolConn.Close, pool.go:98-121) and the next dial
+        // reuses it (one transport, two requests, like DialContext with
+        // reuse on, adapter/outbound/snell.go:102-117).
+        let psk = test_psk();
+        let (pool, counter) = pool_with_dial_counter(&psk, 4);
+        let target = NetAddr::domain("echo.example", 443).unwrap();
+
+        {
+            let mut conn = pool.dial(&target).await.unwrap();
+            assert_eq!(pooled_request(&mut conn, b"first").await, b"first");
+            conn.shutdown().await.unwrap(); // writeZeroChunk
+            let mut tail = [0u8; 4];
+            let n = pooled_read_timeout(&mut conn, &mut tail).await.unwrap();
+            assert_eq!(n, 0, "the peer zero chunk is a clean EOF");
+            assert!(conn.peer_half_closed());
+        } // Drop → put back to the pool
+        tokio::time::sleep(Duration::from_millis(50)).await; // the put task lands
+        assert_eq!(pool.idle_len().await, 1);
+        {
+            let mut conn = pool.dial(&target).await.unwrap();
+            assert_eq!(pooled_request(&mut conn, b"seco").await, b"seco");
+            conn.shutdown().await.unwrap();
+            let mut tail = [0u8; 4];
+            let n = pooled_read_timeout(&mut conn, &mut tail).await.unwrap();
+            assert_eq!(n, 0);
+        }
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn pool_without_peer_close_does_not_reuse() {
+        // PoolConn.Close refuses to recycle when the peer never
+        // half-closed (pool.go:110-113): dropping after a local
+        // shutdown only (server hasn't answered yet) closes the conn.
+        let psk = test_psk();
+        let (pool, counter) = pool_with_dial_counter(&psk, 4);
+        let target = NetAddr::domain("echo.example", 443).unwrap();
+        {
+            let mut conn = pool.dial(&target).await.unwrap();
+            assert_eq!(pooled_request(&mut conn, b"ping").await, b"ping");
+            conn.shutdown().await.unwrap();
+        } // dropped without observing the peer's zero chunk
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(pool.idle_len().await, 0);
+        {
+            let mut conn = pool.dial(&target).await.unwrap();
+            assert_eq!(pooled_request(&mut conn, b"aga").await, b"aga");
+            conn.shutdown().await.unwrap();
+        }
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn pool_expires_idle_conns() {
+        // GetContext evicts entries older than maxAge (common/pool
+        // pool.go:57-61): after the 15s default (shortened here), the
+        // next dial makes a fresh transport.
+        let psk = test_psk();
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let psk2 = psk.clone();
+        let counter2 = counter.clone();
+        let pool = SnellPool::with_dialer(
+            SnellOut {
+                server: "127.0.0.1".into(),
+                port: 0,
+                psk,
+                version: 4,
+                udp: false,
+            },
+            move || {
+                let psk = psk2.clone();
+                let counter = counter2.clone();
+                Box::pin(async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    pool_transport(&psk, 4).await
+                })
+            },
+        )
+        .unwrap()
+        .with_limits(Duration::from_millis(80), 10);
+        let target = NetAddr::domain("echo.example", 443).unwrap();
+        {
+            let mut conn = pool.dial(&target).await.unwrap();
+            assert_eq!(pooled_request(&mut conn, b"one").await, b"one");
+            conn.shutdown().await.unwrap();
+            let mut tail = [0u8; 3];
+            let _ = pooled_read_timeout(&mut conn, &mut tail).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(pool.idle_len().await, 1, "conn parked");
+        tokio::time::sleep(Duration::from_millis(200)).await; // past max_age
+        {
+            let mut conn = pool.dial(&target).await.unwrap();
+            assert_eq!(pooled_request(&mut conn, b"two").await, b"two");
+            conn.shutdown().await.unwrap();
+            let mut tail = [0u8; 3];
+            let _ = pooled_read_timeout(&mut conn, &mut tail).await;
+        }
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn pool_concurrent_dials_each_get_a_conn() {
+        // No pooled conn is handed to two users at once: concurrent
+        // dials take the one cached conn plus fresh transports
+        // (GetContext pops, never shares).
+        let psk = test_psk();
+        let (pool, counter) = pool_with_dial_counter(&psk, 4);
+        let target = NetAddr::domain("echo.example", 443).unwrap();
+        // Park one conn first.
+        {
+            let mut conn = pool.dial(&target).await.unwrap();
+            assert_eq!(pooled_request(&mut conn, b"park").await, b"park");
+            conn.shutdown().await.unwrap();
+            let mut tail = [0u8; 4];
+            let _ = pooled_read_timeout(&mut conn, &mut tail).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut a = pool.dial(&target).await.unwrap(); // reuses the parked one
+        let mut b = pool.dial(&target).await.unwrap(); // fresh transport
+        let mut c = pool.dial(&target).await.unwrap(); // fresh transport
+        let (ra, rb, rc) = tokio::join!(
+            pooled_request(&mut a, b"aaa"),
+            pooled_request(&mut b, b"bbb"),
+            pooled_request(&mut c, b"ccc"),
+        );
+        assert_eq!(ra, b"aaa".to_vec());
+        assert_eq!(rb, b"bbb".to_vec());
+        assert_eq!(rc, b"ccc".to_vec());
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn pool_v2_and_version_gates() {
+        // v2 pools (reuse always on); v1/v3 never pool (adapter
+        // snell.go:252).
+        let psk = test_psk();
+        let (pool, counter) = pool_with_dial_counter(&psk, 2);
+        let target = NetAddr::domain("echo.example", 443).unwrap();
+        {
+            let mut conn = pool.dial(&target).await.unwrap();
+            assert_eq!(pooled_request(&mut conn, b"v2-p").await, b"v2-p");
+            conn.shutdown().await.unwrap();
+            let mut tail = [0u8; 4];
+            let _ = pooled_read_timeout(&mut conn, &mut tail).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        {
+            let mut conn = pool.dial(&target).await.unwrap();
+            assert_eq!(pooled_request(&mut conn, b"v2-q").await, b"v2-q");
+            conn.shutdown().await.unwrap();
+            let mut tail = [0u8; 4];
+            let _ = pooled_read_timeout(&mut conn, &mut tail).await;
+        }
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
+        for version in [1u8, 3] {
+            let err = match SnellPool::new(SnellOut {
+                server: "127.0.0.1".into(),
+                port: 0,
+                psk: psk.clone(),
+                version,
+                udp: false,
+            }) {
+                Ok(_) => panic!("version {version} must not pool"),
+                Err(e) => e,
+            };
+            assert!(err.to_string().contains("version"), "{err}");
+        }
+        // v5 normalizes to 4 → pools fine (adapter snell.go:248-252).
+        assert!(SnellPool::new(SnellOut {
+            server: "127.0.0.1".into(),
+            port: 0,
+            psk: psk.clone(),
+            version: 5,
+            udp: false,
+        })
+        .is_ok());
     }
 
     async fn timeout_read(stream: &mut BoxProxyStream, buf: &mut [u8]) -> io::Result<usize> {

@@ -39,6 +39,14 @@
 //! error on anything but Linux).
 
 #[cfg(target_os = "linux")]
+mod device_linux;
+#[cfg(target_os = "macos")]
+mod device_macos;
+#[cfg(target_os = "windows")]
+mod device_windows;
+/// The platform-dispatched device layer: `device::TunDevice` is the Linux
+/// `/dev/net/tun` backend, WinTUN on Windows and utun on macOS (the latter
+/// two cfg'd out here but compiled and layout-tested on their targets).
 pub mod device;
 #[cfg(target_os = "linux")]
 pub mod netstack;

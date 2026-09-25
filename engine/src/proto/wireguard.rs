@@ -1,7 +1,10 @@
-//! WireGuard outbound: the Noise_IKpsk2 (Construction v1) handshake, the
+//! WireGuard: the Noise_IKpsk2 (Construction v1) handshake, the
 //! ChaCha20Poly1305 transport with 64-bit counters and an anti-replay
-//! window, and a client-side smoltcp netstack that terminates TCP/UDP
-//! toward targets inside the tunnel.
+//! window, a client-side smoltcp netstack that terminates TCP/UDP toward
+//! targets inside the tunnel, and an ENDPOINT (server) mode — the handshake
+//! responder with roaming, cookie-under-load and cryptokey routing that
+//! bridges decrypted packets into the engine like a TUN inbound
+//! ([`serve_endpoint`], sing-box's `endpoint` of type wireguard).
 //!
 //! # Scope and shape
 //!
@@ -12,11 +15,18 @@
 //!   [`crate::proto::hysteria2`]). The formulas are transcribed from the
 //!   canonical WireGuard protocol description (wireguard.com/protocol);
 //!   every derivation step is cited in a comment next to the code.
-//! * **Client only**: a single fixed peer (mihomo `type: wireguard` /
-//!   sing-box `type: wireguard` outbound), no endpoint roaming, no cookie
-//!   *generation* (that is a server-side under-load mechanism) — cookie
-//!   *consumption* is implemented so an under-load server can still be
-//!   reached.
+//! * **Client**: a single fixed peer (mihomo `type: wireguard` /
+//!   sing-box `type: wireguard` outbound), no endpoint roaming, cookie
+//!   *consumption* so an under-load server can still be reached.
+//! * **Endpoint (server)**: listens on UDP, answers initiations (promoted
+//!   from the in-test noise responder into [`open_initiation`] /
+//!   [`respond_initiation`]), tracks peers by receiver index with roaming
+//!   on every authenticated packet, guards against initiation replays via
+//!   TAI64N, replies with cookies when handshake load exceeds
+//!   wireguard-go's 64/s trip point, and routes decrypted packets by
+//!   allowed_ips into an accepting netstack whose TCP connections and UDP
+//!   sessions are handed to the engine's relay exactly like the TUN
+//!   inbound's.
 //! * **Netstack**: one task owns the smoltcp `Interface`, the `SocketSet`
 //!   and the UDP socket to the peer, mirroring the inbound TUN netstack's
 //!   single-owner design. TCP dials become [`WgStream`] (an
@@ -72,6 +82,7 @@ use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::addr::NetAddr;
 use crate::error::{Error, Result};
+use crate::inbound::{SharedRelay, TcpMeta};
 use crate::stream::BoxProxyStream;
 
 // ---------------------------------------------------------------------------
@@ -2100,6 +2111,1424 @@ impl Drop for WgUdp {
 }
 
 // ---------------------------------------------------------------------------
+// ENDPOINT (server) mode: the responder side of the same protocol, a real
+// UDP listener, and a packet-level bridge into the engine — sing-box's
+// `endpoint` of type wireguard (protocol/wireguard/endpoint.go): the
+// handshake responder (wireguard-go's device), transport with roaming, and
+// the decrypted IP packets fed into a userspace stack whose TCP/UDP legs are
+// handed to the engine exactly like the TUN inbound's.
+// ---------------------------------------------------------------------------
+
+/// One peer of the endpoint (sing-box `peers[]`: `public_key`,
+/// `pre_shared_key`, `allowed_ips`, `persistent_keepalive`).
+#[derive(Debug, Clone)]
+pub struct WgEndpointPeer {
+    /// The peer's static public key, base64 (32 bytes decoded).
+    pub public_key: String,
+    /// Optional pre-shared key, base64; empty/None = none.
+    pub pre_shared_key: Option<String>,
+    /// `allowed_ips`: the source ranges this peer may speak from and be
+    /// routed to — `(address, prefix)` pairs, either family. On a server
+    /// these double as cryptokey routing: the longest matching entry picks
+    /// the peer an outbound packet is encrypted to.
+    pub allowed_ips: Vec<(IpAddr, u8)>,
+    /// Persistent keepalive interval, seconds (0/None = off): an empty
+    /// transport message every interval while the session lives.
+    pub persistent_keepalive: Option<u16>,
+}
+
+/// A WireGuard endpoint (server) inbound, dialect-independent. The
+/// integrator maps sing-box's endpoint wireguard options (`private_key`,
+/// `listen_port`, `mtu`, `address[]`, `peers[]`, `udp_timeout`) onto these
+/// fields; mihomo has no WireGuard listener, so there is nothing to mirror.
+#[derive(Debug, Clone)]
+pub struct WgEndpointCfg {
+    /// Inbound tag (routing / IN-TYPE like every listener).
+    pub tag: String,
+    /// Our static private key, base64 (32 bytes decoded).
+    pub private_key: String,
+    /// UDP listen port; 0 lets the kernel pick (the bound address is
+    /// returned by [`serve_endpoint`]).
+    pub listen_port: u16,
+    /// Inner MTU; 0 selects the same 1408 default as the outbound.
+    pub mtu: u16,
+    /// The endpoint's own tunnel-side IPv4 address + prefix (sing-box
+    /// `address` v4 entry) — the userspace stack's interface address.
+    /// `None` falls back to `172.16.0.1/30`.
+    pub address: Option<(Ipv4Addr, u8)>,
+    /// The IPv6 twin (sing-box `address` v6 entry); `None` = v4-only peers.
+    pub inet6_address: Option<(Ipv6Addr, u8)>,
+    /// Idle UDP relay sessions are reaped after this long (sing-box
+    /// `udp_timeout`); `None` = 300s.
+    pub udp_timeout: Option<Duration>,
+    /// The clients allowed to connect, matched by their static public key.
+    pub peers: Vec<WgEndpointPeer>,
+}
+
+/// Cap on relayed TCP connections (mirrors the TUN netstack).
+const EP_MAX_CONNS: usize = 256;
+/// Cap on smoltcp UDP sockets (one per destination port in use).
+const EP_MAX_UDP_SOCKETS: usize = 256;
+/// Cap on UDP relay sessions (one per client source address).
+const EP_MAX_UDP_SESSIONS: usize = 1024;
+/// Cap on replies waiting to be handed to the stack in one batch.
+const EP_MAX_PENDING_REPLIES: usize = 1024;
+/// Default UDP session idle reap.
+const EP_UDP_TIMEOUT: Duration = Duration::from_secs(300);
+/// Cookie secret rotation (wireguard-go's CookieRefresh).
+const EP_COOKIE_REFRESH: Duration = Duration::from_secs(120);
+/// More initiations than this in one second switches the endpoint into
+/// cookie mode (wireguard-go's ratelimiter trips at 64/s).
+const EP_COOKIE_LOAD: u32 = 64;
+
+// -- server-side handshake ---------------------------------------------------
+
+/// Everything learned from an authenticated initiation, before the (peer
+/// specific) PSK enters the math.
+struct OpenInitiation {
+    sender: u32,
+    ephemeral: [u8; 32],
+    client_static: [u8; 32],
+    timestamp: [u8; 12],
+    /// Chain key and hash after the encrypted-timestamp step.
+    chaining_key: [u8; 32],
+    hash: [u8; 32],
+}
+
+/// Verify a handshake initiation exactly as the responder does, up to (but
+/// excluding) the psk2 step: MAC1 keyed by our own static, the initiator
+/// static unsealed, the timestamp unsealed. Promoted from the in-test
+/// responder; every derivation step cites the protocol page.
+fn open_initiation(server_static: &StaticKeys, msg: &WgMsg) -> Result<OpenInitiation> {
+    let WgMsg::Initiation {
+        sender,
+        ephemeral,
+        enc_static,
+        enc_timestamp,
+        mac1,
+        ..
+    } = msg
+    else {
+        return Err(Error::protocol("endpoint: not an initiation"));
+    };
+    // MAC1 first, keyed by OUR static public key: no unauthenticated work
+    // beyond the hash (whitepaper "First Message" + wireguard-go
+    // ReceivedHandshakeInitiation).
+    let mut covered = Vec::with_capacity(116);
+    covered.extend_from_slice(&1u32.to_le_bytes());
+    covered.extend_from_slice(&sender.to_le_bytes());
+    covered.extend_from_slice(ephemeral);
+    covered.extend_from_slice(enc_static);
+    covered.extend_from_slice(enc_timestamp);
+    if blake2s_mac(&mac1_key(&server_static.pk), &covered) != *mac1 {
+        return Err(Error::crypto("endpoint: initiation MAC1 mismatch"));
+    }
+
+    // Mirror the initiator's derivation (build_initiation, step for step).
+    let mut ck = blake2s256(CONSTRUCTION);
+    let ident_hash = hash2(&ck, IDENTIFIER);
+    let mut h = hash2(&ident_hash, &server_static.pk);
+    h = hash2(&h, ephemeral);
+    ck = kdf1(&ck, ephemeral);
+    // es = DH(responder static, initiator ephemeral)
+    let es = x25519_dh(&server_static.sk, ephemeral)?;
+    let (ck, key_es) = kdf2(&ck, &es);
+    let client_static: [u8; 32] = aead_open(&key_es, 0, enc_static, &h)?
+        .try_into()
+        .map_err(|_| Error::protocol("endpoint: static has wrong length"))?;
+    h = hash2(&h, enc_static);
+    // ss = DH(responder static, initiator static)
+    let ss = x25519_dh(&server_static.sk, &client_static)?;
+    let (ck, key_ss) = kdf2(&ck, &ss);
+    let timestamp = aead_open(&key_ss, 0, enc_timestamp, &h)?;
+    h = hash2(&h, enc_timestamp);
+    if timestamp.len() != 12 {
+        return Err(Error::protocol("endpoint: timestamp has wrong length"));
+    }
+    let timestamp: [u8; 12] = timestamp.try_into().unwrap();
+    Ok(OpenInitiation {
+        sender: *sender,
+        ephemeral: *ephemeral,
+        client_static,
+        timestamp,
+        chaining_key: ck,
+        hash: h,
+    })
+}
+
+/// Server-side session keys from a consumed initiation: (server index,
+/// peer index, client-send key, client-recv key).
+type ServerKeys = (u32, u32, [u8; 32], [u8; 32]);
+
+/// Complete the handshake with the peer's PSK: the response message plus the
+/// session keys (see [`ServerKeys`]). The server sends with the client-recv
+/// key.
+fn respond_initiation(
+    open: OpenInitiation,
+    psk: &[u8; 32],
+    server_index: u32,
+) -> Result<(Vec<u8>, ServerKeys)> {
+    let OpenInitiation {
+        sender,
+        ephemeral,
+        client_static,
+        timestamp: _,
+        chaining_key: mut ck,
+        hash: mut h,
+    } = open;
+
+    // The responder's half of the "Second Message" block.
+    let e = x25519_keypair();
+    h = hash2(&h, &e.pk);
+    ck = kdf1(&ck, &e.pk);
+    // ee = DH(responder ephemeral, initiator ephemeral)
+    let ee = x25519_dh(&e.sk, &ephemeral)?;
+    ck = kdf1(&ck, &ee);
+    // se = DH(responder ephemeral, initiator static)
+    let se = x25519_dh(&e.sk, &client_static)?;
+    ck = kdf1(&ck, &se);
+    // psk2
+    let (ck, temp2, key) = kdf3(&ck, psk);
+    h = hash2(&h, &temp2);
+    let enc_nothing = aead_seal(&key, 0, &[], &h)?;
+    // Both sides take the transcript step; the transport keys derive from
+    // the chain alone (matching note in consume_response).
+    let _ = hash2(&h, &enc_nothing);
+
+    let mut resp = Vec::with_capacity(MSG_RESPONSE_LEN);
+    resp.extend_from_slice(&2u32.to_le_bytes());
+    resp.extend_from_slice(&server_index.to_le_bytes());
+    resp.extend_from_slice(&sender.to_le_bytes());
+    resp.extend_from_slice(&e.pk);
+    resp.extend_from_slice(&enc_nothing);
+    // MAC1 keyed by the initiator's (now unsealed) static.
+    let mac1 = blake2s_mac(&mac1_key(&client_static), &resp);
+    resp.extend_from_slice(&mac1);
+    // MAC2: only with a cookie in play; zeros otherwise.
+    resp.extend_from_slice(&[0u8; 16]);
+    debug_assert_eq!(resp.len(), MSG_RESPONSE_LEN);
+
+    let (k_client_send, k_client_recv) = derive_transport_keys(&ck);
+    Ok((resp, (server_index, sender, k_client_send, k_client_recv)))
+}
+
+impl Session {
+    /// The responder's session: it sends with the initiator's receive key
+    /// and receives with the initiator's send key
+    /// (derive_transport_keys returns (initiator-send, initiator-recv)).
+    fn from_responder(
+        local_index: u32,
+        peer_index: u32,
+        k_peer_send: [u8; 32],
+        k_peer_recv: [u8; 32],
+        now: Instant,
+    ) -> Self {
+        Session {
+            local_index,
+            peer_index,
+            created: now,
+            last_tx: now,
+            last_rx: now,
+            send: SendHalf {
+                cipher: make_cipher(&k_peer_recv),
+                next: 0,
+            },
+            recv: RecvHalf {
+                cipher: make_cipher(&k_peer_send),
+                replay: AntiReplay::new(),
+            },
+        }
+    }
+}
+
+/// Build a cookie reply (64 bytes) for an initiation we are too loaded to
+/// answer: cookie = MAC16(secret, initiator endpoint), sealed with
+/// XAEAD(HASH(LABEL_COOKIE || responder static), nonce, cookie) and the
+/// initiation's MAC1 as AAD — the whitepaper's "Message 3: Cookie Reply"
+/// and wireguard-go's SendHandshakeCookie. The client's
+/// [`consume_cookie_reply`] is the exact inverse.
+fn build_cookie_reply(
+    server_static_pk: &[u8; 32],
+    receiver_index: u32,
+    initiation_mac1: &[u8; 16],
+    cookie: [u8; 16],
+) -> Result<Vec<u8>> {
+    let mut nonce = [0u8; 24];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let enc = XChaCha20Poly1305::new_from_slice(&cookie_key(server_static_pk))
+        .map_err(|_| Error::crypto("endpoint: bad cookie key"))?
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &cookie,
+                aad: initiation_mac1,
+            },
+        )
+        .map_err(|_| Error::crypto("endpoint: cookie seal failed"))?;
+    let mut pkt = Vec::with_capacity(MSG_COOKIE_LEN);
+    pkt.extend_from_slice(&3u32.to_le_bytes());
+    pkt.extend_from_slice(&receiver_index.to_le_bytes());
+    pkt.extend_from_slice(&nonce);
+    pkt.extend_from_slice(&enc);
+    debug_assert_eq!(pkt.len(), MSG_COOKIE_LEN);
+    Ok(pkt)
+}
+
+/// The cookie for an initiator endpoint: MAC16(secret, endpoint bytes) —
+/// wireguard-go's CookieGenerator hashes the endpoint address; a String form
+/// is equivalent for the MAC input (the client only reflects it back).
+fn make_cookie(secret: &[u8; 16], from: SocketAddr) -> [u8; 16] {
+    let input = from.to_string();
+    blake2s_mac(secret, input.as_bytes())
+}
+
+/// One-second initiation counter; past [`EP_COOKIE_LOAD`] the endpoint
+/// answers initiations with cookies instead of doing the DH work
+/// (wireguard-go's ratelimiter semantics, simplified to a fixed window).
+#[derive(Default)]
+struct HandshakeLoad {
+    window_start: Option<Instant>,
+    count: u32,
+}
+
+impl HandshakeLoad {
+    fn bump(&mut self, now: Instant) {
+        match self.window_start {
+            Some(t) if now.duration_since(t) < Duration::from_secs(1) => self.count += 1,
+            _ => {
+                self.window_start = Some(now);
+                self.count = 1;
+            }
+        }
+    }
+
+    fn under_load(&self) -> bool {
+        self.count > EP_COOKIE_LOAD
+    }
+}
+
+// -- cryptokey routing (pure) -------------------------------------------------
+
+/// Does `ip` fall inside `net / prefix`? Family must match.
+fn prefix_contains(net: &IpAddr, prefix: u8, ip: &IpAddr) -> bool {
+    match (net, ip) {
+        (IpAddr::V4(n), IpAddr::V4(i)) => {
+            if prefix > 32 {
+                return false;
+            }
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            n.to_bits() & mask == i.to_bits() & mask
+        }
+        (IpAddr::V6(n), IpAddr::V6(i)) => {
+            if prefix > 128 {
+                return false;
+            }
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            n.to_bits() & mask == i.to_bits() & mask
+        }
+        _ => false,
+    }
+}
+
+/// The peer whose allowed_ips contains `ip` with the longest prefix —
+/// cryptokey routing (the whitepaper's "Allowed IPs" table lookup).
+fn route_peer(peers: &[EpPeer], ip: &IpAddr) -> Option<(usize, u8)> {
+    let mut best: Option<(usize, u8)> = None;
+    for (i, p) in peers.iter().enumerate() {
+        for (net, prefix) in &p.allowed {
+            if prefix_contains(net, *prefix, ip) {
+                let better = best.is_none_or(|(_, bp)| *prefix > bp);
+                if better {
+                    best = Some((i, *prefix));
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Is `ip` an allowed *source* for `peer`? (The server-side filter of the
+/// same table.)
+fn source_allowed(peer: &EpPeer, ip: &IpAddr) -> bool {
+    peer.allowed
+        .iter()
+        .any(|(net, prefix)| prefix_contains(net, *prefix, ip))
+}
+
+// -- endpoint state -----------------------------------------------------------
+
+/// Runtime state of one configured peer.
+struct EpPeer {
+    static_pk: [u8; 32],
+    psk: [u8; 32],
+    allowed: Vec<(IpAddr, u8)>,
+    persistent_keepalive: Option<Duration>,
+    /// The strictly-greatest TAI64N accepted from this peer (replay guard).
+    last_timestamp: Option<[u8; 12]>,
+    /// Roaming endpoint, updated by every authenticated packet.
+    endpoint: Option<SocketAddr>,
+    session: Option<Session>,
+    next_persistent: Option<Instant>,
+}
+
+/// The endpoint: peers, sessions and the cookie machinery.
+struct Endpoint {
+    statics: StaticKeys,
+    peers: Vec<EpPeer>,
+    /// Transport receiver-index -> peer.
+    by_index: HashMap<u32, usize>,
+    cookie: ([u8; 16], Instant),
+    load: HandshakeLoad,
+}
+
+impl Endpoint {
+    fn new(cfg: &WgEndpointCfg) -> Result<Self> {
+        let sk = b64key(&cfg.private_key, "private-key")?;
+        let statics = StaticKeys::from_secret(sk);
+        if cfg.peers.is_empty() {
+            return Err(Error::config(
+                "wg endpoint: at least one peer is required (who may connect?)",
+            ));
+        }
+        let mut peers = Vec::with_capacity(cfg.peers.len());
+        let mut seen = HashSet::new();
+        for (i, p) in cfg.peers.iter().enumerate() {
+            let pk = b64key(&p.public_key, "peers[].public-key")?;
+            if !seen.insert(pk) {
+                return Err(Error::config(format!(
+                    "wg endpoint: peers[{i}] repeats a public key"
+                )));
+            }
+            let psk = match p.pre_shared_key.as_deref() {
+                None | Some("") => [0u8; 32],
+                Some(s) => b64key(s, "peers[].pre-shared-key")?,
+            };
+            for (net, prefix) in &p.allowed_ips {
+                let max = if net.is_ipv4() { 32 } else { 128 };
+                if *prefix > max {
+                    return Err(Error::config(format!(
+                        "wg endpoint: peers[{i}] allowed-ip {net}/{prefix} is not a valid prefix"
+                    )));
+                }
+            }
+            if p.allowed_ips.is_empty() {
+                return Err(Error::config(format!(
+                    "wg endpoint: peers[{i}] has no allowed_ips (its packets could not be \
+                     routed back)"
+                )));
+            }
+            peers.push(EpPeer {
+                static_pk: pk,
+                psk,
+                allowed: p.allowed_ips.clone(),
+                persistent_keepalive: p
+                    .persistent_keepalive
+                    .filter(|&s| s > 0)
+                    .map(|s| Duration::from_secs(u64::from(s))),
+                last_timestamp: None,
+                endpoint: None,
+                session: None,
+                next_persistent: None,
+            });
+        }
+        let mut secret = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut secret);
+        Ok(Endpoint {
+            statics,
+            peers,
+            by_index: HashMap::new(),
+            cookie: (secret, Instant::now()),
+            load: HandshakeLoad::default(),
+        })
+    }
+
+    fn peer_by_pk(&self, pk: &[u8; 32]) -> Option<usize> {
+        self.peers.iter().position(|p| &p.static_pk == pk)
+    }
+
+    /// A receiver index not currently in use.
+    fn fresh_index(&self) -> u32 {
+        loop {
+            let idx = rand::random::<u32>();
+            if !self.by_index.contains_key(&idx) && idx != 0 {
+                return idx;
+            }
+        }
+    }
+
+    fn cookie_for(&mut self, now: Instant) -> [u8; 16] {
+        if now.duration_since(self.cookie.1) >= EP_COOKIE_REFRESH {
+            let mut secret = [0u8; 16];
+            rand::rngs::OsRng.fill_bytes(&mut secret);
+            self.cookie = (secret, now);
+        }
+        self.cookie.0
+    }
+
+    /// One datagram from the network.
+    async fn on_datagram(
+        &mut self,
+        socket: &UdpSocket,
+        from: SocketAddr,
+        raw: &mut [u8],
+        stack: &mut EpStack,
+    ) {
+        strip_reserved(raw);
+        let Some(msg) = parse_wg_msg(raw) else {
+            return;
+        };
+        let now = Instant::now();
+        match msg {
+            WgMsg::Initiation {
+                sender, mac1, ..
+            } => {
+                self.load.bump(now);
+                if self.load.under_load() {
+                    // Too many handshakes: answer with a cookie instead of
+                    // doing DH work (whitepaper "under load" + wireguard-go
+                    // ratelimiter). Legitimate initiators retry with MAC2.
+                    let secret = self.cookie_for(now);
+                    let cookie = make_cookie(&secret, from);
+                    if let Ok(reply) =
+                        build_cookie_reply(&self.statics.pk, sender, &mac1, cookie)
+                    {
+                        let _ = socket.send_to(&reply, from).await;
+                    }
+                    return;
+                }
+                let Ok(open) = open_initiation(&self.statics, &msg) else {
+                    return; // unauthenticated: silent
+                };
+                let Some(pi) = self.peer_by_pk(&open.client_static) else {
+                    return; // unknown peer: silent
+                };
+                // Replay guard: strictly newer TAI64N only (memcmp order).
+                if self.peers[pi]
+                    .last_timestamp
+                    .is_some_and(|t| open.timestamp <= t)
+                {
+                    return;
+                }
+                let ts = open.timestamp;
+                let index = self.fresh_index();
+                let Ok((resp, (_idx, peer_index, k_send, k_recv))) =
+                    respond_initiation(open, &self.peers[pi].psk, index)
+                else {
+                    return;
+                };
+                // Replace the peer's session; the old receiver index dies
+                // with it (by_index ops first, then the peer mutation, to
+                // keep the borrows disjoint).
+                if let Some(old) = self.peers[pi].session.as_ref().map(|s| s.local_index) {
+                    self.by_index.remove(&old);
+                }
+                self.by_index.insert(index, pi);
+                let peer = &mut self.peers[pi];
+                peer.last_timestamp = Some(ts);
+                peer.session =
+                    Some(Session::from_responder(index, peer_index, k_send, k_recv, now));
+                peer.endpoint = Some(from);
+                peer.next_persistent = peer.persistent_keepalive.map(|iv| now + iv);
+                tracing::debug!(
+                    target: "engine",
+                    "wg endpoint: session with peer {} from {from}",
+                    key_id(&self.peers[pi].static_pk)
+                );
+                let _ = socket.send_to(&resp, from).await;
+            }
+            WgMsg::Transport { receiver, counter, data } => {
+                let Some(&pi) = self.by_index.get(&receiver) else {
+                    return;
+                };
+                let peer = &mut self.peers[pi];
+                // Roaming happens on any authenticated transport packet:
+                // update the endpoint before decrypting.
+                if peer
+                    .session
+                    .as_ref()
+                    .is_some_and(|s| s.local_index != receiver)
+                {
+                    return; // stale index after a rekey
+                }
+                let Some(sess) = peer.session.as_mut() else {
+                    return;
+                };
+                if session_expired(sess.created, now) {
+                    peer.session = None;
+                    self.by_index.remove(&receiver);
+                    return;
+                }
+                // Replays and corruption fail the tag or the window and
+                // are dropped silently (no else branch, per the whitepaper).
+                if let Ok(mut inner) = sess.open_transport(counter, &data) {
+                    sess.last_rx = now;
+                    peer.endpoint = Some(from);
+                    if inner.is_empty() {
+                        return; // keepalive
+                    }
+                    trim_ip_packet(&mut inner);
+                    // Cryptokey routing's source filter: the packet must
+                    // come from an address this peer owns (whitepaper
+                    // Allowed IPs; sing-box/wireguard-go drop the rest).
+                    let src_ok =
+                        src_ip_of(&inner).is_some_and(|src| source_allowed(peer, &src));
+                    if !src_ok {
+                        tracing::debug!(
+                            target: "engine",
+                            "wg endpoint: packet from an address outside the peer's \
+                             allowed_ips, dropped"
+                        );
+                        return;
+                    }
+                    stack.stage_packet(&inner);
+                }
+            }
+            // A server never initiates, so responses and cookie replies from
+            // peers are unexpected here.
+            _ => {}
+        }
+    }
+
+    /// Periodic work: expire sessions, send keepalives, rotate the cookie
+    /// secret's schedule.
+    async fn on_timer(&mut self, socket: &UdpSocket) {
+        let now = Instant::now();
+        for pi in 0..self.peers.len() {
+            let expired = self.peers[pi]
+                .session
+                .as_ref()
+                .is_some_and(|s| session_expired(s.created, now));
+            if expired {
+                if let Some(old) = self.peers[pi].session.take() {
+                    self.by_index.remove(&old.local_index);
+                }
+                continue;
+            }
+            // Standard keepalive: transmit silence after a received packet
+            // (wireguard-go sends one when receiving if we have been quiet).
+            let want_keepalive = self.peers[pi]
+                .session
+                .as_ref()
+                .is_some_and(|s| needs_keepalive(s.last_tx, now));
+            // Configured persistent keepalive.
+            let due_persistent = self.peers[pi]
+                .next_persistent
+                .is_some_and(|at| now >= at);
+            if want_keepalive || due_persistent {
+                let peer = &mut self.peers[pi];
+                let dst = peer.endpoint;
+                let msg = peer
+                    .session
+                    .as_mut()
+                    .and_then(|s| s.seal_transport(&[]).ok());
+                if let (Some(dst), Some(msg)) = (dst, msg) {
+                    let _ = socket.send_to(&msg, dst).await;
+                }
+                if due_persistent {
+                    if let Some(iv) = self.peers[pi].persistent_keepalive {
+                        self.peers[pi].next_persistent = Some(now + iv);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Encrypt one decrypted-side egress packet to the owning peer
+    /// (cryptokey routing) and send it to that peer's current endpoint.
+    async fn send_inner(&mut self, socket: &UdpSocket, pkt: &[u8]) {
+        let Some(dst_ip) = dst_ip_of(pkt) else {
+            return;
+        };
+        let Some((pi, _prefix)) = route_peer(&self.peers, &dst_ip) else {
+            tracing::debug!(
+                target: "engine",
+                "wg endpoint: no peer route for {dst_ip}, packet dropped"
+            );
+            return;
+        };
+        let peer = &mut self.peers[pi];
+        let dst = peer.endpoint;
+        let msg = peer
+            .session
+            .as_mut()
+            .and_then(|s| s.seal_transport(pkt).ok());
+        if let (Some(dst), Some(msg)) = (dst, msg) {
+            let _ = socket.send_to(&msg, dst).await;
+        }
+    }
+}
+
+/// Short identifying prefix of a key for logs.
+fn key_id(pk: &[u8; 32]) -> String {
+    pk[..4].iter().map(|x| format!("{x:02x}")).collect()
+}
+
+// -- packet classification + local ICMP answers (pure) ------------------------
+
+/// What one decrypted inner packet is. A minimal mirror of the TUN
+/// netstack's classifier — enough to drive listeners, UDP sockets and echo
+/// answers; everything else (extension headers, non-TCP/UDP/ICMP) drops.
+#[derive(Debug, PartialEq, Eq)]
+enum EpIn {
+    Tcp {
+        src: SocketAddr,
+        dst: SocketAddr,
+        syn: bool,
+    },
+    Udp {
+        src: SocketAddr,
+        dst: SocketAddr,
+        payload: (usize, usize),
+    },
+    IcmpEchoRequest {
+        src: IpAddr,
+        dst: IpAddr,
+        v6: bool,
+    },
+    Skip,
+}
+
+/// Classify one inner packet (never panics; every slice is bounds-checked).
+fn ep_classify(pkt: &[u8]) -> EpIn {
+    let Some(&vihl) = pkt.first() else {
+        return EpIn::Skip;
+    };
+    match vihl >> 4 {
+        4 => {
+            let ihl = (vihl & 0x0f) as usize * 4;
+            if ihl < 20 || pkt.len() < ihl {
+                return EpIn::Skip;
+            }
+            let total = u16::from_be_bytes([pkt[2], pkt[3]]) as usize;
+            let end = total.min(pkt.len());
+            let src = IpAddr::V4(Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]));
+            let dst = IpAddr::V4(Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]));
+            match pkt[9] {
+                6 if end >= ihl + 20 => {
+                    let sport = u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]);
+                    let dport = u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]);
+                    let flags = pkt[ihl + 13];
+                    EpIn::Tcp {
+                        src: SocketAddr::new(src, sport),
+                        dst: SocketAddr::new(dst, dport),
+                        syn: flags & 0x02 != 0,
+                    }
+                }
+                17 if end >= ihl + 8 => {
+                    let sport = u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]);
+                    let dport = u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]);
+                    let len = u16::from_be_bytes([pkt[ihl + 4], pkt[ihl + 5]]) as usize;
+                    let payload_end = (ihl + len).min(end);
+                    EpIn::Udp {
+                        src: SocketAddr::new(src, sport),
+                        dst: SocketAddr::new(dst, dport),
+                        payload: (ihl + 8, payload_end),
+                    }
+                }
+                1 => icmp_in(pkt, src, dst, false),
+                _ => EpIn::Skip,
+            }
+        }
+        6 => {
+            if pkt.len() < 40 {
+                return EpIn::Skip;
+            }
+            let src = IpAddr::V6(v6_addr(pkt, 8));
+            let dst = IpAddr::V6(v6_addr(pkt, 24));
+            match pkt[6] {
+                6 if pkt.len() >= 60 => {
+                    let sport = u16::from_be_bytes([pkt[40], pkt[41]]);
+                    let dport = u16::from_be_bytes([pkt[42], pkt[43]]);
+                    EpIn::Tcp {
+                        src: SocketAddr::new(src, sport),
+                        dst: SocketAddr::new(dst, dport),
+                        syn: pkt[53] & 0x02 != 0,
+                    }
+                }
+                17 if pkt.len() >= 48 => {
+                    let sport = u16::from_be_bytes([pkt[40], pkt[41]]);
+                    let dport = u16::from_be_bytes([pkt[42], pkt[43]]);
+                    let len = u16::from_be_bytes([pkt[44], pkt[45]]) as usize;
+                    let payload_end = (40 + len).min(pkt.len());
+                    EpIn::Udp {
+                        src: SocketAddr::new(src, sport),
+                        dst: SocketAddr::new(dst, dport),
+                        payload: (48, payload_end),
+                    }
+                }
+                58 => icmp_in(pkt, src, dst, true),
+                _ => EpIn::Skip, // extension headers not parsed
+            }
+        }
+        _ => EpIn::Skip,
+    }
+}
+
+/// The byte offset where the ICMP message starts (`ihl` for v4, 40 for v6).
+fn icmp_offset(pkt: &[u8]) -> Option<usize> {
+    match pkt.first()? >> 4 {
+        4 => {
+            let ihl = (pkt[0] & 0x0f) as usize * 4;
+            (ihl >= 20 && pkt.len() > ihl).then_some(ihl)
+        }
+        6 => (pkt.len() > 40).then_some(40),
+        _ => None,
+    }
+}
+
+fn icmp_in(pkt: &[u8], src: IpAddr, dst: IpAddr, v6: bool) -> EpIn {
+    let Some(off) = icmp_offset(pkt) else {
+        return EpIn::Skip;
+    };
+    let is_echo_request = if v6 {
+        pkt[off] == 128
+    } else {
+        pkt[off] == 8
+    };
+    if is_echo_request {
+        EpIn::IcmpEchoRequest { src, dst, v6 }
+    } else {
+        EpIn::Skip
+    }
+}
+
+/// Bytes 8..24 / 24..40 of an IPv6 packet as an address.
+fn v6_addr(pkt: &[u8], from: usize) -> Ipv6Addr {
+    let octets: [u8; 16] = pkt[from..from + 16].try_into().expect("16 bytes");
+    Ipv6Addr::from(octets)
+}
+
+/// The destination address of an IP packet, either family.
+fn dst_ip_of(pkt: &[u8]) -> Option<IpAddr> {
+    match pkt.first()? >> 4 {
+        4 if pkt.len() >= 20 => Some(IpAddr::V4(Ipv4Addr::new(
+            pkt[16], pkt[17], pkt[18], pkt[19],
+        ))),
+        6 if pkt.len() >= 40 => Some(IpAddr::V6(v6_addr(pkt, 24))),
+        _ => None,
+    }
+}
+
+/// The source address of an IP packet, either family.
+fn src_ip_of(pkt: &[u8]) -> Option<IpAddr> {
+    match pkt.first()? >> 4 {
+        4 if pkt.len() >= 20 => Some(IpAddr::V4(Ipv4Addr::new(
+            pkt[12], pkt[13], pkt[14], pkt[15],
+        ))),
+        6 if pkt.len() >= 40 => Some(IpAddr::V6(v6_addr(pkt, 8))),
+        _ => None,
+    }
+}
+
+/// Internet checksum (RFC 1071) over a byte slice with an odd-byte tail.
+fn checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let (chunks, tail) = data.as_chunks::<2>();
+    for c in chunks {
+        sum = sum.wrapping_add(u16::from_be_bytes(*c) as u32);
+    }
+    if let [b] = tail {
+        sum = sum.wrapping_add((*b as u32) << 8);
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// An ICMPv4 echo reply for a request: swap the addresses, type 0, recompute
+/// the header checksum (RFC 792). `None` for anything malformed.
+fn ep_icmpv4_echo_reply(pkt: &[u8]) -> Option<Vec<u8>> {
+    let off = icmp_offset(pkt)?;
+    if pkt[off] != 8 {
+        return None;
+    }
+    let mut out = pkt.to_vec();
+    // Swap v4 addresses.
+    let (src, dst) = (
+        [out[12], out[13], out[14], out[15]],
+        [out[16], out[17], out[18], out[19]],
+    );
+    out[12..16].copy_from_slice(&dst);
+    out[16..20].copy_from_slice(&src);
+    out[off] = 0; // echo reply
+    out[off + 2] = 0;
+    out[off + 3] = 0;
+    let sum = checksum(&out[off..]);
+    out[off + 2] = sum.to_be_bytes()[0];
+    out[off + 3] = sum.to_be_bytes()[1];
+    Some(out)
+}
+
+/// An ICMPv6 echo reply: swap, type 129, recompute the checksum over the
+/// whole ICMPv6 message with the IPv6 pseudo-header (RFC 4443).
+fn ep_icmpv6_echo_reply(pkt: &[u8]) -> Option<Vec<u8>> {
+    if pkt.len() <= 40 || pkt[40] != 128 {
+        return None;
+    }
+    let mut out = pkt.to_vec();
+    let src: [u8; 16] = out[8..24].try_into().expect("16 bytes");
+    let dst: [u8; 16] = out[24..40].try_into().expect("16 bytes");
+    out[8..24].copy_from_slice(&dst);
+    out[24..40].copy_from_slice(&src);
+    out[40] = 129;
+    out[42] = 0;
+    out[43] = 0;
+    let payload_len = (out.len() - 40) as u32;
+    let mut pseudo = Vec::with_capacity(40 + out.len() - 40);
+    pseudo.extend_from_slice(&out[8..24]);
+    pseudo.extend_from_slice(&out[24..40]);
+    pseudo.extend_from_slice(&payload_len.to_be_bytes());
+    pseudo.extend_from_slice(&[0, 0, 0, 58]);
+    pseudo.extend_from_slice(&out[40..]);
+    let sum = checksum(&pseudo);
+    out[42] = sum.to_be_bytes()[0];
+    out[43] = sum.to_be_bytes()[1];
+    Some(out)
+}
+
+// -- the endpoint's userspace stack -------------------------------------------
+
+/// A datagram to hand back into the tunnel: to `client`, appearing to come
+/// from `local` (the destination the client dialled).
+struct EpReply {
+    client: SocketAddr,
+    local: SocketAddr,
+    data: Vec<u8>,
+}
+
+/// One accepted TCP connection bridged to a [`WgStream`].
+struct EpConn {
+    handle: SocketHandle,
+    shared: Arc<StreamShared>,
+    fin_sent: bool,
+}
+
+/// One UDP relay association (per client source address); dropping it aborts
+/// the downlink pump.
+struct EpUdpSession {
+    uplink: mpsc::Sender<(NetAddr, Vec<u8>)>,
+    last_activity: Instant,
+    pump: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for EpUdpSession {
+    fn drop(&mut self) {
+        self.pump.abort();
+    }
+}
+
+/// The packet-level half of the endpoint: a smoltcp stack that accepts the
+/// TCP connections and UDP flows arriving over WireGuard and hands them to
+/// the engine's [`RelayHandler`](crate::inbound::RelayHandler) — the same
+/// bridge the TUN inbound runs, minus the kernel device (the "wire" is the
+/// endpoint task) and the DNS hijack (an endpoint relays like sing-box's,
+/// which hijacks nothing). Egress (the stack's replies plus ICMP answers) is
+/// what the driver encrypts back to the peers.
+struct EpStack {
+    iface: Interface,
+    sockets: SocketSet<'static>,
+    shim: Shim,
+    relay: SharedRelay,
+    tag: String,
+    udp_timeout: Duration,
+    listeners: Vec<(SocketHandle, u16)>,
+    conns: Vec<EpConn>,
+    udp_sockets: HashMap<u16, SocketHandle>,
+    sessions: HashMap<SocketAddr, EpUdpSession>,
+    replies: Arc<Mutex<VecDeque<EpReply>>>,
+    /// Locally generated packets (ICMP echo replies) to emit as egress.
+    local_egress: VecDeque<Vec<u8>>,
+    wake: Arc<Notify>,
+    start: Instant,
+    next_gc: Instant,
+    pump_buf: Vec<u8>,
+}
+
+impl EpStack {
+    fn new(cfg: &WgEndpointCfg, relay: SharedRelay, wake: Arc<Notify>) -> Result<Self> {
+        let mtu = if cfg.mtu == 0 {
+            1408
+        } else {
+            cfg.mtu.clamp(576, 65535) as usize
+        };
+        let mut shim = Shim::new(mtu);
+        let mut iface_cfg = IfaceConfig::new(HardwareAddress::Ip);
+        iface_cfg.random_seed = rand::random();
+        let mut iface = Interface::new(iface_cfg, &mut shim, SmolInstant::ZERO);
+        let (v4, p4) = cfg
+            .address
+            .unwrap_or((Ipv4Addr::new(172, 16, 0, 1), 30));
+        if p4 > 32 {
+            return Err(Error::config(format!("wg endpoint: /{p4} is not a valid IPv4 prefix")));
+        }
+        iface.update_ip_addrs(|addrs| {
+            let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(v4), p4));
+            if let Some((inet6, p6)) = cfg.inet6_address {
+                let _ = addrs.push(IpCidr::new(IpAddress::Ipv6(inet6), p6.min(128)));
+            }
+        });
+        iface
+            .routes_mut()
+            .add_default_ipv4_route(v4)
+            .map_err(|_| Error::network("wg endpoint: route table full"))?;
+        if let Some((inet6, _)) = cfg.inet6_address {
+            iface
+                .routes_mut()
+                .add_default_ipv6_route(inet6)
+                .map_err(|_| Error::network("wg endpoint: route table full"))?;
+        }
+        // Accept traffic to any destination: the peers' allowed_ips decide
+        // the real reachability, exactly like the TUN stack's any_ip.
+        iface.set_any_ip(true);
+        let now = Instant::now();
+        Ok(EpStack {
+            iface,
+            sockets: SocketSet::new(Vec::new()),
+            shim,
+            relay,
+            tag: cfg.tag.clone(),
+            udp_timeout: cfg.udp_timeout.unwrap_or(EP_UDP_TIMEOUT),
+            listeners: Vec::new(),
+            conns: Vec::new(),
+            udp_sockets: HashMap::new(),
+            sessions: HashMap::new(),
+            replies: Arc::new(Mutex::new(VecDeque::new())),
+            local_egress: VecDeque::new(),
+            wake,
+            start: now,
+            next_gc: now + Duration::from_secs(10),
+            pump_buf: vec![0u8; PUMP_CHUNK],
+        })
+    }
+
+    fn now(&self) -> SmolInstant {
+        SmolInstant::from_micros(self.start.elapsed().as_micros() as i64)
+    }
+
+    /// One decrypted inner packet: pre-stage listeners/sessions, then hand
+    /// the packet to smoltcp.
+    fn stage_packet(&mut self, pkt: &[u8]) {
+        match ep_classify(pkt) {
+            EpIn::Tcp { dst, syn, .. } => {
+                if syn && self.needs_listener(dst.port()) {
+                    self.add_listener(dst.port());
+                }
+                self.shim.stage(pkt);
+            }
+            EpIn::Udp {
+                src,
+                dst,
+                payload: (a, b),
+            } => {
+                self.ensure_udp_socket(dst.port());
+                self.udp_uplink(src, dst, &pkt[a..b]);
+                self.shim.stage(pkt);
+            }
+            EpIn::IcmpEchoRequest { v6, .. } => {
+                let reply = if v6 {
+                    ep_icmpv6_echo_reply(pkt)
+                } else {
+                    ep_icmpv4_echo_reply(pkt)
+                };
+                // Answered locally: the reply is egress, not stack input.
+                if let Some(r) = reply {
+                    self.local_egress.push_back(r);
+                    self.wake.notify_one();
+                }
+            }
+            EpIn::Skip => {}
+        }
+    }
+
+    fn needs_listener(&self, port: u16) -> bool {
+        !self.listeners.iter().any(|(_, p)| *p == port)
+    }
+
+    fn add_listener(&mut self, port: u16) {
+        if self.listeners.len() + self.conns.len() >= EP_MAX_CONNS {
+            tracing::debug!(target: "engine", "wg endpoint: connection limit reached, refusing port {port}");
+            return;
+        }
+        let mut sock = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0; TCP_RX_BYTES]),
+            tcp::SocketBuffer::new(vec![0; TCP_TX_BYTES]),
+        );
+        if let Err(e) = sock.listen(IpListenEndpoint { addr: None, port }) {
+            tracing::debug!(target: "engine", "wg endpoint: cannot listen on {port}: {e:?}");
+            return;
+        }
+        self.listeners.push((self.sockets.add(sock), port));
+    }
+
+    fn ensure_udp_socket(&mut self, port: u16) -> Option<SocketHandle> {
+        if let Some(handle) = self.udp_sockets.get(&port) {
+            return Some(*handle);
+        }
+        if self.udp_sockets.len() >= EP_MAX_UDP_SOCKETS {
+            tracing::debug!(target: "engine", "wg endpoint: too many udp ports, dropping {port}");
+            return None;
+        }
+        let mut sock = udp::Socket::new(
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; UDP_PACKETS],
+                vec![0; UDP_RX_BYTES],
+            ),
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; UDP_PACKETS],
+                vec![0; UDP_TX_BYTES],
+            ),
+        );
+        if let Err(e) = sock.bind(IpListenEndpoint { addr: None, port }) {
+            tracing::debug!(target: "engine", "wg endpoint: cannot bind udp {port}: {e:?}");
+            return None;
+        }
+        let handle = self.sockets.add(sock);
+        self.udp_sockets.insert(port, handle);
+        Some(handle)
+    }
+
+    fn udp_uplink(&mut self, src: SocketAddr, dst: SocketAddr, payload: &[u8]) {
+        let uplink = match self.sessions.get_mut(&src) {
+            Some(s) => {
+                s.last_activity = Instant::now();
+                s.uplink.clone()
+            }
+            None => {
+                if self.sessions.len() >= EP_MAX_UDP_SESSIONS {
+                    tracing::debug!(target: "engine", "wg endpoint: udp session limit, dropping {src}");
+                    return;
+                }
+                self.open_session(src)
+            }
+        };
+        // UDP is lossy: a full queue drops rather than blocks.
+        let _ = uplink.try_send((NetAddr::ip(dst.ip(), dst.port()), payload.to_vec()));
+    }
+
+    fn open_session(&mut self, src: SocketAddr) -> mpsc::Sender<(NetAddr, Vec<u8>)> {
+        let (up_tx, up_rx) = mpsc::channel::<(NetAddr, Vec<u8>)>(64);
+        let (down_tx, mut down_rx) = mpsc::channel::<(NetAddr, Vec<u8>)>(64);
+        self.relay
+            .clone()
+            .handle_udp(src, self.tag.clone(), up_rx, down_tx);
+        let replies = self.replies.clone();
+        let wake = self.wake.clone();
+        // Downlink pump: relay replies queue up as (client, from, data) and
+        // wake the driver; it ends with the session (aborted on drop).
+        let pump = tokio::spawn(async move {
+            while let Some((from, data)) = down_rx.recv().await {
+                let NetAddr {
+                    host: crate::addr::Host::Ip(ip),
+                    port,
+                } = &from
+                else {
+                    continue;
+                };
+                let mut q = replies.lock().unwrap_or_else(|e| e.into_inner());
+                if q.len() >= EP_MAX_PENDING_REPLIES {
+                    continue;
+                }
+                q.push_back(EpReply {
+                    client: src,
+                    local: SocketAddr::new(*ip, *port),
+                    data,
+                });
+                drop(q);
+                wake.notify_one();
+            }
+        });
+        self.sessions.insert(
+            src,
+            EpUdpSession {
+                uplink: up_tx.clone(),
+                last_activity: Instant::now(),
+                pump,
+            },
+        );
+        up_tx
+    }
+
+    /// One pass: poll, promote listeners to relayed connections, service
+    /// the streams, drain replies, reap idle sessions. Returns egress
+    /// packets (stack replies + locally generated ones).
+    fn step(&mut self) -> Vec<Vec<u8>> {
+        let now = self.now();
+        self.iface.poll(now, &mut self.shim, &mut self.sockets);
+
+        self.convert_listeners();
+        self.drain_replies();
+        self.service_conns();
+        self.drain_udp_rx();
+
+        let now = self.now();
+        self.iface.poll(now, &mut self.shim, &mut self.sockets);
+        self.gc_sessions();
+
+        let mut out: Vec<Vec<u8>> = self.local_egress.drain(..).collect();
+        out.extend(self.shim.egress.drain(..));
+        out
+    }
+
+    fn convert_listeners(&mut self) {
+        let mut keep = Vec::with_capacity(self.listeners.len());
+        let mut dead: Vec<SocketHandle> = Vec::new();
+        for (handle, port) in self.listeners.drain(..) {
+            let sock = self.sockets.get_mut::<tcp::Socket>(handle);
+            match sock.state() {
+                tcp::State::Listen | tcp::State::SynReceived => keep.push((handle, port)),
+                tcp::State::Established => {
+                    let (local, remote) = (
+                        sock.local_endpoint().map(ep_to_sockaddr),
+                        sock.remote_endpoint().map(ep_to_sockaddr),
+                    );
+                    match (local, remote) {
+                        (Some((lip, lport)), Some((rip, rport))) => {
+                            let source = SocketAddr::new(rip, rport);
+                            let target = NetAddr::ip(lip, lport);
+                            tracing::debug!(
+                                target: "engine",
+                                "wg endpoint: new tcp {source} -> {target}"
+                            );
+                            let shared = Arc::new(StreamShared::new(self.wake.clone()));
+                            self.relay.clone().handle_tcp(
+                                TcpMeta {
+                                    target,
+                                    source,
+                                    inbound: self.tag.clone(),
+                                    inbound_port: None,
+                                    inbound_kind: "tun",
+                                },
+                                Box::new(WgStream {
+                                    shared: shared.clone(),
+                                }),
+                            );
+                            self.conns.push(EpConn {
+                                handle,
+                                shared,
+                                fin_sent: false,
+                            });
+                        }
+                        _ => dead.push(handle),
+                    }
+                }
+                _ => dead.push(handle),
+            }
+        }
+        self.listeners = keep;
+        for handle in dead {
+            self.sockets.remove(handle);
+        }
+    }
+
+    fn drain_replies(&mut self) {
+        let items: Vec<EpReply> = {
+            let mut q = self.replies.lock().unwrap_or_else(|e| e.into_inner());
+            q.drain(..).collect()
+        };
+        for r in items {
+            let Some(handle) = self.ensure_udp_socket(r.local.port()) else {
+                continue;
+            };
+            let sock = self.sockets.get_mut::<udp::Socket>(handle);
+            let mut meta = udp::UdpMetadata::from(IpEndpoint::new(
+                smol_ip(r.client.ip()),
+                r.client.port(),
+            ));
+            meta.local_address = Some(smol_ip(r.local.ip()));
+            if let Err(e) = sock.send_slice(&r.data, meta) {
+                tracing::debug!(target: "engine", "wg endpoint: udp reply to {}: {e:?}", r.client);
+            }
+        }
+    }
+
+    fn service_conns(&mut self) {
+        let mut dead: Vec<SocketHandle> = Vec::new();
+        for c in self.conns.iter_mut() {
+            let sock = self.sockets.get_mut::<tcp::Socket>(c.handle);
+            let mut g = c.shared.lock();
+
+            while g.to_proxy.len() < STREAM_QUEUE_MAX && sock.can_recv() {
+                let n = match sock.recv_slice(&mut self.pump_buf) {
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                g.to_proxy.extend(self.pump_buf[..n].iter().copied());
+            }
+            if !sock.may_recv() && sock.recv_queue() == 0 {
+                g.read_eof = true;
+            }
+            while !g.to_stack.is_empty() && sock.can_send() {
+                let n = match sock.send_slice(g.to_stack.make_contiguous()) {
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                g.to_stack.drain(..n);
+            }
+            if g.write_closed && g.to_stack.is_empty() && !c.fin_sent {
+                sock.close();
+                c.fin_sent = true;
+            }
+            if g.aborted {
+                sock.abort();
+            }
+            let gone = sock.state() == tcp::State::Closed;
+            if gone {
+                g.read_eof = true;
+            }
+
+            if (!g.to_proxy.is_empty() || g.read_eof) && g.read_waker.is_some() {
+                if let Some(w) = g.read_waker.take() {
+                    w.wake();
+                }
+            }
+            if (gone || g.to_stack.len() < STREAM_QUEUE_MAX) && g.write_waker.is_some() {
+                if let Some(w) = g.write_waker.take() {
+                    w.wake();
+                }
+            }
+            drop(g);
+            if gone {
+                dead.push(c.handle);
+            }
+        }
+        if !dead.is_empty() {
+            self.conns.retain(|c| !dead.contains(&c.handle));
+            for handle in dead {
+                self.sockets.remove(handle);
+            }
+        }
+    }
+
+    fn drain_udp_rx(&mut self) {
+        for handle in self.udp_sockets.values() {
+            let sock = self.sockets.get_mut::<udp::Socket>(*handle);
+            while sock.can_recv() {
+                if sock.recv_slice(&mut self.pump_buf).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn gc_sessions(&mut self) {
+        let now = Instant::now();
+        if now < self.next_gc {
+            return;
+        }
+        self.next_gc = now + Duration::from_secs(10);
+        self.sessions
+            .retain(|_, s| now.duration_since(s.last_activity) < self.udp_timeout);
+    }
+
+    /// When the driver should wake on its own.
+    fn poll_delay(&mut self) -> Duration {
+        let stack = self
+            .iface
+            .poll_delay(self.now(), &self.sockets)
+            .map(|d| Duration::from_micros(d.total_micros()))
+            .unwrap_or(MAX_TICK);
+        stack.clamp(MIN_TICK, MAX_TICK)
+    }
+}
+
+/// smoltcp `IpEndpoint` -> `(IpAddr, u16)`.
+fn ep_to_sockaddr(ep: IpEndpoint) -> (IpAddr, u16) {
+    match ep.addr {
+        IpAddress::Ipv4(a) => (IpAddr::V4(a), ep.port),
+        IpAddress::Ipv6(a) => (IpAddr::V6(a), ep.port),
+    }
+}
+
+fn smol_ip(ip: IpAddr) -> IpAddress {
+    match ip {
+        IpAddr::V4(a) => IpAddress::Ipv4(a),
+        IpAddr::V6(a) => IpAddress::Ipv6(a),
+    }
+}
+
+/// Drive the endpoint until the socket dies.
+async fn run_endpoint(socket: Arc<UdpSocket>, mut ep: Endpoint, mut stack: EpStack, wake: Arc<Notify>) {
+    let mut rx = vec![0u8; 65_536];
+    loop {
+        let egress = stack.step();
+        for pkt in egress {
+            ep.send_inner(&socket, &pkt).await;
+        }
+        let offset = stack
+            .poll_delay()
+            .clamp(MIN_TICK, MAX_TICK);
+        let deadline = Instant::now() + offset;
+        let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+        tokio::select! {
+            biased;
+            r = socket.recv_from(&mut rx) => {
+                match r {
+                    Ok((n, from)) => {
+                        ep.on_datagram(&socket, from, &mut rx[..n], &mut stack).await;
+                    }
+                    Err(e) => {
+                        tracing::debug!(target: "engine", "wg endpoint: udp recv error: {e}");
+                    }
+                }
+            }
+            _ = wake.notified() => {}
+            _ = sleep => {
+                ep.on_timer(&socket).await;
+            }
+        }
+    }
+}
+
+/// Bind, spawn the endpoint driver, and return the bound address plus the
+/// driver's task handle (tests use the handle for teardown; production goes
+/// through [`serve_endpoint`]).
+async fn spawn_endpoint(
+    cfg: &WgEndpointCfg,
+    relay: SharedRelay,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+    let ep = Endpoint::new(cfg)?;
+    let port = cfg.listen_port;
+    // Dual-stack when the platform allows it, plain v4 otherwise (the
+    // docker e2e hosts run v6-disabled kernels).
+    let socket = match UdpSocket::bind(format!("[::]:{port}")).await {
+        Ok(s) => s,
+        Err(_) => UdpSocket::bind(format!("0.0.0.0:{port}"))
+            .await
+            .map_err(|e| Error::network(format!("wg endpoint: bind udp {port}: {e}")))?,
+    };
+    let local = socket.local_addr().map_err(|e| {
+        Error::network(format!("wg endpoint: bound socket has no address: {e}"))
+    })?;
+    let socket = Arc::new(socket);
+    let wake = Arc::new(Notify::new());
+    let stack = EpStack::new(cfg, relay, wake.clone())?;
+    let task_socket = socket.clone();
+    let task = tokio::spawn(async move {
+        run_endpoint(task_socket, ep, stack, wake).await;
+    });
+    tracing::info!(target: "engine", "wg endpoint {} listening on {local}", cfg.tag);
+    Ok((local, task))
+}
+
+/// Start a WireGuard endpoint (server): bind the UDP listener, spawn the
+/// handshake/transport driver, and return the bound address. The endpoint
+/// runs until the runtime shuts down; the engine's other inbounds share the
+/// shape (bind + spawn + report the address).
+pub async fn serve_endpoint(cfg: &WgEndpointCfg, relay: SharedRelay) -> Result<SocketAddr> {
+    let (local, _task) = spawn_endpoint(cfg, relay).await?;
+    Ok(local)
+}
+
+// ---------------------------------------------------------------------------
 // Tests: crypto vectors, handshake round-trips against an in-test
 // responder, timer boundaries, and full loopback tunnels (real UDP
 // sockets on 127.0.0.1, keys generated at runtime).
@@ -2650,96 +4079,18 @@ mod tests {
         /// (server index, peer index, client-send key, client-recv key).
         type ServerKeys = (u32, u32, [u8; 32], [u8; 32]);
 
-        /// Consume a handshake initiation exactly as a WireGuard responder
-        /// does, and produce the response plus the server-side session
-        /// keys and the decrypted TAI64N timestamp (for the replay guard).
-        /// Returns Err for any unauthenticated/malformed initiation (the
-        /// caller then stays silent, per the whitepaper).
+        /// Thin adapter over the production responder (open_initiation +
+        /// respond_initiation) keeping the in-test call sites' shape.
         pub(crate) fn consume_initiation_and_respond(
             server_static: &StaticKeys,
             msg: &WgMsg,
             psk: &[u8; 32],
             server_index: u32,
         ) -> Result<(Vec<u8>, ServerKeys, [u8; 12])> {
-            let WgMsg::Initiation {
-                sender,
-                ephemeral,
-                enc_static,
-                enc_timestamp,
-                mac1,
-                mac2,
-            } = msg
-            else {
-                return Err(Error::protocol("server: not an initiation"));
-            };
-            // MAC1 first: keyed by the server's OWN static public key, and
-            // the only unauthenticated work allowed before this point is
-            // the hash. Rebuild the covered bytes (type..encrypted_timestamp).
-            let mut covered = Vec::with_capacity(116);
-            covered.extend_from_slice(&1u32.to_le_bytes());
-            covered.extend_from_slice(&sender.to_le_bytes());
-            covered.extend_from_slice(ephemeral);
-            covered.extend_from_slice(enc_static);
-            covered.extend_from_slice(enc_timestamp);
-            if blake2s_mac(&mac1_key(&server_static.pk), &covered) != *mac1 {
-                return Err(Error::crypto("server: initiation MAC1 mismatch"));
-            }
-            let _ = mac2; // not under load in tests; MAC2 stays zeros
-
-            // Mirror the initiator's derivation.
-            let mut ck = blake2s256(CONSTRUCTION);
-            let ident_hash = hash2(&ck, IDENTIFIER);
-            let mut h = hash2(&ident_hash, &server_static.pk);
-            h = hash2(&h, ephemeral);
-            ck = kdf1(&ck, ephemeral);
-            let es = x25519_dh(&server_static.sk, ephemeral)?;
-            let (ck, key_es) = kdf2(&ck, &es);
-            let client_static: [u8; 32] = aead_open(&key_es, 0, enc_static, &h)?
-                .try_into()
-                .map_err(|_| Error::protocol("server: static has wrong length"))?;
-            h = hash2(&h, enc_static);
-            let ss = x25519_dh(&server_static.sk, &client_static)?;
-            let (mut ck, key_ss) = kdf2(&ck, &ss);
-            let timestamp = aead_open(&key_ss, 0, enc_timestamp, &h)?;
-            h = hash2(&h, enc_timestamp);
-            if timestamp.len() != 12 {
-                return Err(Error::protocol("server: timestamp has wrong length"));
-            }
-            let timestamp: [u8; 12] = timestamp.try_into().unwrap();
-
-            // Response message.
-            let e = x25519_keypair();
-            h = hash2(&h, &e.pk);
-            ck = kdf1(&ck, &e.pk);
-            let ee = x25519_dh(&e.sk, ephemeral)?;
-            ck = kdf1(&ck, &ee);
-            let se = x25519_dh(&e.sk, &client_static)?;
-            ck = kdf1(&ck, &se);
-            let (ck, temp2, key) = kdf3(&ck, psk);
-            h = hash2(&h, &temp2);
-            let enc_nothing = aead_seal(&key, 0, &[], &h)?;
-            // Transcript-complete step; the transport keys derive from the
-            // chaining key alone (see the client's matching note).
-            let _ = hash2(&h, &enc_nothing);
-
-            let mut resp = Vec::with_capacity(MSG_RESPONSE_LEN);
-            resp.extend_from_slice(&2u32.to_le_bytes());
-            resp.extend_from_slice(&server_index.to_le_bytes());
-            resp.extend_from_slice(&sender.to_le_bytes());
-            resp.extend_from_slice(&e.pk);
-            resp.extend_from_slice(&enc_nothing);
-            // MAC1 keyed by the initiator's (now known) static.
-            let rmac1 = blake2s_mac(&mac1_key(&client_static), &resp);
-            resp.extend_from_slice(&rmac1);
-            resp.extend_from_slice(&[0u8; 16]); // MAC2: not under load
-            debug_assert_eq!(resp.len(), MSG_RESPONSE_LEN);
-
-            let (k_client_send, k_client_recv) = derive_transport_keys(&ck);
-            Ok((
-                resp,
-                (server_index, *sender, k_client_send, k_client_recv),
-                timestamp,
-            ))
+            let open = open_initiation(server_static, msg)?;
+            let timestamp = open.timestamp;
+            let (resp, keys) = respond_initiation(open, psk, server_index)?;
+            Ok((resp, keys, timestamp))
         }
     }
 
@@ -3253,5 +4604,818 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("disabled"));
+    }
+
+    // ========================================================================
+    // ENDPOINT (server) tests. The engine's own client (the dual-stack
+    // netstack above) drives the production endpoint over real loopback
+    // UDP; a manual client (raw handshake + session) drives the paths the
+    // engine client cannot trigger on demand: roaming, replay rejection,
+    // the allowed-ips source filter, ICMP, cookie-under-load, keepalives.
+    // ========================================================================
+
+    use crate::inbound::RelayHandler;
+
+    /// An engine relay: TCP bytes echoed, UDP datagrams echoed and recorded
+    /// (the shapes the TUN netstack tests use).
+    struct EpEchoRelay(std::sync::Mutex<Vec<(SocketAddr, NetAddr, Vec<u8>)>>);
+
+    impl RelayHandler for EpEchoRelay {
+        fn handle_tcp(self: Arc<Self>, _meta: TcpMeta, client: BoxProxyStream) {
+            tokio::spawn(async move {
+                let mut client = client;
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    match client.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if client.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        fn handle_udp(
+            self: Arc<Self>,
+            source: SocketAddr,
+            _inbound: String,
+            mut uplink: mpsc::Receiver<(NetAddr, Vec<u8>)>,
+            downlink: mpsc::Sender<(NetAddr, Vec<u8>)>,
+        ) {
+            tokio::spawn(async move {
+                while let Some((target, data)) = uplink.recv().await {
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .push((source, target.clone(), data.clone()));
+                    let _ = downlink.send((target, data)).await;
+                }
+            });
+        }
+    }
+
+    const EP_TCP_PORT: u16 = 9021;
+    const EP_UDP_PORT: u16 = 9022;
+
+    fn endpoint_cfg(server_statics: &StaticKeys, client_pk: [u8; 32], psk: [u8; 32]) -> WgEndpointCfg {
+        WgEndpointCfg {
+            tag: "wg-ep".into(),
+            private_key: b64(&server_statics.sk),
+            listen_port: 0,
+            mtu: 0,
+            address: Some((SERVER_TUNNEL_IP, 24)),
+            inet6_address: Some((SERVER_TUNNEL_IP_V6, 64)),
+            udp_timeout: Some(Duration::from_secs(300)),
+            peers: vec![WgEndpointPeer {
+                public_key: b64(&client_pk),
+                pre_shared_key: Some(b64(&psk)),
+                allowed_ips: vec![
+                    (IpAddr::V4(Ipv4Addr::new(172, 16, 200, 2)), 32),
+                    (IpAddr::V6(CLIENT_TUNNEL_IP_V6), 128),
+                ],
+                persistent_keepalive: None,
+            }],
+        }
+    }
+
+    fn endpoint_client_cfg(
+        endpoint: SocketAddr,
+        client: &StaticKeys,
+        server_pk: &[u8; 32],
+        psk: &[u8; 32],
+        ipv6: bool,
+    ) -> WgOut {
+        WgOut {
+            server: "127.0.0.1".into(),
+            port: endpoint.port(),
+            private_key: b64(&client.sk),
+            peer_public_key: b64(server_pk),
+            pre_shared_key: Some(b64(psk)),
+            local_ip: Ipv4Addr::new(172, 16, 200, 2),
+            local_ipv6: ipv6.then_some(CLIENT_TUNNEL_IP_V6),
+            mtu: 0,
+            reserved: [0; 3],
+            udp: true,
+        }
+    }
+
+    /// The endpoint's v4 loopback address (it listens on the wildcard).
+    fn v4_ep(addr: SocketAddr) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
+    }
+
+    /// A manual (non-netstack) client: raw handshake against the endpoint,
+    /// using the exact static identity the endpoint has configured (an
+    /// unknown key would be answered with silence, by design).
+    async fn manual_handshake(
+        client: &StaticKeys,
+        server_pk: &[u8; 32],
+        psk: &[u8; 32],
+        endpoint: SocketAddr,
+    ) -> (tokio::net::UdpSocket, Session, Vec<u8>, InitiationPending) {
+        let statics = StaticKeys::from_secret(client.sk);
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (msg, mut pending) = build_initiation(&statics, server_pk, None, 0xC0DE).unwrap();
+        sock.send_to(&msg, endpoint).await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(10), sock.recv_from(&mut buf))
+            .await
+            .expect("endpoint answers the initiation")
+            .unwrap();
+        let resp = parse_wg_msg(&buf[..n]).expect("a well-formed response");
+        let done = consume_response(&statics, &mut pending, &resp, psk)
+            .expect("endpoint response verifies");
+        let sess = Session::from_handshake(done, Instant::now());
+        (sock, sess, msg, pending)
+    }
+
+    /// Receive the next decryptable inner packet (keepalives skipped);
+    /// `None` on timeout or datagrams not for this session.
+    async fn recv_transport(
+        sock: &tokio::net::UdpSocket,
+        sess: &mut Session,
+        wait: Duration,
+    ) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; 65_536];
+        loop {
+            let Ok(Ok((n, _))) = tokio::time::timeout(wait, sock.recv_from(&mut buf)).await else {
+                return None;
+            };
+            match parse_wg_msg(&buf[..n]) {
+                Some(WgMsg::Transport { receiver, counter, data }) => {
+                    if receiver != sess.local_index {
+                        continue; // stale
+                    }
+                    let plain = sess.open_transport(counter, &data).ok()?;
+                    if plain.is_empty() {
+                        continue; // keepalive
+                    }
+                    let mut p = plain;
+                    trim_ip_packet(&mut p);
+                    return Some(p);
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    /// Send one inner packet through a manual session and await the next
+    /// decryptable inner packet back.
+    async fn manual_roundtrip(
+        sock: &tokio::net::UdpSocket,
+        sess: &mut Session,
+        endpoint: SocketAddr,
+        inner: &[u8],
+    ) -> Vec<u8> {
+        let msg = sess.seal_transport(inner).unwrap();
+        sock.send_to(&msg, endpoint).await.unwrap();
+        manual_recv_inner(sock, sess).await
+    }
+
+    async fn manual_recv_inner(sock: &tokio::net::UdpSocket, sess: &mut Session) -> Vec<u8> {
+        recv_transport(sock, sess, Duration::from_secs(10)).await.expect("a relayed reply")
+    }
+
+    /// A UDP/IPv4 packet with valid header + UDP checksums (smoltcp verifies
+    /// both on input).
+    fn udp4_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Vec<u8> {
+        let (sport, dport) = (src.port(), dst.port());
+        let (src, dst) = (match src.ip() {
+            IpAddr::V4(v4) => v4,
+            _ => panic!("v4 builder"),
+        }, match dst.ip() {
+            IpAddr::V4(v4) => v4,
+            _ => panic!("v4 builder"),
+        });
+        let total = 20 + 8 + payload.len();
+        let mut p = vec![0u8; total];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        p[4..6].copy_from_slice(&0x1234u16.to_be_bytes());
+        p[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+        p[8] = 64;
+        p[9] = 17;
+        p[12..16].copy_from_slice(&src.octets());
+        p[16..20].copy_from_slice(&dst.octets());
+        p[20..22].copy_from_slice(&sport.to_be_bytes());
+        p[22..24].copy_from_slice(&dport.to_be_bytes());
+        p[24..26].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        p[28..28 + payload.len()].copy_from_slice(payload);
+        let hc = checksum(&p[..20]);
+        p[10..12].copy_from_slice(&hc.to_be_bytes());
+        // UDP checksum over the v4 pseudo-header.
+        let mut pseudo = Vec::with_capacity(12 + 8 + payload.len());
+        pseudo.extend_from_slice(&src.octets());
+        pseudo.extend_from_slice(&dst.octets());
+        pseudo.push(0);
+        pseudo.push(17);
+        pseudo.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        pseudo.extend_from_slice(&p[20..]);
+        let uc = checksum(&pseudo);
+        let uc = if uc == 0 { 0xffff } else { uc };
+        p[26..28].copy_from_slice(&uc.to_be_bytes());
+        p
+    }
+
+    fn icmp4_echo_request(src: Ipv4Addr, dst: Ipv4Addr, id: u16, seq: u16) -> Vec<u8> {
+        let mut p = vec![0u8; 20 + 8];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&28u16.to_be_bytes());
+        p[8] = 64;
+        p[9] = 1;
+        p[12..16].copy_from_slice(&src.octets());
+        p[16..20].copy_from_slice(&dst.octets());
+        p[20] = 8; // echo request
+        p[24..26].copy_from_slice(&id.to_be_bytes());
+        p[26..28].copy_from_slice(&seq.to_be_bytes());
+        let hc = checksum(&p[..20]);
+        p[10..12].copy_from_slice(&hc.to_be_bytes());
+        let ic = checksum(&p[20..]);
+        p[22..24].copy_from_slice(&ic.to_be_bytes());
+        p
+    }
+
+    async fn spawn_test_endpoint(cfg: &WgEndpointCfg) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let relay = EpEchoRelay(std::sync::Mutex::new(Vec::new()));
+        spawn_endpoint(cfg, Arc::new(relay)).await.expect("endpoint starts")
+    }
+
+    /// TCP relayed through the endpoint into the engine, driven by the
+    /// module's own dual-stack client.
+    #[tokio::test]
+    async fn endpoint_relays_engine_client_tcp() {
+        let server_statics = x25519_keypair();
+        let client_keys = x25519_keypair();
+        let mut psk = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut psk);
+        let cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
+        let (addr, task) = spawn_test_endpoint(&cfg).await;
+
+        let out = endpoint_client_cfg(v4_ep(addr), &client_keys, &server_statics.pk, &psk, false);
+        let target = NetAddr::ip(IpAddr::V4(SERVER_TUNNEL_IP), EP_TCP_PORT);
+        let mut stream = connect(&out, &target)
+            .await
+            .expect("engine client connects through the endpoint");
+        let payload = b"endpoint relay!".repeat(64);
+        stream.write_all(&payload).await.unwrap();
+        let mut echoed = vec![0u8; payload.len()];
+        stream.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(echoed, payload, "echo through the endpoint both ways");
+        stream.write_all(b"again").await.unwrap();
+        let mut more = vec![0u8; 5];
+        stream.read_exact(&mut more).await.unwrap();
+        assert_eq!(more, b"again");
+        stream.shutdown().await.unwrap();
+        task.abort();
+    }
+
+    /// UDP relayed through the endpoint into the engine, same client.
+    #[tokio::test]
+    async fn endpoint_relays_engine_client_udp() {
+        let server_statics = x25519_keypair();
+        let client_keys = x25519_keypair();
+        let mut psk = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut psk);
+        let cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
+        let (addr, task) = spawn_test_endpoint(&cfg).await;
+
+        let out = endpoint_client_cfg(v4_ep(addr), &client_keys, &server_statics.pk, &psk, false);
+        let udp = WgUdp::bind(&out).await.expect("udp through the endpoint");
+        let target = NetAddr::ip(IpAddr::V4(SERVER_TUNNEL_IP), EP_UDP_PORT);
+        udp.send(&target, b"ep-udp").await.unwrap();
+        let (from, data) = tokio::time::timeout(Duration::from_secs(30), udp.recv())
+            .await
+            .expect("echo datagram")
+            .expect("udp echo");
+        assert_eq!(data, b"ep-udp");
+        assert_eq!(from.to_string(), format!("{SERVER_TUNNEL_IP}:{EP_UDP_PORT}"));
+        udp.send(&target, b"ep-udp-2").await.unwrap();
+        let (_, data2) = tokio::time::timeout(Duration::from_secs(30), udp.recv())
+            .await
+            .expect("second echo")
+            .expect("udp echo 2");
+        assert_eq!(data2, b"ep-udp-2");
+        task.abort();
+    }
+
+    /// The v6 side of the same relay (dual-stack client, v6 inner address).
+    #[tokio::test]
+    async fn endpoint_relays_engine_client_tcp_ipv6() {
+        let server_statics = x25519_keypair();
+        let client_keys = x25519_keypair();
+        let mut psk = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut psk);
+        let cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
+        let (addr, task) = spawn_test_endpoint(&cfg).await;
+
+        let out = endpoint_client_cfg(v4_ep(addr), &client_keys, &server_statics.pk, &psk, true);
+        let target = NetAddr::ip(IpAddr::V6(SERVER_TUNNEL_IP_V6), EP_TCP_PORT);
+        let mut stream = connect(&out, &target)
+            .await
+            .expect("engine client connects over the endpoint's v6 side");
+        stream.write_all(b"v6 via endpoint").await.unwrap();
+        let mut echoed = vec![0u8; b"v6 via endpoint".len()];
+        stream.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(echoed, b"v6 via endpoint".to_vec());
+        task.abort();
+    }
+
+    /// Roaming: transport from a new source port moves the session's
+    /// endpoint; the old port goes silent.
+    #[tokio::test]
+    async fn endpoint_roaming_follows_the_peer_address() {
+        let server_statics = x25519_keypair();
+        let client_keys = x25519_keypair();
+        let mut psk = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut psk);
+        let cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
+        let (addr, task) = spawn_test_endpoint(&cfg).await;
+        let ep = v4_ep(addr);
+
+        let (sock, mut sess, _init, _pending) =
+            manual_handshake(&client_keys, &server_statics.pk, &psk, ep).await;
+        let inner = udp4_packet(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 16, 200, 2)), 5150),
+            SocketAddr::new(IpAddr::V4(SERVER_TUNNEL_IP), EP_UDP_PORT),
+            b"roam-probe",
+        );
+        // First from the handshake socket: proves the session works.
+        let reply = manual_roundtrip(&sock, &mut sess, ep, &inner).await;
+        assert_eq!(&reply[28..], b"roam-probe");
+
+        // Now from a different source port: the endpoint must follow.
+        let sock2 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        manual_roundtrip(&sock2, &mut sess, ep, &inner).await;
+        // Still answered on the new address for a second exchange.
+        manual_roundtrip(&sock2, &mut sess, ep, &inner).await;
+
+        // The old port hears nothing: the session lives on the new address
+        // (a *valid new* packet from the old socket would roam it back —
+        // that is WireGuard roaming — so only unsolicited traffic is
+        // checked here).
+        let mut buf = vec![0u8; 2048];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(700), sock.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "the endpoint must answer on the new address only"
+        );
+        task.abort();
+    }
+
+    /// A replayed initiation (same bytes) is silently ignored: the TAI64N
+    /// replay guard, not a second session.
+    #[tokio::test]
+    async fn endpoint_replayed_initiation_is_silent() {
+        let server_statics = x25519_keypair();
+        let client_keys = x25519_keypair();
+        let mut psk = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut psk);
+        let cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
+        let (addr, task) = spawn_test_endpoint(&cfg).await;
+        let ep = v4_ep(addr);
+
+        let (sock, _sess, init_msg, _pending) =
+            manual_handshake(&client_keys, &server_statics.pk, &psk, ep).await;
+        sock.send_to(&init_msg, ep).await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(700), sock.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "a replayed initiation must not be answered"
+        );
+        task.abort();
+    }
+
+    /// A replayed transport datagram (same counter, same ciphertext) is
+    /// rejected by the anti-replay window: the echo happens exactly once.
+    #[tokio::test]
+    async fn endpoint_replayed_transport_counter_is_silent() {
+        let server_statics = x25519_keypair();
+        let client_keys = x25519_keypair();
+        let mut psk = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut psk);
+        let cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
+        let (addr, task) = spawn_test_endpoint(&cfg).await;
+        let ep = v4_ep(addr);
+
+        let (sock, mut sess, _init, _pending) =
+            manual_handshake(&client_keys, &server_statics.pk, &psk, ep).await;
+        let inner = udp4_packet(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 16, 200, 2)), 5151),
+            SocketAddr::new(IpAddr::V4(SERVER_TUNNEL_IP), EP_UDP_PORT),
+            b"replay-me",
+        );
+        let wire = sess.seal_transport(&inner).unwrap();
+        sock.send_to(&wire, ep).await.unwrap();
+        let reply = manual_recv_inner(&sock, &mut sess).await;
+        assert_eq!(&reply[28..], b"replay-me");
+
+        // The replay: byte-for-byte the same datagram. The tag verifies but
+        // the counter is spent, so the packet is dropped and no second echo
+        // ever leaves the endpoint.
+        sock.send_to(&wire, ep).await.unwrap();
+        assert!(
+            recv_transport(&sock, &mut sess, Duration::from_millis(700))
+                .await
+                .is_none(),
+            "a replayed transport datagram must not be relayed twice"
+        );
+        task.abort();
+    }
+
+    /// Unknown static keys get no response at all (the whitepaper's silence).
+    #[tokio::test]
+    async fn endpoint_unknown_peer_is_silent() {
+        let server_statics = x25519_keypair();
+        let client_keys = x25519_keypair();
+        let mut psk = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut psk);
+        let cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
+        let (addr, task) = spawn_test_endpoint(&cfg).await;
+        let ep = v4_ep(addr);
+
+        let stranger = x25519_keypair();
+        let (msg, _pending) = build_initiation(&stranger, &server_statics.pk, None, 42).unwrap();
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sock.send_to(&msg, ep).await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(700), sock.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "unknown peers must be answered with silence"
+        );
+        task.abort();
+    }
+
+    /// The allowed-ips source filter: a decrypted packet whose source is not
+    /// in the peer's list never reaches the engine.
+    #[tokio::test]
+    async fn endpoint_filters_sources_outside_allowed_ips() {
+        let server_statics = x25519_keypair();
+        let client_keys = x25519_keypair();
+        let mut psk = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut psk);
+        let cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
+        let (addr, task) = spawn_test_endpoint(&cfg).await;
+        let ep = v4_ep(addr);
+
+        let (sock, mut sess, _init, _pending) =
+            manual_handshake(&client_keys, &server_statics.pk, &psk, ep).await;
+
+        // Outside the allowed 172.16.200.2/32: no echo.
+        let rogue = udp4_packet(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 99, 0, 7)), 9000),
+            SocketAddr::new(IpAddr::V4(SERVER_TUNNEL_IP), EP_UDP_PORT),
+            b"let me in",
+        );
+        let msg = sess.seal_transport(&rogue).unwrap();
+        sock.send_to(&msg, ep).await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(700), sock.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "a source outside allowed_ips must be dropped"
+        );
+
+        // Inside: echoed.
+        let ok = udp4_packet(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 16, 200, 2)), 9001),
+            SocketAddr::new(IpAddr::V4(SERVER_TUNNEL_IP), EP_UDP_PORT),
+            b"allowed",
+        );
+        let reply = manual_roundtrip(&sock, &mut sess, ep, &ok).await;
+        assert_eq!(&reply[28..], b"allowed");
+        task.abort();
+    }
+
+    /// ICMP echo requests toward the endpoint are answered locally (both
+    /// families answered by the stack in the TUN inbound's image).
+    #[tokio::test]
+    async fn endpoint_answers_icmp_echo() {
+        let server_statics = x25519_keypair();
+        let client_keys = x25519_keypair();
+        let mut psk = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut psk);
+        let cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
+        let (addr, task) = spawn_test_endpoint(&cfg).await;
+        let ep = v4_ep(addr);
+
+        let (sock, mut sess, _init, _pending) =
+            manual_handshake(&client_keys, &server_statics.pk, &psk, ep).await;
+        let req = icmp4_echo_request(
+            Ipv4Addr::new(172, 16, 200, 2),
+            SERVER_TUNNEL_IP,
+            0xBEEF,
+            7,
+        );
+        let reply = manual_roundtrip(&sock, &mut sess, ep, &req).await;
+        assert_eq!(reply[20], 0, "echo reply type");
+        assert_eq!(&reply[24..26], &0xBEEFu16.to_be_bytes(), "id preserved");
+        assert_eq!(&reply[26..28], &7u16.to_be_bytes(), "seq preserved");
+        // Swapped addresses.
+        assert_eq!(&reply[12..16], &SERVER_TUNNEL_IP.octets());
+        assert_eq!(&reply[16..20], &[172, 16, 200, 2]);
+        // The recomputed checksum verifies (sum over the ICMP message is 0).
+        assert_eq!(checksum(&reply[20..]), 0);
+        task.abort();
+    }
+
+    /// Past 64 initiations in a second the endpoint answers with cookies
+    /// (wireguard-go's under-load behaviour), and the client-side cookie
+    /// consumer can open them.
+    #[tokio::test]
+    async fn endpoint_answers_with_cookies_under_load() {
+        let server_statics = x25519_keypair();
+        let client_keys = x25519_keypair();
+        let mut psk = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut psk);
+        let cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
+        let (addr, task) = spawn_test_endpoint(&cfg).await;
+        let ep = v4_ep(addr);
+
+        let stranger = x25519_keypair();
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // 65 unknown-peer initiations all count toward the load window and
+        // are silently discarded; from 65 on the reply is a cookie.
+        let (msg, _pending) = build_initiation(&stranger, &server_statics.pk, None, 1).unwrap();
+        for _ in 0..EP_COOKIE_LOAD {
+            sock.send_to(&msg, ep).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        let (msg2, pending) = build_initiation(&stranger, &server_statics.pk, None, 2).unwrap();
+        sock.send_to(&msg2, ep).await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(10), sock.recv_from(&mut buf))
+            .await
+            .expect("a cookie reply arrives once under load")
+            .unwrap();
+        let parsed = parse_wg_msg(&buf[..n]).expect("parses");
+        match parsed {
+            WgMsg::Cookie { receiver, .. } => {
+                assert_eq!(receiver, 2, "receiver is our sender index");
+            }
+            other => panic!("expected a cookie reply, got {other:?}"),
+        }
+        // The production client-side consumer opens it with the pending
+        // initiation's MAC1 as AAD.
+        let cookie = consume_cookie_reply(&server_statics.pk, &pending, &parsed)
+            .expect("cookie decrypts");
+        assert_ne!(cookie, [0u8; 16]);
+        task.abort();
+    }
+
+    /// Persistent keepalive: an empty transport message every configured
+    /// interval while the session lives.
+    #[tokio::test]
+    async fn endpoint_sends_persistent_keepalive() {
+        let server_statics = x25519_keypair();
+        let client_keys = x25519_keypair();
+        let mut psk = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut psk);
+        let mut cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
+        cfg.peers[0].persistent_keepalive = Some(1);
+        let (addr, task) = spawn_test_endpoint(&cfg).await;
+        let ep = v4_ep(addr);
+
+        let (sock, mut sess, _init, _pending) =
+            manual_handshake(&client_keys, &server_statics.pk, &psk, ep).await;
+        let mut buf = vec![0u8; 2048];
+        // The next datagram must be an empty transport message.
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
+            .await
+            .expect("the keepalive fires within the interval")
+            .unwrap();
+        match parse_wg_msg(&buf[..n]).unwrap() {
+            WgMsg::Transport { receiver, counter, data } => {
+                assert_eq!(receiver, sess.local_index);
+                let plain = sess.open_transport(counter, &data).unwrap();
+                assert!(plain.is_empty(), "keepalive carries no payload");
+            }
+            other => panic!("expected a transport keepalive, got {other:?}"),
+        }
+        task.abort();
+    }
+
+    // -- pure endpoint pieces --------------------------------------------------
+
+    #[test]
+    fn endpoint_prefix_routing_picks_the_longest_match() {
+        let peer = |allowed: Vec<(IpAddr, u8)>| EpPeer {
+            static_pk: [1; 32],
+            psk: [0; 32],
+            allowed,
+            persistent_keepalive: None,
+            last_timestamp: None,
+            endpoint: None,
+            session: None,
+            next_persistent: None,
+        };
+        let peers = vec![
+            peer(vec![(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8)]),
+            peer(vec![(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 0)), 16)]),
+        ];
+        // Longest prefix wins.
+        let (i, p) = route_peer(&peers, &IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))).unwrap();
+        assert_eq!((i, p), (1, 16));
+        let (i, p) = route_peer(&peers, &IpAddr::V4(Ipv4Addr::new(10, 9, 9, 9))).unwrap();
+        assert_eq!((i, p), (0, 8));
+        // No match -> None; families never cross.
+        assert!(route_peer(&peers, &IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))).is_none());
+        assert!(route_peer(&peers, &IpAddr::V6(Ipv6Addr::LOCALHOST)).is_none());
+
+        let v6peers = vec![peer(vec![(IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0)), 64)])];
+        assert!(
+            route_peer(&v6peers, &IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 1, 2, 3, 4))).is_some()
+        );
+        assert!(route_peer(&v6peers, &IpAddr::V6(Ipv6Addr::new(0xfd00, 1, 0, 0, 0, 0, 0, 0))).is_none());
+        // Edge prefixes.
+        assert!(prefix_contains(&IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0, &IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(!prefix_contains(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 33, &IpAddr::V4(Ipv4Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn endpoint_classifier_reads_both_families() {
+        let tcp_syn = {
+            let mut p = vec![0x45u8, 0, 0, 40, 0, 0, 0x40, 0, 64, 6, 0, 0];
+            p.extend_from_slice(&[172, 16, 200, 2]);
+            p.extend_from_slice(&SERVER_TUNNEL_IP.octets());
+            p.extend_from_slice(&5150u16.to_be_bytes());
+            p.extend_from_slice(&9021u16.to_be_bytes());
+            p.push(0); p.push(0); p.push(0); p.push(0); // seq
+            p.push(0); p.push(0); p.push(0); p.push(0); // ack
+            p.push(0x50); p.push(0x02); // data offset + SYN
+            p.extend_from_slice(&[0x10, 0x00, 0, 0, 0, 0]); // window, checksum, urgent
+            p
+        };
+        match ep_classify(&tcp_syn) {
+            EpIn::Tcp { src, dst, syn } => {
+                assert_eq!(src.port(), 5150);
+                assert_eq!(dst.port(), 9021);
+                assert!(syn);
+            }
+            other => panic!("tcp: {other:?}"),
+        }
+        let udp = udp4_packet(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 16, 200, 2)), 5150),
+            SocketAddr::new(IpAddr::V4(SERVER_TUNNEL_IP), EP_UDP_PORT),
+            b"xyz",
+        );
+        match ep_classify(&udp) {
+            EpIn::Udp { payload, .. } => assert_eq!(&udp[payload.0..payload.1], b"xyz"),
+            other => panic!("udp: {other:?}"),
+        }
+        let icmp = icmp4_echo_request(Ipv4Addr::new(172, 16, 200, 2), SERVER_TUNNEL_IP, 1, 1);
+        assert!(matches!(ep_classify(&icmp), EpIn::IcmpEchoRequest { v6: false, .. }));
+        // v6 UDP.
+        let mut v6 = vec![0x60u8, 0, 0, 0, 0, 11, 17, 64];
+        v6.extend_from_slice(&CLIENT_TUNNEL_IP_V6.octets());
+        v6.extend_from_slice(&SERVER_TUNNEL_IP_V6.octets());
+        v6.extend_from_slice(&5152u16.to_be_bytes());
+        v6.extend_from_slice(&EP_UDP_PORT.to_be_bytes());
+        v6.extend_from_slice(&11u16.to_be_bytes());
+        v6.extend_from_slice(&[0, 0]);
+        v6.extend_from_slice(b"abc");
+        match ep_classify(&v6) {
+            EpIn::Udp { src, dst, payload } => {
+                assert_eq!(src.port(), 5152);
+                assert_eq!(dst.port(), EP_UDP_PORT);
+                assert_eq!(&v6[payload.0..payload.1], b"abc");
+            }
+            other => panic!("v6 udp: {other:?}"),
+        }
+        // Garbage and non-TCP/UDP/ICMP skip.
+        assert_eq!(ep_classify(&[]), EpIn::Skip);
+        assert_eq!(ep_classify(&[0x45, 0, 0, 20]), EpIn::Skip);
+        assert_eq!(ep_classify(&[0x71, 0, 0]), EpIn::Skip);
+    }
+
+    #[test]
+    fn endpoint_icmp_replies_carry_valid_checksums() {
+        let req = icmp4_echo_request(Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::new(5, 6, 7, 8), 9, 10);
+        assert_eq!(checksum(&req[20..]), 0, "the builder's checksum verifies");
+        let reply = ep_icmpv4_echo_reply(&req).unwrap();
+        assert_eq!(checksum(&reply[20..]), 0);
+        assert_eq!(reply[20], 0);
+
+        // v6 echo reply, checksum over the pseudo-header.
+        let mut req6 = vec![0x60u8, 0, 0, 0, 0, 12, 58, 64];
+        req6.extend_from_slice(&CLIENT_TUNNEL_IP_V6.octets());
+        req6.extend_from_slice(&SERVER_TUNNEL_IP_V6.octets());
+        req6.extend_from_slice(&[129 - 1, 0, 0, 0]); // type 128
+        req6.extend_from_slice(&0x1234u16.to_be_bytes());
+        req6.extend_from_slice(&5u16.to_be_bytes());
+        req6.extend_from_slice(&[0xAA; 4]);
+        let rep6 = ep_icmpv6_echo_reply(&req6).unwrap();
+        assert_eq!(rep6[40], 129);
+        let mut pseudo = Vec::new();
+        pseudo.extend_from_slice(&rep6[8..24]);
+        pseudo.extend_from_slice(&rep6[24..40]);
+        pseudo.extend_from_slice(&((rep6.len() - 40) as u32).to_be_bytes());
+        pseudo.extend_from_slice(&[0, 0, 0, 58]);
+        pseudo.extend_from_slice(&rep6[40..]);
+        assert_eq!(checksum(&pseudo), 0, "v6 reply checksum verifies");
+    }
+
+    #[test]
+    fn endpoint_cookie_roundtrip_with_the_client_consumer() {
+        let server = x25519_keypair();
+        let client = x25519_keypair();
+        let (msg, pending) = build_initiation(&client, &server.pk, None, 5).unwrap();
+        let mac1: [u8; 16] = msg[116..132].try_into().unwrap();
+        let full = blake2s256(b"secret");
+        let secret: [u8; 16] = full[..16].try_into().unwrap();
+        let cookie = make_cookie(&secret, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234));
+        let reply = build_cookie_reply(&server.pk, 5, &mac1, cookie).unwrap();
+        assert_eq!(reply.len(), MSG_COOKIE_LEN);
+        let learned =
+            consume_cookie_reply(&server.pk, &pending, &parse_wg_msg(&reply).unwrap()).unwrap();
+        assert_eq!(learned, cookie);
+    }
+
+    #[test]
+    fn endpoint_load_counter_resets_each_second() {
+        let mut load = HandshakeLoad::default();
+        let t0 = Instant::now();
+        for i in 1..=EP_COOKIE_LOAD {
+            load.bump(t0);
+            assert_eq!(load.under_load(), i > EP_COOKIE_LOAD);
+        }
+        load.bump(t0 + Duration::from_secs(2));
+        assert!(!load.under_load(), "a new window starts at 1");
+    }
+
+    #[test]
+    fn endpoint_config_validates_peers() {
+        let base = || WgEndpointCfg {
+            tag: "t".into(),
+            private_key: b64(&[7u8; 32]),
+            listen_port: 0,
+            mtu: 0,
+            address: None,
+            inet6_address: None,
+            udp_timeout: None,
+            peers: vec![WgEndpointPeer {
+                public_key: b64(&[9u8; 32]),
+                pre_shared_key: None,
+                allowed_ips: vec![(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 32)],
+                persistent_keepalive: None,
+            }],
+        };
+        assert!(Endpoint::new(&base()).is_ok());
+        let err = match Endpoint::new(&WgEndpointCfg { peers: vec![], ..base() }) { Err(e) => e.to_string(), Ok(_) => panic!("config must be rejected") };
+        assert!(err.contains("at least one peer"), "{err}");
+        let err = match Endpoint::new(&WgEndpointCfg {
+            peers: vec![WgEndpointPeer {
+                allowed_ips: vec![],
+                ..base().peers.pop().unwrap()
+            }],
+            ..base()
+        }) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("config must be rejected"),
+        };
+        assert!(err.contains("no allowed_ips"), "{err}");
+        let err = match Endpoint::new(&WgEndpointCfg {
+            peers: vec![WgEndpointPeer {
+                allowed_ips: vec![(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 33)],
+                ..base().peers.pop().unwrap()
+            }],
+            ..base()
+        }) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("config must be rejected"),
+        };
+        assert!(err.contains("not a valid prefix"), "{err}");
+        // Bad base64 keys are config errors.
+        let err = match Endpoint::new(&WgEndpointCfg {
+            private_key: "!!".into(),
+            ..base()
+        }) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("config must be rejected"),
+        };
+        assert!(err.contains("base64"), "{err}");
+    }
+
+    #[test]
+    fn checksum_known_vector() {
+        // RFC 1071's worked example: 0x0001f203f4f5f6f7 over the first 12
+        // bytes with the rest zero is 0x220d (little-endian pairs).
+        let data = [0x00u8, 0x01, 0xf2, 0x03, 0xf4, 0xf5, 0xf6, 0xf7];
+        let sum = checksum(&data);
+        // Independent computation: big-endian words, folded manually.
+        let mut acc: u32 = 0x0001 + 0xf203 + 0xf4f5 + 0xf6f7;
+        assert_eq!(sum, 0x220D, "the RFC 1071 worked example");
+        while acc >> 16 != 0 {
+            acc = (acc & 0xffff) + (acc >> 16);
+        }
+        assert_eq!(sum, !(acc as u16));
     }
 }
