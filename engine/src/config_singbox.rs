@@ -208,10 +208,22 @@ pub fn load(text: &str) -> Result<EngineConfig> {
                 udp: true,
                 kind: OutboundKind::Direct,
             }),
-            "block" | "dns" => outbounds.push(OutboundConfig {
+            "block" => outbounds.push(OutboundConfig {
                 name: tag.clone(),
                 udp: false,
                 kind: OutboundKind::Reject,
+            }),
+            // sing-box's dns outbound is an internal DNS server (upstream
+            // protocol/dns: "no outbound connections, all requests are
+            // handled internally") — the engine's Dns kind answers TCP
+            // length-framed queries and UDP datagrams via the resolver.
+            // `udp: true` keeps the UDP arm reachable: the relay's UDP
+            // gate refuses outbounds with udp=false, which would
+            // blackhole hijacked UDP :53 (the common DNS transport).
+            "dns" => outbounds.push(OutboundConfig {
+                name: tag.clone(),
+                udp: true,
+                kind: OutboundKind::Dns,
             }),
             "socks" => outbounds.push(OutboundConfig {
                 name: tag.clone(),
@@ -2048,5 +2060,100 @@ mod tests {
         assert_eq!(tun.netmask, 30);
         assert_eq!(tun.mtu, 1500);
         assert_eq!(tun.dns_hijack.len(), 1);
+    }
+
+    /// A declared `{"type": "dns"}` outbound maps to the engine's Dns
+    /// kind (answered by the resolver), NOT Reject; `block` stays
+    /// Reject; arbitrary tags keep the Dns kind (upstream docs'
+    /// example tag is `dns-out`).
+    #[test]
+    fn dns_outbound_is_dns_kind_not_reject() {
+        let cfg = r#"
+{"inbounds": [{"type": "mixed", "listen_port": 1, "tag": "in"}],
+ "outbounds": [
+   {"type": "dns", "tag": "dns"},
+   {"type": "block", "tag": "block"},
+   {"type": "dns", "tag": "dns-out"},
+   {"type": "direct", "tag": "direct"}]}
+"#;
+        let parsed = load(cfg).unwrap();
+        let dns = parsed.outbounds.iter().find(|o| o.name == "dns").unwrap();
+        assert!(matches!(dns.kind, OutboundKind::Dns), "declared dns must be Dns");
+        assert!(dns.udp, "dns outbound must allow UDP (hijacked UDP :53)");
+        let block = parsed.outbounds.iter().find(|o| o.name == "block").unwrap();
+        assert!(matches!(block.kind, OutboundKind::Reject));
+        assert!(!block.udp);
+        let custom = parsed.outbounds.iter().find(|o| o.name == "dns-out").unwrap();
+        assert!(matches!(custom.kind, OutboundKind::Dns));
+    }
+
+    /// An UNDECLARED `dns` tag still works: the loader appends the
+    /// builtin entry, and it must be Dns too — the router's hijack-dns
+    /// action routes to the literal "dns" tag through the registry.
+    #[test]
+    fn undeclared_dns_builtin_is_dns_kind() {
+        let cfg = r#"
+{"inbounds": [{"type": "mixed", "listen_port": 1, "tag": "in"}],
+ "outbounds": [{"type": "direct", "tag": "direct"}],
+ "route": {"rules": [{"port": 53, "action": "hijack-dns"}], "final": "direct"}}
+"#;
+        let parsed = load(cfg).unwrap();
+        let dns = parsed.outbounds.iter().find(|o| o.name == "dns").unwrap();
+        assert!(matches!(dns.kind, OutboundKind::Dns));
+        assert!(dns.udp);
+    }
+
+    /// End-to-end through the engine with a LOADER-produced config:
+    /// a hijack-dns action rule + the dns outbound answers a DNS
+    /// query from the registry's "dns" outbound channel (fake-ip
+    /// pool — hermetic, the TEST-NET upstream is never contacted).
+    /// Before the loader fix this config produced a Reject-kind
+    /// "dns" outbound: `udp()` errors and DNS is blackholed.
+    #[tokio::test]
+    async fn loader_hijack_dns_config_answers_through_dns_outbound() {
+        let cfg = load(
+            r#"
+{"inbounds": [{"type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": 2080}],
+ "outbounds": [{"type": "direct", "tag": "direct"}, {"type": "dns", "tag": "dns"}],
+ "route": {"rules": [{"port": 53, "action": "hijack-dns"}], "final": "direct"},
+ "dns": {"servers": [{"tag": "local", "address": "udp://192.0.2.53"}],
+         "fakeip": {"enabled": true, "inet4_range": "198.18.0.0/15"}}}
+"#,
+        )
+        .unwrap();
+
+        // Config level: the loaded outbounds carry a Dns-kind "dns", and
+        // the hijack-dns action rides the converted rule's index.
+        let dns = cfg.outbounds.iter().find(|o| o.name == "dns").unwrap();
+        assert!(matches!(dns.kind, OutboundKind::Dns));
+        assert_eq!(
+            cfg.rule_actions.get(&0),
+            Some(&crate::rule::RuleAction::HijackDns)
+        );
+        assert_eq!(cfg.rules[0], "DST-PORT,53,direct");
+        let table = cfg.compile_rules().unwrap();
+        assert_eq!(table.rules()[0].outbound, "direct");
+        assert!(matches!(
+            table.action(0),
+            Some(crate::rule::RuleAction::HijackDns)
+        ));
+
+        // Engine level: the registry resolves the "dns" tag and the
+        // outbound's UDP channel answers the datagram via the resolver.
+        let engine = crate::app::Engine::build(cfg).unwrap();
+        let outbound = engine.registry().resolve("dns").await.unwrap();
+        assert_eq!(outbound.kind_name(), "Dns");
+        assert!(!outbound.is_reject());
+        assert!(outbound.udp);
+        let target = crate::addr::NetAddr::ip("8.8.8.8".parse().unwrap(), 53);
+        let mut channel = outbound.udp(&target).await.expect("dns outbound UDP channel");
+        let query = crate::dns::wire::build_query(9, "probe.test", crate::dns::wire::TYPE_A);
+        channel.send(&target, &query).await.unwrap();
+        let answered =
+            tokio::time::timeout(std::time::Duration::from_secs(5), channel.recv()).await;
+        let (_, data) = answered.expect("answer within 5s").unwrap();
+        let msg = crate::dns::wire::parse(&data).unwrap();
+        assert_eq!(msg.id, 9);
+        assert_eq!(msg.answers.len(), 1, "fake-ip engine answers");
     }
 }
