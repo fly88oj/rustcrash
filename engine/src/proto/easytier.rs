@@ -182,13 +182,42 @@
 //!   listener serves the upgrade (101 + computed accept) behind a
 //!   process-global self-signed `wss` cert ([`connect_ws_tunnel`],
 //!   [`WsVtListener`]).
-//! * **wg — assessed, NOT ported** — WireGuard-as-transport drags
-//!   boringtun's whole `Tunn` endpoint state machine as the tunnel
-//!   (shared digest-derived static keys, synthetic IPv4 headers, the
-//!   update_timers routine); the engine's hand-rolled Noise_IKpsk2
-//!   layer in `proto/wireguard.rs` exists but is woven into its
-//!   netstack client behind module-private seams. The precise recipe
-//!   is mapped in [`NOT_PORTED`].
+//!
+//! # Fifth milestone — LANDED (the WireGuard transport)
+//!
+//! M5 (sources cached under `/tmp/wave15-upstream/`, the v2.6.4 tag)
+//! adds the last direct transport, `wg://` — WireGuard-as-transport
+//! (`tunnel/wireguard.rs`):
+//!
+//! * **Keys** — the SHARED static keypair: every node of a network
+//!   derives the same X25519 pair from
+//!   `generate_digest_from_str(network_name, network_secret)` and
+//!   configures `peer_public == my_public`, so the Noise ss step is
+//!   X25519(sk, sk·G) = sk²·G on both ends — deterministic, no exchange
+//!   ([`wg_static_keys`], upstream `WgConfig::new_from_network_identity`,
+//!   wireguard.rs:62-79).
+//! * **The pump** — [`WgEtPump`], the boringtun `Tunn` equivalent over
+//!   the engine's own Noise_IKpsk2 machinery (proto/wireguard.rs,
+//!   reached through its additive `et_pump` facade): encapsulate/decaps
+//!   -ulate/update_timers with boringtun's exact timers (5s handshake
+//!   retry, 90s attempt budget, 120s initiator rekey, 180s session
+//!   death, 10s keepalive, 540s hard expiry), the responder's TAI64N
+//!   replay guard and its my-static-equals-peer-static check, the
+//!   pre-session queue, cookie-reply consumption, and a session ring
+//!   for in-flight packets across a rekey.
+//! * **Framing** — one `[PMH][payload]` datagram per WG IP packet with
+//!   a 20-byte synthetic IPv4 header (total length = 20 + datagram,
+//!   TTL 64, all else zero; [`wg_ip_packet`]/[`wg_strip_ip_header`]) —
+//!   the same datagram contract as the UDP transport, so the wg tunnel
+//!   reuses [`UdpVtStream`] verbatim.
+//! * **Connector/listener** — the handshake-initiation-first dial
+//!   ([`connect_wg_tunnel`]) and the per-address peer-table listener
+//!   with the 250ms routine tick and the 61s idle sweep
+//!   ([`WgVtListener`]).
+//!
+//! The engine's wg transport is thus wire-compatible with the real
+//! core's boringtun — verified by the ignored real-binary interop test
+//! (`real_easytier_binary_serving_wg`).
 //!
 //! # Remaining milestones
 //!
@@ -197,8 +226,8 @@
 //! 2. Multi-hop OSPF (SPF over `graph_algo.rs`) — the node table and
 //!    forwarding are multi-peer now, but adjacency is still the
 //!    direct-neighbor bitmap.
-//! 3. The `wg://` transport and the hole-punch connector paths (see
-//!    [`NOT_PORTED`]).
+//! 3. IPv6 overlay addressing (see the M5 verdict in [`NOT_PORTED`])
+//!    and the hole-punch connector paths.
 //!
 //! # Config surface
 //!
@@ -232,6 +261,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify};
 
 use crate::error::{Error, Result};
+use crate::proto::wireguard::{et_pump, parse_wg_msg, WgMsg};
 use crate::stream::BoxProxyStream;
 
 /// `defaultListener` (toml.go:10).
@@ -3165,6 +3195,868 @@ impl WsVtListener {
 }
 
 // ---------------------------------------------------------------------------
+// The wg:// peer transport (M5, easytier-core/src/tunnel/wireguard.rs @
+// v2.6.4, cached at /tmp/wave15-upstream/wireguard.rs)
+// ---------------------------------------------------------------------------
+//
+// WireGuard-as-transport. Upstream drives cloudflare/boringtun's `Tunn`
+// as a datagram pump per peer; this port drives the engine's own
+// Noise_IKpsk2 machinery (proto/wireguard.rs, exposed through its
+// additive `et_pump` facade) through the same shape:
+//
+// * **Keys** — `WgConfig::new_from_network_identity`
+//   (wireguard.rs:62-79): `my_secret = generate_digest_from_str(name,
+//   secret)` and `peer_secret = my_secret`, `peer_public = my_public`.
+//   EVERY node of a network runs the SAME static keypair, so the Noise
+//   `ss` step is X25519(my_priv, my_pub) = sk²·G on both ends —
+//   deterministic, no exchange. Nothing in the handshake rejects a peer
+//   whose static equals ours: the initiator seals its static under
+//   es = DH(e_i, peer_pub) and the responder verifies it equals the
+//   configured `peer_static_public` (boringtun handshake.rs:527-532) —
+//   with the shared pair that check is self-consistent by construction.
+// * **Framing** (`InternalUse`, wireguard.rs:131-179 + 318-335) — one
+//   peer frame per WG IP packet: `[20-byte synthetic IPv4 header (0x45,
+//   total len = 20 + PMH + payload, TTL 64, everything else zero)]
+//   [PeerManagerHeader][payload]`, sealed as an ordinary WG transport
+//   datagram. Receive trims AEAD padding by the IPv4 total length, then
+//   strips the synthetic header (20B v4 / 40B v6) before the
+//   `[PMH][payload]` datagram enters the session machinery — the exact
+//   datagram contract of [`UdpVtStream`], so the wg pump reuses it.
+// * **Connector** (`connect_with_socket`, wireguard.rs:626-691) — the
+//   handshake-initiation-first dial: send an initiation, wait for the
+//   first datagram (the response), and only then start the tunnel
+//   tasks. A cookie reply is consumed and the initiation retried with
+//   MAC2 immediately (the engine wg client's `initiate(force)` mirror).
+// * **Listener** (`handle_udp_incoming`, wireguard.rs:489-551) — one
+//   socket, a peer table keyed by remote address (every first datagram
+//   creates a peer and yields a tunnel to accept), a 1s sweep dropping
+//   peers silent > 61s.
+// * **Routine** (`routine_task` + `handle_routine_tun_result`,
+//   wireguard.rs:261-316) — a 250ms tick of boringtun's `update_timers`
+//   (noise/timers.rs:168+, values identical to the engine's
+//   wireguard.rs): retry the initiation every REKEY_TIMEOUT (5s), give
+//   it up after REKEY_ATTEMPT_TIME (90s) and start over, rekey the
+//   session at REKEY_AFTER_TIME (120s, initiator side only), keepalive
+//   after KEEPALIVE_TIMEOUT (10s) of transmit silence, drop everything
+//   at REJECT_AFTER_TIME * 3 (540s).
+//
+// DELTA vs upstream: the responder never answers initiations with
+// cookie replies under load (boringtun's rate limiter trips at 64/s;
+// a two-node mesh never gets there), and crossed simultaneous
+// initiations converge through the retry timers (boringtun keeps two
+// handshakes in flight — `Handshake::previous` — where this port keeps
+// one; both recover the same way).
+
+/// `MAX_PACKET` (tunnel/wireguard.rs:40): the WG packet budget.
+pub const WG_MAX_PACKET: usize = 2048;
+/// The routine tick (`sleep(Duration::from_millis(250))`,
+/// tunnel/wireguard.rs:300-305).
+const WG_TICK: Duration = Duration::from_millis(250);
+/// The listener's idle-peer cutoff (`elapsed().as_secs() < 61`,
+/// tunnel/wireguard.rs:500-502).
+const WG_PEER_IDLE: Duration = Duration::from_secs(61);
+/// boringtun `REKEY_TIMEOUT` (noise/timers.rs:22) — handshake retry.
+const WG_REKEY_TIMEOUT: Duration = Duration::from_secs(5);
+/// boringtun `REKEY_AFTER_TIME` (noise/timers.rs:19) — initiator rekey.
+const WG_REKEY_AFTER_TIME: Duration = Duration::from_secs(120);
+/// boringtun `REJECT_AFTER_TIME` (noise/timers.rs:20) — a session this
+/// old may not receive anymore.
+const WG_REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
+/// boringtun `REKEY_ATTEMPT_TIME` (noise/timers.rs:21) — the overall
+/// handshake attempt budget before the connection expires and a fresh
+/// handshake starts over.
+const WG_REKEY_ATTEMPT_TIME: Duration = Duration::from_secs(90);
+/// boringtun `KEEPALIVE_TIMEOUT` (noise/timers.rs:23).
+const WG_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a superseded session still decrypts in-flight packets
+/// (boringtun keeps `N_SESSIONS = 8` sessions alive; the whitepaper's
+/// grace is 3 * REKEY_TIMEOUT — 15s is the in-flight window that
+/// matters, entries also die at REJECT_AFTER_TIME).
+const WG_OLD_SESSION_GRACE: Duration = Duration::from_secs(15);
+/// The packets `encapsulate` queues while no session exists (boringtun
+/// `queue_packet`; upstream has no bound but the M1 ping loop keeps it
+/// near-empty).
+const WG_QUEUED_PACKETS: usize = 256;
+
+/// The shared static keypair of the network (`new_from_network_identity`
+/// over the same `generate_digest_from_str` as the handshake digest —
+/// config/mod.rs:207-218).
+fn wg_static_keys(network_name: &str, network_secret: &str) -> et_pump::EtStatic {
+    et_pump::static_from_secret(network_secret_digest(network_name, network_secret))
+}
+
+/// The synthetic IPv4 header of one outgoing WG IP packet
+/// (`fill_ip_header`, tunnel/wireguard.rs:318-331): version 0x45, total
+/// length = 20 + datagram, TTL 64, everything else zero (protocol 0 —
+/// nothing parses past the total length).
+fn wg_ip_packet(datagram: &[u8]) -> Vec<u8> {
+    let total = (datagram.len() + 20) as u16;
+    let mut pkt = Vec::with_capacity(datagram.len() + 20);
+    pkt.push(0x45);
+    pkt.push(0);
+    pkt.extend_from_slice(&total.to_be_bytes());
+    pkt.extend_from_slice(&0u16.to_be_bytes());
+    pkt.extend_from_slice(&0u16.to_be_bytes());
+    pkt.push(64);
+    pkt.push(0);
+    pkt.extend_from_slice(&0u16.to_be_bytes());
+    pkt.extend_from_slice(&0u32.to_be_bytes());
+    pkt.extend_from_slice(&0u32.to_be_bytes());
+    pkt.extend_from_slice(datagram);
+    pkt
+}
+
+/// Strip the synthetic IP header off one decrypted inner packet
+/// (`remove_ip_header`, tunnel/wireguard.rs:333-335): 20 bytes for a
+/// v4 packet (the only form this port sends), 40 for v6.
+fn wg_strip_ip_header(ip_packet: &[u8]) -> &[u8] {
+    if ip_packet.first().is_some_and(|b| b >> 4 == 6) {
+        &ip_packet[40.min(ip_packet.len())..]
+    } else {
+        &ip_packet[20.min(ip_packet.len())..]
+    }
+}
+
+/// One established transport session plus its boringtun bookkeeping.
+struct WgEtSession {
+    session: et_pump::EtSession,
+    established: Instant,
+    /// We initiated this handshake (only the initiator rekeys — boringtun
+    /// timers.rs:237-247).
+    initiator: bool,
+}
+
+/// The per-peer `boringtun::noise::Tunn` equivalent: one static pair
+/// (the shared digest keys), at most one outbound handshake in flight,
+/// the session ring and the pre-session queue. All methods are
+/// synchronous and non-blocking — callers serialize through a mutex and
+/// do the UDP I/O on the returned vectors.
+struct WgEtPump {
+    statics: et_pump::EtStatic,
+    peer_pk: [u8; 32],
+    /// The outbound initiation awaiting its response.
+    pending: Option<et_pump::EtPending>,
+    last_initiation: Option<Instant>,
+    /// When the current attempt window started (the 90s budget).
+    handshake_started: Option<Instant>,
+    cookie: Option<([u8; 16], Instant)>,
+    /// Sessions newest-last; the last one is the send session. boringtun
+    /// keeps a ring of `N_SESSIONS = 8` keyed by receiver index.
+    sessions: VecDeque<WgEtSession>,
+    /// Inner IP packets queued while no session exists (boringtun
+    /// `queue_packet`, mod.rs `encapsulate`).
+    queue: VecDeque<Vec<u8>>,
+    /// The responder's replay guard: the strictly-greatest TAI64N
+    /// accepted (boringtun handshake.rs:543-547).
+    last_peer_timestamp: Option<[u8; 12]>,
+    last_tx: Instant,
+    last_rx: Instant,
+    /// Whether this pump ever initiated (the connector re-initiates on
+    /// expiry; a pure listener peer waits — easytier's routine only
+    /// formats a fresh initiation after `ConnectionExpired`).
+    ever_initiated: bool,
+}
+
+/// What one pump step wants the socket to do.
+struct WgEtOut {
+    to_network: Vec<Vec<u8>>,
+    /// `[PMH][payload]` datagrams for the session machinery.
+    to_tunnel: Vec<Vec<u8>>,
+}
+
+impl WgEtPump {
+    fn new(network_name: &str, network_secret: &str) -> Self {
+        let statics = wg_static_keys(network_name, network_secret);
+        // `peer_public = my_public` — the shared pair
+        // (new_from_network_identity, wireguard.rs:69).
+        let peer_pk = statics.public();
+        WgEtPump {
+            statics,
+            peer_pk,
+            pending: None,
+            last_initiation: None,
+            handshake_started: None,
+            cookie: None,
+            sessions: VecDeque::new(),
+            queue: VecDeque::new(),
+            last_peer_timestamp: None,
+            last_tx: Instant::now(),
+            last_rx: Instant::now(),
+            ever_initiated: false,
+        }
+    }
+
+    /// A live send session exists.
+    fn has_session(&self) -> bool {
+        !self.sessions.is_empty()
+    }
+
+    /// Start (or restart) an outbound handshake: a fresh initiation with
+    /// a fresh ephemeral and TAI64N, MAC2 keyed with the learned cookie
+    /// when one is live (`format_handshake_initiation`).
+    fn start_handshake(&mut self) -> Option<Vec<u8>> {
+        if self.handshake_started.is_none() {
+            self.handshake_started = Some(Instant::now());
+        }
+        self.ever_initiated = true;
+        let cookie = self
+            .cookie
+            .filter(|(_, at)| at.elapsed() < WG_REJECT_AFTER_TIME)
+            .map(|(c, _)| c);
+        let index = rand::random();
+        match et_pump::build_initiation(&self.statics, &self.peer_pk, cookie, index) {
+            Ok((msg, pending)) => {
+                self.pending = Some(pending);
+                self.last_initiation = Some(Instant::now());
+                Some(msg)
+            }
+            Err(e) => {
+                tracing::debug!(target: "engine", "easytier wg: cannot build initiation: {e}");
+                None
+            }
+        }
+    }
+
+    /// Install a finished handshake as the send session, keeping the
+    /// superseded one receive-alive for the grace window.
+    fn push_session(&mut self, session: et_pump::EtSession, initiator: bool) {
+        let now = Instant::now();
+        self.sessions
+            .retain(|s| now.duration_since(s.established) < WG_OLD_SESSION_GRACE);
+        self.sessions.push_back(WgEtSession {
+            session,
+            established: now,
+            initiator,
+        });
+        while self.sessions.len() > 8 {
+            self.sessions.pop_front();
+        }
+        self.pending = None;
+        self.handshake_started = None;
+    }
+
+    /// Seal one inner IP packet, or queue it and kick a handshake
+    /// (`Tunn::encapsulate`, boringtun mod.rs — no session: queue +
+    /// initiate). Returns the datagrams to send.
+    fn encapsulate(&mut self, inner_ip: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        if inner_ip.len() + 20 > WG_MAX_PACKET {
+            // boringtun `WireGuardError::LargePacket`; upstream logs and
+            // carries on.
+            tracing::debug!(
+                target: "engine",
+                "easytier wg: dropping {}-byte packet (max {})",
+                inner_ip.len() + 20,
+                WG_MAX_PACKET
+            );
+            return out;
+        }
+        if let Some(sess) = self.sessions.back_mut() {
+            match sess.session.seal(inner_ip) {
+                Ok(msg) => {
+                    self.last_tx = Instant::now();
+                    out.push(msg);
+                }
+                Err(e) => {
+                    tracing::debug!(target: "engine", "easytier wg: seal failed: {e}");
+                }
+            }
+            return out;
+        }
+        if self.queue.len() < WG_QUEUED_PACKETS {
+            self.queue.push_back(inner_ip.to_vec());
+        }
+        if self.pending.is_none() {
+            out.extend(self.start_handshake());
+        }
+        out
+    }
+
+    /// Feed one UDP datagram from the peer (`Tunn::decapsulate`):
+    /// handshakes advance, transport packets decrypt into inner IP
+    /// packets. Returns what to send / deliver.
+    fn decapsulate(&mut self, datagram: &[u8]) -> WgEtOut {
+        let mut out = WgEtOut {
+            to_network: Vec::new(),
+            to_tunnel: Vec::new(),
+        };
+        self.last_rx = Instant::now();
+        let Some(msg) = parse_wg_msg(datagram) else {
+            return out; // boringtun drops malformed datagrams silently
+        };
+        match msg {
+            WgMsg::Initiation { .. } => {
+                // Responder role. boringtun verifies MAC1 (inside
+                // `open_initiation`), unseals the static and REQUIRES it
+                // to equal the configured peer key (handshake.rs:527-532)
+                // — with the shared digest pair, our own public.
+                let opened = match et_pump::open_initiation(&self.statics, &msg) {
+                    Ok(opened) => opened,
+                    Err(e) => {
+                        tracing::debug!(target: "engine", "easytier wg: initiation rejected: {e}");
+                        return out;
+                    }
+                };
+                if opened.initiator_static() != self.peer_pk {
+                    tracing::debug!(target: "engine", "easytier wg: initiation from wrong key");
+                    return out;
+                }
+                let timestamp = opened.timestamp();
+                if self
+                    .last_peer_timestamp
+                    .is_some_and(|last| timestamp <= last)
+                {
+                    // Possibly a replay — boringtun WrongTai64nTimestamp.
+                    return out;
+                }
+                self.last_peer_timestamp = Some(timestamp);
+                match et_pump::respond_initiation(opened, rand::random()) {
+                    Ok((resp, done)) => {
+                        // The responder sends with the initiator's
+                        // receive key and vice versa.
+                        let session = et_pump::EtSession::from_responder(
+                            done.local_index,
+                            done.peer_index,
+                            done.send_key,
+                            done.recv_key,
+                        );
+                        self.push_session(session, false);
+                        out.to_network.push(resp);
+                    }
+                    Err(e) => {
+                        tracing::debug!(target: "engine", "easytier wg: respond failed: {e}")
+                    }
+                }
+            }
+            WgMsg::Response { .. } => {
+                // Initiator role: consume against the pending initiation
+                // (a stale response for a dropped handshake is ignored —
+                // `receiver` must match our index).
+                let Some(mut pending) = self.pending.take() else {
+                    return out;
+                };
+                match et_pump::consume_response(&self.statics, &mut pending, &msg) {
+                    Ok(done) => {
+                        let session = et_pump::EtSession::from_initiator(done);
+                        self.push_session(session, true);
+                        // Confirmation + everything queued while the
+                        // handshake was in flight (boringtun flushes the
+                        // queue on `set_finished`; the empty packet is
+                        // the key confirmation the responder waits for).
+                        let queued: Vec<Vec<u8>> = self.queue.drain(..).collect();
+                        for inner in queued {
+                            out.to_network.extend(self.encapsulate(&inner));
+                        }
+                        if let Some(sess) = self.sessions.back_mut() {
+                            if let Ok(keepalive) = sess.session.seal(&[]) {
+                                self.last_tx = Instant::now();
+                                out.to_network.push(keepalive);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Put the initiation back and wait for the retry
+                        // timer (boringtun keeps it until REKEY_TIMEOUT).
+                        self.pending = Some(pending);
+                        tracing::debug!(target: "engine", "easytier wg: response rejected: {e}");
+                    }
+                }
+            }
+            WgMsg::Cookie { .. } => {
+                // Under-load reply: learn the cookie and retry the
+                // initiation with MAC2 right away (the engine wg client's
+                // `initiate(socket, true)` mirror).
+                if let Some(pending) = &self.pending {
+                    if let Ok(cookie) =
+                        et_pump::consume_cookie_reply(&self.peer_pk, pending, &msg)
+                    {
+                        self.cookie = Some((cookie, Instant::now()));
+                        self.pending = None;
+                        out.to_network.extend(self.start_handshake());
+                    }
+                }
+            }
+            WgMsg::Transport { receiver, counter, data } => {
+                // Find the session by receiver index (boringtun's
+                // N_SESSIONS ring); tag first, replay window after.
+                let now = Instant::now();
+                self.sessions
+                    .retain(|s| now.duration_since(s.established) < WG_REJECT_AFTER_TIME);
+                for sess in self.sessions.iter_mut() {
+                    if sess.session.local_index() != receiver {
+                        continue;
+                    }
+                    match sess.session.open(counter, &data) {
+                        Ok(mut inner) => {
+                            if inner.is_empty() {
+                                return out; // keepalive
+                            }
+                            et_pump::trim_ip_packet(&mut inner);
+                            if inner.len() >= 20 {
+                                let datagram = wg_strip_ip_header(&inner).to_vec();
+                                if !datagram.is_empty() {
+                                    out.to_tunnel.push(datagram);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(target: "engine", "easytier wg: transport open: {e}");
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// The 250ms routine tick (`update_timers`, boringtun timers.rs:
+    /// 168-299, driven by easytier's `routine_task`).
+    fn update_timers(&mut self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let now = Instant::now();
+        if let Some(started) = self.handshake_started {
+            // An outbound handshake is in flight.
+            if now.duration_since(started) >= WG_REKEY_ATTEMPT_TIME {
+                // CONNECTION_EXPIRED(REKEY_ATTEMPT_TIME): the retries
+                // give up, the queue is cleared, and easytier's routine
+                // formats a FRESH initiation (wireguard.rs:280-291).
+                self.pending = None;
+                self.queue.clear();
+                self.handshake_started = None;
+                return out;
+            }
+            if self
+                .last_initiation
+                .is_some_and(|at| now.duration_since(at) >= WG_REKEY_TIMEOUT)
+            {
+                // HANDSHAKE(REKEY_TIMEOUT): retransmit with a fresh
+                // ephemeral and timestamp.
+                self.pending = None;
+                out.extend(self.start_handshake());
+            }
+            return out;
+        }
+        // No handshake in flight.
+        self.sessions
+            .retain(|s| now.duration_since(s.established) < WG_REJECT_AFTER_TIME * 3);
+        if self.sessions.is_empty() {
+            // Either data is queued with no session (boringtun's
+            // encapsulate triggers a handshake) or the connection
+            // expired out from under a dial — easytier's routine
+            // formats a FRESH initiation on ConnectionExpired
+            // (wireguard.rs:280-291). A pure listener peer (never
+            // initiated, nothing queued) waits for the peer instead.
+            if !self.queue.is_empty() || self.ever_initiated {
+                out.extend(self.start_handshake());
+            }
+            return out;
+        }
+        let established = self.sessions.back().unwrap().established;
+        let initiator = self.sessions.back().unwrap().initiator;
+        // HANDSHAKE(REKEY_AFTER_TIME): the ORIGINAL initiator rekeys
+        // under a live session (the responder does not).
+        if initiator && now.duration_since(established) >= WG_REKEY_AFTER_TIME {
+            out.extend(self.start_handshake());
+            return out;
+        }
+        // KEEPALIVE(KEEPALIVE_TIMEOUT): we received since our last send
+        // but have been transmit-silent.
+        if self.last_rx > self.last_tx && now.duration_since(self.last_tx) >= WG_KEEPALIVE_TIMEOUT
+        {
+            if let Some(sess) = self.sessions.back_mut() {
+                if let Ok(keepalive) = sess.session.seal(&[]) {
+                    self.last_tx = Instant::now();
+                    out.push(keepalive);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The sender task (`handle_packet_from_me` — the ring side of
+/// upstream's stream pair): each complete `[PMH][payload]` datagram the
+/// session machinery writes becomes one WG IP packet; with no session
+/// the packet queues and a handshake starts.
+async fn run_wg_sender(
+    socket: Arc<tokio::net::UdpSocket>,
+    dst: SocketAddr,
+    pump: Arc<StdMutex<WgEtPump>>,
+    half: Arc<StdMutex<UdpVtHalf>>,
+    wake: Arc<Notify>,
+) {
+    loop {
+        wake.notified().await;
+        loop {
+            let next = {
+                let mut guard = half.lock().unwrap_or_else(|e| e.into_inner());
+                guard.tx_queue.pop_front()
+            };
+            let Some(datagram) = next else { break };
+            if let Some(w) = half
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .write_waker
+                .take()
+            {
+                w.wake();
+            }
+            let to_network = {
+                let mut pump = pump.lock().unwrap_or_else(|e| e.into_inner());
+                pump.encapsulate(&wg_ip_packet(&datagram))
+            };
+            for packet in to_network {
+                if socket.send_to(&packet, dst).await.is_err() {
+                    let mut guard = half.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.write_error = true;
+                    guard.read_closed = true;
+                    drop(guard);
+                    wake_udp_half(&half);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// The routine task (`routine_task`, wireguard.rs:310-316): tick
+/// `update_timers` every 250ms and send what it produces.
+async fn run_wg_routine(
+    socket: Arc<tokio::net::UdpSocket>,
+    dst: SocketAddr,
+    pump: Arc<StdMutex<WgEtPump>>,
+) {
+    loop {
+        tokio::time::sleep(WG_TICK).await;
+        let to_network = pump
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .update_timers();
+        for packet in to_network {
+            let _ = socket.send_to(&packet, dst).await;
+        }
+    }
+}
+
+/// The receiver task (the spawned `handle_one_packet_from_peer` loop of
+/// the connector, wireguard.rs:660-673).
+async fn run_wg_receiver(
+    socket: Arc<tokio::net::UdpSocket>,
+    dst: SocketAddr,
+    pump: Arc<StdMutex<WgEtPump>>,
+    half: Arc<StdMutex<UdpVtHalf>>,
+) {
+    let mut buf = vec![0u8; WG_MAX_PACKET + 128];
+    loop {
+        match socket.recv_from(&mut buf).await {
+            Ok((n, addr)) => {
+                // `Received packet from changed address` is a warning
+                // upstream (wireguard.rs:653-655); the peer table is
+                // address-keyed and never roams, so foreign datagrams
+                // are dropped.
+                if addr != dst {
+                    continue;
+                }
+                let out = pump.lock().unwrap_or_else(|e| e.into_inner()).decapsulate(&buf[..n]);
+                for packet in out.to_network {
+                    let _ = socket.send_to(&packet, dst).await;
+                }
+                if !out.to_tunnel.is_empty() {
+                    let mut guard = half.lock().unwrap_or_else(|e| e.into_inner());
+                    for datagram in out.to_tunnel {
+                        guard.push_datagram(&datagram);
+                    }
+                    drop(guard);
+                    wake_udp_half(&half);
+                }
+            }
+            Err(_) => {
+                let mut guard = half.lock().unwrap_or_else(|e| e.into_inner());
+                guard.read_closed = true;
+                drop(guard);
+                wake_udp_half(&half);
+                break;
+            }
+        }
+    }
+}
+
+/// The wg:// peer dial (`WgTunnelConnector::connect` →
+/// `connect_with_socket`, tunnel/wireguard.rs:626-691): an ephemeral
+/// socket, the handshake-initiation-first exchange — send an initiation,
+/// wait for the first datagram back (the response, or a cookie reply
+/// which retries immediately) — then the tunnel tasks around the same
+/// datagram half the UDP transport uses.
+pub async fn connect_wg_tunnel(
+    dst: SocketAddr,
+    network_name: &str,
+    network_secret: &str,
+) -> Result<UdpVtStream> {
+    let bind_addr: &str = if dst.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let socket = tokio::net::UdpSocket::bind(bind_addr)
+        .await
+        .map_err(|e| Error::network(format!("easytier: wg bind: {e}")))?;
+    let socket = Arc::new(socket);
+    let pump = Arc::new(StdMutex::new(WgEtPump::new(network_name, network_secret)));
+
+    // "do handshake here so we will return after receive first packet"
+    // (wireguard.rs:641-643).
+    let initiation = {
+        let mut pump = pump.lock().unwrap_or_else(|e| e.into_inner());
+        pump.start_handshake()
+    };
+    if let Some(initiation) = initiation {
+        socket
+            .send_to(&initiation, dst)
+            .await
+            .map_err(|e| Error::network(format!("easytier: wg send initiation: {e}")))?;
+    }
+    let mut buf = vec![0u8; WG_MAX_PACKET + 128];
+    let mut pending_tunnel: Vec<Vec<u8>> = Vec::new();
+    loop {
+        let (n, addr) = tokio::time::timeout(WG_HANDSHAKE_WAIT, socket.recv_from(&mut buf))
+            .await
+            .map_err(|_| Error::network("easytier: wg connect timeout (no handshake response)"))?
+            .map_err(|e| Error::network(format!("easytier: wg recv: {e}")))?;
+        if addr != dst {
+            continue;
+        }
+        let out = pump.lock().unwrap_or_else(|e| e.into_inner()).decapsulate(&buf[..n]);
+        for packet in out.to_network {
+            let _ = socket.send_to(&packet, dst).await;
+        }
+        pending_tunnel.extend(out.to_tunnel);
+        if pump
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .has_session()
+        {
+            break;
+        }
+        // A cookie reply already retried the initiation; keep waiting
+        // for the response within the outer budget.
+    }
+
+    let half = Arc::new(StdMutex::new(UdpVtHalf::new()));
+    let wake = Arc::new(Notify::new());
+    if !pending_tunnel.is_empty() {
+        let mut guard = half.lock().unwrap_or_else(|e| e.into_inner());
+        for datagram in pending_tunnel {
+            guard.push_datagram(&datagram);
+        }
+        drop(guard);
+        wake_udp_half(&half);
+    }
+    tokio::spawn(run_wg_receiver(socket.clone(), dst, pump.clone(), half.clone()));
+    tokio::spawn(run_wg_sender(
+        socket.clone(),
+        dst,
+        pump.clone(),
+        half.clone(),
+        wake.clone(),
+    ));
+    tokio::spawn(run_wg_routine(socket, dst, pump));
+    Ok(UdpVtStream {
+        half,
+        send_wake: wake,
+    })
+}
+
+/// How long the synchronous handshake exchange may take (the direct
+/// connector's 3s budget, connectivity/direct/mod.rs:64 — upstream waits
+/// unbounded; the dial wrapper enforces the same ceiling).
+const WG_HANDSHAKE_WAIT: Duration = Duration::from_secs(3);
+
+/// One listener peer-table entry (`WgPeer` + its tasks).
+struct WgListenerPeer {
+    pump: Arc<StdMutex<WgEtPump>>,
+    half: Arc<StdMutex<UdpVtHalf>>,
+    last_seen: Instant,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl WgListenerPeer {
+    fn shutdown(self) {
+        for task in self.tasks {
+            task.abort();
+        }
+        let mut guard = self.half.lock().unwrap_or_else(|e| e.into_inner());
+        guard.read_closed = true;
+        guard.write_error = true;
+        drop(guard);
+        wake_udp_half(&self.half);
+    }
+}
+
+/// The wg:// listener (`WgTunnelListener`, tunnel/wireguard.rs:455-591):
+/// one UDP socket; every first datagram from an address creates a peer
+/// (whose tunnel is yielded to `accept`), later datagrams feed that
+/// peer's pump; a sweep drops peers silent > 61s.
+pub struct WgVtListener {
+    local: SocketAddr,
+    accept_rx: mpsc::Receiver<UdpVtStream>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl WgVtListener {
+    /// `WgTunnelListener::listen` (wireguard.rs:556-578): bind, then the
+    /// `handle_udp_incoming` task.
+    pub async fn bind(
+        local: SocketAddr,
+        network_name: &str,
+        network_secret: &str,
+    ) -> Result<Self> {
+        let socket = tokio::net::UdpSocket::bind(local)
+            .await
+            .map_err(|e| Error::network(format!("easytier: wg listen {local}: {e}")))?;
+        let local = socket
+            .local_addr()
+            .map_err(|e| Error::network(format!("easytier: wg local addr: {e}")))?;
+        let socket = Arc::new(socket);
+        let (accept_tx, accept_rx) = mpsc::channel(16);
+        let task = tokio::spawn(run_wg_listener(
+            socket,
+            network_name.to_owned(),
+            network_secret.to_owned(),
+            accept_tx,
+        ));
+        Ok(WgVtListener {
+            local,
+            accept_rx,
+            task,
+        })
+    }
+
+    /// The bound address (port 0 resolves, `local_url`).
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local
+    }
+
+    /// `accept` (wireguard.rs:580-587): the next peer tunnel.
+    pub async fn accept(&mut self) -> Result<UdpVtStream> {
+        self.accept_rx
+            .recv()
+            .await
+            .ok_or_else(|| Error::network("easytier: wg listener closed"))
+    }
+}
+
+impl Drop for WgVtListener {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// The listener forward task (`handle_udp_incoming`,
+/// tunnel/wireguard.rs:489-551): the peer table + the 1s retain sweep
+/// (wireguard.rs:498-506).
+async fn run_wg_listener(
+    socket: Arc<tokio::net::UdpSocket>,
+    network_name: String,
+    network_secret: String,
+    accept_tx: mpsc::Sender<UdpVtStream>,
+) {
+    let peers: Arc<StdMutex<HashMap<SocketAddr, WgListenerPeer>>> =
+        Arc::new(StdMutex::new(HashMap::new()));
+    {
+        // The retain sweep: `access_time.elapsed() < 61s && !stopped`.
+        let peers = peers.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let mut guard = peers.lock().unwrap_or_else(|e| e.into_inner());
+                    let now_idle = |peer: &WgListenerPeer| peer.last_seen.elapsed() >= WG_PEER_IDLE;
+                let dead: Vec<SocketAddr> = guard
+                    .iter()
+                    .filter(|(_, peer)| now_idle(peer))
+                    .map(|(addr, _)| *addr)
+                    .collect();
+                for addr in dead {
+                    if let Some(peer) = guard.remove(&addr) {
+                        peer.shutdown();
+                    }
+                }
+            }
+        });
+    }
+    let mut buf = vec![0u8; WG_MAX_PACKET + 128];
+    loop {
+        let (n, addr) = match socket.recv_from(&mut buf).await {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        // "New peer: {}" — the first datagram creates the tunnel no
+        // matter its type; a transport packet for a session nobody has
+        // is then dropped by the pump (upstream behaves identically —
+        // the peer exists before decapsulate sees the packet).
+        {
+            let mut guard = peers.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.get_mut(&addr) {
+                Some(peer) => peer.last_seen = Instant::now(),
+                None => {
+                    let pump =
+                        Arc::new(StdMutex::new(WgEtPump::new(&network_name, &network_secret)));
+                    let half = Arc::new(StdMutex::new(UdpVtHalf::new()));
+                    let wake = Arc::new(Notify::new());
+                    // The connector spawns a dedicated receive task (it
+                    // owns its socket); the LISTENER's datagrams arrive
+                    // through this central loop, so a peer entry only
+                    // runs the sender + routine tasks.
+                    let tasks = vec![
+                        tokio::spawn(run_wg_sender(
+                            socket.clone(),
+                            addr,
+                            pump.clone(),
+                            half.clone(),
+                            wake.clone(),
+                        )),
+                        tokio::spawn(run_wg_routine(socket.clone(), addr, pump.clone())),
+                    ];
+                    guard.insert(
+                        addr,
+                        WgListenerPeer {
+                            pump,
+                            half: half.clone(),
+                            last_seen: Instant::now(),
+                            tasks,
+                        },
+                    );
+                    let stream = UdpVtStream {
+                        half,
+                        send_wake: wake,
+                    };
+                    let _ = accept_tx.try_send(stream);
+                }
+            }
+        }
+        let (out, half) = {
+            let mut guard = peers.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(peer) = guard.get_mut(&addr) else {
+                continue;
+            };
+            let out = peer
+                .pump
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .decapsulate(&buf[..n]);
+            (out, peer.half.clone())
+        };
+        for packet in out.to_network {
+            let _ = socket.send_to(&packet, addr).await;
+        }
+        if !out.to_tunnel.is_empty() {
+            let mut guard = half.lock().unwrap_or_else(|e| e.into_inner());
+            for datagram in out.to_tunnel {
+                guard.push_datagram(&datagram);
+            }
+            drop(guard);
+            wake_udp_half(&half);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Network identity (easytier-core/src/config/mod.rs:135-233)
 // ---------------------------------------------------------------------------
 
@@ -5357,17 +6249,19 @@ where
 
 /// The transport of one parsed peer URI (the `IpScheme` arms the peer
 /// connector dispatches on, connector/mod.rs:247-268: `Tcp`, `Udp`,
-/// `Quic`, `Wg`, `Ws | Wss`; `wg` stays unported — see NOT_PORTED).
+/// `Quic`, `Wg`, `Ws | Wss`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerTransport {
     Tcp,
     Udp,
     Quic,
+    Wg,
     Ws,
     Wss,
 }
 
-/// One parsed `tcp://`/`udp://`/`quic://`/`ws://`/`wss://` peer endpoint.
+/// One parsed `tcp://`/`udp://`/`quic://`/`wg://`/`ws://`/`wss://` peer
+/// endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerEndpoint {
     pub transport: PeerTransport,
@@ -5381,21 +6275,22 @@ pub const DEFAULT_PEER_PORT: u16 = 11010;
 
 /// The per-scheme default port (`IpScheme::default_port`, tunnel/mod.rs:334-342):
 /// `ws` 80, `wss` 443, everything else `11010 + port_offset` with the
-/// offsets `tcp` 0 / `udp` 0 / `quic` 2 / `ws` 1 / `wss` 2
+/// offsets `tcp` 0 / `udp` 0 / `wg` 1 / `quic` 2 / `ws` 1 / `wss` 2
 /// (tunnel/mod.rs:306-328 — only `ws`/`wss` special-case the well-known
 /// ports).
 pub fn transport_default_port(transport: PeerTransport) -> u16 {
     match transport {
         PeerTransport::Tcp | PeerTransport::Udp => DEFAULT_PEER_PORT,
+        PeerTransport::Wg => DEFAULT_PEER_PORT + 1,
         PeerTransport::Quic => DEFAULT_PEER_PORT + 2,
         PeerTransport::Ws => 80,
         PeerTransport::Wss => 443,
     }
 }
 
-/// Parse a peer URI down to transport + host + port. The TCP, UDP, QUIC
-/// and WebSocket schemes are live; anything else names the unported
-/// transports.
+/// Parse a peer URI down to transport + host + port. The TCP, UDP, QUIC,
+/// WireGuard and WebSocket schemes are live; anything else names the
+/// unported transports.
 pub fn parse_peer_endpoint(uri: &str) -> Result<PeerEndpoint> {
     let (transport, rest) = if let Some(rest) = uri.strip_prefix("tcp://") {
         (PeerTransport::Tcp, rest)
@@ -5403,6 +6298,8 @@ pub fn parse_peer_endpoint(uri: &str) -> Result<PeerEndpoint> {
         (PeerTransport::Udp, rest)
     } else if let Some(rest) = uri.strip_prefix("quic://") {
         (PeerTransport::Quic, rest)
+    } else if let Some(rest) = uri.strip_prefix("wg://") {
+        (PeerTransport::Wg, rest)
     } else if let Some(rest) = uri.strip_prefix("ws://") {
         (PeerTransport::Ws, rest)
     } else if let Some(rest) = uri.strip_prefix("wss://") {
@@ -5410,7 +6307,7 @@ pub fn parse_peer_endpoint(uri: &str) -> Result<PeerEndpoint> {
     } else {
         let scheme = uri.split("://").next().unwrap_or(uri);
         return Err(Error::config(format!(
-            "easytier: unsupported peer transport scheme {scheme:?} in {uri:?} (the wg transport is not ported yet)"
+            "easytier: unsupported peer transport scheme {scheme:?} in {uri:?} (the faketcp/hole-punch transports are not ported)"
         )));
     };
     let default_port = transport_default_port(transport);
@@ -5463,15 +6360,16 @@ async fn resolve_peer_addr(endpoint: &PeerEndpoint) -> Result<SocketAddr> {
     Ok(addr)
 }
 
-/// Dial one `tcp://`/`udp://`/`quic://`/`ws://` peer and run the
+/// Dial one `tcp://`/`udp://`/`quic://`/`wg://`/`ws://` peer and run the
 /// plain-mode client handshake — the `PeerManager::add_tunnel_as_client`
 /// path (peers/peer_manager.rs:1990-2021): TCP over `TcpStream::connect`,
 /// UDP over the datagram virtual circuit (`UdpTunnelConnector`, the
 /// connector's `IpScheme::Udp` arm, connector/mod.rs:248), QUIC over the
 /// plaintext quinn tunnel (`IpScheme::Quic`, connector/mod.rs:250-253),
-/// WS/WSS over the websocket tunnel (`IpScheme::Ws | Wss`,
-/// connector/mod.rs:264-267), all with the direct connector's 3s budget
-/// (connectivity/direct/mod.rs:64). DELTA:
+/// WG over the shared-keypair WireGuard tunnel (`IpScheme::Wg`,
+/// connector/mod.rs:254-262), WS/WSS over the websocket tunnel
+/// (`IpScheme::Ws | Wss`, connector/mod.rs:264-267), all with the direct
+/// connector's 3s budget (connectivity/direct/mod.rs:64). DELTA:
 /// after the channel is up, one explicit ping confirms liveness —
 /// upstream's `ensureStarted` equivalent — which also fails the dial
 /// fast when the peer rejects our identity right after its handshake
@@ -5539,6 +6437,16 @@ async fn dial_session(
             let stream = tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, connect_quic_tunnel(addr))
                 .await
                 .map_err(|_| Error::network("easytier: quic connect timeout"))??;
+            client_session(stream, my_peer_id, network_name, &digest, encryptor).await
+        }
+        PeerTransport::Wg => {
+            let addr = resolve_peer_addr(endpoint).await?;
+            let stream = tokio::time::timeout(
+                DIRECT_CONNECT_TIMEOUT,
+                connect_wg_tunnel(addr, network_name, network_secret),
+            )
+            .await
+            .map_err(|_| Error::network("easytier: wg connect timeout"))??;
             client_session(stream, my_peer_id, network_name, &digest, encryptor).await
         }
         PeerTransport::Ws | PeerTransport::Wss => {
@@ -5656,9 +6564,9 @@ pub const SECURE_MODE_NOT_PORTED: &str = concat!(
     "peer-public-key to run the plain (still AEAD-encrypted) mesh"
 );
 
-/// What is still missing after the QUIC + WebSocket transports landed
-/// (M4): the WireGuard transport and the mesh roles beyond the direct
-/// neighborhood. The message names the next milestones precisely.
+/// What is still missing after the WireGuard transport landed (M5):
+/// the mesh roles beyond the direct neighborhood. The message names
+/// the next milestones precisely.
 pub const NOT_PORTED: &str = concat!(
     "easytier: the direct TCP peer tunnel (M1: handshake + framing + ",
     "AEAD packet encryption + ping/pong), the route layer (M2: the ",
@@ -5666,33 +6574,33 @@ pub const NOT_PORTED: &str = concat!(
     "smoltcp userspace stack + connect_tcp/EasyTierUdp dials), the ",
     "M3 listener + UDP transport (serve(cfg) accepting tcp:// and udp:// ",
     "peers into the same node, the udp:// peer dial over the SYN/SACK ",
-    "datagram circuit), and the M4 QUIC + WebSocket transports (the ",
+    "datagram circuit), the M4 QUIC + WebSocket transports (the ",
     "quic:// peer dial and listener over the in-tree port of ",
     "quinn-plaintext — SeaHash-tagged plaintext QUIC, one bi-stream per ",
     "peer — and the ws:// wss:// peer dial and listener, one binary ",
-    "message per peer frame) are in-tree; NOT ported: the wg:// peer ",
-    "transport (WireGuard-as-transport: keys are ",
-    "generate_digest_from_str(network_name, network_secret) — one SHARED ",
-    "static keypair on every node of the network, my_public == ",
-    "peer_public — with boringtun `Tunn` per peer over one UDP socket ",
-    "(tunnel/wireguard.rs), InternalUse framing ",
-    "[20-byte synthetic IPv4 header (0x45, total len, TTL 64, zeros)] ",
-    "[PeerManagerHeader][payload] encapsulated as WireGuard IP packets, ",
-    "the connector's synchronous handshake-initiation-first connect ",
-    "(wireguard.rs:626-691) and the listener's per-remote-address peer ",
-    "table with the 250ms update_timers routine task (handshake retry, ",
-    "keepalive, expiry re-initiation, wireguard.rs:261-352); the engine ",
-    "has the Noise_IKpsk2 handshake + transport sessions in ",
-    "proto/wireguard.rs but woven into its netstack client behind ",
-    "module-private seams — porting wg means promoting/duplicating that ",
-    "crypto as a raw packet pump, deliberately not done), secure mode ",
+    "message per peer frame), and the M5 WireGuard transport (the wg:// ",
+    "peer dial and listener: the shared digest-derived static keypair ",
+    "with my_public == peer_public, boringtun-Tunn-equivalent ",
+    "encapsulate/decapsulate/update_timers over the engine's own ",
+    "Noise_IKpsk2 machinery, [20-byte synthetic IPv4 header][PMH]",
+    "[payload] framing, the connector's handshake-initiation-first ",
+    "connect and the listener's per-address peer table; DELTAs: no ",
+    "cookie replies under load, one in-flight handshake vs boringtun's ",
+    "two) are in-tree; NOT ported: secure mode ",
     "(see SECURE_MODE_NOT_PORTED), the relay path + foreign networks ",
     "(RouteForeignNetworkInfos), multi-hop OSPF convergence (graph_algo.rs ",
-    "SPF beyond the direct-neighbor adjacency), IPv6 overlay addressing, ",
-    "exit-node/proxy-network policy (proxy_networks are announced but not ",
-    "routed), MagicDNS serving (the resolver helpers are ported; the dns ",
-    "server is not), and the hole-punch/punch-client connector paths ",
-    "(the udp listener's STUN and loopback forwards, tunnel/udp.rs:182-241)"
+    "SPF beyond the direct-neighbor adjacency), IPv6 overlay addressing ",
+    "(RoutePeerInfo.ipv6_addr field 15, peer_rpc.proto, through the same ",
+    "SyncRouteInfo gossip + the v6 dhcp allocator + a dual-stack EtStack ",
+    "with v6 source selection — NOT ported because the adapter surface ",
+    "driving this module is IPv4-only end to end: mihomo's EasyTierOption ",
+    "carries no ipv6 field and ListRoute/ParseNodeIPv4 resolve v4 only; ",
+    "the wg/udp/tcp transports themselves are dual-stack already), ",
+    "exit-node/proxy-network policy (proxy_networks are ",
+    "announced but not routed), MagicDNS serving (the resolver helpers ",
+    "are ported; the dns server is not), and the hole-punch/punch-client ",
+    "connector paths (the udp listener's STUN and loopback forwards, ",
+    "tunnel/udp.rs:182-241)"
 );
 
 /// Bring the mesh up against the first `tcp://`/`udp://` peer and
@@ -5714,7 +6622,7 @@ pub async fn connect(config: &EasyTierConfig) -> Result<EasyTierNode> {
         .find(|p| parse_peer_endpoint(p.uri.trim()).is_ok())
         .ok_or_else(|| {
             Error::config(
-                "easytier: no tcp://, udp://, quic://, ws:// or wss:// peer to dial for the direct tunnel (the wg transport is not ported)",
+                "easytier: no tcp://, udp://, quic://, wg://, ws:// or wss:// peer to dial for the direct tunnel",
             )
         })?;
     let algorithm = config
@@ -7597,17 +8505,19 @@ enum BoundListener {
     Tcp(tokio::net::TcpListener),
     Udp(UdpVtListener),
     Quic(QuicVtListener),
+    Wg(WgVtListener),
     Ws(WsVtListener),
 }
 
 /// The inbound stream of one accepted peer: a TCP connection, an
-/// established UDP circuit, the bi-stream of one QUIC connection, or a
-/// upgraded WebSocket (`Box<dyn Tunnel>` upstream — the tunnel trait's
-/// stream side).
+/// established UDP circuit, the bi-stream of one QUIC connection, a
+/// WireGuard peer tunnel, or an upgraded WebSocket (`Box<dyn Tunnel>`
+/// upstream — the tunnel trait's stream side).
 pub enum InboundPeerStream {
     Tcp(tokio::net::TcpStream),
     Udp(UdpVtStream),
     Quic(EtQuicStream),
+    Wg(UdpVtStream),
     Ws(WsPeerStream),
 }
 
@@ -7621,6 +8531,7 @@ impl AsyncRead for InboundPeerStream {
             InboundPeerStream::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
             InboundPeerStream::Udp(stream) => Pin::new(stream).poll_read(cx, buf),
             InboundPeerStream::Quic(stream) => Pin::new(stream).poll_read(cx, buf),
+            InboundPeerStream::Wg(stream) => Pin::new(stream).poll_read(cx, buf),
             InboundPeerStream::Ws(stream) => Pin::new(stream).poll_read(cx, buf),
         }
     }
@@ -7636,6 +8547,7 @@ impl AsyncWrite for InboundPeerStream {
             InboundPeerStream::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
             InboundPeerStream::Udp(stream) => Pin::new(stream).poll_write(cx, buf),
             InboundPeerStream::Quic(stream) => Pin::new(stream).poll_write(cx, buf),
+            InboundPeerStream::Wg(stream) => Pin::new(stream).poll_write(cx, buf),
             InboundPeerStream::Ws(stream) => Pin::new(stream).poll_write(cx, buf),
         }
     }
@@ -7645,6 +8557,7 @@ impl AsyncWrite for InboundPeerStream {
             InboundPeerStream::Tcp(stream) => Pin::new(stream).poll_flush(cx),
             InboundPeerStream::Udp(stream) => Pin::new(stream).poll_flush(cx),
             InboundPeerStream::Quic(stream) => Pin::new(stream).poll_flush(cx),
+            InboundPeerStream::Wg(stream) => Pin::new(stream).poll_flush(cx),
             InboundPeerStream::Ws(stream) => Pin::new(stream).poll_flush(cx),
         }
     }
@@ -7654,6 +8567,7 @@ impl AsyncWrite for InboundPeerStream {
             InboundPeerStream::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
             InboundPeerStream::Udp(stream) => Pin::new(stream).poll_shutdown(cx),
             InboundPeerStream::Quic(stream) => Pin::new(stream).poll_shutdown(cx),
+            InboundPeerStream::Wg(stream) => Pin::new(stream).poll_shutdown(cx),
             InboundPeerStream::Ws(stream) => Pin::new(stream).poll_shutdown(cx),
         }
     }
@@ -7677,6 +8591,10 @@ impl BoundListener {
             BoundListener::Quic(listener) => {
                 let stream = listener.accept().await?;
                 Ok(InboundPeerStream::Quic(stream))
+            }
+            BoundListener::Wg(listener) => {
+                let stream = listener.accept().await?;
+                Ok(InboundPeerStream::Wg(stream))
             }
             BoundListener::Ws(listener) => {
                 let stream = listener.accept().await?;
@@ -7743,10 +8661,16 @@ impl EasyTierServer {
     }
 }
 
-/// `create_listener_by_url` (listeners.rs:26-59) over the four direct
-/// transports: parse the URI, bind it. Unhandled schemes name the
-/// unported transports.
-async fn bind_listener_uri(uri: &str) -> Result<BoundListener> {
+/// `create_listener_by_url` (listeners.rs:26-59) over the five direct
+/// transports: parse the URI, bind it (the `wg://` listener derives its
+/// keypair from the network identity — `WgConfig::
+/// new_from_network_identity`, listeners.rs:36-42). Unhandled schemes
+/// name the unported transports.
+async fn bind_listener_uri(
+    uri: &str,
+    network_name: &str,
+    network_secret: &str,
+) -> Result<BoundListener> {
     let endpoint = parse_peer_endpoint(uri)?;
     match endpoint.transport {
         PeerTransport::Tcp => {
@@ -7765,6 +8689,12 @@ async fn bind_listener_uri(uri: &str) -> Result<BoundListener> {
             let addr = resolve_peer_addr(&endpoint).await?;
             Ok(BoundListener::Quic(QuicVtListener::bind(addr)?))
         }
+        PeerTransport::Wg => {
+            let addr = resolve_peer_addr(&endpoint).await?;
+            Ok(BoundListener::Wg(
+                WgVtListener::bind(addr, network_name, network_secret).await?,
+            ))
+        }
         PeerTransport::Ws | PeerTransport::Wss => {
             Ok(BoundListener::Ws(WsVtListener::bind(&endpoint).await?))
         }
@@ -7779,6 +8709,7 @@ async fn listener_local_addr(listener: &mut BoundListener) -> Result<SocketAddr>
             .map_err(|e| Error::network(format!("easytier: tcp local addr: {e}"))),
         BoundListener::Udp(l) => Ok(l.local_addr()),
         BoundListener::Quic(l) => Ok(l.local_addr()),
+        BoundListener::Wg(l) => Ok(l.local_addr()),
         BoundListener::Ws(l) => Ok(l.local_addr()),
     }
 }
@@ -7817,7 +8748,8 @@ pub async fn serve(cfg: &EasyTierConfig) -> Result<EasyTierServer> {
     // the node starts (listeners.rs:258-277).
     let mut bound_listeners: Vec<BoundListener> = Vec::new();
     for uri in &listener_uris {
-        bound_listeners.push(bind_listener_uri(uri).await?);
+        bound_listeners
+            .push(bind_listener_uri(uri, &cfg.network_name, &cfg.network_secret).await?);
     }
     // The IPv6 dual-stack mirror (listeners.rs:145-161): an unspecified
     // v4 host additionally gets a `[::]` listener on the same port,
@@ -7826,7 +8758,9 @@ pub async fn serve(cfg: &EasyTierConfig) -> Result<EasyTierServer> {
     for uri in &listener_uris {
         if uri.starts_with("tcp://0.0.0.0:") {
             let v6 = uri.replacen("tcp://0.0.0.0:", "tcp://[::]:", 1);
-            if let Ok(listener) = bind_listener_uri(&v6).await {
+            if let Ok(listener) =
+                bind_listener_uri(&v6, &cfg.network_name, &cfg.network_secret).await
+            {
                 bound_listeners.push(listener);
             }
         }
@@ -8428,14 +9362,14 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("peers is required when listeners are empty"), "{err}");
-        // A wg peer names the not-yet-ported transport; the quic/ws
-        // transports dial now.
+        // An unsupported-scheme peer names the missing transports; the
+        // five direct transports (wg:// included) dial now.
         let cfg = EasyTierConfig {
-            peers: vec!["wg://192.0.2.10:11010".into()],
+            peers: vec!["faketcp://192.0.2.10:11010".into()],
             ..EasyTierConfig::new("et", "net")
         };
         let err = connect(&cfg).await.unwrap_err().to_string();
-        assert!(err.contains("no tcp://, udp://, quic://, ws:// or wss:// peer"), "{err}");
+        assert!(err.contains("no tcp://, udp://, quic://, wg://, ws:// or wss:// peer"), "{err}");
         // Secure mode is refused with the staged map.
         let cfg = EasyTierConfig {
             peers: vec!["tcp://192.0.2.10:11010".into()],
@@ -8788,8 +9722,17 @@ mod tests {
                 port: 11011
             }
         );
-        let err = parse_peer_endpoint("wg://192.0.2.10").unwrap_err().to_string();
-        assert!(err.contains("wg"), "{err}");
+        // wg:// parses with its own default port (11010 + offset 1).
+        assert_eq!(
+            parse_peer_endpoint("wg://192.0.2.10").unwrap(),
+            PeerEndpoint {
+                transport: PeerTransport::Wg,
+                host: "192.0.2.10".into(),
+                port: 11011
+            }
+        );
+        let err = parse_peer_endpoint("faketcp://192.0.2.10").unwrap_err().to_string();
+        assert!(err.contains("faketcp"), "{err}");
         assert!(parse_peer_endpoint("tcp://:11010").is_err());
         assert!(parse_peer_endpoint("tcp://host:notaport").is_err());
         assert!(parse_peer_endpoint("tcp://[::1:11010").is_err());
@@ -10627,13 +11570,14 @@ mod tests {
         };
         let err = serve(&cfg).await.unwrap_err().to_string();
         assert!(err.contains("PeerConnNoiseMsg1/2/3"), "{err}");
-        // An unhandled listener scheme names the missing transports.
+        // An unhandled listener scheme names the missing transports
+        // (wg:// binds now — its hermetic listener test is below).
         let cfg = EasyTierConfig {
-            listeners: vec!["wg://127.0.0.1:0".into()],
+            listeners: vec!["faketcp://127.0.0.1:0".into()],
             ..EasyTierConfig::new("et-m3-wg", "net")
         };
         let err = serve(&cfg).await.unwrap_err().to_string();
-        assert!(err.contains("wg"), "{err}");
+        assert!(err.contains("faketcp"), "{err}");
     }
 
     #[tokio::test]
@@ -11486,6 +12430,281 @@ mod tests {
             dhcp: false,
             hostname: Some("rustcrash-m4".to_owned()),
             ..EasyTierConfig::new("et-real-ws-listener", &network)
+        };
+        let server = serve(&cfg).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(25), server.wait_ready())
+            .await
+            .expect("the real node did not sync in time")
+            .unwrap();
+        assert_socks5_through_overlay(&cfg).await;
+        server.shutdown().await;
+    }
+
+    // ========================================================================
+    // M5: the WireGuard transport
+    // ========================================================================
+
+    #[test]
+    fn wg_synthetic_ip_header_roundtrip() {
+        // fill_ip_header (wireguard.rs:318-331): 0x45, big-endian total
+        // length = 20 + datagram, TTL 64, protocol/checksum/addresses zero.
+        let datagram = [7u8; 32];
+        let ip = wg_ip_packet(&datagram);
+        assert_eq!(ip.len(), 52);
+        assert_eq!(ip[0], 0x45);
+        assert_eq!(&ip[2..4], &52u16.to_be_bytes());
+        assert_eq!(ip[8], 64);
+        assert!(ip[1..2].iter().all(|b| *b == 0));
+        assert!(ip[9..12].iter().all(|b| *b == 0));
+        assert!(ip[12..20].iter().all(|b| *b == 0));
+        // remove_ip_header (wireguard.rs:333-335): 20 bytes off a v4
+        // packet, 40 off a v6 one.
+        assert_eq!(wg_strip_ip_header(&ip), &datagram[..]);
+        let mut v6 = vec![0x60u8];
+        v6.extend_from_slice(&[0u8; 39]);
+        v6.extend_from_slice(&datagram);
+        assert_eq!(wg_strip_ip_header(&v6), &datagram[..]);
+    }
+
+    #[test]
+    fn wg_static_keys_are_shared_and_identity_bound() {
+        // new_from_network_identity (wireguard.rs:62-79): both nodes of a
+        // network derive the SAME pair (my_public == peer_public on both
+        // ends), and the pair is bound to name+secret exactly like the
+        // handshake digest (generate_digest_from_str).
+        let a = wg_static_keys("net-x", "secret-y");
+        let b = wg_static_keys("net-x", "secret-y");
+        assert_eq!(a.public(), b.public());
+        assert_ne!(wg_static_keys("net-x", "secret-z").public(), a.public());
+        assert_ne!(wg_static_keys("net-w", "secret-y").public(), a.public());
+        // The secret key IS the 32-byte network digest.
+        assert_eq!(network_secret_digest("net-x", "secret-y").len(), 32);
+    }
+
+    #[tokio::test]
+    async fn wg_tunnel_pingpong() {
+        // WgTunnelListener + WgTunnelConnector over the engine's own
+        // Noise_IKpsk2 machinery with the SHARED digest keys (upstream
+        // `wg_pingpong`, wireguard.rs:793-799): one peer frame each way
+        // through the synthetic-IPv4-header WG encapsulation.
+        let secret = test_secret();
+        let mut listener = WgVtListener::bind("127.0.0.1:0".parse().unwrap(), "net", &secret)
+            .await
+            .unwrap();
+        let addr = listener.local_addr();
+        let server = tokio::spawn(async move {
+            let mut tunnel = listener.accept().await.unwrap();
+            let packet = read_frame(&mut tunnel).await.unwrap().unwrap();
+            write_frame(&mut tunnel, &packet).await.unwrap();
+            // Hold the tunnel so the client's echo is not racing a drop.
+            let _ = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut tunnel)).await;
+        });
+        let mut client = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_wg_tunnel(addr, "net", &secret),
+        )
+        .await
+        .expect("wg connect timeout")
+        .unwrap();
+        let original = PeerPacket::new(0x1111, 0x2222, packet_type::DATA, b"wg-echo");
+        write_frame(&mut client, &original).await.unwrap();
+        let echoed = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut client))
+            .await
+            .expect("wg echo timeout")
+            .unwrap()
+            .unwrap();
+        assert_eq!(echoed, original);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wg_transport_peer_session() {
+        // The full client/server peer session over wg:// — the M1
+        // handshake, the identity check, the post-dial liveness ping and
+        // a Data packet through the AEAD packet encryption, all riding
+        // the WG transport (the `add_tunnel_as_client` /
+        // `add_tunnel_as_server` pair, upstream `wg_pingpong`'s session
+        // flavour).
+        let secret = test_secret();
+        let mut listener = WgVtListener::bind("127.0.0.1:0".parse().unwrap(), "mesh", &secret)
+            .await
+            .unwrap();
+        let addr = listener.local_addr();
+        let encryptor = create_encryptor("aes-gcm", true, &secret).unwrap();
+        let server_secret = secret.clone();
+        let server = tokio::spawn(async move {
+            let tunnel = listener.accept().await.unwrap();
+            let (mut halves, peer) =
+                serve_peer_as(tunnel, 0xdead_beef, "mesh", &server_secret, encryptor)
+                    .await
+                    .unwrap();
+            assert_eq!(peer.peer_id, 0x0000_0042);
+            let frame = halves.data_rx.recv().await.unwrap();
+            (peer, frame)
+        });
+        let endpoint = PeerEndpoint {
+            transport: PeerTransport::Wg,
+            host: "127.0.0.1".into(),
+            port: addr.port(),
+        };
+        let node = connect_peer_as(
+            &endpoint,
+            0x0000_0042,
+            "mesh",
+            &secret,
+            create_encryptor("aes-gcm", true, &secret).unwrap(),
+        )
+        .await
+        .unwrap();
+        let latency = node.ping().await.unwrap();
+        assert!(latency < Duration::from_secs(2));
+        node.send_packet(packet_type::DATA, b"wg-ip-frame")
+            .await
+            .unwrap();
+        let (peer, frame) = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server session timed out")
+            .unwrap();
+        assert_eq!(peer.network_name, "mesh");
+        assert_eq!(frame, b"wg-ip-frame");
+        node.close().await;
+    }
+
+    #[tokio::test]
+    async fn wg_listener_accepts_multiple_peers() {
+        // The listener's per-address peer table (handle_udp_incoming,
+        // wireguard.rs:509-551): two connectors from different source
+        // ports are two independent tunnels off one socket.
+        let secret = test_secret();
+        let mut listener = WgVtListener::bind("127.0.0.1:0".parse().unwrap(), "net", &secret)
+            .await
+            .unwrap();
+        let addr = listener.local_addr();
+        let server = tokio::spawn(async move {
+            for expected in ["first", "second"] {
+                let mut tunnel = listener.accept().await.unwrap();
+                let packet = read_frame(&mut tunnel).await.unwrap().unwrap();
+                assert_eq!(&packet.payload, expected.as_bytes());
+            }
+        });
+        for payload in ["first", "second"] {
+            let mut client = connect_wg_tunnel(addr, "net", &secret).await.unwrap();
+            write_frame(
+                &mut client,
+                &PeerPacket::new(1, 2, packet_type::DATA, payload.as_bytes()),
+            )
+            .await
+            .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("both peers accepted")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn wg_wrong_network_secret_never_connects() {
+        // A different secret means a different static pair: the peer's
+        // boringtun equivalent rejects our initiation at MAC1 (keyed by
+        // ITS static), so the dial exhausts its budget instead of ever
+        // establishing (the shared-key design has no downgrade).
+        let secret = test_secret();
+        let listener = WgVtListener::bind("127.0.0.1:0".parse().unwrap(), "net", &secret)
+            .await
+            .unwrap();
+        let addr = listener.local_addr();
+        let err = connect_wg_tunnel(addr, "net", "a-totally-different-secret")
+            .await
+            .err()
+            .expect("the dial must fail")
+            .to_string();
+        assert!(err.contains("wg connect timeout"), "{err}");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a real easytier-core binary; set EASYTIER_BIN to enable"]
+    async fn real_easytier_binary_serving_wg() {
+        // THE M5 interop: the real binary's boringtun wg:// listener and
+        // our wg:// peer dial — the shared digest keypair + the Noise
+        // IK math + the synthetic-IP-header framing against the real
+        // core, byte for byte.
+        let Ok(bin) = std::env::var("EASYTIER_BIN") else {
+            eprintln!("skipping: EASYTIER_BIN is not set");
+            return;
+        };
+        let network = format!("itnet-{}", rand::random::<u32>());
+        let secret = format!("itsec-{}", rand::random::<u64>());
+        let port = 31000 + rand::random::<u16>() % 20000;
+        let _child = spawn_real_binary(
+            &bin,
+            &network,
+            &secret,
+            &[
+                "-l",
+                &format!("wg://127.0.0.1:{port}"),
+                "--no-tun",
+                "-i",
+                "10.126.126.1",
+                "--hostname",
+                "real-wg-node",
+                "--socks5",
+                "1080",
+            ],
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let cfg = EasyTierConfig {
+            peers: vec![format!("wg://127.0.0.1:{port}")],
+            network_secret: secret,
+            ipv4: Some("10.126.126.2/24".to_owned()),
+            dhcp: false,
+            hostname: Some("rustcrash-m5-wg".to_owned()),
+            ..EasyTierConfig::new("et-real-wg", &network)
+        };
+        assert_socks5_through_overlay(&cfg).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a real easytier-core binary; set EASYTIER_BIN to enable"]
+    async fn real_easytier_binary_dials_our_wg_listener() {
+        // The reverse: the real binary's wg:// connector (boringtun
+        // initiating) into OUR listener — its initiation must pass our
+        // responder's MAC1/static/timestamp checks (dialed on the LAN
+        // address; see `dialable_lan_ip`).
+        let Ok(bin) = std::env::var("EASYTIER_BIN") else {
+            eprintln!("skipping: EASYTIER_BIN is not set");
+            return;
+        };
+        let Some(lan_ip) = dialable_lan_ip() else {
+            eprintln!("skipping: no dialable non-loopback local IP");
+            return;
+        };
+        let network = format!("itnet-{}", rand::random::<u32>());
+        let secret = format!("itsec-{}", rand::random::<u64>());
+        let port = 31000 + rand::random::<u16>() % 20000;
+        let _child = spawn_real_binary(
+            &bin,
+            &network,
+            &secret,
+            &[
+                "-p",
+                &format!("wg://{lan_ip}:{port}"),
+                "--no-listener",
+                "--no-tun",
+                "-i",
+                "10.126.126.1",
+                "--hostname",
+                "real-wg-node",
+                "--socks5",
+                "1080",
+            ],
+        );
+        let cfg = EasyTierConfig {
+            listeners: vec![format!("wg://0.0.0.0:{port}")],
+            network_secret: secret,
+            ipv4: Some("10.126.126.2/24".to_owned()),
+            dhcp: false,
+            hostname: Some("rustcrash-m5".to_owned()),
+            ..EasyTierConfig::new("et-real-wg-listener", &network)
         };
         let server = serve(&cfg).await.unwrap();
         tokio::time::timeout(Duration::from_secs(25), server.wait_ready())

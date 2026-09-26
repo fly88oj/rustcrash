@@ -15,7 +15,7 @@ use crate::dns::wire;
 use crate::error::{Error, Result};
 use crate::inbound::{RelayHandler, TcpMeta};
 use crate::outbound::Registry;
-use crate::rule::{ConnContext, GeoLookups, Network, Rule, RuleSetKind, RuleSets};
+use crate::rule::{ConnContext, GeoLookups, MatchOutcome, Network, Rule, RuleSetKind, RuleSets};
 use crate::stats::Stats;
 use crate::stream::{BoxProxyStream, CountingStream};
 
@@ -32,7 +32,10 @@ struct RouteMeta<'a> {
 pub struct Engine {
     cfg: EngineConfig,
     registry: Arc<Registry>,
-    rules: Vec<Rule>,
+    /// The compiled action-aware rule table the router walks
+    /// (`action: sniff/resolve/hijack-dns` ride a per-index side table;
+    /// the plain mihomo walk is the no-actions degenerate case).
+    rule_table: crate::rule::RuleTable,
     rule_sets: RuleSets,
     geo: GeoLookups,
     dns: Option<Arc<DnsEngine>>,
@@ -47,6 +50,10 @@ pub struct Engine {
     /// Whether any rule may need DNS-resolved destination IPs (drives
     /// the router's single pre-resolve).
     needs_ip: bool,
+    /// Last time each GROUP was routed through (mihomo healthcheck.go
+    /// `touch`): a lazy group's periodic check only runs when this is
+    /// within its interval.
+    last_touch: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
 }
 
 impl Engine {
@@ -60,7 +67,8 @@ impl Engine {
         crate::api::init_log_broadcast();
 
         let cfg = cfg.with_builtin_outbounds();
-        let rules = cfg.parse_rules()?;
+        let rule_table = cfg.compile_rules()?;
+        let rules = rule_table.rules();
         let rule_sets = RuleSets::default();
         let mut geo = GeoLookups::default();
 
@@ -81,7 +89,7 @@ impl Engine {
         }
         // Geosite: only entries referenced by rules or fake-ip filters.
         let mut wanted = Vec::new();
-        for r in &rules {
+        for r in rules {
             if let crate::rule::RuleMatcher::Geosite { name } = &r.matcher {
                 wanted.push(name.clone());
             }
@@ -129,13 +137,13 @@ impl Engine {
             dns.as_ref(),
         )?);
         let mode = tokio::sync::RwLock::new(cfg.mode);
-        let needs_process = crate::rule::needs_process(&rules);
-        let needs_ip = rules.iter().any(|r| r.needs_ip());
+        let needs_process = rule_table.needs_process();
+        let needs_ip = rule_table.needs_ip();
 
         let engine = Arc::new(Engine {
             cfg,
             registry,
-            rules,
+            rule_table,
             rule_sets,
             geo,
             dns,
@@ -143,6 +151,7 @@ impl Engine {
             mode,
             needs_process,
             needs_ip,
+            last_touch: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
         Ok(engine)
     }
@@ -160,7 +169,7 @@ impl Engine {
     }
 
     pub fn rules(&self) -> &[Rule] {
-        &self.rules
+        self.rule_table.rules()
     }
 
     pub async fn mode(&self) -> RuleMode {
@@ -265,7 +274,12 @@ impl Engine {
             crate::api::serve(api.clone(), self.clone()).await?;
         }
 
-        // Health checks for url-test/fallback groups.
+        // Health checks for url-test/fallback groups — per-group lazy
+        // gating exactly per mihomo adapter/provider/healthcheck.go
+        // process(): on each interval tick, a lazy group that has not
+        // been touched (routed through) within its interval skips the
+        // round; each probe counts only when its status matches the
+        // group's expected-status.
         let any_health = self
             .cfg
             .groups
@@ -275,7 +289,7 @@ impl Engine {
             let engine = self.clone();
             tokio::spawn(async move {
                 loop {
-                    engine.registry.health_round().await;
+                    engine.health_tick().await;
                     let interval = engine
                         .cfg
                         .groups
@@ -308,16 +322,25 @@ impl Engine {
 
     /// Full route with connection metadata for the extended rule types.
     /// The inbound metadata rides one struct (TcpMeta-shaped); UDP
-    /// callers pass a synthetic one.
+    /// callers pass a synthetic one. `sniffable` lends the caller's
+    /// client stream so an `action: sniff` rule can read the first
+    /// bytes at match time (None when the caller cannot sniff — UDP
+    /// sessions today); the stream is always handed back. Returns
+    /// (rule display, outbound, effective target) — the effective
+    /// target is what the relay should DIAL: unfaked, and with the
+    /// sniffed host applied when a sniff action overrode it.
     async fn route_with(
         &self,
         target: &NetAddr,
         source: SocketAddr,
         meta: RouteMeta<'_>,
-    ) -> (String, String) {
+        sniffable: Option<&mut Option<BoxProxyStream>>,
+    ) -> (String, String, NetAddr) {
         let mode = *self.mode.read().await;
-        match mode {
-            RuleMode::Direct => return ("mode:direct".into(), "DIRECT".into()),
+        let routed = match mode {
+            RuleMode::Direct => {
+                ("mode:direct".into(), "DIRECT".into(), self.unfake_target(target))
+            }
             RuleMode::Global => {
                 // GLOBAL semantics: prefer the first group (the config's
                 // primary selector), else the first outbound.
@@ -328,44 +351,178 @@ impl Engine {
                     .cloned()
                     .or_else(|| self.registry.leaf_names().first().cloned())
                     .unwrap_or_else(|| "DIRECT".to_string());
-                return ("mode:global".into(), name);
+                ("mode:global".into(), name, self.unfake_target(target))
             }
-            RuleMode::Rule => {}
+            RuleMode::Rule => self.route_rules(target, source, meta, sniffable).await,
+        };
+        // mihomo healthcheck.go `touch`: routing through a group marks it
+        // used, so a lazy group's next interval tick runs its check
+        // (idle lazy groups skip). Only the group the ROUTE selected is
+        // touched; transitive sub-groups keep their own touches.
+        if self.registry.group(&routed.1).is_some() {
+            self.last_touch
+                .lock()
+                .unwrap()
+                .insert(routed.1.clone(), std::time::Instant::now());
         }
+        routed
+    }
 
+    /// The rule-mode walk: sing-box route/route.go `matchRule`
+    /// semantics — the first matching rule routes UNLESS it carries a
+    /// non-final action (`sniff`/`resolve`), in which case the action
+    /// mutates the match context and the walk CONTINUES from the next
+    /// rule instead of restarting. `resume_at` strictly increases, so
+    /// the loop runs at most rules.len() steps; the iteration cap is a
+    /// defensive guard. Without actions (mihomo dialect) this is exactly
+    /// the old single-pass walk.
+    async fn route_rules(
+        &self,
+        target: &NetAddr,
+        source: SocketAddr,
+        meta: RouteMeta<'_>,
+        mut sniffable: Option<&mut Option<BoxProxyStream>>,
+    ) -> (String, String, NetAddr) {
         // Reverse fake-ip before matching.
-        let effective = self.unfake_target(target);
+        let mut effective = self.unfake_target(target);
 
         // One pre-resolve for every IP-hungry rule (IP-CIDR/GEOIP/rule-set
-        // without no-resolve); the evaluator itself stays synchronous.
-        let resolved = match (&self.dns, effective.host.as_domain()) {
+        // without no-resolve); the evaluator itself stays synchronous. A
+        // walk-time `action: resolve` fills the same field on demand.
+        let mut resolved = self.pre_resolve(&effective).await;
+
+        let cap = self.rule_table.rules().len() + 1;
+        let mut at = 0usize;
+        for _ in 0..cap {
+            let ctx = ConnContext {
+                host: &effective.host,
+                port: effective.port,
+                source_ip: Some(source.ip()),
+                source_port: Some(source.port()),
+                resolved: resolved.clone(),
+                mode: RuleMode::Rule,
+                network: meta.network,
+                inbound: meta.inbound,
+                inbound_kind: meta.inbound_kind,
+                inbound_port: meta.inbound_port,
+                process: meta.proc_info.map(|p| p.exe.as_str()),
+                uid: meta.proc_info.and_then(|p| p.uid),
+                user: meta.proc_info.and_then(|p| p.user.as_deref()),
+                dscp: None,
+            };
+            match self.rule_table.match_from(at, &ctx, &self.rule_sets, &self.geo) {
+                MatchOutcome::Route { rule, .. } => {
+                    return (format_rule(rule), rule.outbound.clone(), effective);
+                }
+                MatchOutcome::Sniff { action, resume_at, .. } => {
+                    // The action sniffs independently of the config-level
+                    // sniffer: its protocol subset (empty = all) narrows
+                    // the global policy via for_action, and every byte
+                    // read is replayed loss-free below (PrependStream),
+                    // exactly like the config-level sniff in relay_tcp.
+                    // (The walk only yields Sniff for a Sniff action.)
+                    let crate::rule::RuleAction::Sniff { sniffer } = action else {
+                        at = resume_at;
+                        continue;
+                    };
+                    let sniff_cfg = self.cfg.sniff.for_action(sniffer);
+                    if let Some(slot) = sniffable.as_deref_mut() {
+                        if let Some(mut stream) = slot.take() {
+                            let (sniffed, peeked) =
+                                Self::sniff_client(&mut stream, &sniff_cfg, effective.port).await;
+                            let stream: BoxProxyStream = if peeked.is_empty() {
+                                stream
+                            } else {
+                                Box::new(crate::inbound::PrependStream::new(stream, peeked))
+                            };
+                            *slot = Some(stream);
+                            // Shared override policy (apply_sniffed): an IP
+                            // target always takes the sniffed domain; a
+                            // domain target only with override-destination
+                            // or a force-domain match.
+                            if let Some(t) =
+                                crate::sniffer::apply_sniffed(&effective, &sniffed, &sniff_cfg)
+                            {
+                                tracing::debug!(target: "engine",
+                                    "action sniff {} -> {}", effective, t);
+                                effective = t;
+                                // The pre-resolve belonged to the old
+                                // host: re-derive (or clear) for the new
+                                // one.
+                                resolved = self.pre_resolve(&effective).await;
+                            }
+                        }
+                    }
+                    at = resume_at;
+                }
+                MatchOutcome::Resolve { resume_at, .. } => {
+                    // `action: resolve`: fill ConnContext::resolved from
+                    // the engine resolver (mirrors the pre-resolve above;
+                    // IP targets need nothing — ctx.ips() reads them
+                    // directly).
+                    if let (Some(dns), Some(name)) = (&self.dns, effective.host.as_domain()) {
+                        if !name.is_empty() {
+                            resolved = dns.resolve(name, wire::TYPE_A).await;
+                        }
+                    }
+                    at = resume_at;
+                }
+                MatchOutcome::HijackDns { index } => {
+                    // Route to the registry's `dns` outbound (sing-box's
+                    // builtin tag): its TCP arm answers length-framed
+                    // DNS-over-TCP and its UDP arm echoes datagrams, both
+                    // via the engine resolver.
+                    let rule = &self.rule_table.rules()[index];
+                    return (
+                        format_rule_target(rule, "hijack-dns"),
+                        "dns".to_string(),
+                        effective,
+                    );
+                }
+                MatchOutcome::NoMatch => break,
+            }
+        }
+        ("no-match".into(), "DIRECT".into(), effective)
+    }
+
+    /// The router's single pre-resolve: when any rule is IP-hungry and
+    /// the target is a domain, resolve it once up front (None keeps the
+    /// walk IP-blind; `action: resolve` fills the field later).
+    async fn pre_resolve(&self, target: &NetAddr) -> Option<Vec<std::net::IpAddr>> {
+        match (&self.dns, target.host.as_domain()) {
             (Some(dns), Some(name)) if self.needs_ip && !name.is_empty() => {
                 dns.resolve(name, wire::TYPE_A).await
             }
             _ => None,
-        };
-        let ctx = ConnContext {
-            host: &effective.host,
-            port: effective.port,
-            source_ip: Some(source.ip()),
-            source_port: Some(source.port()),
-            resolved,
-            mode,
-            network: meta.network,
-            inbound: meta.inbound,
-            inbound_kind: meta.inbound_kind,
-            inbound_port: meta.inbound_port,
-            process: meta.proc_info.map(|p| p.exe.as_str()),
-            uid: meta.proc_info.and_then(|p| p.uid),
-            user: meta.proc_info.and_then(|p| p.user.as_deref()),
-            dscp: None,
-        };
-        for rule in &self.rules {
-            if rule.evaluate(&ctx, &self.rule_sets, &self.geo) {
-                return (format_rule(rule), rule.outbound.clone());
+        }
+    }
+
+    /// One health-check tick (the run() interval task's body, mihomo
+    /// healthcheck.go process()): compute the due set — every
+    /// url-test/fallback group whose lazy gate passes (non-lazy always
+    /// due; lazy due iff touched within its interval) — and probe it,
+    /// scoring each member against the group's expected-status.
+    pub async fn health_tick(&self) {
+        let now = std::time::Instant::now();
+        let mut due: Vec<(String, crate::config::ExpectedStatus)> = Vec::new();
+        {
+            let touches = self.last_touch.lock().unwrap();
+            for g in &self.cfg.groups {
+                if !matches!(
+                    g.policy,
+                    crate::outbound::GroupPolicy::UrlTest | crate::outbound::GroupPolicy::Fallback
+                ) {
+                    continue;
+                }
+                let interval = Duration::from_secs(g.interval.max(1));
+                let health = self.cfg.group_health(&g.name);
+                let last_touch = touches.get(&g.name).copied();
+                if health.due(interval, last_touch, now) {
+                    due.push((g.name.clone(), health.expected_status));
+                }
             }
         }
-        ("no-match".into(), "DIRECT".into())
+        self.registry.health_round(&due).await;
     }
 
     async fn relay_tcp(self: Arc<Self>, meta: TcpMeta, mut client: BoxProxyStream) {
@@ -400,7 +557,11 @@ impl Engine {
         } else {
             None
         };
-        let (rule, outbound_name) = self
+        // The client stream rides an Option slot so an `action: sniff`
+        // rule can borrow it for the first-bytes sniff inside route_with
+        // (bytes replayed loss-free); route_with always hands it back.
+        let mut client_slot = Some(client);
+        let (rule, outbound_name, target) = self
             .route_with(
                 &target,
                 meta.source,
@@ -411,8 +572,10 @@ impl Engine {
                     inbound_port: meta.inbound_port,
                     proc_info: proc_info.as_ref(),
                 },
+                Some(&mut client_slot),
             )
             .await;
+        let client = client_slot.expect("route_with returns the client stream");
         let outbound = match self.registry.resolve(&outbound_name).await {
             Ok(o) => o,
             Err(e) => {
@@ -543,7 +706,7 @@ impl Engine {
         } else {
             None
         };
-        let (rule, outbound_name) = self
+        let (rule, outbound_name, effective) = self
             .route_with(
                 &effective,
                 source,
@@ -554,6 +717,7 @@ impl Engine {
                     inbound_port: None,
                     proc_info: proc_info.as_ref(),
                 },
+                None,
             )
             .await;
         let Ok(outbound) = self.registry.resolve(&outbound_name).await else {
@@ -632,6 +796,12 @@ impl Engine {
 }
 
 fn format_rule(rule: &Rule) -> String {
+    format_rule_target(rule, &rule.outbound)
+}
+
+/// Matcher rendering with an explicit target — action outcomes display
+/// the action name instead of the converted line's placeholder outbound.
+fn format_rule_target(rule: &Rule, target: &str) -> String {
     let matcher = match &rule.matcher {
         crate::rule::RuleMatcher::Domain(d) => format!("DOMAIN({d})"),
         crate::rule::RuleMatcher::DomainSuffix(s) => format!("DOMAIN-SUFFIX({s})"),
@@ -657,7 +827,7 @@ fn format_rule(rule: &Rule) -> String {
         crate::rule::RuleMatcher::Logic { mode, .. } => format!("LOGIC({mode:?})"),
         crate::rule::RuleMatcher::MatchAll => "MATCH".to_string(),
     };
-    format!("{matcher} => {}", rule.outbound)
+    format!("{matcher} => {target}")
 }
 
 /// Config-build provider load: parse the file and insert the set,
@@ -1046,7 +1216,7 @@ mod tests {
     #[tokio::test]
     async fn engine_builds_and_routes_to_direct() {
         let engine = Engine::build(minimal_config()).unwrap();
-        let (rule, outbound) = engine
+        let (rule, outbound, _) = engine
             .route_with(
                 &NetAddr::domain("example.com", 443).unwrap(),
                 "127.0.0.1:50000".parse().unwrap(),
@@ -1057,6 +1227,7 @@ mod tests {
                     inbound_port: None,
                     proc_info: None,
                 },
+                None,
             )
             .await;
         assert_eq!(outbound, "DIRECT");
@@ -1076,7 +1247,7 @@ mod tests {
             tolerance: 0,
         }];
         let engine = Engine::build(cfg).unwrap();
-        let (_, outbound) = engine
+        let (_, outbound, _) = engine
             .route_with(
                 &NetAddr::domain("x.test", 80).unwrap(),
                 "127.0.0.1:1".parse().unwrap(),
@@ -1087,6 +1258,7 @@ mod tests {
                     inbound_port: None,
                     proc_info: None,
                 },
+                None,
             )
             .await;
         assert_eq!(outbound, "Auto");
@@ -1161,5 +1333,494 @@ mod tests {
         c.read_exact(&mut body).await.unwrap();
         let msg = wire::parse(&body).unwrap();
         assert_eq!(msg.id, 7);
+    }
+
+    // -----------------------------------------------------------------
+    // Rule-action re-entry (sing-box `action:` rules) + health glue
+    // -----------------------------------------------------------------
+
+    /// Hand-built minimal TLS ClientHello carrying `sni` (same shape as
+    /// the sniffer's own fixture: record → handshake → SNI extension).
+    fn client_hello(sni: &str) -> Vec<u8> {
+        let name = sni.as_bytes();
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&((name.len() + 3) as u16).to_be_bytes());
+        ext.push(0x00); // host_name
+        ext.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        ext.extend_from_slice(name);
+        let mut ext_block = Vec::new();
+        ext_block.extend_from_slice(&0u16.to_be_bytes()); // server_name type
+        ext_block.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        ext_block.extend_from_slice(&ext);
+
+        let mut body = Vec::new();
+        body.push(0x01); // ClientHello
+        body.extend_from_slice(&[0, 0, 0]); // length, patched below
+        body.extend_from_slice(&0x0303u16.to_be_bytes());
+        body.extend(&[0x42u8; 32]); // random
+        body.push(0); // session_id_len
+        body.extend_from_slice(&2u16.to_be_bytes()); // cipher_suites len
+        body.extend_from_slice(&0x1301u16.to_be_bytes());
+        body.push(1); // compression methods len
+        body.push(0);
+        body.extend_from_slice(&(ext_block.len() as u16).to_be_bytes());
+        body.extend_from_slice(&ext_block);
+        let handshake_len = (body.len() - 4) as u32;
+        body[1..4].copy_from_slice(&handshake_len.to_be_bytes()[1..4]);
+
+        let mut rec = Vec::new();
+        rec.push(0x16);
+        rec.extend_from_slice(&0x0301u16.to_be_bytes());
+        rec.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&body);
+        rec
+    }
+
+    /// A minimal in-test SOCKS5 upstream: completes the no-auth
+    /// handshake, grants every CONNECT (recording the requested target),
+    /// then serves one canned HTTP status to whatever follows. The
+    /// handshake count is the "was this outbound used / probed" signal.
+    async fn spawn_socks_upstream(
+        status_line: &'static str,
+    ) -> (
+        SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let targets = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        tokio::spawn({
+            let count = count.clone();
+            let targets = targets.clone();
+            async move {
+                loop {
+                    let Ok((mut sock, _)) = listener.accept().await else {
+                        continue;
+                    };
+                    let count = count.clone();
+                    let targets = targets.clone();
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        // Greeting: VER NMETHODS METHODS...
+                        let mut head = [0u8; 2];
+                        if sock.read_exact(&mut head).await.is_err() {
+                            return;
+                        }
+                        let mut methods = vec![0u8; head[1] as usize];
+                        if sock.read_exact(&mut methods).await.is_err() {
+                            return;
+                        }
+                        if sock.write_all(&[0x05, 0x00]).await.is_err() {
+                            return;
+                        }
+                        // Request: VER CMD RSV ATYP ...
+                        let mut req = [0u8; 4];
+                        if sock.read_exact(&mut req).await.is_err() {
+                            return;
+                        }
+                        let tail = match req[3] {
+                            0x01 => 4 + 2,
+                            0x03 => {
+                                let mut l = [0u8; 1];
+                                if sock.read_exact(&mut l).await.is_err() {
+                                    return;
+                                }
+                                l[0] as usize + 2
+                            }
+                            0x04 => 16 + 2,
+                            _ => return,
+                        };
+                        let mut rest = vec![0u8; tail];
+                        if sock.read_exact(&mut rest).await.is_err() {
+                            return;
+                        }
+                        if req[3] == 0x03 && tail >= 2 {
+                            let n = tail - 2;
+                            targets
+                                .lock()
+                                .unwrap()
+                                .push(String::from_utf8_lossy(&rest[..n]).to_string());
+                        }
+                        // Grant.
+                        let ok = [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+                        if sock.write_all(&ok).await.is_err() {
+                            return;
+                        }
+                        count.fetch_add(1, Ordering::SeqCst);
+                        // Serve the follow-up request (health probe GET /
+                        // replayed sniff bytes), then close.
+                        let mut buf = Vec::new();
+                        let mut byte = [0u8; 1];
+                        loop {
+                            match sock.read(&mut byte).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => {
+                                    buf.push(byte[0]);
+                                    if buf.ends_with(b"\r\n\r\n") || buf.len() > 16 * 1024 {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        let resp = format!(
+                            "HTTP/1.1 {status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    });
+                }
+            }
+        });
+        (addr, count, targets)
+    }
+
+    fn socks_outbound(name: &str, server: &str, port: u16) -> crate::outbound::OutboundConfig {
+        crate::outbound::OutboundConfig {
+            name: name.into(),
+            udp: false,
+            kind: crate::outbound::OutboundKind::Socks {
+                server: server.into(),
+                port,
+                username: None,
+                password: None,
+            },
+        }
+    }
+
+    fn tcp_meta(target: NetAddr, source: SocketAddr) -> TcpMeta {
+        TcpMeta {
+            target,
+            source,
+            inbound: "in".into(),
+            inbound_port: Some(17890),
+            inbound_kind: "mixed",
+        }
+    }
+
+    /// `action: sniff` re-enters the walk with the sniffed host: a real
+    /// TLS ClientHello through an in-test listener (the client pair)
+    /// makes the SNI replace the bare-IP destination, so the LATER
+    /// DOMAIN-SUFFIX rule routes to the socks upstream — which sees a
+    /// CONNECT for the sniffed domain.
+    #[cfg(feature = "singbox")]
+    #[tokio::test]
+    async fn sniff_action_reroutes_on_sniffed_sni() {
+        use tokio::io::AsyncWriteExt;
+        let (upstream, count, targets) = spawn_socks_upstream("204 No Content").await;
+        let cfg = crate::config_singbox::load(&format!(
+            r#"{{
+              "inbounds": [{{"type": "mixed", "listen": "127.0.0.1", "listen_port": 17890, "tag": "in"}}],
+              "outbounds": [
+                {{"type": "direct", "tag": "direct"}},
+                {{"type": "socks", "tag": "probe-b", "server": "127.0.0.1", "server_port": {}}}
+              ],
+              "route": {{"rules": [
+                {{"port": 443, "action": "sniff", "sniffer": ["tls"]}},
+                {{"domain_suffix": ["sniffed.test"], "outbound": "probe-b"}}
+              ], "final": "direct"}}
+            }}"#,
+            upstream.port()
+        ))
+        .unwrap();
+        let engine = Engine::build(cfg).unwrap();
+
+        // The inbound client: a real TCP pair (listener stands in for
+        // the inbound); the test side writes the ClientHello.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let laddr = listener.local_addr().unwrap();
+        let mut test_client = tokio::net::TcpStream::connect(laddr).await.unwrap();
+        let (client_sock, peer) = listener.accept().await.unwrap();
+        test_client.write_all(&client_hello("www.sniffed.test")).await.unwrap();
+
+        let relay_engine = engine.clone();
+        let relay = tokio::spawn(async move {
+            relay_engine
+                .relay_tcp(
+                    tcp_meta(NetAddr::ip("203.0.113.9".parse().unwrap(), 443), peer),
+                    Box::new(client_sock),
+                )
+                .await;
+        });
+
+        // The socks upstream granted a CONNECT — for the SNI domain.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline, "upstream never saw the CONNECT");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        drop(test_client); // EOF unwinds the relay copy
+        let _ = tokio::time::timeout(Duration::from_secs(5), relay).await;
+        let seen = targets.lock().unwrap();
+        assert!(
+            seen.iter().any(|t| t == "www.sniffed.test"),
+            "CONNECT targets: {seen:?}"
+        );
+    }
+
+    /// `action: resolve` fills `resolved` at walk time: the IP-CIDR rule
+    /// carries no-resolve (so the router's pre-resolve is OFF) and only
+    /// matches after the action resolved the domain through the engine
+    /// resolver (static hosts).
+    #[tokio::test]
+    async fn resolve_action_fills_resolved_for_ip_rules() {
+        let mut cfg = minimal_config();
+        cfg.rules = vec![
+            "DOMAIN,ipflag.test,-".into(), // action: resolve rides index 0
+            "IP-CIDR,203.0.113.0/24,PROXY-OUT,no-resolve".into(),
+        ];
+        cfg.rule_actions =
+            std::collections::HashMap::from([(0, crate::rule::RuleAction::Resolve)]);
+        cfg.outbounds.push(crate::outbound::OutboundConfig {
+            name: "PROXY-OUT".into(),
+            udp: false,
+            kind: crate::outbound::OutboundKind::Reject,
+        });
+        if let Some(d) = &mut cfg.dns {
+            d.hosts.insert(
+                "ipflag.test".into(),
+                vec!["203.0.113.7".parse().unwrap()],
+            );
+        }
+        let engine = Engine::build(cfg).unwrap();
+        let (rule, outbound, _) = engine
+            .route_with(
+                &NetAddr::domain("ipflag.test", 80).unwrap(),
+                "127.0.0.1:50000".parse().unwrap(),
+                RouteMeta {
+                    network: Network::Tcp,
+                    inbound: "",
+                    inbound_kind: "",
+                    inbound_port: None,
+                    proc_info: None,
+                },
+                None,
+            )
+            .await;
+        assert_eq!(outbound, "PROXY-OUT", "IP-CIDR must match after the resolve action");
+        assert!(rule.contains("IP-CIDR"), "{rule}");
+
+        // Control: strip the action and the same walk stays IP-blind
+        // (no-resolve suppresses the pre-resolve) → no-match → DIRECT.
+        let mut bare = minimal_config();
+        bare.rules = vec![
+            "DOMAIN,ipflag.test,DIRECT".into(),
+            "IP-CIDR,203.0.113.0/24,PROXY-OUT,no-resolve".into(),
+        ];
+        bare.outbounds.push(crate::outbound::OutboundConfig {
+            name: "PROXY-OUT".into(),
+            udp: false,
+            kind: crate::outbound::OutboundKind::Reject,
+        });
+        if let Some(d) = &mut bare.dns {
+            d.hosts.insert(
+                "ipflag.test".into(),
+                vec!["203.0.113.7".parse().unwrap()],
+            );
+        }
+        let engine = Engine::build(bare).unwrap();
+        let (_, outbound, _) = engine
+            .route_with(
+                &NetAddr::domain("ipflag.test", 80).unwrap(),
+                "127.0.0.1:50000".parse().unwrap(),
+                RouteMeta {
+                    network: Network::Tcp,
+                    inbound: "",
+                    inbound_kind: "",
+                    inbound_port: None,
+                    proc_info: None,
+                },
+                None,
+            )
+            .await;
+        assert_eq!(outbound, "DIRECT");
+    }
+
+    /// `action: hijack-dns` lands on the registry's `dns` outbound: a
+    /// DNS query in (TCP length-framed, and a UDP datagram) is answered
+    /// by the engine resolver through the relay.
+    #[tokio::test]
+    async fn hijack_dns_action_answers_via_dns_outbound() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut cfg = minimal_config();
+        cfg.rules = vec!["DST-PORT,53,-".into(), "MATCH,DIRECT".into()];
+        cfg.rule_actions =
+            std::collections::HashMap::from([(0, crate::rule::RuleAction::HijackDns)]);
+        cfg.outbounds.push(crate::outbound::OutboundConfig {
+            name: "dns".into(),
+            udp: true,
+            kind: crate::outbound::OutboundKind::Dns,
+        });
+        let engine = Engine::build(cfg).unwrap();
+
+        // The route decision itself.
+        let (rule, outbound, _) = engine
+            .route_with(
+                &NetAddr::ip("8.8.8.8".parse().unwrap(), 53),
+                "127.0.0.1:50000".parse().unwrap(),
+                RouteMeta {
+                    network: Network::Tcp,
+                    inbound: "",
+                    inbound_kind: "",
+                    inbound_port: None,
+                    proc_info: None,
+                },
+                None,
+            )
+            .await;
+        assert_eq!(outbound, "dns");
+        assert!(rule.contains("hijack-dns"), "{rule}");
+
+        // TCP: length-framed DNS-over-TCP in through the relay, framed
+        // answer back.
+        let (mut asker, gate) = tokio::io::duplex(4096);
+        let source: SocketAddr = "127.0.0.1:50001".parse().unwrap();
+        let relay_engine = engine.clone();
+        let relay = tokio::spawn(async move {
+            relay_engine
+                .relay_tcp(
+                    tcp_meta(NetAddr::ip("8.8.8.8".parse().unwrap(), 53), source),
+                    Box::new(gate),
+                )
+                .await;
+        });
+        let q = wire::build_query(9, "probe.test", wire::TYPE_A);
+        asker.write_all(&(q.len() as u16).to_be_bytes()).await.unwrap();
+        asker.write_all(&q).await.unwrap();
+        let mut len = [0u8; 2];
+        asker.read_exact(&mut len).await.unwrap();
+        let n = u16::from_be_bytes(len) as usize;
+        let mut body = vec![0u8; n];
+        asker.read_exact(&mut body).await.unwrap();
+        let msg = wire::parse(&body).unwrap();
+        assert_eq!(msg.id, 9);
+        assert_eq!(msg.answers.len(), 1, "fake-ip engine answers");
+        drop(asker);
+        let _ = tokio::time::timeout(Duration::from_secs(5), relay).await;
+
+        // UDP: one datagram in, answered.
+        let (up_tx, up_rx) = mpsc::channel(4);
+        let (dl_tx, mut dl_rx) = mpsc::channel(4);
+        up_tx
+            .send((NetAddr::ip("8.8.8.8".parse().unwrap(), 53), q))
+            .await
+            .unwrap();
+        let udp_engine = engine.clone();
+        tokio::spawn(async move {
+            udp_engine
+                .relay_udp_inner(source, "in".into(), up_rx, dl_tx)
+                .await;
+        });
+        let answered = tokio::time::timeout(Duration::from_secs(5), dl_rx.recv()).await;
+        let (_, data) = answered.unwrap().unwrap();
+        assert_eq!(wire::parse(&data).unwrap().id, 9);
+    }
+
+    /// Lazy groups (mihomo `lazy`, default true): untouched → the health
+    /// round skips them (upstream sees no probe); routed through once →
+    /// the next round probes.
+    #[tokio::test]
+    async fn lazy_group_skips_probe_until_routed() {
+        use std::sync::atomic::Ordering;
+        let (upstream, count, _targets) = spawn_socks_upstream("204 No Content").await;
+        let mut cfg = minimal_config();
+        cfg.outbounds
+            .push(socks_outbound("up", "127.0.0.1", upstream.port()));
+        cfg.groups = vec![crate::outbound::GroupConfig {
+            name: "Lazy".into(),
+            members: vec!["up".into()],
+            policy: crate::outbound::GroupPolicy::UrlTest,
+            url: Some("http://health.test/check".into()),
+            interval: 300,
+            tolerance: 0,
+        }];
+        cfg.group_health.insert(
+            "Lazy".into(),
+            crate::config::GroupHealth {
+                lazy: true,
+                ..Default::default()
+            },
+        );
+        cfg.rules = vec!["MATCH,Lazy".into()];
+        let engine = Engine::build(cfg).unwrap();
+
+        // Idle: the lazy gate skips the whole round.
+        engine.health_tick().await;
+        assert_eq!(count.load(Ordering::SeqCst), 0, "idle lazy group must not probe");
+
+        // Route through the group (touch), then the round probes.
+        let (rule, outbound, _) = engine
+            .route_with(
+                &NetAddr::domain("x.test", 80).unwrap(),
+                "127.0.0.1:50000".parse().unwrap(),
+                RouteMeta {
+                    network: Network::Tcp,
+                    inbound: "",
+                    inbound_kind: "",
+                    inbound_port: None,
+                    proc_info: None,
+                },
+                None,
+            )
+            .await;
+        assert_eq!(outbound, "Lazy");
+        assert!(rule.contains("MATCH"));
+        engine.health_tick().await;
+        assert_eq!(count.load(Ordering::SeqCst), 1, "touched lazy group must probe");
+        let latencies = engine.registry().latency_snapshot().await;
+        assert!(
+            latencies.get("up").is_some_and(|s| s.is_some()),
+            "probe succeeded (a fast loopback probe may legitimately be 0 ms): {latencies:?}"
+        );
+    }
+
+    /// expected-status flows through the health round: against a
+    /// 404-returning health URL, a group expecting 404 scores healthy
+    /// while a group expecting 204 scores dead.
+    #[tokio::test]
+    async fn expected_status_scores_health_probes() {
+        let (upstream, count, _targets) = spawn_socks_upstream("404 Not Found").await;
+        let mut cfg = minimal_config();
+        cfg.outbounds
+            .push(socks_outbound("up-a", "127.0.0.1", upstream.port()));
+        cfg.outbounds
+            .push(socks_outbound("up-b", "127.0.0.1", upstream.port()));
+        let eager = |name: &str, member: &str, expected: &str| {
+            (
+                crate::outbound::GroupConfig {
+                    name: name.into(),
+                    members: vec![member.into()],
+                    policy: crate::outbound::GroupPolicy::UrlTest,
+                    url: Some("http://health.test/check".into()),
+                    interval: 300,
+                    tolerance: 0,
+                },
+                crate::config::GroupHealth {
+                    lazy: false,
+                    expected_status: crate::config::ExpectedStatus::parse(expected).unwrap(),
+                },
+            )
+        };
+        let (g404, h404) = eager("Want404", "up-a", "404");
+        let (g204, h204) = eager("Want204", "up-b", "204");
+        cfg.groups = vec![g404, g204];
+        cfg.group_health.insert("Want404".into(), h404);
+        cfg.group_health.insert("Want204".into(), h204);
+        cfg.rules = vec!["MATCH,DIRECT".into()];
+        let engine = Engine::build(cfg).unwrap();
+
+        engine.health_tick().await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let latencies = engine.registry().latency_snapshot().await;
+        assert!(
+            latencies.get("up-a").is_some_and(|s| s.is_some()),
+            "404 expected → healthy probe: {latencies:?}"
+        );
+        assert_eq!(
+            latencies.get("up-b"),
+            Some(&None),
+            "204 expected on a 404 → failed probe (None): {latencies:?}"
+        );
     }
 }
