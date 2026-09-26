@@ -470,10 +470,29 @@ pub fn load(text: &str) -> Result<EngineConfig> {
         }
     }
 
-    // Route rules → clash-style rule lines.
+    // Route rules → clash-style rule lines. sing-box rule actions
+    // (option/rule_action.go) ride a side table keyed by converted-line
+    // index — the clash line syntax itself has no action slot.
     let mut rules = Vec::new();
+    let mut rule_actions: std::collections::HashMap<usize, crate::rule::RuleAction> =
+        std::collections::HashMap::new();
     if let Some(route) = &raw.route {
         for rule in &route.rules {
+            match route_rule_action(rule)? {
+                // route-options is non-final and its fields map onto
+                // nothing here — dropping the rule keeps upstream's
+                // "continue matching" semantics (options lost, warned).
+                RouteActionDirective::Unsupported => continue,
+                RouteActionDirective::Route => {}
+                RouteActionDirective::Action(action) => {
+                    let base = rules.len();
+                    rules.extend(rule_to_clash(rule)?);
+                    for i in base..rules.len() {
+                        rule_actions.insert(i, action.clone());
+                    }
+                    continue;
+                }
+            }
             rules.extend(rule_to_clash(rule)?);
         }
         let final_tag = route
@@ -583,6 +602,12 @@ pub fn load(text: &str) -> Result<EngineConfig> {
         proxy_servers,
         tun,
         wg_endpoints: parse_wireguard_endpoints(&raw.endpoints)?,
+        // sing-box urltest groups carry no lazy/expected-status
+        // upstream (option/group.go URLTestOutboundOptions) — the map
+        // stays empty and EngineConfig::group_health falls back to
+        // never-skip/any-status.
+        group_health: Default::default(),
+        rule_actions,
     })
 }
 
@@ -1191,16 +1216,100 @@ fn rule_to_clash(rule: &BTreeMap<String, Json>) -> Result<Vec<String>> {
     if json_str(rule, "type").as_deref() == Some("logical") {
         return logical_rule_to_clash(rule);
     }
-    let outbound = json_str(rule, "outbound").unwrap_or_else(|| "direct".into());
+    let outbound = rule_outbound(rule);
     let invert = rule.get("invert").and_then(Json::as_bool).unwrap_or(false);
     let groups = rule_groups(rule)?;
     combine_groups(&groups, "AND", &outbound, invert)
 }
 
+/// The outbound a converted rule line targets. Plain rules (and
+/// `action: route`, which carries its own `outbound`) use the outbound
+/// field, default `direct`; `action: reject` remaps to the dialect's
+/// `block` outbound — the engine has a single Reject behavior, so the
+/// docs' `method` default/drop/reply distinction (RejectActionOptions)
+/// maps to one target.
+fn rule_outbound(rule: &BTreeMap<String, Json>) -> String {
+    match json_str(rule, "action").as_deref() {
+        Some("reject") => "block".to_string(),
+        _ => json_str(rule, "outbound").unwrap_or_else(|| "direct".into()),
+    }
+}
+
+/// What the engine should do with one sing-box route rule's `action:`
+/// field (option/rule_action.go enum: route, route-options, direct,
+/// bypass, reject, hijack-dns, sniff, resolve).
+enum RouteActionDirective {
+    /// Route via the (possibly remapped) outbound: no action, or the
+    /// route-family actions.
+    Route,
+    /// A portable action carried on the rule instead of routing.
+    Action(crate::rule::RuleAction),
+    /// `route-options`: non-final and none of its fields map onto
+    /// engine machinery — the rule is dropped from the converted list
+    /// (a dropped non-final rule ≈ upstream's "continue matching").
+    Unsupported,
+}
+
+/// Sniffer names the upstream action enum recognizes
+/// (RouteActionSniff); the engine sniffs the first three.
+const ACTION_SNIFFERS: &[&str] = &["tls", "http", "quic", "dns", "stun", "bittorrent", "dtls", "ssh", "rdp", "ntp"];
+
+fn route_rule_action(rule: &BTreeMap<String, Json>) -> Result<RouteActionDirective> {
+    let Some(action) = json_str(rule, "action") else {
+        return Ok(RouteActionDirective::Route);
+    };
+    match action.as_str() {
+        // Route-family actions fold into the line's outbound
+        // (see rule_outbound).
+        "route" | "direct" | "bypass" | "reject" => Ok(RouteActionDirective::Route),
+        "sniff" => {
+            let requested = string_list(rule, "sniffer");
+            let mut sniffer = Vec::with_capacity(requested.len());
+            for name in requested {
+                if !ACTION_SNIFFERS.contains(&name.as_str()) {
+                    // Upstream's JSON schema rejects unknown enum values.
+                    return Err(Error::config(format!(
+                        "unknown sniffer {name:?} in action sniff"
+                    )));
+                }
+                if !["tls", "http", "quic"].contains(&name.as_str()) {
+                    tracing::warn!(target: "engine",
+                        "action sniff sniffer {name:?} not supported by the Rust engine; \
+                         ignoring (supported: tls, http, quic)");
+                    continue;
+                }
+                sniffer.push(name);
+            }
+            Ok(RouteActionDirective::Action(crate::rule::RuleAction::Sniff { sniffer }))
+        }
+        "resolve" => {
+            if let Some(server) = json_str(rule, "server").filter(|s| !s.is_empty()) {
+                tracing::warn!(target: "engine",
+                    "action resolve server {server:?}: the engine resolves through its \
+                     own resolver; the per-server selection is ignored");
+            }
+            Ok(RouteActionDirective::Action(crate::rule::RuleAction::Resolve))
+        }
+        "hijack-dns" => Ok(RouteActionDirective::Action(
+            crate::rule::RuleAction::HijackDns,
+        )),
+        "route-options" => {
+            tracing::warn!(target: "engine",
+                "route rule action route-options: override_address/port, udp_connect etc. \
+                 are not supported by the Rust engine yet; the rule is dropped");
+            Ok(RouteActionDirective::Unsupported)
+        }
+        other => Err(Error::config(format!(
+            "unknown rule action {other:?} (supported: route, route-options, direct, \
+             bypass, reject, hijack-dns, sniff, resolve)"
+        ))),
+    }
+}
+
 /// sing-box logical rule: `type: "logical"`, `mode: and|or`, `rules` is
 /// an array of sub-rule objects (no outbounds of their own).
 fn logical_rule_to_clash(rule: &BTreeMap<String, Json>) -> Result<Vec<String>> {
-    let outbound = json_str(rule, "outbound").unwrap_or_else(|| "direct".into());
+    let outbound = rule_outbound(rule);
     let invert = rule.get("invert").and_then(Json::as_bool).unwrap_or(false);
     let mode = json_str(rule, "mode").unwrap_or_else(|| "and".into());
     let mode = if mode.eq_ignore_ascii_case("or") { "OR" } else { "AND" };
@@ -1738,6 +1847,111 @@ mod tests {
         assert!(parsed.rules.contains(&"IN-NAME,in,direct".to_string()));
         assert!(parsed.rules.contains(&"PROCESS-NAME,curl,direct".to_string()));
         assert!(parsed.rules.contains(&"NOT,((DOMAIN-SUFFIX,b.test)),direct".to_string()));
+    }
+
+    #[test]
+    fn route_rule_actions_parse() {
+        let cfg = r#"
+{"inbounds": [{"type": "mixed", "listen_port": 1, "tag": "in"}],
+ "outbounds": [{"type": "direct", "tag": "direct"}],
+ "route": {"rules": [
+    {"port": 443, "action": "sniff", "sniffer": ["tls", "dns"]},
+    {"domain_suffix": ["resolve-me.test"], "action": "resolve"},
+    {"port": 53, "action": "hijack-dns"},
+    {"domain_suffix": ["ads.test"], "action": "reject", "method": "drop"},
+    {"domain_suffix": ["ok.test"], "outbound": "direct"}
+ ], "final": "direct"}}
+"#;
+        let parsed = load(cfg).unwrap();
+        // Converted lines keep their order; only the final MATCH follows.
+        assert_eq!(parsed.rules.len(), 6);
+        assert_eq!(parsed.rules[0], "DST-PORT,443,direct"); // placeholder target
+        assert_eq!(parsed.rules[1], "DOMAIN-SUFFIX,resolve-me.test,direct");
+        assert_eq!(parsed.rules[2], "DST-PORT,53,direct");
+        assert_eq!(parsed.rules[3], "DOMAIN-SUFFIX,ads.test,block");
+        assert_eq!(parsed.rules[4], "DOMAIN-SUFFIX,ok.test,direct");
+        assert_eq!(parsed.rules[5], "MATCH,direct");
+
+        // Actions attach to the converted line indexes — dns was warned
+        // away, leaving the tls subset on the sniff rule.
+        use crate::rule::RuleAction;
+        assert_eq!(
+            parsed.rule_actions.get(&0),
+            Some(&RuleAction::Sniff {
+                sniffer: vec!["tls".to_string()]
+            })
+        );
+        assert_eq!(parsed.rule_actions.get(&1), Some(&RuleAction::Resolve));
+        assert_eq!(parsed.rule_actions.get(&2), Some(&RuleAction::HijackDns));
+        // reject routes via the block outbound — no action entry.
+        assert!(!parsed.rule_actions.contains_key(&3));
+
+        // compile_rules pairs the lines with their actions.
+        let table = parsed.compile_rules().unwrap();
+        assert!(table.action(0).is_some());
+        assert_eq!(table.rules().len(), 6);
+    }
+
+    #[test]
+    fn route_rule_action_variants_validate() {
+        // Unknown action → error (mirrors the upstream schema enum).
+        let bad = load(
+            r#"
+{"inbounds": [{"type": "mixed", "listen_port": 1}],
+ "outbounds": [{"type": "direct", "tag": "direct"}],
+ "route": {"rules": [{"port": 80, "action": "sniff-all"}]}}
+"#,
+        );
+        assert!(bad.is_err());
+
+        // Unknown sniffer name → error.
+        let bad = load(
+            r#"
+{"inbounds": [{"type": "mixed", "listen_port": 1}],
+ "outbounds": [{"type": "direct", "tag": "direct"}],
+ "route": {"rules": [{"port": 80, "action": "sniff", "sniffer": ["smb"]} ]}}
+"#,
+        );
+        assert!(bad.is_err());
+
+        // route-options is dropped (non-final; options unsupported) —
+        // the later plain rule still converts, so the config loads.
+        let cfg = load(
+            r#"
+{"inbounds": [{"type": "mixed", "listen_port": 1}],
+ "outbounds": [{"type": "direct", "tag": "direct"}],
+ "route": {"rules": [
+    {"port": 80, "action": "route-options", "udp_connect": true},
+    {"domain_suffix": ["x.test"], "outbound": "direct"}
+ ]}}
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.rules, vec!["DOMAIN-SUFFIX,x.test,direct", "MATCH,direct"]);
+
+        // Action on a logical rule attaches to the combined line.
+        let cfg = load(
+            r#"
+{"inbounds": [{"type": "mixed", "listen_port": 1}],
+ "outbounds": [{"type": "direct", "tag": "direct"}],
+ "route": {"rules": [
+    {"type": "logical", "mode": "and", "action": "sniff",
+     "rules": [{"domain_suffix": ["a.test"]}, {"port": [443]}]}
+ ]}}
+"#,
+        )
+        .unwrap();
+        assert!(cfg.rules[0].starts_with("AND,("));
+        assert!(matches!(
+            cfg.rule_actions.get(&0),
+            Some(crate::rule::RuleAction::Sniff { sniffer }) if sniffer.is_empty()
+        ));
+
+        // An action rule's placeholder outbound is exempt from
+        // validation; plain dangling targets still fail.
+        let mut cfg = cfg;
+        cfg.rules.push("DOMAIN-SUFFIX,broken.test,NOSUCH".to_string());
+        assert!(crate::config::validate(&cfg.with_builtin_outbounds()).is_err());
     }
 
     #[test]

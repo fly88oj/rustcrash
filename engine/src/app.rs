@@ -53,9 +53,15 @@ impl Engine {
     /// Build (without starting) from a normalized config: loads rule
     /// providers, geo databases, and constructs the outbound registry.
     pub fn build(cfg: EngineConfig) -> Result<Arc<Self>> {
+        // Log broadcast tap (the /logs endpoint's event source): create
+        // the process-wide bus and best-effort install it as the
+        // global tracing subscriber. Must precede any engine tracing
+        // that /logs should carry.
+        crate::api::init_log_broadcast();
+
         let cfg = cfg.with_builtin_outbounds();
         let rules = cfg.parse_rules()?;
-        let mut rule_sets = RuleSets::default();
+        let rule_sets = RuleSets::default();
         let mut geo = GeoLookups::default();
 
         // GeoIP.
@@ -95,7 +101,7 @@ impl Engine {
 
         // Rule providers.
         for p in &cfg.rule_providers {
-            load_provider(p, &mut rule_sets);
+            load_provider(p, &rule_sets);
         }
 
         // DNS.
@@ -163,6 +169,24 @@ impl Engine {
 
     pub async fn set_mode(&self, mode: RuleMode) {
         *self.mode.write().await = mode;
+    }
+
+    /// Runtime rule-provider reload — mihomo hub/route/provider.go
+    /// updateRuleProvider → `RP.Initial()` re-fetch: re-read the
+    /// provider's file, re-parse it, and swap the matcher set behind
+    /// rule evaluation. The set is fully built BEFORE the swap, so a
+    /// parse failure leaves the live table untouched; on success the
+    /// next relay's RULE-SET evaluation follows the new set (in-flight
+    /// evaluations keep the snapshot they cloned).
+    pub fn reload_rule_provider(&self, name: &str) -> std::result::Result<(), String> {
+        let Some(spec) = self.cfg.rule_providers.iter().find(|p| p.name == name) else {
+            return Err(format!("provider {name:?} not found"));
+        };
+        let kind = try_load_provider(spec)?;
+        self.rule_sets.insert(spec.name.clone(), kind);
+        tracing::info!(target: "engine",
+            "rule provider {} reloaded from {}", spec.name, spec.path);
+        Ok(())
     }
 
     pub fn config(&self) -> &EngineConfig {
@@ -636,11 +660,29 @@ fn format_rule(rule: &Rule) -> String {
     format!("{matcher} => {}", rule.outbound)
 }
 
-fn load_provider(p: &crate::config::RuleProviderSpec, sets: &mut RuleSets) {
+/// Config-build provider load: parse the file and insert the set,
+/// warning (never failing) on error — a bad provider must not abort
+/// engine startup. Runtime reload uses [`Engine::reload_rule_provider`],
+/// which surfaces the same errors to the API caller.
+fn load_provider(p: &crate::config::RuleProviderSpec, sets: &RuleSets) {
+    match try_load_provider(p) {
+        Ok(kind) => sets.insert(p.name.clone(), kind),
+        Err(e) => tracing::warn!(target: "engine", "rule provider {}: {e}", p.name),
+    }
+}
+
+/// Read and parse one rule-provider file into a fresh set — the shared
+/// path between config-build loading and the runtime reload. `Err`
+/// carries the human-facing reason (surfaced as the 503 body by
+/// `PUT /providers/rules/{name}`, mirroring upstream's
+/// updateRuleProvider → provider.Update() error path).
+fn try_load_provider(p: &crate::config::RuleProviderSpec) -> std::result::Result<RuleSetKind, String> {
+    let bytes = std::fs::read(&p.path)
+        .map_err(|e| format!("cannot read {}: {e}", p.path))?;
     // Binary formats (.srs / .mrs) are sniffed from the file magic —
     // they override the declared behavior (the binary carries both
     // domain and ip-cidr data) and fold into a classical set.
-    if let Ok(bytes) = std::fs::read(&p.path) {
+    if bytes.starts_with(b"SRS") || bytes.starts_with(b"MRS") {
         let parsed: std::result::Result<Vec<String>, crate::error::Error> =
             if bytes.starts_with(b"SRS") {
                 crate::ruleset_bin::parse_srs(&bytes).map(|srs| {
@@ -661,7 +703,7 @@ fn load_provider(p: &crate::config::RuleProviderSpec, sets: &mut RuleSets) {
                         .chain(srs.ip_cidrs.iter().map(|c| format!("IP-CIDR,{c},DIRECT")))
                         .collect()
                 })
-            } else if bytes.starts_with(b"MRS") {
+            } else {
                 crate::ruleset_bin::parse_mrs(&bytes).map(|mrs| {
                     mrs.suffixes
                         .iter()
@@ -670,11 +712,9 @@ fn load_provider(p: &crate::config::RuleProviderSpec, sets: &mut RuleSets) {
                         .chain(mrs.ip_cidrs.iter().map(|c| format!("IP-CIDR,{c},DIRECT")))
                         .collect()
                 })
-            } else {
-                Ok(Vec::new())
             };
-        if let Ok(lines) = parsed {
-            if !lines.is_empty() {
+        match parsed {
+            Ok(lines) if !lines.is_empty() => {
                 let rules = lines
                     .iter()
                     .filter_map(|l| match crate::rule::Rule::parse(l) {
@@ -687,19 +727,17 @@ fn load_provider(p: &crate::config::RuleProviderSpec, sets: &mut RuleSets) {
                     })
                     .collect::<Vec<_>>();
                 if !rules.is_empty() {
-                    sets.insert(p.name.clone(), RuleSetKind::Classical(rules));
-                    return;
+                    return Ok(RuleSetKind::Classical(rules));
                 }
+                // An empty binary folds through to the text path below,
+                // matching the config-build loader.
             }
-        } else if let Err(e) = parsed {
-            tracing::warn!(target: "engine", "rule provider {} binary: {e}", p.name);
-            return;
+            Ok(_) => { /* empty binary: fall through to text */ }
+            Err(e) => return Err(format!("binary parse: {e}")),
         }
     }
-    let Ok(content) = std::fs::read_to_string(&p.path) else {
-        tracing::warn!(target: "engine", "rule provider {}: cannot read {}", p.name, p.path);
-        return;
-    };
+    let content = String::from_utf8(bytes)
+        .map_err(|_| format!("{} is not valid UTF-8 text", p.path))?;
     let kind = match (p.behavior, p.format) {
         (crate::config::ProviderBehavior::Domain, crate::config::ProviderFormat::Text) => {
             let mut m = crate::rule::DomainMatcher::default();
@@ -750,13 +788,12 @@ fn load_provider(p: &crate::config::RuleProviderSpec, sets: &mut RuleSets) {
             RuleSetKind::Classical(rules)
         }
         (behavior, format) => {
-            tracing::warn!(target: "engine",
-                "rule provider {}: behavior {behavior:?} with format {format:?} not supported yet",
-                p.name);
-            return;
+            return Err(format!(
+                "behavior {behavior:?} with format {format:?} not supported yet"
+            ));
         }
     };
-    sets.insert(p.name.clone(), kind);
+    Ok(kind)
 }
 
 /// DNS hijack server (UDP + TCP with length-prefix framing).
@@ -976,6 +1013,8 @@ mod tests {
 
     fn minimal_config() -> EngineConfig {
         EngineConfig {
+            group_health: Default::default(),
+            rule_actions: Default::default(),
             mode: RuleMode::Rule,
             ipv6: false,
             listeners: vec![ListenerConfig {

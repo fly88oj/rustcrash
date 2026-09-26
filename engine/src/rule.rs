@@ -249,6 +249,38 @@ pub enum LogicMode {
     Not,
 }
 
+/// A sing-box route rule action (option/rule_action.go: the `action:`
+/// field on a route rule object), carried INSTEAD of routing. mihomo
+/// rule lines have no actions — upstream's trailing params are only
+/// `no-resolve` and `src` (rules/common/base.go `ParseParams`), and
+/// sniffing there is config-level (`sniffer:` block) — so only the
+/// sing-box loader ever sets these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleAction {
+    /// Non-final `action: sniff` (RouteActionSniff): sniff the
+    /// connection when the rule matches, then CONTINUE matching from
+    /// the next rule (route/route.go `matchRule` continues the loop, it
+    /// does not restart). `sniffer` is sing-box's protocol subset
+    /// (`tls,http,quic,dns,stun,bittorrent,dtls,ssh,rdp,ntp`); empty =
+    /// all (the engine sniffs tls/http/quic).
+    Sniff { sniffer: Vec<String> },
+    /// Non-final `action: resolve` (RouteActionResolve): resolve the
+    /// destination domain to IPs, then continue matching.
+    Resolve,
+    /// Final `action: hijack-dns`: answer the connection from the
+    /// engine's DNS module instead of routing it.
+    HijackDns,
+}
+
+impl RuleAction {
+    /// Final actions end rule matching (sing-box docs group route/
+    /// reject/hijack-dns as "Final actions"); the non-final ones
+    /// (sniff/resolve) apply and matching continues.
+    pub fn is_final(&self) -> bool {
+        matches!(self, RuleAction::HijackDns)
+    }
+}
+
 /// A rule with its outbound target.
 #[derive(Debug, Clone)]
 pub struct Rule {
@@ -533,16 +565,18 @@ impl Rule {
                 .is_some_and(|p| (range.start..=range.end).contains(&p)),
             RuleMatcher::RuleSet { name, .. } => match providers.get(name) {
                 None => false,
-                Some(RuleSetKind::Domain(m)) => {
-                    ctx.host.as_domain().is_some_and(|d| m.matches(d))
-                }
-                Some(RuleSetKind::IpCidr(nets)) => ctx
-                    .ips()
-                    .iter()
-                    .any(|ip| nets.iter().any(|n| n.contains(*ip))),
-                Some(RuleSetKind::Classical(rules)) => {
-                    rules.iter().any(|r| r.evaluate(ctx, providers, geo))
-                }
+                Some(kind) => match &*kind {
+                    RuleSetKind::Domain(m) => {
+                        ctx.host.as_domain().is_some_and(|d| m.matches(d))
+                    }
+                    RuleSetKind::IpCidr(nets) => ctx
+                        .ips()
+                        .iter()
+                        .any(|ip| nets.iter().any(|n| n.contains(*ip))),
+                    RuleSetKind::Classical(rules) => {
+                        rules.iter().any(|r| r.evaluate(ctx, providers, geo))
+                    }
+                },
             },
             RuleMatcher::ClashMode(mode) => ctx.mode.as_str() == mode,
             RuleMatcher::Network(n) => ctx.network == *n,
@@ -665,9 +699,20 @@ fn ip_matches_suffix(ip: IpAddr, suffix: &str) -> bool {
 
 
 /// Loaded rule-provider sets.
+///
+/// Interior-mutable so one provider can be re-loaded at runtime
+/// (mihomo `PUT /providers/rules/{name}` → `RP.Initial()` re-fetch)
+/// while relays evaluate rules concurrently: entries live behind
+/// `Arc`s, [`RuleSets::get`] clones the Arc out of a read lock, and a
+/// reload swaps the entry under the write lock. An in-flight
+/// evaluation therefore always observes one consistent snapshot — the
+/// set it cloned — and the replaced set drops once the last reader
+/// using it finishes. The std lock (not tokio's) is deliberate:
+/// evaluation is fully synchronous, so critical sections never
+/// `.await` and cannot starve the runtime.
 #[derive(Default)]
 pub struct RuleSets {
-    sets: std::collections::HashMap<String, RuleSetKind>,
+    sets: std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<RuleSetKind>>>,
 }
 
 pub enum RuleSetKind {
@@ -677,14 +722,29 @@ pub enum RuleSetKind {
 }
 
 impl RuleSets {
-    pub fn insert(&mut self, name: impl Into<String>, kind: RuleSetKind) {
-        self.sets.insert(name.into(), kind);
+    /// Insert (or replace) one provider set — the runtime-reload swap
+    /// point. Building the new set happens before this call, so a
+    /// parse failure never disturbs the live table.
+    pub fn insert(&self, name: impl Into<String>, kind: RuleSetKind) {
+        // A panicking writer only ever leaves a fully-owned old map
+        // behind — recover the lock rather than poisoning every relay.
+        let mut sets = match self.sets.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        sets.insert(name.into(), std::sync::Arc::new(kind));
     }
 
-    pub fn get(&self, name: &str) -> Option<&RuleSetKind> {
-        self.sets.get(name)
+    /// A snapshot handle to one provider set: the clone pins the
+    /// current matcher set for the caller's whole evaluation, immune
+    /// to concurrent reloads.
+    pub fn get(&self, name: &str) -> Option<std::sync::Arc<RuleSetKind>> {
+        let sets = match self.sets.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        sets.get(name).cloned()
     }
-
 }
 
 /// Domain set with exact/suffix/keyword/regex parts.
@@ -886,6 +946,128 @@ fn matcher_needs_process(m: &RuleMatcher) -> bool {
     }
 }
 
+/// One step of the sing-box action-aware rule walk.
+#[derive(Debug)]
+pub enum MatchOutcome<'a> {
+    /// A rule with no action (or a route-family action) matched: route
+    /// to `rule.outbound`.
+    Route { rule: &'a Rule, index: usize },
+    /// A rule with `action: sniff` matched: sniff the connection (the
+    /// action's `sniffer` subset selects protocols — see
+    /// [`crate::sniffer::SniffConfig::for_action`]), rebuild the match
+    /// context with the sniffed host, and re-enter the walk at
+    /// `resume_at` (the index AFTER this rule — sing-box continues the
+    /// rule loop instead of restarting it).
+    Sniff {
+        action: &'a RuleAction,
+        index: usize,
+        resume_at: usize,
+    },
+    /// A rule with `action: resolve` matched: resolve the context's
+    /// host into `ConnContext::resolved`, then re-enter the walk at
+    /// `resume_at`.
+    Resolve { index: usize, resume_at: usize },
+    /// A rule with `action: hijack-dns` matched: answer the connection
+    /// from the engine's DNS module.
+    HijackDns { index: usize },
+    /// Nothing matched (or every matching rule was non-final and the
+    /// list ran out): fall through to the default route.
+    NoMatch,
+}
+
+/// Parsed rules paired with their per-index actions — the compile
+/// result the router walks. The action side-table (rather than a field
+/// on [`Rule`]) keeps `Rule::parse` purely mihomo-faithful: the clash
+/// line syntax upstream carries no actions.
+#[derive(Debug, Clone, Default)]
+pub struct RuleTable {
+    rules: Vec<Rule>,
+    actions: std::collections::HashMap<usize, RuleAction>,
+}
+
+impl RuleTable {
+    pub fn from_parts(
+        rules: Vec<Rule>,
+        actions: std::collections::HashMap<usize, RuleAction>,
+    ) -> Self {
+        RuleTable { rules, actions }
+    }
+
+    pub fn rules(&self) -> &[Rule] {
+        &self.rules
+    }
+
+    /// The action attached to rule `index`, if any.
+    pub fn action(&self, index: usize) -> Option<&RuleAction> {
+        self.actions.get(&index)
+    }
+
+    /// Walk the whole table (equivalent to [`RuleTable::match_from`] at
+    /// index 0).
+    pub fn walk<'a>(
+        &'a self,
+        ctx: &ConnContext<'_>,
+        providers: &RuleSets,
+        geo: &GeoLookups,
+    ) -> MatchOutcome<'a> {
+        self.match_from(0, ctx, providers, geo)
+    }
+
+    /// Ordered walk from rule `start` with sing-box `matchRule`
+    /// semantics (route/route.go): the first matching rule ends the
+    /// walk UNLESS its action is non-final, in which case the outcome
+    /// reports the action and the caller re-enters at `resume_at` after
+    /// applying it (sniffing / resolving mutate the match context, so
+    /// the walk itself stays synchronous). `resume_at` strictly
+    /// increases, so a re-entry loop terminates.
+    pub fn match_from<'a>(
+        &'a self,
+        start: usize,
+        ctx: &ConnContext<'_>,
+        providers: &RuleSets,
+        geo: &GeoLookups,
+    ) -> MatchOutcome<'a> {
+        for (i, rule) in self.rules.iter().enumerate().skip(start) {
+            if !rule.evaluate(ctx, providers, geo) {
+                continue;
+            }
+            let action = self.actions.get(&i);
+            match action {
+                None => return MatchOutcome::Route { rule, index: i },
+                Some(a @ RuleAction::Sniff { .. }) => {
+                    return MatchOutcome::Sniff {
+                        action: a,
+                        index: i,
+                        resume_at: i + 1,
+                    }
+                }
+                Some(RuleAction::Resolve) => {
+                    return MatchOutcome::Resolve {
+                        index: i,
+                        resume_at: i + 1,
+                    }
+                }
+                Some(RuleAction::HijackDns) => return MatchOutcome::HijackDns { index: i },
+            }
+        }
+        MatchOutcome::NoMatch
+    }
+
+    /// Whether any rule may need destination IPs obtained via DNS
+    /// (drives the router's single pre-resolve). Same rule set as
+    /// [`Rule::needs_ip`]; a `resolve` action does not add to it
+    /// because it fills `ConnContext::resolved` at walk time.
+    pub fn needs_ip(&self) -> bool {
+        self.rules.iter().any(|r| r.needs_ip())
+    }
+
+    /// Whether any rule needs the client process (drives the eager
+    /// /proc lookup in the TCP relay).
+    pub fn needs_process(&self) -> bool {
+        needs_process(&self.rules)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1038,7 +1220,7 @@ mod tests {
 
     #[test]
     fn rule_set_domain_evaluation() {
-        let mut sets = RuleSets::default();
+        let sets = RuleSets::default();
         let mut m = DomainMatcher::default();
         m.add_domain_line("example.com");
         m.add_domain_line("+.google.com");
@@ -1057,6 +1239,85 @@ mod tests {
         let host = Host::Domain("nope.test".into());
         let c = ctx(&host, 443);
         assert!(!rule.evaluate(&c, &sets, &geo));
+    }
+
+    #[test]
+    fn rule_sets_runtime_swap_semantics() {
+        // The runtime-reload contract (PUT /providers/rules/{name}):
+        // insert() REPLACES the entry, get() pins the snapshot it
+        // returned, and an unknown name misses — all through &self.
+        let sets = RuleSets::default();
+        assert!(sets.get("ads").is_none());
+
+        let mut old = DomainMatcher::default();
+        old.add_domain_line("+.old.test");
+        sets.insert("ads", RuleSetKind::Domain(old));
+        let pinned = sets.get("ads").unwrap();
+
+        let mut new = DomainMatcher::default();
+        new.add_domain_line("+.new.test");
+        sets.insert("ads", RuleSetKind::Domain(new));
+
+        let fresh = sets.get("ads").unwrap();
+        assert!(
+            !std::sync::Arc::ptr_eq(&pinned, &fresh),
+            "reload must swap in a fresh set"
+        );
+
+        // The pinned snapshot still matches the OLD content...
+        let geo = GeoLookups::default();
+        assert!(match &*pinned {
+            RuleSetKind::Domain(m) => m.matches("a.old.test"),
+            _ => false,
+        });
+        // ...while a fresh RULE-SET evaluation follows the new table:
+        // new domain in, old domain gone (replace, not merge).
+        let rule = Rule::parse("RULE-SET,ads,P").unwrap();
+        let host_new = Host::Domain("a.new.test".into());
+        let c_new = ctx(&host_new, 443);
+        let host_old = Host::Domain("a.old.test".into());
+        let c_old = ctx(&host_old, 443);
+        assert!(rule.evaluate(&c_new, &sets, &geo));
+        assert!(!rule.evaluate(&c_old, &sets, &geo));
+    }
+
+    #[test]
+    fn rule_sets_concurrent_get_during_swap() {
+        // Relays evaluate (get) while a reload swaps: no deadlock, no
+        // panic, every observed snapshot is internally consistent.
+        let sets = std::sync::Arc::new(RuleSets::default());
+        let mut m = DomainMatcher::default();
+        m.add_domain_line("host0.test");
+        sets.insert("ads", RuleSetKind::Domain(m));
+
+        let writer = {
+            let sets = sets.clone();
+            std::thread::spawn(move || {
+                for i in 1..1000u32 {
+                    let mut m = DomainMatcher::default();
+                    m.add_domain_line(&format!("host{i}.test"));
+                    sets.insert("ads", RuleSetKind::Domain(m));
+                }
+            })
+        };
+        let reader = {
+            let sets = sets.clone();
+            std::thread::spawn(move || {
+                for _ in 0..1000 {
+                    let kind = sets.get("ads").expect("entry always present");
+                    // Whatever snapshot we hold must be one complete set
+                    // (exactly one exact domain, no torn state).
+                    match &*kind {
+                        RuleSetKind::Domain(m) => {
+                            assert!(m.matches("host0.test") || (1..1000).any(|i| m.matches(&format!("host{i}.test"))));
+                        }
+                        _ => panic!("wrong kind"),
+                    }
+                }
+            })
+        };
+        writer.join().unwrap();
+        reader.join().unwrap();
     }
 
     #[test]
@@ -1229,5 +1490,193 @@ mod tests {
         assert!(!nr.needs_ip());
         assert!(Rule::parse("IP-SUFFIX,8..8,P").is_err());
         assert!(Rule::parse("IP-SUFFIX,.8,P").is_err());
+    }
+
+    // --- sing-box rule actions (RuleTable walk) -------------------------
+
+    /// Build a table from clash lines, attaching `actions` by index.
+    fn table(lines: &[&str], actions: Vec<(usize, RuleAction)>) -> RuleTable {
+        let rules = lines.iter().map(|l| Rule::parse(l).unwrap()).collect();
+        RuleTable::from_parts(rules, actions.into_iter().collect())
+    }
+
+    #[test]
+    fn rule_action_finality_and_walk_route() {
+        assert!(!RuleAction::Sniff { sniffer: vec![] }.is_final());
+        assert!(!RuleAction::Resolve.is_final());
+        assert!(RuleAction::HijackDns.is_final());
+
+        // A plain rule routes to its outbound; the action table stays
+        // out of the way.
+        let host = Host::Domain("cdn.example.com".into());
+        let c = ctx(&host, 443);
+        let sets = RuleSets::default();
+        let geo = GeoLookups::default();
+        let t = table(
+            &["DOMAIN-SUFFIX,example.com,PROXY", "MATCH,DIRECT"],
+            vec![],
+        );
+        let MatchOutcome::Route { rule, index } = t.walk(&c, &sets, &geo) else {
+            panic!("expected Route");
+        };
+        assert_eq!(rule.outbound, "PROXY");
+        assert_eq!(index, 0);
+        assert_eq!(t.rules().len(), 2);
+        assert_eq!(t.action(0), None);
+        // needs_ip / needs_process aggregate over the rules.
+        assert!(!t.needs_ip() && !t.needs_process());
+        let t_ip = table(&["IP-CIDR,1.2.3.0/24,PROXY"], vec![]);
+        assert!(t_ip.needs_ip());
+    }
+
+    #[test]
+    fn rule_action_sniff_continues_from_next_rule() {
+        // sing-box route/route.go matchRule: a matching `action: sniff`
+        // rule reports the sniff and the walk CONTINUES from the next
+        // rule when re-entered — the first walk stops AT the action.
+        let host = Host::Ip("93.184.216.34".parse().unwrap());
+        let c = ctx(&host, 443);
+        let sets = RuleSets::default();
+        let geo = GeoLookups::default();
+        let t = table(
+            &["DST-PORT,443,direct", "MATCH,PROXY"],
+            vec![(0, RuleAction::Sniff { sniffer: vec!["tls".into()] })],
+        );
+        let MatchOutcome::Sniff {
+            action,
+            index,
+            resume_at,
+        } = t.walk(&c, &sets, &geo)
+        else {
+            panic!("expected Sniff");
+        };
+        assert_eq!(index, 0);
+        assert_eq!(resume_at, 1);
+        assert_eq!(
+            action,
+            &RuleAction::Sniff {
+                sniffer: vec!["tls".to_string()]
+            }
+        );
+        // After the sniff (host becomes a domain), re-entering at 1
+        // hits the MATCH rule.
+        let sniffed = Host::Domain("cdn.example.com".into());
+        let c2 = ctx(&sniffed, 443);
+        let MatchOutcome::Route { rule, index } = t.match_from(resume_at, &c2, &sets, &geo)
+        else {
+            panic!("expected Route after sniff");
+        };
+        assert_eq!((rule.outbound.as_str(), index), ("PROXY", 1));
+    }
+
+    #[test]
+    fn rule_action_sniff_skips_when_rule_misses() {
+        // The action rides the rule's conditions: a non-matching sniff
+        // rule is just skipped.
+        let host = Host::Domain("plain.test".into());
+        let c = ctx(&host, 80);
+        let sets = RuleSets::default();
+        let geo = GeoLookups::default();
+        let t = table(
+            &["DST-PORT,443,direct", "MATCH,PROXY"],
+            vec![(0, RuleAction::Sniff { sniffer: vec![] })],
+        );
+        let MatchOutcome::Route { rule, .. } = t.walk(&c, &sets, &geo) else {
+            panic!("expected Route");
+        };
+        assert_eq!(rule.outbound, "PROXY");
+    }
+
+    #[test]
+    fn rule_action_resolve_then_ip_rule() {
+        // resolve fires, and after the caller fills `resolved` the
+        // re-entry lets an IP-CIDR rule match (sing-box's resolve feeds
+        // ip_cidr rules).
+        let host = Host::Domain("example.com".into());
+        let c = ctx(&host, 80);
+        let sets = RuleSets::default();
+        let geo = GeoLookups::default();
+        let t = table(
+            &["DOMAIN-KEYWORD,example,direct", "IP-CIDR,1.2.3.0/24,PROXY"],
+            vec![(0, RuleAction::Resolve)],
+        );
+        let MatchOutcome::Resolve { index, resume_at } = t.walk(&c, &sets, &geo) else {
+            panic!("expected Resolve");
+        };
+        assert_eq!((index, resume_at), (0, 1));
+        // Before resolving, the IP rule cannot match; with resolved IPs
+        // filled by the caller it does.
+        assert!(!t.rules()[1].evaluate(&c, &sets, &geo));
+        let mut c2 = ctx(&host, 80);
+        c2.resolved = Some(vec!["1.2.3.4".parse().unwrap()]);
+        let MatchOutcome::Route { rule, index } = t.match_from(resume_at, &c2, &sets, &geo)
+        else {
+            panic!("expected Route after resolve");
+        };
+        assert_eq!((rule.outbound.as_str(), index), ("PROXY", 1));
+    }
+
+    #[test]
+    fn rule_action_hijack_dns_is_final_and_no_match_falls_through() {
+        let host = Host::Domain("anything.test".into());
+        let c = ctx(&host, 53);
+        let sets = RuleSets::default();
+        let geo = GeoLookups::default();
+        let t = table(&["DST-PORT,53,direct"], vec![(0, RuleAction::HijackDns)]);
+        let MatchOutcome::HijackDns { index } = t.walk(&c, &sets, &geo) else {
+            panic!("expected HijackDns");
+        };
+        assert_eq!(index, 0);
+
+        // A non-final action on the LAST matching rule: the walk stops
+        // at the action; after applying it, re-entry runs off the end →
+        // NoMatch (sing-box falls to the default route).
+        let t2 = table(&["MATCH,direct"], vec![(0, RuleAction::Resolve)]);
+        let MatchOutcome::Resolve { resume_at, .. } = t2.walk(&c, &sets, &geo) else {
+            panic!("expected Resolve before NoMatch");
+        };
+        assert_eq!(resume_at, 1);
+        assert!(matches!(
+            t2.match_from(resume_at, &c, &sets, &geo),
+            MatchOutcome::NoMatch
+        ));
+
+        // An empty table never matches.
+        let t3 = RuleTable::default();
+        assert!(matches!(t3.walk(&c, &sets, &geo), MatchOutcome::NoMatch));
+        assert!(!t3.needs_ip() && !t3.needs_process());
+    }
+
+    #[test]
+    fn rule_action_chain_sniff_then_resolve_then_route() {
+        // Actions chain across consecutive rules exactly like sing-box's
+        // continued loop: sniff, resolve, then a plain rule routes.
+        let host = Host::Ip("10.0.0.1".parse().unwrap());
+        let c = ctx(&host, 443);
+        let sets = RuleSets::default();
+        let geo = GeoLookups::default();
+        let t = table(
+            &[
+                "NETWORK,tcp,direct",
+                "DST-PORT,443,direct",
+                "MATCH,PROXY",
+            ],
+            vec![
+                (0, RuleAction::Sniff { sniffer: vec![] }),
+                (1, RuleAction::Resolve),
+            ],
+        );
+        let MatchOutcome::Sniff { resume_at: r1, .. } = t.walk(&c, &sets, &geo) else {
+            panic!("expected Sniff");
+        };
+        let MatchOutcome::Resolve { resume_at: r2, .. } = t.match_from(r1, &c, &sets, &geo)
+        else {
+            panic!("expected Resolve");
+        };
+        assert_eq!(r2, 2);
+        let MatchOutcome::Route { rule, .. } = t.match_from(r2, &c, &sets, &geo) else {
+            panic!("expected Route");
+        };
+        assert_eq!(rule.outbound, "PROXY");
     }
 }
