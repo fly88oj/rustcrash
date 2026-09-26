@@ -1158,10 +1158,7 @@ async fn vless_front(
                 Ok(Box::new(client) as BoxProxyStream)
             }
             OutboundKind::ZeroTier(cfg) => {
-                crate::proto::zerotier::connect(cfg).await?;
-                Err(Error::config(
-                    "zerotier: connect returned without a tunnel (unreachable)",
-                ))
+                crate::proto::zerotier::connect(cfg, target).await
             }
             OutboundKind::EasyTier(cfg) => {
                 // IPv4 overlay (adapter dials tcp4); domains resolve
@@ -1531,9 +1528,12 @@ async fn vless_front(
                 let udp = crate::proto::easytier::EasyTierUdp::bind(cfg).await?;
                 Ok(UdpChannel::EasyTier(udp))
             }
+            OutboundKind::ZeroTier(cfg) => {
+                let udp = crate::proto::zerotier::ZtUdp::bind(cfg).await?;
+                Ok(UdpChannel::ZeroTier(udp))
+            }
             OutboundKind::AnyTls(_)
-            | OutboundKind::Restls { .. }
-            | OutboundKind::ZeroTier(_) => Err(
+            | OutboundKind::Restls { .. } => Err(
                 Error::protocol(format!("{} does not support UDP", self.kind_name())),
             ),
             OutboundKind::Reject
@@ -1712,6 +1712,8 @@ pub enum UdpChannel {
     EasyTier(crate::proto::easytier::EasyTierUdp),
     /// The `dns` outbound's UDP echo (resolver-answered datagrams).
     Dns(crate::dns::DnsUdpEcho),
+    /// zerotier overlay UDP (managed-IP targets).
+    ZeroTier(crate::proto::zerotier::ZtUdp),
 }
 
 impl UdpChannel {
@@ -1843,6 +1845,7 @@ impl UdpChannel {
             UdpChannel::OpenVpn(o) => o.send(target, data).await,
             UdpChannel::Tailscale(t) => t.send(target, data).await,
             UdpChannel::Dns(d) => d.send(data).await,
+            UdpChannel::ZeroTier(z) => z.send(target, data).await,
             UdpChannel::EasyTier(e) => {
                 let addr = match &target.host {
                     crate::addr::Host::Ip(ip) => std::net::SocketAddr::new(*ip, target.port),
@@ -1952,6 +1955,7 @@ impl UdpChannel {
             UdpChannel::OpenVpn(o) => o.recv().await,
             UdpChannel::Tailscale(t) => t.recv().await,
             UdpChannel::Dns(d) => d.recv().await,
+            UdpChannel::ZeroTier(z) => z.recv().await,
             UdpChannel::EasyTier(e) => {
                 let (addr, data) = e.recv().await?;
                 Ok((
@@ -2191,10 +2195,15 @@ impl Registry {
         out
     }
 
-    /// Run one URL-test round for every url-test/fallback group member
-    /// that has no fresh sample yet.
-    pub async fn health_round(&self) {
-        for g in &self.groups {
+    /// Run one URL-test round for the given groups — the engine
+    /// computes the due set (lazy gating) and hands each group's
+    /// expected-status here; a probe only counts when its HTTP status
+    /// matches (`probe_expect`). Skips Direct/Reject members as before.
+    pub async fn health_round(&self, due: &[(String, crate::config::ExpectedStatus)]) {
+        for (name, expected) in due {
+            let Some(g) = self.groups.iter().find(|g| &g.cfg.name == name) else {
+                continue;
+            };
             if !matches!(g.cfg.policy, GroupPolicy::UrlTest | GroupPolicy::Fallback) {
                 continue;
             }
@@ -2209,7 +2218,7 @@ impl Registry {
                     continue;
                 }
                 let started = std::time::Instant::now();
-                let probe = probe(&url, outbound).await;
+                let probe = probe_expect(&url, outbound, expected).await;
                 let sample = probe.ok().map(|_| started.elapsed().as_millis() as u32);
                 self.record_latency(m, sample).await;
             }
@@ -2217,8 +2226,27 @@ impl Registry {
     }
 }
 
-/// Fetch a URL through an outbound (GET via a minimal HTTP/1.1 request).
+/// Fetch a URL through an outbound (GET via a minimal HTTP/1.1 request),
+/// healthy only for the legacy 200..=399 window — the API delay tests'
+/// behavior. Health checks use [`probe_expect`] with the group's
+/// expected-status instead.
 pub async fn probe(url: &str, outbound: &Outbound) -> Result<()> {
+    // Default expectation = the legacy window (200..=399).
+    let window = crate::config::ExpectedStatus::parse("200-399")
+        .expect("constant expected-status range parses");
+    probe_expect(url, outbound, &window).await
+}
+
+/// [`probe`] with the caller's expected-status (mihomo group
+/// `expected-status`, utils.IntRanges.Check): the probe only counts as
+/// healthy when `expected.matches(code)` — an EMPTY list accepts every
+/// status (mihomo healthcheck.go treats any response as alive when no
+/// expected-status is configured).
+pub async fn probe_expect(
+    url: &str,
+    outbound: &Outbound,
+    expected: &crate::config::ExpectedStatus,
+) -> Result<()> {
     let (host, port, path) = parse_probe_url(url)?;
     let target = NetAddr::domain(&host, port)?;
     let mut stream = outbound.connect(&target).await?;
@@ -2240,7 +2268,7 @@ pub async fn probe(url: &str, outbound: &Outbound) -> Result<()> {
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|c| c.parse::<u16>().ok())
         .unwrap_or(0);
-    if (200..400).contains(&code) {
+    if expected.matches(code) {
         Ok(())
     } else {
         Err(Error::network(format!("probe status {code}")))
@@ -2394,6 +2422,69 @@ mod tests {
         assert_eq!(p, 8080);
         assert_eq!(path, "/");
         assert!(parse_probe_url("https://x").is_err());
+    }
+
+    /// A one-request HTTP upstream answering a canned status line.
+    async fn spawn_status_upstream(status_line: &'static str) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    continue;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = Vec::new();
+                    let mut byte = [0u8; 1];
+                    loop {
+                        match sock.read(&mut byte).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {
+                                buf.push(byte[0]);
+                                if buf.ends_with(b"\r\n\r\n") || buf.len() > 4096 {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let resp =
+                        format!("HTTP/1.1 {status_line}\r\nContent-Length: 0\r\n\r\n");
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn probe_expect_status_windows() {
+        use crate::config::ExpectedStatus;
+        let out = Outbound::from_config(&direct("D")).unwrap();
+
+        // A 404 health URL: the legacy window rejects it (default
+        // expectation → unhealthy); an expected-404 group accepts it;
+        // an expected-204 group rejects it; an ANY list (mihomo's
+        // no-expected-status default) accepts every status.
+        let addr = spawn_status_upstream("404 Not Found").await;
+        let url = format!("http://{addr}/health");
+        assert!(probe(&url, &out).await.is_err(), "legacy window rejects 404");
+        assert!(
+            probe_expect(&url, &out, &ExpectedStatus::parse("404").unwrap())
+                .await
+                .is_ok(),
+            "expected 404 counts as healthy"
+        );
+        assert!(
+            probe_expect(&url, &out, &ExpectedStatus::parse("204").unwrap())
+                .await
+                .is_err()
+        );
+        assert!(probe_expect(&url, &out, &ExpectedStatus::default()).await.is_ok());
+
+        // A 204 URL stays healthy under the legacy window.
+        let addr204 = spawn_status_upstream("204 No Content").await;
+        assert!(probe(&format!("http://{addr204}/"), &out).await.is_ok());
     }
 
     #[test]

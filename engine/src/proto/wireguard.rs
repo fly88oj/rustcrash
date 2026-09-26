@@ -3555,6 +3555,208 @@ pub async fn serve_endpoint(cfg: &WgEndpointCfg, relay: SharedRelay) -> Result<S
 }
 
 // ---------------------------------------------------------------------------
+// et_pump: the raw packet surface for the easytier wg:// transport
+// ---------------------------------------------------------------------------
+//
+// easytier's `tunnel/wireguard.rs` (v2.6.4) is WireGuard-as-transport: it
+// drives cloudflare/boringtun's `Tunn` (the Noise_IKpsk2 handshake + the
+// ChaCha20Poly1305 transport sessions + the update_timers routine) as a
+// plain datagram pump under its `WgPeer`. This module exposes exactly the
+// pieces of the engine's hand-rolled implementation that the easytier
+// port (proto/easytier.rs) needs, through additive pub(crate) wrappers
+// over the existing machinery above — nothing here changes behaviour, it
+// only makes the already-tested builders/sessions reachable from the
+// sibling module. Timer constants are NOT re-exported: boringtun's
+// `noise/timers.rs` (REKEY_AFTER_TIME 120s, REJECT_AFTER_TIME 180s,
+// REKEY_ATTEMPT_TIME 90s, REKEY_TIMEOUT 5s, KEEPALIVE_TIMEOUT 10s) is
+// byte-identical to this file's, and easytier.rs cites its own copies.
+
+/// The pub(crate) facade consumed by `proto::easytier` (its `wg://`
+/// peer transport). Every item is a thin wrapper around the private
+/// handshake/session machinery of this module.
+pub(crate) mod et_pump {
+    use super::*;
+
+    /// The static keypair of one wg:// node. easytier derives it from the
+    /// network identity (`WgConfig::new_from_network_identity`,
+    /// tunnel/wireguard.rs:62-79): `sk = generate_digest_from_str(name,
+    /// secret)`, and BOTH nodes of a network run the SAME pair, so each
+    /// peer's configured `peer_public == my_public` and the Noise ss
+    /// shared secret is X25519(sk, sk·G) = sk²·G — deterministic on both
+    /// sides without any exchange.
+    pub(crate) struct EtStatic(StaticKeys);
+
+    /// Wrap a 32-byte secret into the static pair (pk = clamped X25519
+    /// base multiplication).
+    pub(crate) fn static_from_secret(sk: [u8; 32]) -> EtStatic {
+        EtStatic(StaticKeys::from_secret(sk))
+    }
+
+    impl EtStatic {
+        /// Our static public key (= the peer's, on the easytier mesh).
+        pub(crate) fn public(&self) -> [u8; 32] {
+            self.0.pk
+        }
+    }
+
+    /// An outbound initiation awaiting its response (opaque state).
+    pub(crate) struct EtPending(InitiationPending);
+
+    /// [`StaticKeys`]-level `build_initiation`: the 148-byte initiation
+    /// plus the state to consume the response.
+    pub(crate) fn build_initiation(
+        statics: &EtStatic,
+        peer_pk: &[u8; 32],
+        cookie: Option<[u8; 16]>,
+        local_index: u32,
+    ) -> Result<(Vec<u8>, EtPending)> {
+        let (msg, pending) = super::build_initiation(&statics.0, peer_pk, cookie, local_index)?;
+        Ok((msg, EtPending(pending)))
+    }
+
+    /// The result of a completed handshake: transport keys plus the
+    /// session indices.
+    pub(crate) struct EtHandshakeDone {
+        pub local_index: u32,
+        pub peer_index: u32,
+        /// Initiator-side send key.
+        pub send_key: [u8; 32],
+        /// Initiator-side receive key.
+        pub recv_key: [u8; 32],
+    }
+
+    pub(crate) fn consume_response(
+        statics: &EtStatic,
+        pending: &mut EtPending,
+        msg: &WgMsg,
+    ) -> Result<EtHandshakeDone> {
+        // easytier never configures a PSK (Tunn::new(.., None, ..)).
+        let done = super::consume_response(&statics.0, &mut pending.0, msg, &[0u8; 32])?;
+        Ok(EtHandshakeDone {
+            local_index: done.local_index,
+            peer_index: done.peer_index,
+            send_key: done.send_key,
+            recv_key: done.recv_key,
+        })
+    }
+
+    /// Consume a cookie-reply datagram for a pending initiation.
+    pub(crate) fn consume_cookie_reply(
+        peer_pk: &[u8; 32],
+        pending: &EtPending,
+        msg: &WgMsg,
+    ) -> Result<[u8; 16]> {
+        super::consume_cookie_reply(peer_pk, &pending.0, msg)
+    }
+
+    /// An authenticated initiation awaiting the psk2/response step
+    /// (`OpenInitiation`, opaque; the timestamp and initiator static are
+    /// readable for the replay guard and the peer-key check).
+    pub(crate) struct EtOpenInitiation(OpenInitiation);
+
+    impl EtOpenInitiation {
+        /// The initiation's TAI64N (memcmp-comparable; strictly greater
+        /// than the last accepted one, boringtun handshake.rs:543-547).
+        pub(crate) fn timestamp(&self) -> [u8; 12] {
+            self.0.timestamp
+        }
+
+        /// The initiator's unsealed static public key — easytier requires
+        /// it to equal the configured peer key (boringtun's
+        /// `verify_slices_are_equal(peer_static_public, decrypted)`,
+        /// handshake.rs:527-532 → `WrongKey`).
+        pub(crate) fn initiator_static(&self) -> [u8; 32] {
+            self.0.client_static
+        }
+    }
+
+    /// Responder half: verify an initiation up to (excluding) psk2.
+    pub(crate) fn open_initiation(statics: &EtStatic, msg: &WgMsg) -> Result<EtOpenInitiation> {
+        Ok(EtOpenInitiation(super::open_initiation(&statics.0, msg)?))
+    }
+
+    /// Responder half: complete the handshake (PSK always zero on the
+    /// easytier mesh), returning the 92-byte response plus the session
+    /// keys from the responder's perspective (`send_key` = the key the
+    /// initiator sends with, `recv_key` = the one it receives with).
+    pub(crate) fn respond_initiation(
+        open: EtOpenInitiation,
+        server_index: u32,
+    ) -> Result<(Vec<u8>, EtHandshakeDone)> {
+        let (resp, (_server_index, peer_index, k_client_send, k_client_recv)) =
+            super::respond_initiation(open.0, &[0u8; 32], server_index)?;
+        Ok((
+            resp,
+            EtHandshakeDone {
+                local_index: server_index,
+                peer_index,
+                send_key: k_client_send,
+                recv_key: k_client_recv,
+            },
+        ))
+    }
+
+    /// One transport session (send + receive halves with the 64-bit
+    /// counter and the anti-replay window).
+    pub(crate) struct EtSession(Session);
+
+    impl EtSession {
+        /// The initiator's session (`Session::from_handshake`).
+        pub(crate) fn from_initiator(done: EtHandshakeDone) -> Self {
+            EtSession(Session::from_handshake(
+                HandshakeDone {
+                    local_index: done.local_index,
+                    peer_index: done.peer_index,
+                    send_key: done.send_key,
+                    recv_key: done.recv_key,
+                },
+                Instant::now(),
+            ))
+        }
+
+        /// The responder's session (`Session::from_responder` — sends
+        /// with the initiator's receive key and vice versa).
+        pub(crate) fn from_responder(
+            local_index: u32,
+            peer_index: u32,
+            peer_send_key: [u8; 32],
+            peer_recv_key: [u8; 32],
+        ) -> Self {
+            EtSession(Session::from_responder(
+                local_index,
+                peer_index,
+                peer_send_key,
+                peer_recv_key,
+                Instant::now(),
+            ))
+        }
+
+        /// Our receiver index (the peer's `receiver` field addressing us).
+        pub(crate) fn local_index(&self) -> u32 {
+            self.0.local_index
+        }
+
+        /// Seal one inner IP packet into a transport datagram (padded to
+        /// a multiple of 16, counter claimed first).
+        pub(crate) fn seal(&mut self, inner: &[u8]) -> Result<Vec<u8>> {
+            self.0.seal_transport(inner)
+        }
+
+        /// Open a transport payload (tag, then replay window).
+        pub(crate) fn open(&mut self, counter: u64, data: &[u8]) -> Result<Vec<u8>> {
+            self.0.open_transport(counter, data)
+        }
+    }
+
+    /// Trim AEAD padding off a decrypted inner packet via the IPv4
+    /// total-length field (boringtun trims the same way in
+    /// `decrypt_packet`, noise/mod.rs).
+    pub(crate) fn trim_ip_packet(pkt: &mut Vec<u8>) {
+        super::trim_ip_packet(pkt)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests: crypto vectors, handshake round-trips against an in-test
 // responder, timer boundaries, and full loopback tunnels (real UDP
 // sockets on 127.0.0.1, keys generated at runtime).
