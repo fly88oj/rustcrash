@@ -128,6 +128,31 @@ pub(crate) fn auth_accepted(
         .any(|(u, p)| u.as_bytes() == user.as_bytes() && p.as_bytes() == pass.as_bytes())
 }
 
+/// Format a listener bind failure. `AddrInUse` gets the migration-era
+/// explanation instead of the bare OS string: this engine is a drop-in
+/// for ShellCrash installs, and a taken port on a fresh start is
+/// overwhelmingly "the OLD instance is still running" (a live
+/// ShellCrash/CrashCore kernel holds 7890/7893/1053, or a second engine
+/// was started). Name it and say how to stop it — the raw
+/// "Address already in use (os error 98)" names nobody.
+pub(crate) fn bind_failure(
+    kind: &str,
+    addr: impl std::fmt::Display,
+    e: std::io::Error,
+) -> crate::error::Error {
+    if e.kind() == std::io::ErrorKind::AddrInUse {
+        return crate::error::Error::network(format!(
+            "{kind} listener cannot bind {addr}: {e} — the port is already in use, so another \
+             proxy instance is probably still running (a live ShellCrash/CrashCore kernel, an \
+             external mihomo/sing-box, or a second engine). Stop the old one first: ShellCrash: \
+             `/etc/ShellCrash/start.sh stop` (or `sc stop`); RustCrash: `crash start stop`. If \
+             the old instance was killed without cleanup, its firewall rules may also still be \
+             loaded: run `crash firewall cleanup`"
+        ));
+    }
+    crate::error::Error::network(format!("{kind} listener bind {addr}: {e}"))
+}
+
 /// Bind every configured listener; returns the bound addresses (for logs
 /// and port-echo tests).
 pub async fn spawn_all(

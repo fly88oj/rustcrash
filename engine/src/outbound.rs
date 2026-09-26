@@ -255,6 +255,28 @@ impl Outbound {
         let _ = self.dns.set(dns);
     }
 
+    /// Resolve a domain through the attached engine resolver (A first,
+    /// AAAA as fallback — mihomo's ip-mode ordering). `None` when no
+    /// resolver is attached or it cannot answer; the caller decides
+    /// whether the OS resolver is an acceptable fallback (DIRECT dials
+    /// say no — mihomo #859).
+    async fn resolve_via_engine(&self, name: &str) -> Option<std::net::IpAddr> {
+        if name.is_empty() {
+            return None;
+        }
+        let dns = self.dns.get()?;
+        if let Some(ip) = dns
+            .resolve(name, crate::dns::wire::TYPE_A)
+            .await
+            .and_then(|v| v.first().copied())
+        {
+            return Some(ip);
+        }
+        dns.resolve(name, crate::dns::wire::TYPE_AAAA)
+            .await
+            .and_then(|v| v.first().copied())
+    }
+
     /// The shared QUIC connection for hy2/tuic outbounds, dialed on
     /// first use and reused until the server closes it.
     async fn quic_conn<F, Fut>(&self, dial: F) -> Result<std::sync::Arc<quinn::Connection>>
@@ -685,10 +707,34 @@ async fn vless_front(
     pub async fn connect(&self, target: &NetAddr) -> Result<BoxProxyStream> {
         match &self.kind {
             OutboundKind::Direct => {
-                let host = target.host.to_text();
-                let tcp = crate::mark::tcp_connect(&host, target.port)
-                    .await
-                    .map_err(|e| Error::network(format!("direct dial {target}: {e}")))?;
+                // mihomo #859: a domain dial on DIRECT must resolve
+                // through the ENGINE resolver, never silently through the
+                // OS one — when the built-in DNS is flaky, falling back to
+                // /etc/resolv.conf is exactly the polluted-answer leak.
+                // The OS resolver stays only for engines with no DNS
+                // configured (dns.enable: false).
+                let dial_addr = match &target.host {
+                    crate::addr::Host::Ip(ip) => {
+                        Some(std::net::SocketAddr::new(*ip, target.port))
+                    }
+                    crate::addr::Host::Domain(d) => self
+                        .resolve_via_engine(d)
+                        .await
+                        .map(|ip| std::net::SocketAddr::new(ip, target.port)),
+                };
+                let tcp = match dial_addr {
+                    Some(addr) => crate::mark::tcp_connect_addr(addr).await,
+                    None if self.dns.get().is_none() => {
+                        crate::mark::tcp_connect(&target.host.to_text(), target.port).await
+                    }
+                    None => {
+                        return Err(Error::network(format!(
+                            "direct dial {target}: the engine resolver could not resolve it \
+                             (no fallback to the system resolver — mihomo #859)"
+                        )))
+                    }
+                }
+                .map_err(|e| Error::network(format!("direct dial {target}: {e}")))?;
                 let _ = tcp.set_nodelay(true);
                 Ok(Box::new(tcp))
             }
@@ -1235,7 +1281,10 @@ async fn vless_front(
         match &self.kind {
             OutboundKind::Direct => {
                 let socket = crate::mark::udp_bind_ephemeral().await?;
-                Ok(UdpChannel::Direct(socket))
+                Ok(UdpChannel::Direct {
+                    socket,
+                    dns: self.dns.get().cloned(),
+                })
             }
             OutboundKind::Socks {
                 server,
@@ -1668,7 +1717,14 @@ impl Drop for QuicUdp {
 
 /// A UDP channel through any UDP-capable outbound.
 pub enum UdpChannel {
-    Direct(tokio::net::UdpSocket),
+    /// Plain-socket UDP. Carries the engine resolver so DOMAIN targets
+    /// resolve through it (mihomo #859 — the OS resolver must not
+    /// silently answer engine traffic); `None` when the engine has no
+    /// DNS configured, where the OS resolver is the only option.
+    Direct {
+        socket: tokio::net::UdpSocket,
+        dns: Option<std::sync::Arc<crate::dns::resolver::DnsEngine>>,
+    },
     Socks(Box<SocksUdp>),
     Ss(Box<SsUdp>),
     /// vmess tunnel: one body chunk per packet, `socks-addr || data`.
@@ -1719,12 +1775,62 @@ pub enum UdpChannel {
 impl UdpChannel {
     pub async fn send(&mut self, target: &NetAddr, data: &[u8]) -> Result<()> {
         match self {
-            UdpChannel::Direct(socket) => {
-                let host = target.host.to_text();
-                socket
-                    .send_to(data, (host.as_str(), target.port))
-                    .await
-                    .map_err(|e| Error::network(format!("udp send: {e}")))?;
+            UdpChannel::Direct { socket, dns } => {
+                // DOMAIN targets resolve through the engine resolver when
+                // one is attached (mihomo #859: a silent fallback to the
+                // OS resolver is the pollution vector); without one, the
+                // OS resolver is all there is.
+                match &target.host {
+                    crate::addr::Host::Ip(ip) => {
+                        socket
+                            .send_to(data, std::net::SocketAddr::new(*ip, target.port))
+                            .await
+                            .map_err(|e| Error::network(format!("udp send: {e}")))?;
+                    }
+                    crate::addr::Host::Domain(name) => {
+                        let resolved = match dns {
+                            Some(dns) => {
+                                let a = dns
+                                    .resolve(name, crate::dns::wire::TYPE_A)
+                                    .await
+                                    .and_then(|v| v.first().copied());
+                                let aaaa = match a {
+                                    Some(_) => None,
+                                    None => {
+                                        dns.resolve(name, crate::dns::wire::TYPE_AAAA)
+                                            .await
+                                            .and_then(|v| v.first().copied())
+                                    }
+                                };
+                                match a.or(aaaa) {
+                                    Some(ip) => Some(std::net::SocketAddr::new(ip, target.port)),
+                                    None => {
+                                        return Err(Error::network(format!(
+                                            "udp send {target}: the engine resolver could not \
+                                             resolve it (no fallback to the system resolver)"
+                                        )))
+                                    }
+                                }
+                            }
+                            None => None,
+                        };
+                        match resolved {
+                            Some(addr) => {
+                                socket
+                                    .send_to(data, addr)
+                                    .await
+                                    .map_err(|e| Error::network(format!("udp send: {e}")))?;
+                            }
+                            // No engine resolver: OS-resolving send_to.
+                            None => {
+                                socket
+                                    .send_to(data, (name.as_str(), target.port))
+                                    .await
+                                    .map_err(|e| Error::network(format!("udp send: {e}")))?;
+                            }
+                        }
+                    }
+                }
                 Ok(())
             }
             UdpChannel::Socks(socks) => {
@@ -1862,7 +1968,7 @@ impl UdpChannel {
 
     pub async fn recv(&mut self) -> Result<(NetAddr, Vec<u8>)> {
         match self {
-            UdpChannel::Direct(socket) => {
+            UdpChannel::Direct { socket, .. } => {
                 let mut buf = vec![0u8; 65536];
                 // The reply source only decides the address family; the
                 // dummy target is what the socks encoder writes back.
@@ -1974,6 +2080,10 @@ pub struct Registry {
     index: HashMap<String, usize>,
     groups: Vec<GroupState>,
     group_index: HashMap<String, usize>,
+    /// Connection counter for load-balance rotation (real round-robin per
+    /// connection — a time-sliced index would pin every connection in the
+    /// same second to one member).
+    lb_counter: std::sync::atomic::AtomicU64,
 }
 
 /// A proxy group.
@@ -1998,7 +2108,9 @@ pub enum GroupPolicy {
 pub struct GroupState {
     pub cfg: GroupConfig,
     selected: RwLock<Option<usize>>,
-    /// Latest latency per member (ms). None = untested, Some(0) = failed.
+    /// Latest latency per member (ms). `None` = the latest probe FAILED
+    /// (or the member was never probed — absent key);
+    /// `Some(ms)` = alive, where `Some(0)` is a legitimate sub-ms success.
     latencies: RwLock<HashMap<String, Option<u32>>>,
 }
 
@@ -2059,6 +2171,7 @@ impl Registry {
             index,
             groups: group_states,
             group_index,
+            lb_counter: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -2105,14 +2218,15 @@ impl Registry {
             GroupPolicy::UrlTest => {
                 // Lowest latency wins, but only by more than `tolerance`:
                 // mihomo keeps the incumbent unless a challenger beats it
-                // by the configured margin (avoids flapping).
+                // by the configured margin (avoids flapping). A failed
+                // probe (`None`) is excluded by the pattern; `Some(0)` is
+                // a fast SUCCESS, not a failure (mihomo #1298 shape: a
+                // sub-millisecond member wrongly evicted is the
+                // "continuous fail" misreport).
                 let latencies = group.latencies.read().await;
                 let mut best: Option<(usize, u32)> = None;
                 for (i, m) in members.iter().enumerate() {
                     if let Some(Some(lat)) = latencies.get(m) {
-                        if *lat == 0 {
-                            continue; // failed probe
-                        }
                         match best {
                             None => best = Some((i, *lat)),
                             Some((_, bl)) if (*lat + u32::from(group.cfg.tolerance)) < bl => {
@@ -2129,22 +2243,41 @@ impl Registry {
             GroupPolicy::Fallback => {
                 // First ALIVE member in config order — fallback preserves
                 // priority order, it does not hunt for the fastest.
+                // Alive = a successful probe (Some(_)); Some(0) is a
+                // legitimate sub-millisecond success.
                 let latencies = group.latencies.read().await;
                 for m in members.iter() {
-                    if matches!(latencies.get(m), Some(Some(lat)) if *lat > 0) {
+                    if matches!(latencies.get(m), Some(Some(_))) {
                         return Ok(m.clone());
                     }
                 }
                 Ok(members[0].clone())
             }
             GroupPolicy::LoadBalance => {
-                let count = members.len() as u64;
-                let tick = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let idx = (tick % count.max(1)) as usize;
-                Ok(members[idx].clone())
+                // mihomo #1298 (load-balance continuous-fail): rotation
+                // must evict members whose latest health probe FAILED —
+                // a dead node otherwise keeps receiving 1/N of the
+                // traffic forever. Untested members stay eligible (an
+                // absent sample evicts nothing); when EVERY member failed
+                // the full set keeps rotating (parking the group would be
+                // worse than trying dead nodes).
+                let latencies = group.latencies.read().await;
+                let eligible: Vec<&String> = members
+                    .iter()
+                    .filter(|m| !matches!(latencies.get(*m), Some(None)))
+                    .collect();
+                let pool: Vec<&String> = if eligible.is_empty() {
+                    members.iter().collect()
+                } else {
+                    eligible
+                };
+                drop(latencies);
+                let count = pool.len().max(1) as u64;
+                let tick = self
+                    .lb_counter
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let idx = (tick % count) as usize;
+                Ok((*pool[idx]).clone())
             }
         }
     }
@@ -2204,7 +2337,10 @@ impl Registry {
             let Some(g) = self.groups.iter().find(|g| &g.cfg.name == name) else {
                 continue;
             };
-            if !matches!(g.cfg.policy, GroupPolicy::UrlTest | GroupPolicy::Fallback) {
+            if !matches!(
+                g.cfg.policy,
+                GroupPolicy::UrlTest | GroupPolicy::Fallback | GroupPolicy::LoadBalance
+            ) {
                 continue;
             }
             let url = g.cfg.url.clone().unwrap_or_else(|| {
@@ -2293,6 +2429,7 @@ fn parse_probe_url(url: &str) -> Result<(String, u16, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dns::resolver::DnsEngine;
     use crate::proto::shadowsocks::SsMethod;
 
     fn direct(name: &str) -> OutboundConfig {
@@ -2309,6 +2446,112 @@ mod tests {
             udp: false,
             kind: OutboundKind::Reject,
         }
+    }
+
+    /// The engine-resolved DNS config used by the direct-dial tests:
+    /// `hosts` answers everything (no live upstream needed).
+    fn test_dns_engine(host: &str, ip: std::net::IpAddr) -> std::sync::Arc<crate::dns::resolver::DnsEngine> {
+        use std::collections::HashMap;
+        DnsEngine::new(
+            crate::config::DnsConfig {
+                fakeip_store: None,
+                enable: true,
+                listen: None,
+                enhanced_mode: crate::config::EnhancedMode::RedirHost,
+                ipv6: false,
+                nameservers: vec!["udp://127.0.0.1:1".into()],
+                fallback: vec![],
+                fakeip_range: "198.18.0.1/15".into(),
+                fakeip_filter: vec![],
+                hosts: HashMap::from([(host.to_string(), vec![ip])]),
+                nameserver_policy: Vec::new(),
+                client_subnet: None,
+                rules: Vec::new(),
+            },
+            crate::rule::DomainMatcher::default(),
+        )
+        .unwrap()
+    }
+
+    /// mihomo #859: DIRECT domain dials must resolve through the ENGINE
+    /// resolver (here: a `hosts` entry), never silently through the OS
+    /// resolver — and when the engine resolver cannot answer, the dial
+    /// fails instead of leaking the lookup to /etc/resolv.conf.
+    #[tokio::test]
+    async fn direct_dials_resolve_through_the_engine_resolver() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let accepted = accepted.clone();
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((sock, _)) = listener.accept().await {
+                    accepted.store(true, std::sync::atomic::Ordering::SeqCst);
+                    held.push(sock);
+                }
+            });
+        }
+        let dns = test_dns_engine("direct.test", "127.0.0.1".parse().unwrap());
+        let reg = Registry::build(vec![direct("D")], vec![], Some(&dns)).unwrap();
+        let out = reg.resolve("D").await.unwrap();
+        let _stream = out
+            .connect(&NetAddr::domain("direct.test", port).unwrap())
+            .await
+            .expect("the hosts entry steers the dial to loopback");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !accepted.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "listener never saw the dial");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // The engine resolver cannot answer this one (dead upstream, no
+        // hosts entry): the dial must FAIL — not fall back to the system
+        // resolver (the #859 pollution vector).
+        let err = out
+            .connect(&NetAddr::domain("unresolvable.test", port).unwrap())
+            .await;
+        assert!(err.is_err(), "unresolved domain must fail the direct dial");
+
+        // Control: without an engine resolver the OS path stays (dns
+        // disabled engines must keep working).
+        let reg_plain = Registry::build(vec![direct("D2")], vec![], None).unwrap();
+        let out_plain = reg_plain.resolve("D2").await.unwrap();
+        let _ = out_plain
+            .connect(&NetAddr::domain("localhost", port).unwrap())
+            .await
+            .expect("OS-resolver fallback still works without engine dns");
+    }
+
+    /// The UDP arm of the same rule: a domain datagram on the Direct
+    /// channel resolves through the engine resolver.
+    #[tokio::test]
+    async fn direct_udp_domain_sends_resolve_through_the_engine_resolver() {
+        let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = sink.local_addr().unwrap().port();
+        let dns = test_dns_engine("udp.test", "127.0.0.1".parse().unwrap());
+        let reg = Registry::build(vec![direct("D")], vec![], Some(&dns)).unwrap();
+        let out = reg.resolve("D").await.unwrap();
+        let mut channel = out.udp(&NetAddr::ip("127.0.0.1".parse().unwrap(), port)).await.unwrap();
+        channel
+            .send(&NetAddr::domain("udp.test", port).unwrap(), b"probe")
+            .await
+            .expect("domain send resolves through the engine resolver");
+        let mut buf = [0u8; 16];
+        let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(5), sink.recv_from(&mut buf))
+            .await
+            .expect("the datagram lands on the mapped address")
+            .unwrap();
+        assert_eq!(&buf[..n], b"probe");
+
+        // Unresolvable domain: error, not a silent system lookup.
+        assert!(
+            channel
+                .send(&NetAddr::domain("nowhere.test", port).unwrap(), b"x")
+                .await
+                .is_err(),
+            "unresolved domain must fail the udp send"
+        );
     }
 
     #[tokio::test]
@@ -2328,6 +2571,84 @@ mod tests {
         assert_eq!(reg.resolve("G").await.unwrap().name, "B");
         assert!(reg.set_selected("G", "R").await.is_err());
         assert!(reg.set_selected("A", "A").await.is_err());
+    }
+
+    /// mihomo #1298 (load-balance continuous-fail): a member whose latest
+    /// probe FAILED must be evicted from the rotation — a dead node
+    /// otherwise keeps receiving 1/N of the traffic forever. Untested
+    /// members stay eligible; when everything failed the whole set keeps
+    /// rotating.
+    #[tokio::test]
+    async fn load_balance_evicts_failed_members() {
+        let groups = vec![GroupConfig {
+            name: "LB".into(),
+            members: vec!["A".into(), "B".into()],
+            policy: GroupPolicy::LoadBalance,
+            url: Some("http://health.test/204".into()),
+            interval: 300,
+            tolerance: 0,
+        }];
+        let reg =
+            Registry::build(vec![direct("A"), direct("B")], groups, None).unwrap();
+
+        // Untested: both rotate.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..8 {
+            seen.insert(reg.resolve("LB").await.unwrap().name.clone());
+        }
+        assert_eq!(seen.len(), 2, "untested members must all rotate");
+
+        // B's probe failed (None) — only A remains.
+        reg.record_latency("B", None).await;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..8 {
+            seen.insert(reg.resolve("LB").await.unwrap().name.clone());
+        }
+        assert_eq!(seen, ["A".to_string()].into(), "failed member must be evicted");
+
+        // Everything failed: the full set rotates again (parking the
+        // group would blackhole all traffic).
+        reg.record_latency("A", None).await;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..8 {
+            seen.insert(reg.resolve("LB").await.unwrap().name.clone());
+        }
+        assert_eq!(seen.len(), 2, "all-failed must keep rotating the full set");
+
+        // A recovers: rotation returns to A only (B still failed).
+        reg.record_latency("A", Some(12)).await;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..8 {
+            seen.insert(reg.resolve("LB").await.unwrap().name.clone());
+        }
+        assert_eq!(seen, ["A".to_string()].into());
+    }
+
+    /// mihomo #1298's misreport shape: a sub-millisecond probe records
+    /// Some(0), which url-test and fallback used to treat as "failed" —
+    /// a healthy fast member was evicted and fallback fell through to the
+    /// first (possibly dead) member.
+    #[tokio::test]
+    async fn zero_ms_probe_is_alive_not_failed() {
+        let mk = |policy: GroupPolicy| GroupConfig {
+            name: format!("{policy:?}"),
+            members: vec!["A".into(), "B".into()],
+            policy,
+            url: Some("http://health.test/204".into()),
+            interval: 300,
+            tolerance: 0,
+        };
+        let reg = Registry::build(
+            vec![direct("A"), direct("B")],
+            vec![mk(GroupPolicy::UrlTest), mk(GroupPolicy::Fallback)],
+            None,
+        )
+        .unwrap();
+        // A failed (None); B is fast: Some(0).
+        reg.record_latency("A", None).await;
+        reg.record_latency("B", Some(0)).await;
+        assert_eq!(reg.resolve("UrlTest").await.unwrap().name, "B");
+        assert_eq!(reg.resolve("Fallback").await.unwrap().name, "B");
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@
 //! forwarding with cache, static hosts overrides, and the resolver the
 //! router uses.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::DnsConfig;
 use crate::dns::fakeip::FakeIpPool;
-use crate::dns::upstream::{parse_upstream, Upstream};
+use crate::dns::upstream::{parse_upstream, Upstream, EXCHANGE_TOTAL_TIMEOUT};
 use crate::dns::wire::{self, DnsMessage};
 use crate::error::{Error, Result};
 use crate::rule::DomainMatcher;
@@ -21,11 +21,47 @@ struct CacheEntry {
     ttl_until: Instant,
 }
 
+/// Expired cache entries are swept at most this often on insert. Without
+/// a sweep the map grows without bound — one entry per unique
+/// (name, qtype) ever queried stays resident forever even after its TTL
+/// lapses, which is precisely the slow heap growth of mihomo #955 /
+/// #2196 (OOM on OpenWrt after hours).
+const CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// One upstream walk's inputs (see [`DnsEngine::forward`]); a struct so
+/// the walk signature stays under clippy's argument budget.
+struct UpstreamWalk<'a> {
+    query: &'a DnsMessage,
+    name: &'a str,
+    qtype: u16,
+    upstreams: &'a [Upstream],
+    subnet: Option<&'a crate::dns::edns::ClientSubnet>,
+    rewrite_ttl: Option<u32>,
+    cache_ok: bool,
+}
+
+/// Releases an in-flight loop-guard key when dropped — on return, panic
+/// OR cancellation of the `forward` future (a leaked key would pin that
+/// (id, name, qtype) into permanent SERVFAIL).
+struct InFlightGuard<'a> {
+    engine: &'a DnsEngine,
+    key: (u16, String, u16),
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.engine.inflight.lock().unwrap().remove(&self.key);
+    }
+}
+
 pub struct DnsEngine {
     cfg: DnsConfig,
     fakeip: Option<FakeIpPool>,
     fakeip_filter: DomainMatcher,
     cache: Mutex<HashMap<(String, u16), CacheEntry>>,
+    /// When expired cache entries were last swept (drives the insert-time
+    /// sweep; guarded by `cache`'s lock).
+    next_cache_sweep: Mutex<Instant>,
     query_id: AtomicU32,
     upstreams: Vec<Upstream>,
     /// Static hosts overrides (`hosts:` in mihomo config / sing-box hosts).
@@ -34,6 +70,17 @@ pub struct DnsEngine {
     policy: Option<crate::dns::policy::NameserverPolicy>,
     /// sing-box dns.rules (per-rule server/ttl/cache).
     rules: Option<crate::dns::rules::DnsRules>,
+    /// Queries currently being forwarded, keyed by (id, qname, qtype) —
+    /// the DNS-loopback guard (sing-box #2704 / #3878). When the engine's
+    /// own outgoing query is re-routed back into the engine (tun
+    /// auto-route without a routing-mark exemption, a `system` upstream
+    /// pointing at a local stub, dns-hijack any:53), the re-entered
+    /// packet carries the SAME id and question; seeing our own key
+    /// in-flight means the packet came from us, and answering SERVFAIL
+    /// (instead of forwarding again) breaks the loop after one bounce.
+    /// The false-positive case — two distinct clients picking the same
+    /// 16-bit id for the same name simultaneously — costs one retry.
+    inflight: Mutex<HashSet<(u16, String, u16)>>,
 }
 
 impl DnsEngine {
@@ -100,11 +147,13 @@ impl DnsEngine {
             fakeip,
             fakeip_filter,
             cache: Mutex::new(HashMap::new()),
+            next_cache_sweep: Mutex::new(Instant::now() + CACHE_SWEEP_INTERVAL),
             query_id: AtomicU32::new(1),
             upstreams,
             hosts,
             policy,
             rules,
+            inflight: Mutex::new(HashSet::new()),
         }))
     }
 
@@ -219,6 +268,60 @@ impl DnsEngine {
         let subnet = rule
             .and_then(|r| r.client_subnet.as_ref())
             .or(self.cfg.client_subnet.as_ref());
+
+        // DNS-loopback guard (sing-box #2704 / #3878): the outgoing query
+        // below carries the client's id, so if it is re-routed back into
+        // this engine the re-entered forward() arrives with the exact same
+        // (id, name, qtype) while the original is still parked on its
+        // upstream. Refuse to forward our own query a second time. The
+        // Drop guard removes the key even when the future is cancelled
+        // mid-exchange (a client that walks away must not leave the pair
+        // SERVFAIL-ing forever).
+        let guard_key = (query.id, name.to_string(), qtype);
+        {
+            let mut inflight = self.inflight.lock().unwrap();
+            if inflight.contains(&guard_key) {
+                tracing::warn!(target: "engine",
+                    "dns loop detected: query id {} for {name} is already in flight — \
+                     answering SERVFAIL instead of forwarding again", query.id);
+                return wire::build_response(query, wire::RCODE_SERVFAIL, &[]);
+            }
+            inflight.insert(guard_key.clone());
+        }
+        let _inflight = InFlightGuard {
+            engine: self,
+            key: guard_key,
+        };
+        let rewrite_ttl = rule.and_then(|r| r.rewrite_ttl);
+        let resp = self
+            .forward_upstreams(UpstreamWalk {
+                query,
+                name,
+                qtype,
+                upstreams,
+                subnet,
+                rewrite_ttl,
+                cache_ok,
+            })
+            .await;
+        // `_inflight` drops here (or on cancellation) and frees the key.
+        resp
+    }
+
+    /// The upstream walk under the in-flight guard: first answer wins,
+    /// every exchange capped at [`EXCHANGE_TOTAL_TIMEOUT`] so a phase
+    /// without its own timeout (a black-holed TCP/QUIC connect) cannot
+    /// park the query on the OS connect timeout (mihomo #2560).
+    async fn forward_upstreams(&self, w: UpstreamWalk<'_>) -> Vec<u8> {
+        let UpstreamWalk {
+            query,
+            name,
+            qtype,
+            upstreams,
+            subnet,
+            rewrite_ttl,
+            cache_ok,
+        } = w;
         // Ask each upstream in order until one answers; the outgoing query
         // carries the client's id so the answer maps back without state.
         for upstream in upstreams {
@@ -227,13 +330,20 @@ impl DnsEngine {
                 crate::dns::edns::append_to_query(&mut outbound, subnet);
             }
             outbound[0..2].copy_from_slice(&query.id.to_be_bytes());
-            match upstream.exchange(&outbound).await {
-                Ok(mut resp) => {
+            let exchanged =
+                tokio::time::timeout(EXCHANGE_TOTAL_TIMEOUT, upstream.exchange(&outbound)).await;
+            match exchanged {
+                // Total-cap expiry counts as a failed upstream: move on.
+                Err(_) => {
+                    tracing::debug!(target: "engine",
+                        "dns upstream {upstream}: no answer within the total exchange cap");
+                }
+                Ok(Ok(mut resp)) => {
                     resp[0..2].copy_from_slice(&query.id.to_be_bytes());
                     // TTL rewrite happens BEFORE caching so the served
                     // TTL and the cache expiry agree (sing-box does the
                     // same in applyResponseOptions → storeCache).
-                    if let Some(ttl) = rule.and_then(|r| r.rewrite_ttl) {
+                    if let Some(ttl) = rewrite_ttl {
                         if let Err(e) = crate::dns::rules::rewrite_ttl(&mut resp, ttl) {
                             tracing::debug!(target: "engine", "dns ttl rewrite: {e}");
                         }
@@ -243,7 +353,7 @@ impl DnsEngine {
                     }
                     return resp;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::debug!(target: "engine", "dns upstream {upstream}: {e}");
                 }
             }
@@ -276,13 +386,35 @@ impl DnsEngine {
             return;
         }
         let ttl = min_ttl.clamp(5, 300);
-        self.cache.lock().unwrap().insert(
+        let mut cache = self.cache.lock().unwrap();
+        cache.insert(
             (name.to_string(), qtype),
             CacheEntry {
                 addrs,
                 ttl_until: Instant::now() + Duration::from_secs(ttl as u64),
             },
         );
+        self.sweep_cache_locked(&mut cache);
+    }
+
+    /// Drop expired entries (called with the cache lock held, at most once
+    /// per [`CACHE_SWEEP_INTERVAL`]). `cache_get` already treats expired
+    /// entries as misses, so this is purely about reclaiming the memory of
+    /// names nobody has asked about since their TTL lapsed — without it
+    /// the map only ever grows (the mihomo #955 / #2196 slow-leak shape).
+    fn sweep_cache_locked(&self, cache: &mut HashMap<(String, u16), CacheEntry>) {
+        let mut next = self.next_cache_sweep.lock().unwrap();
+        let now = Instant::now();
+        if now < *next {
+            return;
+        }
+        *next = now + CACHE_SWEEP_INTERVAL;
+        let before = cache.len();
+        cache.retain(|_, e| now <= e.ttl_until);
+        let swept = before - cache.len();
+        if swept > 0 {
+            tracing::debug!(target: "engine", "dns cache: swept {swept} expired entries");
+        }
     }
 
     fn next_id(&self) -> u16 {
@@ -509,5 +641,139 @@ mod tests {
             2,
             "after the flush the next query re-hits the upstream"
         );
+    }
+
+    /// sing-box #2704 / #3878: when the engine's own outgoing query is
+    /// re-routed back into the engine (tun auto-route without a mark
+    /// exemption, a `system` upstream at a local stub, dns-hijack
+    /// any:53), the re-entered packet carries the SAME id and question.
+    /// The in-flight guard must answer SERVFAIL instead of forwarding
+    /// again — and must not poison the original query, which still
+    /// completes once its upstream answers.
+    #[tokio::test]
+    async fn looped_back_query_gets_servfail_and_original_completes() {
+        use std::sync::atomic::AtomicBool;
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let seen = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(tokio::sync::Notify::new());
+        {
+            let seen = seen.clone();
+            let release = release.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 512];
+                loop {
+                    let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
+                        continue;
+                    };
+                    seen.store(true, Ordering::SeqCst);
+                    // Hold the answer until the test releases it, so the
+                    // first query is observably still in flight.
+                    release.notified().await;
+                    let q = &buf[..n];
+                    let mut resp = Vec::with_capacity(n + 16);
+                    resp.extend_from_slice(&q[..2]);
+                    resp.extend_from_slice(&[0x81, 0x80]);
+                    resp.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 0]);
+                    resp.extend_from_slice(&q[12..]);
+                    resp.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0, 1]);
+                    resp.extend_from_slice(&60u32.to_be_bytes());
+                    resp.extend_from_slice(&4u16.to_be_bytes());
+                    resp.extend_from_slice(&[203, 0, 113, 7]);
+                    let _ = sock.send_to(&resp, peer).await;
+                }
+            });
+        }
+        let engine = DnsEngine::new(
+            DnsConfig {
+                enhanced_mode: crate::config::EnhancedMode::RedirHost,
+                nameservers: vec![format!("udp://{addr}")],
+                ..dns_config()
+            },
+            DomainMatcher::default(),
+        )
+        .unwrap();
+        let query = wire::build_query(77, "loop.test", wire::TYPE_A);
+
+        let first_engine = engine.clone();
+        let first_query = query.clone();
+        let first =
+            tokio::spawn(async move { first_engine.handle(&first_query).await });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !seen.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "upstream never saw the query");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // The same wire query arriving again (the looped-back packet):
+        // SERVFAIL, immediately, without a second upstream exchange.
+        let second = engine.handle(&query).await;
+        let msg = wire::parse(&second).unwrap();
+        assert_eq!(msg.rcode, wire::RCODE_SERVFAIL, "looped query must be refused");
+        assert!(seen.load(Ordering::SeqCst));
+
+        // The original still finishes normally.
+        release.notify_one();
+        let done = tokio::time::timeout(std::time::Duration::from_secs(5), first)
+            .await
+            .expect("first query completes")
+            .unwrap();
+        let msg = wire::parse(&done).unwrap();
+        assert_eq!(msg.rcode, wire::RCODE_NOERROR);
+        assert_eq!(msg.answers.len(), 1);
+    }
+
+    /// mihomo #2560: a nameserver whose packets are black-holed (here: the
+    /// TCP connect to a reserved TEST-NET address never completes) must
+    /// cost exactly one total-exchange cap, not the OS connect timeout —
+    /// the query resolves to a failure answer within the cap. (Test
+    /// builds shrink the cap; see the const.)
+    #[tokio::test]
+    async fn blackholed_upstream_is_capped_by_the_total_timeout() {
+        let engine = DnsEngine::new(
+            DnsConfig {
+                enhanced_mode: crate::config::EnhancedMode::RedirHost,
+                // TEST-NET-1: guaranteed not to answer anywhere.
+                nameservers: vec!["tcp://192.0.2.1:53".into()],
+                ..dns_config()
+            },
+            DomainMatcher::default(),
+        )
+        .unwrap();
+        let query = wire::build_query(5, "blackhole.test", wire::TYPE_A);
+        let resp = engine.handle(&query).await;
+        let msg = wire::parse(&resp).unwrap();
+        assert_eq!(msg.id, 5);
+        assert_eq!(msg.rcode, wire::RCODE_NXDOMAIN, "all upstreams failed");
+        assert!(msg.answers.is_empty());
+    }
+
+    /// mihomo #955 / #2196: expired entries must actually leave the cache
+    /// map, not just read as misses — one resident entry per name ever
+    /// queried is the slow heap growth that OOMs routers.
+    #[tokio::test]
+    async fn expired_cache_entries_are_swept_on_insert() {
+        let engine = DnsEngine::new(dns_config(), DomainMatcher::default()).unwrap();
+        let resp = {
+            let q = wire::parse(&wire::build_query(1, "sweep.test", wire::TYPE_A)).unwrap();
+            wire::build_response(&q, wire::RCODE_NOERROR, &[("203.0.113.9".parse().unwrap(), 300)])
+        };
+        engine.cache_insert("sweep.test", wire::TYPE_A, &resp);
+        engine.cache_insert("live.test", wire::TYPE_A, &resp);
+        assert_eq!(engine.cache.lock().unwrap().len(), 2);
+        // Age one entry out and make the sweep due.
+        {
+            let mut cache = engine.cache.lock().unwrap();
+            cache
+                .get_mut(&("sweep.test".to_string(), wire::TYPE_A))
+                .unwrap()
+                .ttl_until = Instant::now() - Duration::from_secs(1);
+        }
+        *engine.next_cache_sweep.lock().unwrap() = Instant::now() - Duration::from_secs(1);
+        // The next insert sweeps the expired entry but keeps the live one.
+        engine.cache_insert("fresh.test", wire::TYPE_A, &resp);
+        let cache = engine.cache.lock().unwrap();
+        assert!(!cache.contains_key(&("sweep.test".to_string(), wire::TYPE_A)));
+        assert!(cache.contains_key(&("live.test".to_string(), wire::TYPE_A)));
+        assert!(cache.contains_key(&("fresh.test".to_string(), wire::TYPE_A)));
     }
 }

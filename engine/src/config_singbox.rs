@@ -202,6 +202,18 @@ pub fn load(text: &str) -> Result<EngineConfig> {
     for (i, outbound) in raw_outbounds.iter().enumerate() {
         let otype = json_str(outbound, "type").unwrap_or_default();
         let tag = json_str(outbound, "tag").unwrap_or_else(|| format!("out-{i}"));
+        // sing-box `detour` is mihomo's dialer-proxy under another name:
+        // chaining this outbound's dial through another outbound is NOT
+        // implemented here. Silently ignoring the field would dial the
+        // server DIRECTLY — the real-IP leak of mihomo #2426 — so the
+        // config is refused instead.
+        if let Some(detour) = json_str(outbound, "detour").filter(|s| !s.is_empty()) {
+            return Err(Error::config(format!(
+                "outbound {tag:?}: detour {detour:?} is not supported by the Rust engine; \
+                 refusing to run because ignoring it would dial {tag:?} directly and leak \
+                 the real IP (mihomo #2426)"
+            )));
+        }
         match otype.as_str() {
             "direct" => outbounds.push(OutboundConfig {
                 name: tag.clone(),
@@ -757,13 +769,15 @@ fn parse_tun_inbound(
         });
     // dns hijack: sing-box hijacks via route rules (action hijack-dns);
     // the common shorthand is a `dns` field on the old inbound form.
+    // Same entry grammar as the mihomo dialect (any:53 / ip[:port], with
+    // an optional scheme prefix — see tun::parse_dns_hijack_entry).
     let dns_hijack = inbound
         .get("dns_hijack")
         .and_then(Json::as_array)
         .map(|list| {
             list.iter()
                 .filter_map(Json::as_str)
-                .filter_map(|s| s.trim().parse().ok())
+                .filter_map(crate::inbound::tun::parse_dns_hijack_entry)
                 .collect()
         })
         .unwrap_or_default();
@@ -1598,6 +1612,29 @@ fn combine_groups(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outbound_detour_is_refused_not_silently_ignored() {
+        // mihomo #2426 / sing-box `detour`: silently dropping the field
+        // would dial the server directly and leak the real IP.
+        let cfg = r#"
+{
+  "inbounds": [
+    {"type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": 2080}
+  ],
+  "outbounds": [
+    {"type": "trojan", "tag": "back", "server": "t.example", "server_port": 443,
+     "password": "pw", "detour": "front"},
+    {"type": "socks", "tag": "front", "server": "f.example", "server_port": 1080}
+  ],
+  "route": {"final": "back"}
+}
+"#;
+        let err = load(cfg).unwrap_err().to_string();
+        assert!(err.contains("detour"), "{err}");
+        assert!(err.contains("leak the real IP"), "{err}");
+        assert!(err.contains("\"back\""), "{err}");
+    }
 
     const SAMPLE: &str = r#"
 {

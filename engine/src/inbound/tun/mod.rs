@@ -20,7 +20,7 @@
 //!     address: "172.19.0.1".parse().unwrap(),
 //!     netmask: 30,
 //!     mtu: 1500,
-//!     dns_hijack: vec!["172.19.0.2".parse().unwrap()],
+//!     dns_hijack: vec!["172.19.0.2".parse::<std::net::IpAddr>().unwrap().into()],
 //!     inet6_address: Some(("fd00::1".parse().unwrap(), 64)),
 //! };
 //! let hooks = TunHooks { dns: engine.dns().cloned() };
@@ -82,10 +82,11 @@ pub struct TunConfig {
     pub netmask: u8,
     /// Interface MTU; also the stack's MTU and its read buffer size.
     pub mtu: u16,
-    /// UDP destinations answered by the engine's own resolver instead of
-    /// being relayed (mihomo `dns-hijack`). Matched by address, either
-    /// family.
-    pub dns_hijack: Vec<IpAddr>,
+    /// UDP/TCP destinations answered by the engine's own resolver instead
+    /// of being relayed (mihomo `dns-hijack`). Matched by address AND
+    /// port — `any:53` is any address on port 53, `8.8.8.8:53` is that
+    /// exact destination (see [`DnsHijack`]).
+    pub dns_hijack: Vec<DnsHijack>,
     /// Optional IPv6 address + prefix for the interface (mihomo's
     /// `inet6-address: fd00::1/64`, an `(addr, prefix)` pair). When set, the
     /// interface gets the address through the platform's v6 assignment path
@@ -101,6 +102,76 @@ pub struct TunConfig {
 #[derive(Clone)]
 pub struct TunHooks {
     pub dns: Option<Arc<DnsEngine>>,
+}
+
+/// One `dns-hijack` destination: an address (any family, or `any`) plus
+/// the port whose DNS traffic is answered by the engine's own resolver.
+///
+/// mihomo's config forms (mihomo #1689 pinned the semantics: `any` is
+/// ADDRESS-wildcard but port-53-only; a configured port is matched
+/// exactly — the old "any port on a hijack address" over-capture
+/// hijacked non-DNS traffic): `any:53`, `8.8.8.8:53`, `any`,
+/// `8.8.8.8`, each optionally behind a `udp://` / `tcp://` scheme
+/// prefix (both spell the same destination; the hijack applies to that
+/// address/port on both transports).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DnsHijack {
+    /// `None` = any address (`any:53`).
+    pub ip: Option<IpAddr>,
+    pub port: u16,
+}
+
+impl From<IpAddr> for DnsHijack {
+    /// A bare address keeps its pre-port-matching meaning of "this
+    /// resolver" and defaults to the DNS port.
+    fn from(ip: IpAddr) -> Self {
+        DnsHijack { ip: Some(ip), port: 53 }
+    }
+}
+
+/// Parse one `dns-hijack` entry (both config dialects funnel here).
+/// `None` for entries that carry no usable destination.
+pub fn parse_dns_hijack_entry(entry: &str) -> Option<DnsHijack> {
+    // Optional transport scheme: for hijack purposes udp:// and tcp://
+    // spell the same destination.
+    let entry = entry
+        .strip_prefix("udp://")
+        .or_else(|| entry.strip_prefix("tcp://"))
+        .unwrap_or(entry)
+        .trim();
+    if entry.is_empty() {
+        return None;
+    }
+    // Bracketed v6, with an optional port: `[fd00::1]` / `[fd00::1]:53`.
+    if let Some(rest) = entry.strip_prefix('[') {
+        let (addr, tail) = rest.split_once(']')?;
+        let ip: IpAddr = addr.parse().ok()?;
+        let port = match tail.strip_prefix(':') {
+            Some(p) => p.parse().ok()?,
+            None if tail.is_empty() => 53,
+            _ => return None,
+        };
+        return Some(DnsHijack { ip: Some(ip), port });
+    }
+    // `any` or host:port — but only split on the colon when what precedes
+    // it can actually carry a port suffix (v4 or the `any` wildcard); a
+    // bare v6 literal's colons are address separators.
+    let (addr_part, port) = match entry.split_once(':') {
+        None => (entry, 53u16),
+        Some((head, tail))
+            if head.eq_ignore_ascii_case("any")
+                || head == "*"
+                || head.parse::<std::net::Ipv4Addr>().is_ok() =>
+        {
+            (head, tail.parse().ok()?)
+        }
+        Some(_) => (entry, 53),
+    };
+    if addr_part.eq_ignore_ascii_case("any") || addr_part == "*" {
+        return Some(DnsHijack { ip: None, port });
+    }
+    let ip: IpAddr = addr_part.parse().ok()?;
+    Some(DnsHijack { ip: Some(ip), port })
 }
 
 /// Create the platform device, configure it, and relay through the stack
@@ -201,6 +272,45 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Mutex;
     use tokio::sync::mpsc;
+
+    /// mihomo #1689's grammar: `any:53` is the common form and must parse
+    /// (previously only bare IPs parsed, so the canonical config silently
+    /// hijacked nothing), and the port is part of the match.
+    #[test]
+    fn dns_hijack_entry_parsing() {
+        use std::net::IpAddr;
+        let any53 = parse_dns_hijack_entry("any:53").unwrap();
+        assert_eq!(any53, DnsHijack { ip: None, port: 53 });
+        assert_eq!(parse_dns_hijack_entry("any").unwrap(), any53);
+        assert_eq!(parse_dns_hijack_entry("udp://any:53").unwrap(), any53);
+        assert_eq!(parse_dns_hijack_entry("tcp://any:53").unwrap(), any53);
+        let ip: IpAddr = "8.8.8.8".parse().unwrap();
+        assert_eq!(
+            parse_dns_hijack_entry("8.8.8.8:53").unwrap(),
+            DnsHijack { ip: Some(ip), port: 53 }
+        );
+        // Bare IP keeps meaning "this resolver, DNS port".
+        assert_eq!(
+            parse_dns_hijack_entry("8.8.8.8").unwrap(),
+            DnsHijack { ip: Some(ip), port: 53 }
+        );
+        assert_eq!(
+            parse_dns_hijack_entry("udp://1.1.1.1:5353").unwrap(),
+            DnsHijack { ip: Some("1.1.1.1".parse().unwrap()), port: 5353 }
+        );
+        // v6 bracketed and bare.
+        let v6: IpAddr = "fd00::1".parse().unwrap();
+        assert_eq!(
+            parse_dns_hijack_entry("[fd00::1]:53").unwrap(),
+            DnsHijack { ip: Some(v6), port: 53 }
+        );
+        assert_eq!(
+            parse_dns_hijack_entry("fd00::1").unwrap(),
+            DnsHijack { ip: Some(v6), port: 53 }
+        );
+        assert!(parse_dns_hijack_entry("garbage").is_none());
+        assert!(parse_dns_hijack_entry("").is_none());
+    }
 
     struct NoopRelay;
 

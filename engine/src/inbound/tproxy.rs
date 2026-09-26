@@ -82,9 +82,9 @@ impl TcpTransparentListener {
             .map_err(|e| Error::network(format!("tproxy reuse_port: {e}")))?;
         set_transparent(&SockRef::from(&socket), ip.is_ipv4())?;
         let addr = SocketAddr::new(ip, port);
-        socket
-            .bind(&addr.into())
-            .map_err(|e| Error::network(format!("tproxy bind {addr}: {e}")))?;
+        socket.bind(&addr.into()).map_err(|e| {
+            crate::inbound::bind_failure("tproxy tcp", addr, e)
+        })?;
         socket
             .listen(1024)
             .map_err(|e| Error::network(format!("tproxy listen: {e}")))?;
@@ -138,9 +138,9 @@ impl UdpTransparentSocket {
         set_transparent(&SockRef::from(&socket), ip.is_ipv4())?;
         set_recv_orig_dst(&SockRef::from(&socket), ip.is_ipv4())?;
         let addr = SocketAddr::new(ip, port);
-        socket
-            .bind(&addr.into())
-            .map_err(|e| Error::network(format!("tproxy udp bind {addr}: {e}")))?;
+        socket.bind(&addr.into()).map_err(|e| {
+            crate::inbound::bind_failure("tproxy udp", addr, e)
+        })?;
         socket
             .set_nonblocking(true)
             .map_err(|e| Error::network(format!("tproxy udp nonblocking: {e}")))?;

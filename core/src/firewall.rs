@@ -48,6 +48,385 @@ pub const fn ipv6_tproxy_table() -> u32 {
     TABLE + 1
 }
 
+// ---------------------------------------------------------------------------
+// ShellCrash migration residue (detection + foreign-rule pre-clean)
+// ---------------------------------------------------------------------------
+
+/// Detected leftovers from a ShellCrash install that was not stopped or
+/// uninstalled before RustCrash took over (the "user migrated from
+/// ShellCrash, but the old one is still working" scenario).
+///
+/// Every field is a distinct residue class:
+/// - install dirs / `crash` wrapper scripts / profile aliases: the OLD
+///   manager still owns the `crash` command (alias expansion beats PATH,
+///   and ShellCrash's container install writes a real `/usr/bin/crash`).
+/// - live cores: a CrashCore kernel process holds the standard ports.
+/// - nft table / iptables chains / stale ip rules: the OLD firewall
+///   layer is still loaded and hijacks traffic alongside ours.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ShellCrashResidue {
+    /// ShellCrash install directories found (contain menu.sh/start.sh).
+    pub install_dirs: Vec<String>,
+    /// `crash` wrapper scripts that exec ShellCrash's menu.sh.
+    pub wrapper_scripts: Vec<String>,
+    /// Shell profile files carrying the `crash` → menu.sh alias.
+    pub profile_aliases: Vec<String>,
+    /// Live foreign kernel processes ("CrashCore (pid 123)").
+    pub live_cores: Vec<String>,
+    /// The foreign `inet shellcrash` nft table is loaded.
+    pub nft_table: bool,
+    /// Foreign iptables/ip6tables chains found ("iptables/nat shellcrash").
+    pub iptables_chains: Vec<String>,
+    /// fwmark → table 100/101 policy routing that ours did not create.
+    pub stale_ip_rules: bool,
+}
+
+impl ShellCrashResidue {
+    /// Scan the live system for ShellCrash residue.
+    pub fn scan() -> Self {
+        Self::scan_at(std::path::Path::new("/"), true)
+    }
+
+    /// Scan with every filesystem probe rooted at `root` (tests point
+    /// this at a temp dir) and process scanning optional. Command probes
+    /// (nft/iptables/ip) always target the live system; they are
+    /// best-effort and simply report nothing when the tool is absent.
+    pub fn scan_at(root: &std::path::Path, scan_procs: bool) -> Self {
+        let mut residue = ShellCrashResidue::default();
+
+        // Install directories: a directory only counts when it looks like
+        // a ShellCrash install (menu.sh / start.sh / version marker), not
+        // any directory that happens to be named ShellCrash.
+        let mut candidate_dirs: Vec<String> = [
+            "/etc/ShellCrash",
+            "/usr/share/ShellCrash",
+            "/data/ShellCrash",
+            "/jffs/ShellCrash",
+            "/etc/storage/ShellCrash",
+            "/tmp/ShellCrash",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        if root == std::path::Path::new("/") {
+            if let Ok(home) = std::env::var("HOME") {
+                candidate_dirs.push(format!("{home}/.local/share/ShellCrash"));
+            }
+        }
+        for dir in candidate_dirs {
+            let path = root.join(dir.trim_start_matches('/'));
+            let looks_installed = ["menu.sh", "start.sh", "version"]
+                .iter()
+                .any(|f| path.join(f).exists());
+            if looks_installed {
+                residue.install_dirs.push(dir);
+            }
+        }
+
+        // `crash` wrapper scripts: ShellCrash's container install writes a
+        // real /usr/bin/crash that execs menu.sh — it shadows or is
+        // shadowed by this binary depending on PATH order.
+        for wrapper in ["/usr/bin/crash", "/bin/crash"] {
+            let path = root.join(wrapper.trim_start_matches('/'));
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if content.contains("menu.sh") {
+                    residue.wrapper_scripts.push(wrapper.to_string());
+                }
+            }
+        }
+
+        // Profile aliases: `alias crash='bash /etc/ShellCrash/menu.sh'` —
+        // in interactive shells alias expansion beats PATH lookup, so
+        // typing `crash` runs the OLD manager even with our binary first
+        // on PATH.
+        for profile in ["/etc/profile", "/opt/etc/profile"] {
+            let path = root.join(profile.trim_start_matches('/'));
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if content.contains("ShellCrash/menu.sh") {
+                    residue.profile_aliases.push(profile.to_string());
+                }
+            }
+        }
+
+        // Live foreign kernels. CrashCore is ShellCrash's kernel binary
+        // name and never ours (we run mihomo/sing-box/the engine).
+        if scan_procs {
+            if let Ok(entries) = std::fs::read_dir("/proc") {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let Some(pid) = name.to_str().and_then(|n| n.parse::<u32>().ok()) else {
+                        continue;
+                    };
+                    let comm = entry.path().join("comm");
+                    if let Ok(comm) = std::fs::read_to_string(&comm) {
+                        let comm = comm.trim();
+                        if comm == "CrashCore" {
+                            residue.live_cores.push(format!("CrashCore (pid {pid})"));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Foreign nft table (ShellCrash's nftables firewall_mod lives in
+        // exactly one table: inet shellcrash).
+        if Command::new("nft")
+            .args(["list", "table", "inet", "shellcrash"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            residue.nft_table = true;
+        }
+
+        // Foreign iptables/ip6tables chains (ShellCrash fw_*.sh names).
+        for tool in ["iptables", "ip6tables"] {
+            for table in ["nat", "mangle", "filter"] {
+                if let Some(dump) = run_capture(tool, &["-t", table, "-S"]) {
+                    for chain in foreign_chains_in(&dump) {
+                        residue
+                            .iptables_chains
+                            .push(format!("{tool}/{table} {chain}"));
+                    }
+                }
+            }
+        }
+
+        // Stale fwmark policy routing: ShellCrash defaults to fwmark
+        // <redir_port> (not our 0x80000) into table 100 — leftovers loop
+        // packets into whatever now owns table 100 (us).
+        for family in ["ip", "ip -6"] {
+            if let Some(rules) = run_capture(family, &["rule", "show"]) {
+                let stale = rules.lines().any(|l| {
+                    let fwmark = l.contains("fwmark ");
+                    let table = l.contains("lookup 100") || l.contains("lookup 101");
+                    fwmark && table
+                });
+                if stale {
+                    residue.stale_ip_rules = true;
+                }
+            }
+        }
+
+        residue
+    }
+
+    /// Whether any residue class was found.
+    pub fn is_present(&self) -> bool {
+        !self.install_dirs.is_empty()
+            || !self.wrapper_scripts.is_empty()
+            || !self.profile_aliases.is_empty()
+            || !self.live_cores.is_empty()
+            || self.nft_table
+            || !self.iptables_chains.is_empty()
+            || self.stale_ip_rules
+    }
+
+    /// Whether the FIREWALL layer specifically carries foreign state.
+    pub fn firewall_residue(&self) -> bool {
+        self.nft_table || !self.iptables_chains.is_empty() || self.stale_ip_rules
+    }
+
+    /// Human-readable summary lines (one per residue class found).
+    pub fn summary_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if !self.install_dirs.is_empty() {
+            lines.push(format!(
+                "ShellCrash installation present at: {}",
+                self.install_dirs.join(", ")
+            ));
+        }
+        if !self.wrapper_scripts.is_empty() {
+            lines.push(format!(
+                "'crash' command is ShellCrash's wrapper script at: {} (PATH-order conflict \
+                 with this binary)",
+                self.wrapper_scripts.join(", ")
+            ));
+        }
+        if !self.profile_aliases.is_empty() {
+            lines.push(format!(
+                "Shell profile carries ShellCrash's 'crash' alias ({}) — in interactive \
+                 shells the alias wins over this binary on PATH",
+                self.profile_aliases.join(", ")
+            ));
+        }
+        if !self.live_cores.is_empty() {
+            lines.push(format!(
+                "ShellCrash kernel still RUNNING: {} — stop it before starting the RustCrash \
+                 engine or the standard ports (7890/7893/1053) will collide",
+                self.live_cores.join(", ")
+            ));
+        }
+        if self.nft_table {
+            lines.push("foreign nft table 'inet shellcrash' is loaded".to_string());
+        }
+        if !self.iptables_chains.is_empty() {
+            lines.push(format!(
+                "foreign iptables chains present: {}",
+                self.iptables_chains.join(", ")
+            ));
+        }
+        if self.stale_ip_rules {
+            lines.push(
+                "stale fwmark policy routing into table 100/101 (ShellCrash leftovers loop \
+                 packets into the current table owner)"
+                    .to_string(),
+            );
+        }
+        lines
+    }
+}
+
+/// Whether an `iptables -S` rule line references a ShellCrash-named
+/// chain (`-j shellcrash…`). RustCrash's own iptables chains share the
+/// `shellcrash` prefix by design (drop-in compat); the caller deletes
+/// ours first, so survivors are foreign.
+fn references_shellcrash_chain(rule: &str) -> bool {
+    let mut tokens = rule.split_whitespace();
+    while let Some(tok) = tokens.next() {
+        if tok == "-j" || tok == "-g" {
+            if let Some(target) = tokens.next() {
+                return target.starts_with("shellcrash");
+            }
+        }
+    }
+    false
+}
+
+/// The ShellCrash-named chains declared in an `iptables -S` dump.
+fn foreign_chains_in(dump: &str) -> Vec<String> {
+    dump.lines()
+        .filter_map(|l| l.strip_prefix("-N "))
+        .map(str::trim)
+        .filter(|name| name.starts_with("shellcrash"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Run a tool and capture stdout (None when the tool is absent or the
+/// command fails — best-effort probes).
+fn run_capture(tool: &str, args: &[&str]) -> Option<String> {
+    let tool = tool.split_whitespace().collect::<Vec<_>>();
+    let output = Command::new(tool[0])
+        .args(&tool[1..])
+        .args(args)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        None
+    }
+}
+
+/// Delete rules from an `iptables -S` dump. Lines come back as `-A …`;
+/// the matching deletion is the same line with `-D` — returned as the
+/// argument vector for `<tool> -t <table> <args…>`.
+fn deletion_args(rule: &str) -> Vec<String> {
+    rule.replacen("-A", "-D", 1)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Remove foreign ShellCrash firewall state so our own rules apply on a
+/// clean slate instead of stacking on top of the old hijack layer:
+///
+/// 1. iptables + ip6tables: every rule that JUMPS to a `shellcrash*`
+///    chain is deleted first (iptables refuses `-X` while jumps
+///    reference the chain — with the old jumps left in place our apply
+///    script dies at `iptables -t nat -N shellcrash_out` under `set -e`),
+///    then the chains are flushed and deleted.
+/// 2. The `inet shellcrash` nft table (ShellCrash's nftables mode).
+/// 3. fwmark → table 100/101 policy routing that predates this apply
+///    (ShellCrash defaults its fwmark to the redir port, not our
+///    0x80000, so `cleanup_tun_routing` never sees it).
+///
+/// Idempotent; returns one human line per thing actually removed. Our
+/// own rules are (re)created afterwards by `apply_full`.
+pub fn clean_foreign_shellcrash() -> Vec<String> {
+    let mut removed = Vec::new();
+
+    // 1. iptables / ip6tables chains and their jump rules.
+    for tool in ["iptables", "ip6tables"] {
+        for table in ["nat", "mangle", "filter"] {
+            let Some(dump) = run_capture(tool, &["-t", table, "-S"]) else {
+                continue;
+            };
+            // Jump rules first: order matters (see doc comment).
+            let jumps: Vec<&str> = dump
+                .lines()
+                .filter(|l| l.starts_with("-A ") && references_shellcrash_chain(l))
+                .collect();
+            for rule in jumps {
+                let argv = deletion_args(rule);
+                let mut cmd = Command::new(tool);
+                cmd.arg("-t").arg(table);
+                for a in &argv {
+                    cmd.arg(a);
+                }
+                if cmd.output().map(|o| o.status.success()).unwrap_or(false) {
+                    removed.push(format!("{tool} -t {table}: removed jump {rule}"));
+                }
+            }
+            for chain in foreign_chains_in(&dump) {
+                for op in ["-F", "-X"] {
+                    let _ = Command::new(tool)
+                        .args(["-t", table, op, &chain])
+                        .output();
+                }
+                removed.push(format!("{tool} -t {table}: deleted chain {chain}"));
+            }
+        }
+    }
+
+    // 2. Foreign nft table.
+    if Command::new("nft")
+        .args(["list", "table", "inet", "shellcrash"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        let _ = Command::new("nft")
+            .args(["delete", "table", "inet", "shellcrash"])
+            .output();
+        removed.push("nft: deleted table inet shellcrash".to_string());
+    }
+
+    // 3. Stale fwmark policy routing into the proxy tables (100/101).
+    for family in ["ip", "ip -6"] {
+        let Some(rules) = run_capture(family, &["rule", "show"]) else {
+            continue;
+        };
+        for line in rules.lines() {
+            let Some((prio, rest)) = line.split_once(':') else {
+                continue;
+            };
+            let stale = rest.contains("fwmark ")
+                && (rest.contains("lookup 100") || rest.contains("lookup 101"));
+            if !stale {
+                continue;
+            }
+            // del by priority until the rule is gone (duplicates stack).
+            for _ in 0..16 {
+                let tool = family.split_whitespace().collect::<Vec<_>>();
+                let ok = Command::new(tool[0])
+                    .args(&tool[1..])
+                    .args(["rule", "del", "pref", prio.trim()])
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false);
+                if !ok {
+                    break;
+                }
+            }
+            removed.push(format!("{family} rule: removed stale '{line}'"));
+        }
+    }
+
+    removed
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MacFilterType {
     Blacklist,
@@ -253,6 +632,15 @@ impl Firewall {
         // Routing first: purge both families unconditionally — the add
         // scripts re-create exactly what this config wants.
         self.cleanup_tun_routing();
+        // Migration residue pre-clean: a not-properly-stopped ShellCrash
+        // leaves hijack chains/jumps and stale policy routing loaded.
+        // Stacking our rules on top loops traffic (their jumps run first),
+        // and their leftover jumps into `shellcrash_out`/`shellcrash_mark`
+        // make our apply script abort at `-N` under `set -e`. Remove the
+        // foreign layer first, then apply ours on a clean slate.
+        for item in clean_foreign_shellcrash() {
+            tracing::warn!(target: "firewall", "removed stale ShellCrash rule: {item}");
+        }
         match self.backend {
             FirewallBackend::Nftables => {
                 // `nft -f` MERGES into live tables; without a reset,
@@ -349,7 +737,15 @@ impl Firewall {
             FirewallBackend::Nftables => self.cleanup_nftables(),
             FirewallBackend::Iptables => self.cleanup_iptables(),
             FirewallBackend::None => Ok(()),
+        }?;
+        // Also sweep foreign ShellCrash state the backend-specific
+        // cleanup may not cover (the `inet shellcrash` nft table survives
+        // `flush ruleset` as an empty table; iptables full flush covers
+        // the chains but stale fwmark ip rules are invisible to it).
+        for item in clean_foreign_shellcrash() {
+            tracing::warn!(target: "firewall", "removed stale ShellCrash rule: {item}");
         }
+        Ok(())
     }
 
     pub fn generate_nft_script(&self, _mode: &str) -> String {
@@ -1617,6 +2013,147 @@ mod tests {
             panic!("root group must resolve on unix");
         }
         assert!(crate::service::lookup_group_gid("definitely-not-a-group-xyz").is_none());
+    }
+
+    // ============== ShellCrash migration residue tests ==============
+
+    #[test]
+    fn test_shellcrash_residue_scan_detects_install_layout() {
+        // The "both installed" scenario: a live ShellCrash install plus
+        // its wrapper/alias still on the box a user migrated from.
+        let root = tempfile::tempdir().unwrap();
+        let sc = root.path().join("etc/ShellCrash");
+        std::fs::create_dir_all(&sc).unwrap();
+        std::fs::write(sc.join("menu.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::create_dir_all(root.path().join("usr/bin")).unwrap();
+        std::fs::write(
+            root.path().join("usr/bin/crash"),
+            "#!/bin/sh\nCRASHDIR=${CRASHDIR:-/etc/ShellCrash}\nexec \"$CRASHDIR/menu.sh\" \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("etc/profile"),
+            "alias crash='bash /etc/ShellCrash/menu.sh'\n",
+        )
+        .unwrap();
+
+        let residue = ShellCrashResidue::scan_at(root.path(), false);
+        assert_eq!(residue.install_dirs, vec!["/etc/ShellCrash".to_string()]);
+        assert_eq!(residue.wrapper_scripts, vec!["/usr/bin/crash".to_string()]);
+        assert_eq!(residue.profile_aliases, vec!["/etc/profile".to_string()]);
+        let lines = residue.summary_lines();
+        assert!(lines.iter().any(|l| l.contains("/etc/ShellCrash")), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("PATH-order conflict")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("alias wins")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn test_shellcrash_residue_scan_clean_root() {
+        // Filesystem probes on a bare root find nothing (the command
+        // probes target the live system and are not asserted here).
+        let root = tempfile::tempdir().unwrap();
+        let residue = ShellCrashResidue::scan_at(root.path(), false);
+        assert!(residue.install_dirs.is_empty());
+        assert!(residue.wrapper_scripts.is_empty());
+        assert!(residue.profile_aliases.is_empty());
+        // A dir merely NAMED ShellCrash is not an install.
+        std::fs::create_dir_all(root.path().join("etc/ShellCrash")).unwrap();
+        let residue = ShellCrashResidue::scan_at(root.path(), false);
+        assert!(residue.install_dirs.is_empty());
+    }
+
+    #[test]
+    fn test_foreign_chain_detection_from_iptables_dump() {
+        // The exact rule shapes ShellCrash's fw_iptables.sh leaves behind
+        // (from its fw_stop.sh deletion set).
+        let dump = "\
+-P PREROUTING ACCEPT
+-N shellcrash
+-N shellcrash_dns
+-N shellcrash_dns_out
+-N shellcrash_out
+-N shellcrash_vm
+-N shellcrash_vm_dns
+-N DOCKER
+-A PREROUTING -p tcp -m multiport --dports 22,80,443 -j shellcrash
+-A PREROUTING -p tcp --dport 53 -j shellcrash_dns
+-A PREROUTING -p udp --dport 53 -j shellcrash_dns
+-A OUTPUT -p tcp -m multiport --dports 22,80,443 -j shellcrash_out
+-A OUTPUT -p udp --dport 53 -j shellcrash_dns_out
+-A PREROUTING -d 172.17.0.0/16 -j DOCKER
+";
+        let mut chains = foreign_chains_in(dump);
+        chains.sort();
+        assert_eq!(
+            chains,
+            vec![
+                "shellcrash",
+                "shellcrash_dns",
+                "shellcrash_dns_out",
+                "shellcrash_out",
+                "shellcrash_vm",
+                "shellcrash_vm_dns",
+            ]
+        );
+        for line in [
+            "-A PREROUTING -p tcp -m multiport --dports 22,80,443 -j shellcrash",
+            "-A OUTPUT -p tcp -j shellcrash_out",
+            "-A PREROUTING -p tcp --dport 53 -j shellcrashv6_dns",
+        ] {
+            assert!(references_shellcrash_chain(line), "{line}");
+        }
+        // Foreign chains (docker etc.) must never match.
+        assert!(!references_shellcrash_chain(
+            "-A PREROUTING -d 172.17.0.0/16 -j DOCKER"
+        ));
+        assert!(!references_shellcrash_chain(
+            "-A FORWARD -j ufw-before-forward"
+        ));
+
+        // Deletion transform: -A → -D with the same match spec.
+        let args = deletion_args("-A OUTPUT -p tcp -j shellcrash_out");
+        assert_eq!(
+            args,
+            vec![
+                "-D".to_string(),
+                "OUTPUT".to_string(),
+                "-p".to_string(),
+                "tcp".to_string(),
+                "-j".to_string(),
+                "shellcrash_out".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_residue_summary_names_running_core_and_firewall() {
+        // The "both RUNNING" + leftover-rules scenario: every class is
+        // named in the summary a user sees.
+        let residue = ShellCrashResidue {
+            live_cores: vec!["CrashCore (pid 4242)".to_string()],
+            nft_table: true,
+            iptables_chains: vec!["iptables/nat shellcrash".to_string()],
+            stale_ip_rules: true,
+            ..ShellCrashResidue::default()
+        };
+        assert!(residue.is_present());
+        assert!(residue.firewall_residue());
+        let lines = residue.summary_lines();
+        assert!(lines.iter().any(|l| l.contains("pid 4242")), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("inet shellcrash")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("policy routing")),
+            "{lines:?}"
+        );
     }
 
     #[test]

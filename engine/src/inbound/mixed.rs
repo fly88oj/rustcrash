@@ -18,7 +18,7 @@ pub async fn serve(
 ) -> Result<SocketAddr> {
     let listener = TcpListener::bind((cfg.bind.as_str(), cfg.port))
         .await
-        .map_err(|e| Error::network(format!("bind {}:{}: {e}", cfg.bind, cfg.port)))?;
+        .map_err(|e| crate::inbound::bind_failure("mixed", format!("{}:{}", cfg.bind, cfg.port), e))?;
     let addr = listener.local_addr().map_err(|e| Error::network(e.to_string()))?;
     let tag = cfg.tag.clone();
     let authentication = authentication.to_vec();
@@ -143,5 +143,29 @@ mod tests {
         let mut buf = vec![0u8; 64];
         let n = c.read(&mut buf).await.unwrap();
         assert!(buf[..n].starts_with(b"HTTP/1.1 200"));
+    }
+
+    #[tokio::test]
+    async fn second_instance_bind_failure_names_the_old_one() {
+        // Migration residue (the "both RUNNING" case): a second engine
+        // starting while the old instance (ShellCrash/CrashCore or a
+        // previous engine) still holds the port must fail with a message
+        // that NAMES the likely cause and the stop command — the bare
+        // "Address already in use (os error 98)" names nobody.
+        let holder = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = holder.local_addr().unwrap().port();
+        let cfg = ListenerConfig {
+            tag: "m".into(),
+            bind: "127.0.0.1".into(),
+            port,
+            kind: ListenerKind::Mixed,
+        };
+        let capture = Arc::new(Capture(std::sync::Mutex::new(vec![])));
+        let err = serve(&cfg, &[], capture).await.unwrap_err().to_string();
+        assert!(err.contains("already in use"), "{err}");
+        assert!(err.contains("ShellCrash"), "{err}");
+        assert!(err.contains("start.sh stop"), "{err}");
+        assert!(err.contains("crash start stop"), "{err}");
+        assert!(err.contains("127.0.0.1"), "{err}");
     }
 }
