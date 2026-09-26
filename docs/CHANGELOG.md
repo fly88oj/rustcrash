@@ -27,6 +27,36 @@ All notable changes to RustCrash. Format based on
   passthrough (the framing half of the splice; the raw-transport
   rebind is tracked).
 
+### Engine — wave 16 (closing): dns-tag fix, easytier secure mode, proxy providers, zerotier direct paths + moons
+
+- **The sing-box `dns` tag maps to the real `dns` outbound** (was
+  Reject — a loader bug found by the rule-action wiring; hijack-dns
+  configs now answer end-to-end through the loader, declared or
+  builtin).
+- **easytier secure mode**: the Noise_XX handshake
+  (easytier-peerconn-noise prologue, role election, HMAC proofs at the
+  upstream capture points) and the session layer — epoch-keyed
+  traffic keys with the epoch riding the AEAD tail, sliding-window
+  replay protection, root-key sync grace, session invalidation —
+  replacing the network-secret AEAD on every payload packet. Verified
+  against the REAL easytier-core in both directions (12/12 interops).
+- **Proxy providers (core)**: mihomo `proxy-providers` semantics —
+  file/http fetch, YAML/JSON subscription parse through the SAME
+  outbound parser the config uses, and the full API surface (GET
+  list/detail, PUT reload with parse-before-swap).
+- **zerotier**: direct-path learning (RENDEZVOUS + PUSH_DIRECT_PATHS
+  codecs and runtime — probe HELLOs at introduced paths, confirmation
+  releases the root relay; an e2e proves a dial SURVIVES THE ROOT
+  DYING), state persistence (identity + peers survive restarts,
+  corrupt files fail loudly), moon adoption (orbit seeds via HELLO
+  world updates with all the signature gates).
+- **tailscale packet filter**: parsed, carried on the netmap, and
+  queryable (the upstream walk semantics) — enforcement is structurally
+  N/A on an outbound.
+- **The audit closes**: every NOT_PORTED entry now ends in
+  {implemented + tested, no-driver with evidence,
+  headless-out-of-scope, upstream-absent} — see §5's parity statement.
+
 ### Engine — wave 15: rule actions live, zerotier connect() live, easytier wg://
 
 - **The rule-action runtime is live**: route_with runs the
