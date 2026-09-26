@@ -199,6 +199,7 @@ impl SocksUdp {
             "[::]:0"
         })
         .await?;
+        crate::mark::apply(&socket);
         Ok(SocksUdp {
             control: SocksStream {
                 inner: Box::new(tcp),

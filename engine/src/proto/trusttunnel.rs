@@ -1628,8 +1628,7 @@ async fn quic_dial(cfg: &TrustTunnelOut) -> Result<quinn::Connection> {
     transport.keep_alive_interval(Some(Duration::from_secs(10)));
     client_cfg.transport_config(Arc::new(transport));
     let remote = quic::resolve_remote(&dial.server, dial.port).await?;
-    let mut endpoint = quinn::Endpoint::client(quic::family_bind_addr(remote))
-        .map_err(|e| Error::network(format!("trusttunnel: quic bind: {e}")))?;
+    let mut endpoint = quic::client_endpoint(quic::family_bind_addr(remote)).await?;
     endpoint.set_default_client_config(client_cfg);
     let connect = endpoint
         .connect(remote, &dial.sni)

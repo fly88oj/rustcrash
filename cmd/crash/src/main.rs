@@ -381,7 +381,201 @@ pub enum SubAction {
     Check {},
 }
 
+// ---------------------------------------------------------------------------
+// mihomo kernel CLI compat (raw drop-in)
+// ---------------------------------------------------------------------------
+
+/// Recognize the mihomo kernel flag grammar (`-t`, `-v`, `-h`, `-d DIR`,
+/// `-f FILE` in any order) and run the translated engine command.
+/// Returns None when argv is NOT that grammar (the normal `crash`
+/// subcommand surface, including `-h`/`--help` alone, stays with clap).
+fn kernel_compat(argv: Vec<std::ffi::OsString>) -> Option<i32> {
+    Some(run_kernel_compat(parse_kernel_compat(argv)?))
+}
+
+/// The recognized kernel invocation: (test, version, help, dir, file).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct KernelCompat {
+    test: bool,
+    version: bool,
+    help: bool,
+    dir: Option<String>,
+    file: Option<String>,
+}
+
+fn parse_kernel_compat(argv: Vec<std::ffi::OsString>) -> Option<KernelCompat> {
+    let args: Vec<String> = argv
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    if args.is_empty() {
+        return None;
+    }
+    let mut compat = KernelCompat::default();
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => compat.test = true,
+            // (-V/--version stay clap's: only mihomo's -v form is ours)
+            "-v" => compat.version = true,
+            "-h" => compat.help = true,
+            "-d" | "-f" => {
+                // A flag without its value is malformed kernel CLI —
+                // hand it to clap (which reports the unknown flag).
+                let value = args.get(i + 1)?.clone();
+                if args[i] == "-d" {
+                    compat.dir = Some(value);
+                } else {
+                    compat.file = Some(value);
+                }
+                i += 1;
+            }
+            // Anything else means this is a normal crash invocation
+            // (subcommand or manager flag), never the kernel grammar.
+            _ => return None,
+        }
+        i += 1;
+    }
+    // Nothing actionable (e.g. a lone `-t`): not ours either.
+    if compat.file.is_none() && compat.dir.is_none() && !compat.version && !compat.help {
+        return None;
+    }
+    Some(compat)
+}
+
+/// Execute the translated kernel command; the return value is the exit
+/// code (mihomo's: 0 = valid config / clean run, 1 = failed test, 2 =
+/// usage error).
+fn run_kernel_compat(compat: KernelCompat) -> i32 {
+    use rustcrash_core::engine;
+
+    let KernelCompat {
+        test,
+        version,
+        help,
+        dir,
+        file,
+    } = compat;
+
+    // mihomo's `-d DIR` is the kernel HOME: the default config lives
+    // there and geodata is resolved from it — map it onto CRASHDIR so
+    // the engine's `platform.crash_dir()` lookups follow.
+    if let Some(dir) = &dir {
+        std::env::set_var("CRASHDIR", dir);
+    }
+    // The engine logs through tracing like every crash path; managers
+    // redirect stdout, so parity with mihomo's console output is
+    // best-effort by design.
+    rustcrash_core::logging::init_logging("info");
+
+    if version && file.is_none() {
+        // First line mirrors mihomo's `-v` shape ("Mihomo Meta v1.19.13
+        // linux amd64 ..."): ShellCrash's core_check extracts the
+        // version with `head -n 1 | sed 's/ linux.*//;s/.* //'`.
+        println!(
+            "RustCrash v{} linux {} (kernel-compatible mode)",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::ARCH
+        );
+        println!("{} (flavors: {})", engine::version(), {
+            let flavors = engine::available_flavors();
+            if flavors.is_empty() {
+                "none (rebuild with --features engine-full)".to_string()
+            } else {
+                flavors.join(", ")
+            }
+        });
+        return 0;
+    }
+    if help {
+        // The kernel-usage block first (ShellCrash's core_find greps -h
+        // output for '-t' to classify the binary as a mihomo-family
+        // kernel), then the full manager surface so `crash -h` stays a
+        // useful manager help too.
+        print_kernel_compat_usage();
+        println!();
+        use clap::CommandFactory as _;
+        let mut cmd = Args::command();
+        let _ = cmd.print_help();
+        return 0;
+    }
+    // mihomo defaults the config to DIR/config.yaml when -f is absent.
+    let Some(config) = file.or_else(|| dir.as_ref().map(|d| format!("{d}/config.yaml"))) else {
+        print_kernel_compat_usage();
+        return 2;
+    };
+    let Ok(platform) = Detect::platform() else {
+        eprintln!("crash: failed to detect platform");
+        return 1;
+    };
+    let flavor = detect_kernel_flavor(&config);
+    if let Err(e) = engine::ensure_supported(flavor) {
+        eprintln!("crash: {e}");
+        return 1;
+    }
+    if test {
+        match engine::test(flavor, &config, &platform) {
+            Ok(warnings) => {
+                for w in warnings {
+                    println!("[WARN] {w}");
+                }
+                println!("[OK] config {config} test is successful");
+                0
+            }
+            Err(e) => {
+                eprintln!("config {config} test failed: {e}");
+                1
+            }
+        }
+    } else {
+        match engine::run(flavor, &config, &platform) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("engine exited: {e}");
+                1
+            }
+        }
+    }
+}
+
+/// mihomo's `-h` output shape (ShellCrash's libs/core_tools.sh core_check
+/// greps it for `-t` to classify the binary as a usable kernel).
+fn print_kernel_compat_usage() {
+    println!("Usage: crash [-t] [-d DIR] -f FILE");
+    println!("  -t  test configuration and exit");
+    println!("  -d  configuration directory (kernel home: default config, geodata)");
+    println!("  -f  configuration file");
+    println!("  -v  show version");
+}
+
+/// Pick the engine flavor from the config file itself: sing-box configs
+/// are JSON (leading `{`), mihomo configs are YAML.
+fn detect_kernel_flavor(path: &str) -> rustcrash_core::engine::EngineFlavor {
+    match std::fs::read_to_string(path) {
+        Ok(text) if text.trim_start().starts_with('{') => {
+            rustcrash_core::engine::EngineFlavor::SingBox
+        }
+        _ => rustcrash_core::engine::EngineFlavor::Mihomo,
+    }
+}
+
 fn main() {
+    // mihomo kernel CLI compat layer (the RAW drop-in story): proxy
+    // managers — ShellCrash above all — invoke their kernel binary with
+    // mihomo's flag grammar, hardcoded in their own scripts:
+    //
+    //     CrashCore -t -d $BINDIR -f $TMPDIR/config.yaml   (validate)
+    //     CrashCore    -d $BINDIR -f $TMPDIR/config.yaml   (run)
+    //     CrashCore -v / -h                                (probes)
+    //
+    // When argv is exactly that grammar, translate to the engine
+    // test/run path instead of falling through to clap, which rejects
+    // the flags outright ("unexpected argument '-t'") and would make
+    // the binary unusable as a kernel replacement.
+    if let Some(code) = kernel_compat(std::env::args_os().skip(1).collect()) {
+        process::exit(code);
+    }
+
     let args = Args::parse();
 
     // Set CRASHDIR env if provided
@@ -1847,12 +2041,85 @@ fn run_update_now(platform: &Platform) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::{detect_kernel_flavor, parse_kernel_compat, KernelCompat};
     use rustcrash_core::platform::{Detect, FirewallBackend, InitSystem, Platform};
     use rustcrash_core::{Config, ProxyKernel};
     use tempfile::TempDir;
 
     fn test_platform() -> Platform {
         Detect::platform().unwrap()
+    }
+
+    fn os_args(items: &[&str]) -> Vec<std::ffi::OsString> {
+        items.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    #[test]
+    fn kernel_compat_grammar_matches_mihomo_forms() {
+        // ShellCrash's exact invocations (starts/clash_modify.sh,
+        // configs/command.env):
+        let parsed = parse_kernel_compat(os_args(&["-t", "-d", "/etc/ShellCrash", "-f", "/tmp/c.yaml"]));
+        assert_eq!(
+            parsed,
+            Some(KernelCompat {
+                test: true,
+                dir: Some("/etc/ShellCrash".into()),
+                file: Some("/tmp/c.yaml".into()),
+                ..Default::default()
+            })
+        );
+        let parsed = parse_kernel_compat(os_args(&["-d", "/etc/ShellCrash", "-f", "/tmp/c.yaml"]));
+        assert_eq!(
+            parsed,
+            Some(KernelCompat {
+                dir: Some("/etc/ShellCrash".into()),
+                file: Some("/tmp/c.yaml".into()),
+                ..Default::default()
+            })
+        );
+        // -v / -h probes (a bare -h is core_find's kernel probe too).
+        assert_eq!(
+            parse_kernel_compat(os_args(&["-v"])),
+            Some(KernelCompat {
+                version: true,
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            parse_kernel_compat(os_args(&["-h"])),
+            Some(KernelCompat {
+                help: true,
+                ..Default::default()
+            })
+        );
+        let help = parse_kernel_compat(os_args(&["-h", "-f", "/tmp/c.yaml"])).unwrap();
+        assert!(help.help && help.file.as_deref() == Some("/tmp/c.yaml"));
+    }
+
+    #[test]
+    fn kernel_compat_rejects_manager_invocations() {
+        // Normal crash surface never enters the kernel layer.
+        assert!(parse_kernel_compat(os_args(&[])).is_none());
+        assert!(parse_kernel_compat(os_args(&["-c", "/etc/ShellCrash", "config", "show"])).is_none());
+        assert!(parse_kernel_compat(os_args(&["engine", "run", "--flavor", "rust-mihomo"])).is_none());
+        // A lone -t is ambiguous junk.
+        assert!(parse_kernel_compat(os_args(&["-t"])).is_none());
+        // A valueless -d is malformed.
+        assert!(parse_kernel_compat(os_args(&["-d"])).is_none());
+    }
+
+    #[test]
+    fn kernel_flavor_sniffed_from_file_shape() {
+        use rustcrash_core::engine::EngineFlavor;
+        let dir = tempfile::tempdir().unwrap();
+        let json = dir.path().join("sb.json");
+        std::fs::write(&json, "{\"inbounds\": []}").unwrap();
+        assert_eq!(detect_kernel_flavor(json.to_str().unwrap()), EngineFlavor::SingBox);
+        let yaml = dir.path().join("clash.yaml");
+        std::fs::write(&yaml, "mixed-port: 7890\n").unwrap();
+        assert_eq!(detect_kernel_flavor(yaml.to_str().unwrap()), EngineFlavor::Mihomo);
+        // Missing files default to the mihomo dialect, not a crash.
+        assert_eq!(detect_kernel_flavor("/nonexistent.yaml"), EngineFlavor::Mihomo);
     }
 
     #[test]

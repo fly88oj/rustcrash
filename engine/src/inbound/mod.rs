@@ -106,18 +106,41 @@ pub trait RelayHandler: Send + Sync + 'static {
 
 pub type SharedRelay = Arc<dyn RelayHandler>;
 
+/// Inbound proxy credentials (mihomo `authentication: ["user:pass"]`):
+/// enforced on the mixed/socks/http listeners when non-empty — HTTP via
+/// a `407 Proxy Authentication Required` challenge (Basic), SOCKS5 via
+/// the RFC 1929 username/password auth method. Transparent listeners
+/// (redir/tproxy) ignore it: their clients cannot authenticate.
+pub type InboundAuth = Vec<(String, String)>;
+
+/// Verify one presented credential pair against the configured list
+/// (mihomo component/auth-userpass and the http authenticator compare
+/// plaintext pairs the same way).
+pub(crate) fn auth_accepted(
+    authentication: &[(String, String)],
+    user: &[u8],
+    pass: &[u8],
+) -> bool {
+    let user = String::from_utf8_lossy(user);
+    let pass = String::from_utf8_lossy(pass);
+    authentication
+        .iter()
+        .any(|(u, p)| u.as_bytes() == user.as_bytes() && p.as_bytes() == pass.as_bytes())
+}
+
 /// Bind every configured listener; returns the bound addresses (for logs
 /// and port-echo tests).
 pub async fn spawn_all(
     listeners: &[ListenerConfig],
+    authentication: &[(String, String)],
     relay: SharedRelay,
 ) -> Result<Vec<(String, SocketAddr)>> {
     let mut out = Vec::new();
     for l in listeners {
         let addr = match l.kind {
-            ListenerKind::Socks => socks::serve(l, relay.clone()).await?,
-            ListenerKind::Http => http::serve(l, relay.clone()).await?,
-            ListenerKind::Mixed => mixed::serve(l, relay.clone()).await?,
+            ListenerKind::Socks => socks::serve(l, authentication, relay.clone()).await?,
+            ListenerKind::Http => http::serve(l, authentication, relay.clone()).await?,
+            ListenerKind::Mixed => mixed::serve(l, authentication, relay.clone()).await?,
             ListenerKind::Redir => redir::serve(l, relay.clone()).await?,
             ListenerKind::Tproxy => tproxy::serve(l, relay.clone()).await?,
         };

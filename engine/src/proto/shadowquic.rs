@@ -753,6 +753,7 @@ pub async fn connect(option: &ShadowQuicOption) -> Result<Client> {
     endpoint_config.supported_versions(versions.iter().map(|v| v.wire_code()).collect());
     let socket = std::net::UdpSocket::bind(quic::family_bind_addr(remote))
         .map_err(|e| Error::network(format!("shadowquic bind: {e}")))?;
+    crate::mark::apply(&socket);
     let mut endpoint = quinn::Endpoint::new(
         endpoint_config,
         None,

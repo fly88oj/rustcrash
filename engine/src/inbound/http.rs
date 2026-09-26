@@ -12,12 +12,17 @@ use crate::inbound::{ListenerConfig, SharedRelay, TcpMeta};
 use crate::stream::BoxProxyStream;
 
 /// Serve an HTTP proxy listener; returns the bound address.
-pub async fn serve(cfg: &ListenerConfig, relay: SharedRelay) -> Result<SocketAddr> {
+pub async fn serve(
+    cfg: &ListenerConfig,
+    authentication: &[(String, String)],
+    relay: SharedRelay,
+) -> Result<SocketAddr> {
     let listener = TcpListener::bind((cfg.bind.as_str(), cfg.port))
         .await
         .map_err(|e| Error::network(format!("bind {}:{}: {e}", cfg.bind, cfg.port)))?;
     let addr = listener.local_addr().map_err(|e| Error::network(e.to_string()))?;
     let tag = cfg.tag.clone();
+    let authentication = authentication.to_vec();
     tokio::spawn(async move {
         loop {
             let Ok((stream, peer)) = listener.accept().await else {
@@ -27,8 +32,11 @@ pub async fn serve(cfg: &ListenerConfig, relay: SharedRelay) -> Result<SocketAdd
             let port = stream.local_addr().map(|a| a.port()).ok();
             let relay = relay.clone();
             let tag = tag.clone();
+            let authentication = authentication.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle(Box::new(stream), peer, tag, port, "http", relay).await {
+                if let Err(e) =
+                    handle(Box::new(stream), peer, tag, port, "http", authentication, relay).await
+                {
                     tracing::debug!(target: "engine", "http-in {peer}: {e}");
                 }
             });
@@ -44,9 +52,10 @@ pub async fn handle_stream(
     tag: String,
     inbound_port: Option<u16>,
     inbound_kind: &'static str,
+    authentication: Vec<(String, String)>,
     relay: SharedRelay,
 ) -> Result<()> {
-    handle(stream, peer, tag, inbound_port, inbound_kind, relay).await
+    handle(stream, peer, tag, inbound_port, inbound_kind, authentication, relay).await
 }
 
 async fn handle(
@@ -55,10 +64,25 @@ async fn handle(
     tag: String,
     inbound_port: Option<u16>,
     inbound_kind: &'static str,
+    authentication: Vec<(String, String)>,
     relay: SharedRelay,
 ) -> Result<()> {
     // Read the request head (bounded).
     let head = crate::transport::read_head(&mut stream, "http-in").await?;
+    // mihomo `authentication`: when credentials are configured the
+    // proxy demands Proxy-Authorization (Basic) on every request —
+    // missing or wrong pairs draw a 407 challenge and the connection
+    // closes, exactly like mihomo's http listener.
+    if !authentication.is_empty() && !proxy_authorized(&head, &authentication) {
+        stream
+            .write_all(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+                  Proxy-Authenticate: Basic realm=\"rustcrash\"\r\n\
+                  Content-Length: 0\r\n\r\n",
+            )
+            .await?;
+        return Err(Error::protocol(format!("http-in {peer}: authentication failed")));
+    }
     let mut lines = head.split("\r\n");
     let request_line = lines.next().unwrap_or_default().to_string();
     let mut parts = request_line.split_whitespace();
@@ -127,6 +151,31 @@ async fn handle(
 pub fn parse_hostport(s: &str) -> Result<NetAddr> {
     let (host, port) = split_hostport(s, 80)?;
     Ok(NetAddr::new(host, port))
+}
+
+/// Whether the request head carries valid `Proxy-Authorization: Basic
+/// base64(user:pass)` credentials (the one scheme mihomo's inbound
+/// authenticator accepts for HTTP proxies).
+fn proxy_authorized(head: &str, authentication: &[(String, String)]) -> bool {
+    use base64::Engine as _;
+    for line in head.split("\r\n") {
+        let Some((name, value)) = line.split_once(':') else { continue };
+        if !name.trim().eq_ignore_ascii_case("proxy-authorization") {
+            continue;
+        }
+        let value = value.trim();
+        let Some(b64) = value.strip_prefix("Basic ").or_else(|| value.strip_prefix("basic ")) else {
+            continue;
+        };
+        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
+            let pair = String::from_utf8_lossy(&decoded);
+            let (user, pass) = pair.split_once(':').unwrap_or((pair.as_ref(), ""));
+            if crate::inbound::auth_accepted(authentication, user.as_bytes(), pass.as_bytes()) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn split_hostport(s: &str, default_port: u16) -> Result<(Host, u16)> {
@@ -224,7 +273,7 @@ mod tests {
             kind: ListenerKind::Http,
         };
         let capture = Arc::new(Capture(std::sync::Mutex::new(vec![])));
-        let bound = serve(&cfg, capture.clone()).await.unwrap();
+        let bound = serve(&cfg, &[], capture.clone()).await.unwrap();
         let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
         c.write_all(b"CONNECT site.test:443 HTTP/1.1\r\nHost: site.test:443\r\n\r\n")
             .await
@@ -254,7 +303,7 @@ mod tests {
             kind: ListenerKind::Http,
         };
         let capture = Arc::new(Capture(std::sync::Mutex::new(vec![])));
-        let bound = serve(&cfg, capture.clone()).await.unwrap();
+        let bound = serve(&cfg, &[], capture.clone()).await.unwrap();
         let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
         c.write_all(b"GET http://plain.test/path?q=1 HTTP/1.1\r\nHost: plain.test\r\n\r\nmore")
             .await
@@ -272,6 +321,71 @@ mod tests {
             capture.0.lock().unwrap()[0].host,
             Host::Domain("plain.test".into())
         );
+    }
+
+    /// The full engine-shaped flow minus routing: a Capture relay that
+    /// just accepts the tunnel.
+    async fn relay_ok(bound: std::net::SocketAddr, auth_header: Option<&str>) -> bool {
+        let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
+        let mut req = b"CONNECT site.test:443 HTTP/1.1\r\nHost: site.test:443\r\n".to_vec();
+        if let Some(h) = auth_header {
+            req.extend_from_slice(format!("Proxy-Authorization: {h}\r\n").as_bytes());
+        }
+        req.extend_from_slice(b"\r\n");
+        c.write_all(&req).await.unwrap();
+        let mut buf = vec![0u8; 128];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), c.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap_or(0);
+        buf[..n].starts_with(b"HTTP/1.1 200")
+    }
+
+    #[tokio::test]
+    async fn authentication_enforced_with_407() {
+        use base64::Engine as _;
+        let cfg = ListenerConfig {
+            tag: "t".into(),
+            bind: "127.0.0.1".into(),
+            port: 0,
+            kind: ListenerKind::Http,
+        };
+        let capture = Arc::new(Capture(std::sync::Mutex::new(vec![])));
+        let auth = vec![("e2e-user".to_string(), "e2e-pass".to_string())];
+        let bound = serve(&cfg, &auth, capture.clone()).await.unwrap();
+
+        // No credentials: a 407 challenge with the Basic scheme.
+        let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
+        c.write_all(b"CONNECT site.test:443 HTTP/1.1\r\nHost: site.test:443\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 256];
+        let n = c.read(&mut buf).await.unwrap();
+        assert!(buf[..n].starts_with(b"HTTP/1.1 407"), "{n} bytes");
+        assert!(buf[..n].windows(18).any(|w| w == b"Proxy-Authenticate"));
+
+        // Wrong pair: refused again.
+        let wrong = base64::engine::general_purpose::STANDARD.encode("e2e-user:WRONG");
+        assert!(!relay_ok(bound, Some(&format!("Basic {wrong}"))).await);
+
+        // Right pair: the tunnel opens.
+        let right = base64::engine::general_purpose::STANDARD.encode("e2e-user:e2e-pass");
+        assert!(relay_ok(bound, Some(&format!("Basic {right}"))).await);
+
+        // An empty credential list keeps the proxy open (mihomo default).
+        let open = serve(
+            &ListenerConfig {
+                tag: "t2".into(),
+                bind: "127.0.0.1".into(),
+                port: 0,
+                kind: ListenerKind::Http,
+            },
+            &[],
+            capture,
+        )
+        .await
+        .unwrap();
+        assert!(relay_ok(open, None).await);
     }
 
     #[test]

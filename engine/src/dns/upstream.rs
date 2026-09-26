@@ -7,7 +7,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 
 use crate::error::{Error, Result};
 use crate::transport::TlsSettings;
@@ -70,7 +70,7 @@ impl Upstream {
             Upstream::Udp(addr) => Self::exchange_udp(*addr, query).await,
             Upstream::Tcp(addr) => Self::exchange_tcp_stream(*addr, query).await,
             Upstream::Tls { addr, name } => {
-                let tcp = TcpStream::connect(addr)
+                let tcp = crate::mark::tcp_connect_addr(*addr)
                     .await
                     .map_err(|e| Error::dns(format!("dot connect: {e}")))?;
                 let tls = crate::transport::tls_connect(
@@ -222,6 +222,7 @@ impl Upstream {
     async fn exchange_udp(addr: SocketAddr, query: &[u8]) -> Result<Vec<u8>> {
         let bind = if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
         let socket = UdpSocket::bind(bind).await.map_err(|e| Error::dns(e.to_string()))?;
+        crate::mark::apply(&socket);
         socket.send_to(query, addr).await.map_err(|e| Error::dns(e.to_string()))?;
         let mut buf = vec![0u8; 4096];
         let (n, _) = tokio::time::timeout(EXCHANGE_TIMEOUT, socket.recv_from(&mut buf))
@@ -239,7 +240,7 @@ impl Upstream {
 
     /// Length-framed wireformat over a plain TCP stream.
     async fn exchange_tcp_stream(addr: SocketAddr, query: &[u8]) -> Result<Vec<u8>> {
-        let mut stream = TcpStream::connect(addr)
+        let mut stream = crate::mark::tcp_connect_addr(addr)
             .await
             .map_err(|e| Error::dns(format!("dns-tcp connect: {e}")))?;
         Self::write_framed(&mut stream, query).await?;
@@ -291,7 +292,7 @@ impl Upstream {
         path: &str,
         query: &[u8],
     ) -> Result<Vec<u8>> {
-        let tcp = TcpStream::connect(addr)
+        let tcp = crate::mark::tcp_connect_addr(addr)
             .await
             .map_err(|e| Error::dns(format!("doh connect: {e}")))?;
         let mut tls = crate::transport::tls_connect(Box::new(tcp), name, &TlsSettings::client(name)).await?;

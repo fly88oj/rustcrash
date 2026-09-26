@@ -1660,7 +1660,7 @@ pub const SNELL_POOL_MAX_AGE: std::time::Duration = std::time::Duration::from_mi
 pub const SNELL_POOL_MAX_IDLE: usize = 10;
 
 async fn dial_tcp_transport(server: &str, port: u16) -> Result<BoxProxyStream> {
-    let tcp = tokio::net::TcpStream::connect((server, port))
+    let tcp = crate::mark::tcp_connect(server, port)
         .await
         .map_err(|e| Error::network(format!("dial {server}:{port}: {e}")))?;
     Ok(Box::new(tcp))

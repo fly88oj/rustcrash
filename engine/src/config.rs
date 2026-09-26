@@ -16,12 +16,17 @@ pub enum RuleMode {
 }
 
 impl RuleMode {
+    /// mihomo lowercases the value before matching (config/config.go
+    /// `parseMode` receives the lowercased string), and ShellCrash's
+    /// set.yaml hardcodes the capitalized `mode: Rule` — accept any
+    /// casing like upstream instead of rejecting the config.
     pub fn parse(s: &str) -> Result<Self> {
-        match s {
+        let lower = s.trim().to_ascii_lowercase();
+        match lower.as_str() {
             "rule" => Ok(RuleMode::Rule),
             "global" => Ok(RuleMode::Global),
             "direct" => Ok(RuleMode::Direct),
-            other => Err(Error::config(format!("bad mode {other:?}"))),
+            _ => Err(Error::config(format!("bad mode {s:?}"))),
         }
     }
 
@@ -192,6 +197,16 @@ pub struct EngineConfig {
     /// (attached by [`EngineConfig::compile_rules`]). mihomo rule lines
     /// carry no actions upstream, so that loader never fills this.
     pub rule_actions: std::collections::HashMap<usize, crate::rule::RuleAction>,
+    /// mihomo `authentication`: `user:pass` pairs enforced on the
+    /// http/socks/mixed inbound listeners (HTTP 407 challenge, SOCKS5
+    /// RFC 1929 auth). Empty = open proxy, mihomo's default.
+    pub authentication: Vec<(String, String)>,
+    /// mihomo `routing-mark`: SO_MARK stamped on every socket the
+    /// engine dials so a transparent-proxy firewall can exempt the
+    /// engine's own traffic (`meta mark <mark> return` loop-guards —
+    /// without it each relay dials straight back into the tproxy/redir
+    /// port and self-relays until FD exhaustion). None = unmarked.
+    pub routing_mark: Option<u32>,
 }
 
 impl EngineConfig {
@@ -270,14 +285,34 @@ impl GroupPolicy {
 
 /// Split an external-controller address (`host:port`, `[v6]:port`, or
 /// bare port-less host) into bind host and port — shared by both config
-/// dialects.
+/// dialects. The leading-colon form (`:9999`, mihomo's all-interfaces
+/// default) and `*:port` bind every interface: an empty host would fail
+/// address lookup at bind time.
 pub fn split_controller(controller: &str) -> (String, u16) {
+    let controller = controller.trim();
     match controller.rsplit_once(':') {
-        Some((host, port)) => (
-            host.trim_start_matches('[').trim_end_matches(']').to_string(),
-            port.parse().unwrap_or(9090),
-        ),
+        Some((host, port)) => {
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            let bind = match host {
+                "" | "*" => "0.0.0.0".to_string(),
+                other => other.to_string(),
+            };
+            (bind, port.parse().unwrap_or(9090))
+        }
         None => ("127.0.0.1".to_string(), 9090),
+    }
+}
+
+/// Normalize a listen address for parsing: mihomo's leading-colon
+/// shorthand (`listen: :1053`, the form ShellCrash's dns.yaml emits)
+/// means all interfaces, i.e. `0.0.0.0:port` (`SocketAddr::parse`
+/// would reject the bare `:port` form outright).
+pub fn normalize_listen(listen: &str) -> String {
+    let listen = listen.trim();
+    if let Some(port) = listen.strip_prefix(':') {
+        format!("0.0.0.0:{port}")
+    } else {
+        listen.to_string()
     }
 }
 
@@ -516,8 +551,31 @@ mod tests {
     fn mode_parsing() {
         assert_eq!(RuleMode::parse("rule").unwrap(), RuleMode::Rule);
         assert_eq!(RuleMode::parse("global").unwrap(), RuleMode::Global);
+        assert_eq!(RuleMode::parse("direct").unwrap(), RuleMode::Direct);
         assert!(RuleMode::parse("wild").is_err());
+        // mihomo lowercases before matching: ShellCrash's set.yaml
+        // hardcodes the capitalized forms, which must parse.
+        assert_eq!(RuleMode::parse("Rule").unwrap(), RuleMode::Rule);
+        assert_eq!(RuleMode::parse("GLOBAL").unwrap(), RuleMode::Global);
+        assert_eq!(RuleMode::parse("Direct").unwrap(), RuleMode::Direct);
+        assert_eq!(RuleMode::parse("  Rule ").unwrap(), RuleMode::Rule);
         assert_eq!(GroupPolicy::parse("url-test").unwrap().as_str(), "URLTest");
+    }
+
+    #[test]
+    fn controller_and_listen_mihomo_shorthands() {
+        // Plain and bracketed hosts unchanged.
+        assert_eq!(split_controller("127.0.0.1:9090"), ("127.0.0.1".into(), 9090));
+        assert_eq!(split_controller("[::1]:9090"), ("::1".into(), 9090));
+        assert_eq!(split_controller("127.0.0.1"), ("127.0.0.1".into(), 9090));
+        // mihomo's leading-colon / `*` all-interfaces forms bind 0.0.0.0
+        // (an empty host fails address lookup at bind time).
+        assert_eq!(split_controller(":9999"), ("0.0.0.0".into(), 9999));
+        assert_eq!(split_controller("*:9999"), ("0.0.0.0".into(), 9999));
+        assert_eq!(normalize_listen(":1053"), "0.0.0.0:1053");
+        assert_eq!(normalize_listen("0.0.0.0:1053"), "0.0.0.0:1053");
+        assert_eq!(normalize_listen(" [::]:1053 "), "[::]:1053");
+        assert!(normalize_listen(":1053").parse::<std::net::SocketAddr>().is_ok());
     }
 
     #[test]

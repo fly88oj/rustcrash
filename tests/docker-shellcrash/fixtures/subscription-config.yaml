@@ -1,0 +1,62 @@
+# The SUBSCRIPTION-SHAPE config a converter emits (what ShellCrash's
+# "import config" flow writes to yamls/config.yaml): a multi-proxy list
+# plus groups and rules — and converter junk ShellCrash must DISCARD
+# (its own port/dns wins; only proxies/proxy-groups/rules/... are split
+# out by starts/clash_modify.sh).
+#
+# All servers point at the in-container mihomo listener fixture
+# (mihomo-server.yaml) on loopback; all credentials are fake test values.
+port: 1234
+socks-port: 1235
+allow-lan: false
+mode: global
+log-level: silent
+dns:
+  enable: false
+
+proxies:
+  - name: sub-ss-aes256
+    type: ss
+    server: 127.0.0.1
+    port: 39388
+    cipher: aes-256-gcm
+    password: sc-e2e-ss-psk-8f3a
+    udp: true
+  - name: sub-vmess-tcp
+    type: vmess
+    server: 127.0.0.1
+    port: 39400
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    alterId: 0
+    cipher: aes-128-gcm
+  - name: sub-vmess-ws
+    type: vmess
+    server: 127.0.0.1
+    port: 39401
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    alterId: 0
+    cipher: auto
+    network: ws
+    ws-opts:
+      path: /ws
+
+proxy-groups:
+  - name: sub-select
+    type: select
+    proxies:
+      - sub-ss-aes256
+      - sub-vmess-tcp
+      - sub-vmess-ws
+  - name: sub-urltest
+    type: url-test
+    url: http://127.0.0.1:38080/hello.txt
+    interval: 600
+    proxies:
+      - sub-ss-aes256
+      - sub-vmess-tcp
+      - sub-vmess-ws
+
+rules:
+  - DOMAIN,web.shellcrash.test,sub-select
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - MATCH,sub-select

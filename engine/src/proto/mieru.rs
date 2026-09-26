@@ -2062,6 +2062,7 @@ async fn dial_packet(cfg: &MieruOut) -> Result<DuplexStream> {
     let sock = UdpSocket::bind(("0.0.0.0", 0))
         .await
         .map_err(|e| Error::network(format!("mieru: bind udp underlay: {e}")))?;
+    crate::mark::apply(&sock);
     sock.connect((cfg.server.as_str(), port))
         .await
         .map_err(|e| {
@@ -2732,6 +2733,7 @@ impl MieruMux {
                 let sock = UdpSocket::bind(("0.0.0.0", 0))
                     .await
                     .map_err(|e| Error::network(format!("mieru: bind udp underlay: {e}")))?;
+                crate::mark::apply(&sock);
                 sock.connect((self.cfg.server.as_str(), port))
                     .await
                     .map_err(|e| {

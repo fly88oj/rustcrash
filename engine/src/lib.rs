@@ -15,6 +15,7 @@ pub mod error;
 pub mod geosite;
 pub mod grpc;
 pub mod inbound;
+pub mod mark;
 pub mod outbound;
 pub mod process;
 pub mod proto;

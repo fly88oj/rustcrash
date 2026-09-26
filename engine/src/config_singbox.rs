@@ -620,6 +620,11 @@ pub fn load(text: &str) -> Result<EngineConfig> {
         // never-skip/any-status.
         group_health: Default::default(),
         rule_actions,
+        // sing-box has no inbound-credential or routing-mark equivalent
+        // on the JSON dialect's proxy inbounds (auth rides per-listener
+        // `users`; marks ride route rules) — both stay empty here.
+        authentication: Vec::new(),
+        routing_mark: None,
     })
 }
 

@@ -1,0 +1,34 @@
+# ShellCrash migration e2e: the REAL ShellCrash manager installed from its
+# own release tarball inside the shared engine container, first driven with
+# its real mihomo kernel (baseline), then with the Rust engine binary
+# swapped in as the kernel (the migration path under test).
+#
+# One container, everything on internal loopback 127.0.0.1: the in-container
+# mihomo proxy server (the "remote" the subscription points at), the web/DNS
+# targets, ShellCrash itself and the probes. The image is the SAME
+# engine-full image the tests/docker-engine suite builds
+# (tests/docker-engine/Dockerfile.engine) — this suite adds nothing to it;
+# the ShellCrash tarball is committed under fixtures/ and the mihomo kernel
+# comes from the image itself (or the host cache), so the suite runs fully
+# offline on a warm host.
+services:
+  rustcrash:
+    build:
+      context: ../..
+      dockerfile: tests/docker-engine/Dockerfile.engine
+    image: docker-engine-rustcrash
+    networks:
+      - scnet
+    cap_add:
+      - NET_ADMIN
+    environment:
+      CRASHDIR: /etc/ShellCrash
+      USER: root
+    volumes:
+      - ./fixtures:/sc-fixtures:ro
+    entrypoint: bash
+    command: -c "sleep infinity"
+
+networks:
+  scnet:
+    driver: bridge

@@ -42,6 +42,13 @@ struct RawConfig {
     ipv6: bool,
     #[serde(default, rename = "external-controller")]
     external_controller: Option<String>,
+    #[serde(default, rename = "routing-mark", alias = "routing_mark")]
+    routing_mark: Option<u32>,
+    /// mihomo `authentication: ["user:pass"]` — inbound credentials for
+    /// the http/socks/mixed listeners (an entry without `:` is a bare
+    /// username with an empty password, upstream's parseAuth split).
+    #[serde(default)]
+    authentication: Option<Vec<String>>,
     #[serde(default)]
     secret: Option<String>,
     #[serde(default)]
@@ -294,6 +301,19 @@ pub fn load(text: &str) -> Result<EngineConfig> {
 
     let tun = parse_tun(raw.tun.as_ref())?;
 
+    // mihomo `authentication`: split each entry at the first `:`; a
+    // bare entry is a username with an empty password (parseAuth).
+    let authentication = raw
+        .authentication
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| match s.split_once(':') {
+            Some((u, p)) => (u.to_string(), p.to_string()),
+            None => (s, String::new()),
+        })
+        .collect::<Vec<_>>();
+
     Ok(EngineConfig {
         mode: raw
             .mode
@@ -318,6 +338,8 @@ pub fn load(text: &str) -> Result<EngineConfig> {
         // mihomo rule lines carry no actions upstream (rules/common/
         // base.go ParseParams knows only `no-resolve`/`src`).
         rule_actions: std::collections::HashMap::new(),
+        authentication,
+        routing_mark: raw.routing_mark,
     })
 }
 
@@ -2340,6 +2362,36 @@ fn ws_opts(entry: &BTreeMap<String, Yaml>) -> (String, Option<String>) {
 mod tests {
     use super::*;
 
+    const SAMPLE_SHELLCRASH: &str = r#"
+mode: Rule
+mixed-port: 7890
+redir-port: 7892
+tproxy-port: 7893
+allow-lan: true
+external-controller: :9999
+routing-mark: 7894
+unified-delay: true
+authentication:
+  - "e2e-user:e2e-pass"
+dns:
+  enable: true
+  listen: :1053
+  enhanced-mode: fake-ip
+  fake-ip-filter:
+    - '+.*'
+  nameserver:
+    - udp://223.5.5.5
+proxies:
+  - name: node-ss
+    type: ss
+    server: 10.0.0.5
+    port: 8388
+    cipher: aes-256-gcm
+    password: psk-placeholder
+rules:
+  - MATCH,DIRECT
+"#;
+
     const SAMPLE: &str = r#"
 mixed-port: 7890
 redir-port: 7891
@@ -2404,6 +2456,29 @@ rules:
   - GEOIP,CN,DIRECT
   - MATCH,Auto
 "#;
+
+    #[test]
+    fn shellcrash_dialect_forms_parse() {
+        // The exact shapes ShellCrash's generator emits that used to be
+        // rejected: capitalized `mode: Rule`, leading-colon dns listen
+        // and external-controller, `authentication`, `routing-mark`.
+        let cfg = load(SAMPLE_SHELLCRASH).unwrap();
+        assert_eq!(cfg.mode, crate::config::RuleMode::Rule);
+        assert_eq!(cfg.dns.as_ref().unwrap().listen.as_deref(), Some(":1053"));
+        let api = cfg.api.as_ref().unwrap();
+        assert_eq!((api.bind.as_str(), api.port), ("0.0.0.0", 9999));
+        assert_eq!(cfg.routing_mark, Some(7894));
+        assert_eq!(
+            cfg.authentication,
+            vec![("e2e-user".to_string(), "e2e-pass".to_string())]
+        );
+        // The normalized listen/controller forms bind as real addresses.
+        assert!(crate::config::normalize_listen(":1053")
+            .parse::<std::net::SocketAddr>()
+            .is_ok());
+        let (bind, port) = crate::config::split_controller(":9999");
+        assert_eq!((bind.as_str(), port), ("0.0.0.0", 9999));
+    }
 
     #[test]
     fn loads_full_config() {

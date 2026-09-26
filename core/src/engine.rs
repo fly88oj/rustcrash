@@ -208,7 +208,16 @@ mod imp {
             .build()
             .map_err(|e| Error::Process(format!("engine runtime: {e}")))?;
         let engine = rustcrash_engine::Engine::build(cfg)?;
-        Ok(runtime.block_on(engine.run())?)
+        let result = runtime.block_on(engine.run());
+        // Bounded teardown: DROPPING a runtime blocks until every
+        // blocking-pool task finishes — an in-flight getaddrinfo under
+        // an unreachable resolver can hang for many seconds, and a
+        // manager's stop path (ShellCrash's start.sh stop) must see the
+        // process exit within a couple of seconds of SIGTERM. Cap the
+        // wait; anything still running is reclaimed by process exit,
+        // exactly like mihomo's prompt TERM shutdown.
+        runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+        result.map_err(|e| e.into())
     }
 }
 

@@ -800,7 +800,14 @@ impl DomainMatcher {
         if self.exact.contains(&d) {
             return true;
         }
-        if self.suffix.iter().any(|s| d == *s || d.ends_with(&format!(".{s}"))) {
+        if self.suffix.iter().any(|s| {
+            // A bare `*` suffix (`+.*`, mihomo's "exclude EVERYTHING"
+            // fake-ip-filter ShellCrash's redir_host mode emits) is a
+            // wildcard over every label: any domain — one label or
+            // more — matches, exactly like mihomo's domain trie
+            // (`+.` allows one-or-more labels above the wildcard).
+            *s == "*" || d == *s || d.ends_with(&format!(".{s}"))
+        }) {
             return true;
         }
         if self.keyword.iter().any(|k| d.contains(k.as_str())) {
@@ -1340,6 +1347,27 @@ mod tests {
         assert!(m.matches("re123.test"));
         assert!(!m.matches("nope.test"));
         assert!(m.matches("re123.test"));
+    }
+
+    #[test]
+    fn domain_matcher_plus_star_matches_everything() {
+        // `+.*` — ShellCrash's redir_host fake-ip-filter — is a suffix
+        // wildcard over every label: any domain matches (mihomo's
+        // domain trie: `+.` admits one-or-more labels above `*`).
+        let mut m = DomainMatcher::default();
+        m.add_domain_line("+.*");
+        assert!(m.matches("a.test"));
+        assert!(m.matches("single"));
+        assert!(m.matches("deep.nested.labels.test"));
+        // It must not leak into a matcher that carries other entries.
+        let mut m2 = DomainMatcher::default();
+        m2.add_domain_line("+.suffix.test");
+        assert!(!m2.matches("other.test"));
+        // A lone `*` (no `+.`) never reaches the suffix set — keep
+        // matching exact-only behavior unchanged for such lines.
+        let mut m3 = DomainMatcher::default();
+        m3.add_domain_line("*");
+        assert!(!m3.matches("anything.test"));
     }
 
     #[test]

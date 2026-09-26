@@ -152,12 +152,49 @@ pub fn client_config_custom(
     Ok(quic)
 }
 
+/// A quinn client endpoint over a PRE-MARKED UDP socket (mihomo
+/// `routing-mark`): [`quinn::Endpoint::client`] creates its own
+/// unmarked socket with no way to stamp it, so dial paths that must
+/// carry the firewall's loop-guard mark bind, mark and wrap the socket
+/// themselves — the same construction Endpoint::client runs internally
+/// (socket2 bind → runtime wrap → endpoint).
+pub async fn client_endpoint(bind: SocketAddr) -> Result<quinn::Endpoint> {
+    let socket = socket2::Socket::new(
+        if bind.is_ipv4() {
+            socket2::Domain::IPV4
+        } else {
+            socket2::Domain::IPV6
+        },
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .map_err(|e| Error::network(format!("quic bind: {e}")))?;
+    socket
+        .bind(&bind.into())
+        .map_err(|e| Error::network(format!("quic bind {bind}: {e}")))?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|e| Error::network(e.to_string()))?;
+    crate::mark::apply(&socket);
+    let wrapped = <quinn::TokioRuntime as quinn::Runtime>::wrap_udp_socket(
+        &quinn::TokioRuntime,
+        socket.into(),
+    )
+    .map_err(|e| Error::network(format!("quic socket registration: {e}")))?;
+    quinn::Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        None,
+        wrapped,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .map_err(|e| Error::network(format!("quic endpoint: {e}")))
+}
+
 /// Open a client endpoint (UDP socket bound per address family) and
 /// connect to the configured server.
 pub async fn dial(cfg: &QuicDial) -> Result<quinn::Connection> {
     let remote = resolve_remote(&cfg.server, cfg.port).await?;
-    let mut endpoint = quinn::Endpoint::client(family_bind_addr(remote))
-        .map_err(|e| Error::network(format!("quic bind: {e}")))?;
+    let mut endpoint = client_endpoint(family_bind_addr(remote)).await?;
     endpoint.set_default_client_config(client_config(cfg)?);
     let connect = endpoint
         .connect(remote, &cfg.sni)
@@ -179,8 +216,7 @@ pub async fn dial_custom(
     cover: &QuicTlsCover,
 ) -> Result<quinn::Connection> {
     let remote = resolve_remote(&cfg.server, cfg.port).await?;
-    let mut endpoint = quinn::Endpoint::client(family_bind_addr(remote))
-        .map_err(|e| Error::network(format!("quic bind: {e}")))?;
+    let mut endpoint = client_endpoint(family_bind_addr(remote)).await?;
     endpoint.set_default_client_config(client_config_custom(cfg, cover)?);
     let connect = endpoint
         .connect(remote, &cfg.sni)

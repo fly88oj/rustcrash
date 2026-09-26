@@ -11,12 +11,17 @@ use crate::inbound::{ListenerConfig, SharedRelay};
 use crate::stream::BoxProxyStream;
 
 /// Serve a mixed listener; returns the bound address.
-pub async fn serve(cfg: &ListenerConfig, relay: SharedRelay) -> Result<SocketAddr> {
+pub async fn serve(
+    cfg: &ListenerConfig,
+    authentication: &[(String, String)],
+    relay: SharedRelay,
+) -> Result<SocketAddr> {
     let listener = TcpListener::bind((cfg.bind.as_str(), cfg.port))
         .await
         .map_err(|e| Error::network(format!("bind {}:{}: {e}", cfg.bind, cfg.port)))?;
     let addr = listener.local_addr().map_err(|e| Error::network(e.to_string()))?;
     let tag = cfg.tag.clone();
+    let authentication = authentication.to_vec();
     tokio::spawn(async move {
         loop {
             let Ok((stream, peer)) = listener.accept().await else {
@@ -25,8 +30,9 @@ pub async fn serve(cfg: &ListenerConfig, relay: SharedRelay) -> Result<SocketAdd
             let _ = stream.set_nodelay(true);
             let relay = relay.clone();
             let tag = tag.clone();
+            let authentication = authentication.clone();
             tokio::spawn(async move {
-                if let Err(e) = route(stream, peer, tag, relay).await {
+                if let Err(e) = route(stream, peer, tag, authentication, relay).await {
                     tracing::debug!(target: "engine", "mixed {peer}: {e}");
                 }
             });
@@ -39,6 +45,7 @@ async fn route(
     mut stream: tokio::net::TcpStream,
     peer: SocketAddr,
     tag: String,
+    authentication: Vec<(String, String)>,
     relay: SharedRelay,
 ) -> Result<()> {
     let inbound_port = stream.local_addr().map(|a| a.port()).ok();
@@ -50,12 +57,28 @@ async fn route(
     ));
     match first[0] {
         0x05 => {
-            crate::inbound::socks::handle_stream(stream, peer, tag, inbound_port, "mixed", relay)
-                .await
+            crate::inbound::socks::handle_stream(
+                stream,
+                peer,
+                tag,
+                inbound_port,
+                "mixed",
+                authentication,
+                relay,
+            )
+            .await
         }
         b'C' | b'G' | b'H' | b'P' | b'D' | b'O' | b'T' | b'U' | b'c' | b'g' | b'h' | b'p' | b'd' | b'o' | b't' | b'u' => {
-            crate::inbound::http::handle_stream(stream, peer, tag, inbound_port, "mixed", relay)
-                .await
+            crate::inbound::http::handle_stream(
+                stream,
+                peer,
+                tag,
+                inbound_port,
+                "mixed",
+                authentication,
+                relay,
+            )
+            .await
         }
         other => Err(Error::protocol(format!(
             "mixed: unrecognized first byte {other:#x}"
@@ -103,7 +126,7 @@ mod tests {
             kind: ListenerKind::Mixed,
         };
         let capture = Arc::new(Capture(std::sync::Mutex::new(vec![])));
-        let bound = serve(&cfg, capture.clone()).await.unwrap();
+        let bound = serve(&cfg, &[], capture.clone()).await.unwrap();
 
         // SOCKS5 greeting goes down the socks path.
         let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();

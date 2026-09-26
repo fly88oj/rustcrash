@@ -9,16 +9,21 @@ use tokio::sync::mpsc;
 
 use crate::addr::{Host, NetAddr};
 use crate::error::{Error, Result};
-use crate::inbound::{ListenerConfig, SharedRelay, TcpMeta};
+use crate::inbound::{auth_accepted, ListenerConfig, SharedRelay, TcpMeta};
 use crate::stream::BoxProxyStream;
 
 /// Serve a SOCKS5 listener; returns the bound address.
-pub async fn serve(cfg: &ListenerConfig, relay: SharedRelay) -> Result<SocketAddr> {
+pub async fn serve(
+    cfg: &ListenerConfig,
+    authentication: &[(String, String)],
+    relay: SharedRelay,
+) -> Result<SocketAddr> {
     let listener = TcpListener::bind((cfg.bind.as_str(), cfg.port))
         .await
         .map_err(|e| Error::network(format!("bind {}:{}: {e}", cfg.bind, cfg.port)))?;
     let addr = listener.local_addr().map_err(|e| Error::network(e.to_string()))?;
     let tag = cfg.tag.clone();
+    let authentication = authentication.to_vec();
     tokio::spawn(async move {
         loop {
             let Ok((stream, peer)) = listener.accept().await else {
@@ -27,12 +32,14 @@ pub async fn serve(cfg: &ListenerConfig, relay: SharedRelay) -> Result<SocketAdd
             let _ = stream.set_nodelay(true);
             let relay = relay.clone();
             let tag = tag.clone();
+            let authentication = authentication.clone();
             // The listener's own IP is the address clients reach us on —
             // advertised in UDP ASSOCIATE replies.
             let server_ip = addr.ip();
             tokio::spawn(async move {
                 let port = stream.local_addr().map(|a| a.port()).ok();
-                handle(stream, peer, tag, port, "socks", relay, Some(server_ip)).await;
+                handle(stream, peer, tag, port, "socks", authentication, relay, Some(server_ip))
+                    .await;
             });
         }
     });
@@ -47,34 +54,57 @@ pub async fn handle_stream(
     tag: String,
     inbound_port: Option<u16>,
     inbound_kind: &'static str,
+    authentication: Vec<(String, String)>,
     relay: SharedRelay,
 ) -> Result<()> {
-    handle_inner(stream, peer, &tag, inbound_port, inbound_kind, relay, None).await
+    handle_inner(
+        stream,
+        peer,
+        &tag,
+        inbound_port,
+        inbound_kind,
+        authentication,
+        relay,
+        None,
+    )
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle(
     stream: tokio::net::TcpStream,
     peer: SocketAddr,
     tag: String,
     inbound_port: Option<u16>,
     inbound_kind: &'static str,
+    authentication: Vec<(String, String)>,
     relay: SharedRelay,
     server_ip: Option<std::net::IpAddr>,
 ) {
-    if let Err(e) =
-        handle_inner(Box::new(stream), peer, &tag, inbound_port, inbound_kind, relay, server_ip)
-            .await
+    if let Err(e) = handle_inner(
+        Box::new(stream),
+        peer,
+        &tag,
+        inbound_port,
+        inbound_kind,
+        authentication,
+        relay,
+        server_ip,
+    )
+    .await
     {
         tracing::debug!(target: "engine", "socks5 {peer}: {e}");
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_inner(
     mut stream: BoxProxyStream,
     peer: SocketAddr,
     tag: &str,
     inbound_port: Option<u16>,
     inbound_kind: &'static str,
+    authentication: Vec<(String, String)>,
     relay: SharedRelay,
     server_ip: Option<std::net::IpAddr>,
 ) -> Result<()> {
@@ -90,9 +120,38 @@ async fn handle_inner(
     }
     let mut methods = vec![0u8; nmethods];
     stream.read_exact(&mut methods).await?;
-    // No-auth only (mihomo local auth is rarely used for the mixed port;
-    // add when a config asks for it).
-    stream.write_all(&[0x05, 0x00]).await?;
+    // mihomo `authentication`: when credentials are configured the
+    // listener demands the RFC 1929 username/password method (0x02).
+    // A client that did not offer it gets "no acceptable methods"
+    // (0xFF) and the connection closes; one that did runs the
+    // sub-negotiation and a failed pair fails it (0x01 status).
+    if !authentication.is_empty() {
+        if !methods.contains(&0x02) {
+            stream.write_all(&[0x05, 0xFF]).await?;
+            return Err(Error::protocol("socks5: authentication required"));
+        }
+        stream.write_all(&[0x05, 0x02]).await?;
+        let mut ver = [0u8; 1];
+        stream.read_exact(&mut ver).await?;
+        if ver[0] != 0x01 {
+            return Err(Error::protocol("bad socks auth version"));
+        }
+        let mut len = [0u8; 1];
+        stream.read_exact(&mut len).await?;
+        let mut user = vec![0u8; len[0] as usize];
+        stream.read_exact(&mut user).await?;
+        stream.read_exact(&mut len).await?;
+        let mut pass = vec![0u8; len[0] as usize];
+        stream.read_exact(&mut pass).await?;
+        if auth_accepted(&authentication, &user, &pass) {
+            stream.write_all(&[0x01, 0x00]).await?;
+        } else {
+            stream.write_all(&[0x01, 0x01]).await?;
+            return Err(Error::protocol("socks5: authentication failed"));
+        }
+    } else {
+        stream.write_all(&[0x05, 0x00]).await?;
+    }
 
     // Request.
     let mut req = [0u8; 4];
@@ -308,7 +367,7 @@ mod tests {
             kind: ListenerKind::Socks,
         };
         let capture = Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
-        let _ = serve(&cfg, capture.clone()).await;
+        let _ = serve(&cfg, &[], capture.clone()).await;
         (capture, cfg)
     }
 
@@ -325,7 +384,7 @@ mod tests {
             port: addr.port(),
             ..cfg
         };
-        let bound = serve(&cfg, capture.clone()).await.unwrap();
+        let bound = serve(&cfg, &[], capture.clone()).await.unwrap();
         let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
         c.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
         let mut r = [0u8; 2];
@@ -348,5 +407,57 @@ mod tests {
             capture.0.lock().unwrap()[0].host,
             Host::Domain("echo.test".into())
         );
+    }
+
+    #[tokio::test]
+    async fn authentication_enforced_via_rfc1929() {
+        let capture = Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let cfg = ListenerConfig {
+            tag: "auth".into(),
+            bind: "127.0.0.1".into(),
+            port: addr.port(),
+            kind: ListenerKind::Socks,
+        };
+        let auth = vec![("e2e-user".to_string(), "e2e-pass".to_string())];
+        let bound = serve(&cfg, &auth, capture).await.unwrap();
+
+        // A client offering only no-auth gets "no acceptable methods".
+        let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
+        c.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut r = [0u8; 2];
+        c.read_exact(&mut r).await.unwrap();
+        assert_eq!(&r, &[0x05, 0xFF]);
+
+        // The RFC 1929 sub-negotiation with the right pair succeeds.
+        let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
+        c.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+        let mut r = [0u8; 2];
+        c.read_exact(&mut r).await.unwrap();
+        assert_eq!(&r, &[0x05, 0x02]);
+        let user = b"e2e-user";
+        let pass = b"e2e-pass";
+        let mut sub = vec![0x01, user.len() as u8];
+        sub.extend_from_slice(user);
+        sub.push(pass.len() as u8);
+        sub.extend_from_slice(pass);
+        c.write_all(&sub).await.unwrap();
+        let mut r = [0u8; 2];
+        c.read_exact(&mut r).await.unwrap();
+        assert_eq!(&r, &[0x01, 0x00]);
+
+        // And with a wrong pair the status byte fails the handshake.
+        let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
+        c.write_all(&[0x05, 0x02, 0x00, 0x02]).await.unwrap();
+        let mut r = [0u8; 2];
+        c.read_exact(&mut r).await.unwrap();
+        assert_eq!(&r, &[0x05, 0x02]);
+        let sub = vec![0x01, 5, b'w', b'r', b'o', b'n', b'g', 4, b'p', b'a', b's', b's'];
+        c.write_all(&sub).await.unwrap();
+        let mut r = [0u8; 2];
+        c.read_exact(&mut r).await.unwrap();
+        assert_eq!(r[1], 0x01);
     }
 }
