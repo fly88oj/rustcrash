@@ -27,6 +27,33 @@ All notable changes to RustCrash. Format based on
   passthrough (the framing half of the splice; the raw-transport
   rebind is tracked).
 
+### Engine — wave 15: rule actions live, zerotier connect() live, easytier wg://
+
+- **The rule-action runtime is live**: route_with runs the
+  MatchOutcome re-entry loop — a sniff action narrows the sniffer
+  policy, re-sniffs the client through the loss-free PrependStream,
+  applies the sniffed host (also to the DIAL target), and matching
+  continues at the next rule; resolve fills the IP context; hijack-dns
+  terminates at the engine's `dns` outbound. Group health applies the
+  mihomo semantics for real: lazy groups (default) skip probing until
+  routed, and expected-status decides whether a probe counts.
+- **ZeroTier connect() is LIVE** (milestone 2, still no C): world/planet
+  parsing with signature verification (the real Earth planet
+  round-trips byte-for-byte), the UDP node loop (HELLO a root, WHOIS
+  the controller, request the netconf, apply managed IPs to smoltcp),
+  a peer table with root-relay fallback, Switch-faithful
+  fragmentation. A hermetic e2e drives the whole overlay: five
+  in-test PoW identities, a signed planet, root/controller/bridge
+  mimics, and a 9000-byte echo over fragmented 1280-MTU paths, TCP
+  and UDP. The outbound and its UDP channel are wired.
+- **easytier wg://**: the shared-static-keypair design (every node of
+  a network derives the SAME X25519 pair — the shared secret is
+  k²G, deterministic both ways) with the synthetic-IPv4-header
+  encapsulation and boringtun-faithful timers, riding an additive
+  facade over the engine's existing WireGuard machinery. Ten of ten
+  real-binary interop checks now cover TCP/UDP/QUIC/WS/WG in both
+  directions.
+
 ### Engine — wave 14: API finals, easytier M4 (QUIC+WS), group health + rule actions, ZeroTier Rust core milestone 1
 
 - **API finals**: PUT /providers/rules/{name} really reloads (RwLock-swapped rule sets — the swap is race-free, in-flight evaluations keep their snapshot; corrupt files 503 with the reason and keep routing); GET /logs streams live events via a hand-rolled tracing Subscriber feeding a process-wide broadcast (level filter, structured format, websocket); v2rayapi verified absent from current mihomo — recorded N/A.
