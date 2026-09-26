@@ -28,6 +28,42 @@ struct RouteMeta<'a> {
     proc_info: Option<&'a crate::process::ProcessInfo>,
 }
 
+/// Cap on establishing an outbound connection (dial + protocol
+/// handshake). Without it a proxy server that accepts TCP but never
+/// finishes its handshake parks the relay task — and the entry it
+/// already opened in the connection table — forever: the mihomo #921 /
+/// #2897 shape ("active connections from days ago still listed"). The
+/// client socket is held open too, so the leak compounds. 10s follows
+/// mihomo's 5s dial timeout with headroom for layered TLS handshakes.
+#[cfg(not(test))]
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Test builds shrink the knob so lifecycle tests stay fast (semantics
+/// only — the production duration is not itself under test).
+#[cfg(test)]
+const DIAL_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How long the SECOND half of a half-closed relay may linger after the
+/// first peer finished. `tokio::io::copy_bidirectional` alone relays a
+/// received FIN by shutting down the other write half but then waits for
+/// the second peer's own EOF — a client that goes silent after the
+/// remote closed (mobile apps parked in the background, WeChat being the
+/// canonical reporter) leaves the relay, its table entry and the remote
+/// socket in CLOSE_WAIT indefinitely (mihomo #1703 / #2897). After the
+/// grace the relay unwinds and both sockets are dropped.
+#[cfg(not(test))]
+const HALF_CLOSE_GRACE: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const HALF_CLOSE_GRACE: Duration = Duration::from_millis(200);
+
+/// Idle cap for one DNS-over-TCP/DoH connection: a client that connects
+/// and never sends (or stalls between queries) must not pin a server
+/// task forever — the accumulating zombie tasks are the mihomo #2560
+/// resource-exhaustion shape.
+#[cfg(not(test))]
+const DNS_TCP_IDLE: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const DNS_TCP_IDLE: Duration = Duration::from_millis(200);
+
 /// A running engine.
 pub struct Engine {
     cfg: EngineConfig,
@@ -297,7 +333,14 @@ impl Engine {
             .cfg
             .groups
             .iter()
-            .any(|g| matches!(g.policy, crate::outbound::GroupPolicy::UrlTest | crate::outbound::GroupPolicy::Fallback));
+            .any(|g| {
+                matches!(
+                    g.policy,
+                    crate::outbound::GroupPolicy::UrlTest
+                        | crate::outbound::GroupPolicy::Fallback
+                        | crate::outbound::GroupPolicy::LoadBalance
+                )
+            });
         if any_health {
             let engine = self.clone();
             tokio::spawn(async move {
@@ -523,7 +566,9 @@ impl Engine {
             for g in &self.cfg.groups {
                 if !matches!(
                     g.policy,
-                    crate::outbound::GroupPolicy::UrlTest | crate::outbound::GroupPolicy::Fallback
+                    crate::outbound::GroupPolicy::UrlTest
+                        | crate::outbound::GroupPolicy::Fallback
+                        | crate::outbound::GroupPolicy::LoadBalance
                 ) {
                     continue;
                 }
@@ -624,8 +669,8 @@ impl Engine {
         // address (and SNI stays correct).
         let dial_target = self.unfake_target(&target);
 
-        match outbound.connect(&dial_target).await {
-            Ok(remote) => {
+        match tokio::time::timeout(DIAL_TIMEOUT, outbound.connect(&dial_target)).await {
+            Ok(Ok(remote)) => {
                 let client_side = CountingStream::new(client, counters.clone());
                 let remote_side = CountingStream::new(remote, counters.clone());
                 let (mut a, mut b) = (client_side, remote_side);
@@ -636,7 +681,7 @@ impl Engine {
                 // sockets they wrap) drop at scope end — the client sees
                 // EOF while stats.close below folds the counters.
                 let result = tokio::select! {
-                    r = tokio::io::copy_bidirectional(&mut a, &mut b) => Some(r),
+                    r = copy_bidirectional_half_close(&mut a, &mut b) => Some(r),
                     _ = cancel.cancelled() => {
                         tracing::debug!(target: "engine",
                             "relay {} via {}: closed by api", target, outbound_name);
@@ -648,9 +693,14 @@ impl Engine {
                         "relay {} via {}: {e}", target, outbound_name);
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(target: "engine",
                     "connect {} via {}: {e}", target, outbound_name);
+            }
+            Err(_) => {
+                tracing::warn!(target: "engine",
+                    "connect {} via {}: timed out after {DIAL_TIMEOUT:?} \
+                     (connection released)", target, outbound_name);
             }
         }
         self.stats.close(id, &counters);
@@ -689,6 +739,98 @@ impl Engine {
         .await
         .unwrap_or(crate::sniffer::SniffResult::Unknown);
         (found, buf)
+    }
+}
+
+/// `tokio::io::copy_bidirectional` with a half-close grace period
+/// ([`HALF_CLOSE_GRACE`]).
+///
+/// Same relay semantics as tokio's — EOF on one side shuts down the
+/// other side's writer, the reverse direction keeps running, an error
+/// ends the copy — with one addition: once EITHER direction has
+/// finished, the remaining direction gets at most the grace period
+/// before the whole copy unwinds and both sockets are dropped. That is
+/// the CLOSE_WAIT reaper mihomo is still missing (#1703/#2897): a
+/// backgrounded client that never closes its half after the remote
+/// finished no longer pins the connection-table entry (and the remote
+/// socket's CLOSE_WAIT state) forever.
+async fn copy_bidirectional_half_close<A, B>(a: &mut A, b: &mut B) -> std::io::Result<()>
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf_a = [0u8; 16 * 1024];
+    let mut buf_b = [0u8; 16 * 1024];
+    let mut a_to_b_done = false;
+    let mut b_to_a_done = false;
+    // Phase 1: both directions live — plain bidirectional copy until the
+    // first direction finishes (or errors).
+    loop {
+        if a_to_b_done || b_to_a_done {
+            break;
+        }
+        tokio::select! {
+            r = a.read(&mut buf_a) => {
+                match r {
+                    Ok(0) => {
+                        a_to_b_done = true;
+                        let _ = b.shutdown().await;
+                    }
+                    Ok(n) => b.write_all(&buf_a[..n]).await?,
+                    Err(e) => return Err(e),
+                }
+            }
+            r = b.read(&mut buf_b) => {
+                match r {
+                    Ok(0) => {
+                        b_to_a_done = true;
+                        let _ = a.shutdown().await;
+                    }
+                    Ok(n) => a.write_all(&buf_b[..n]).await?,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+    if a_to_b_done && b_to_a_done {
+        return Ok(());
+    }
+    // Phase 2: one direction remains, bounded by the grace measured from
+    // the FIRST peer's finish.
+    let grace = tokio::time::sleep(HALF_CLOSE_GRACE);
+    tokio::pin!(grace);
+    loop {
+        if a_to_b_done && b_to_a_done {
+            return Ok(());
+        }
+        tokio::select! {
+            r = a.read(&mut buf_a), if !a_to_b_done => {
+                match r {
+                    Ok(0) => {
+                        a_to_b_done = true;
+                        let _ = b.shutdown().await;
+                    }
+                    Ok(n) => b.write_all(&buf_a[..n]).await?,
+                    Err(e) => return Err(e),
+                }
+            }
+            r = b.read(&mut buf_b), if !b_to_a_done => {
+                match r {
+                    Ok(0) => {
+                        b_to_a_done = true;
+                        let _ = a.shutdown().await;
+                    }
+                    Ok(n) => a.write_all(&buf_b[..n]).await?,
+                    Err(e) => return Err(e),
+                }
+            }
+            _ = &mut grace => {
+                tracing::debug!(target: "engine",
+                    "relay half-close grace expired; releasing connection");
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -764,10 +906,23 @@ impl Engine {
         if !outbound.udp || outbound.is_reject() {
             return;
         }
-        let Ok(mut channel) = outbound.udp(&effective).await else {
-            tracing::debug!(target: "engine", "udp {} via {}: channel failed", effective, outbound_name);
-            return;
+        // Same dial cap as the TCP relay: a UDP associate that never
+        // completes (unresponsive proxy) must release the session.
+        let channel = match tokio::time::timeout(DIAL_TIMEOUT, outbound.udp(&effective)).await {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
+                tracing::debug!(target: "engine",
+                    "udp {} via {}: channel failed: {e}", effective, outbound_name);
+                return;
+            }
+            Err(_) => {
+                tracing::debug!(target: "engine",
+                    "udp {} via {}: associate timed out after {DIAL_TIMEOUT:?}",
+                    effective, outbound_name);
+                return;
+            }
         };
+        let mut channel = channel;
         tracing::debug!(target: "engine",
             "udp {} -> {} via {} ({})", source, effective, outbound_name, rule);
         let (id, counters, cancel) = self.stats.open(&inbound, "udp", &effective, source);
@@ -1038,7 +1193,7 @@ async fn spawn_dns_server(listen: &str, dns: Arc<DnsEngine>) -> Result<()> {
     // UDP.
     let udp = tokio::net::UdpSocket::bind(addr)
         .await
-        .map_err(|e| Error::network(format!("dns bind {addr}: {e}")))?;
+        .map_err(|e| crate::inbound::bind_failure("dns", addr, e))?;
     let udp_local = udp.local_addr().ok();
     tracing::info!(target: "engine", "dns listening on {:?}", udp_local);
     let udp = Arc::new(udp);
@@ -1068,12 +1223,13 @@ async fn spawn_dns_server(listen: &str, dns: Arc<DnsEngine>) -> Result<()> {
     // is length-framed wireformat).
     let tcp = tokio::net::TcpListener::bind(addr)
         .await
-        .map_err(|e| Error::network(format!("dns tcp bind {addr}: {e}")))?;
+        .map_err(|e| crate::inbound::bind_failure("dns tcp", addr, e))?;
     tokio::spawn(async move {
         loop {
             let Ok((mut sock, _)) = tcp.accept().await else {
                 continue;
             };
+            let _ = sock.set_nodelay(true);
             let dns = dns.clone();
             tokio::spawn(async move {
                 serve_dns_tcp(&mut sock, dns).await;
@@ -1085,11 +1241,16 @@ async fn spawn_dns_server(listen: &str, dns: Arc<DnsEngine>) -> Result<()> {
 
 /// One DNS-over-TCP connection: first two bytes disambiguate DoH from
 /// the length-framed wireformat (an HTTP method start vs a frame
-/// length), re-checked between requests for keep-alive.
-async fn serve_dns_tcp(sock: &mut tokio::net::TcpStream, dns: Arc<DnsEngine>) {
-    use tokio::io::AsyncReadExt;
+/// length), re-checked between requests for keep-alive. Generic over the
+/// stream so the TUN inbound's TCP DNS hijack reuses it over a
+/// `TunStream`. Every read is idle-capped ([`DNS_TCP_IDLE`]) so a silent
+/// client cannot pin the task forever (mihomo #2560's zombie-task shape).
+pub(crate) async fn serve_dns_tcp<S>(sock: &mut S, dns: Arc<DnsEngine>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let mut pre = [0u8; 2];
-    if sock.read_exact(&mut pre).await.is_err() {
+    if !read_exact_idle(sock, &mut pre).await {
         return;
     }
     loop {
@@ -1102,7 +1263,7 @@ async fn serve_dns_tcp(sock: &mut tokio::net::TcpStream, dns: Arc<DnsEngine>) {
             return;
         }
         let mut query = vec![0u8; n];
-        if sock.read_exact(&mut query).await.is_err() {
+        if !read_exact_idle(sock, &mut query).await {
             return;
         }
         let resp = dns.handle(&query).await;
@@ -1114,10 +1275,23 @@ async fn serve_dns_tcp(sock: &mut tokio::net::TcpStream, dns: Arc<DnsEngine>) {
         if sock.write_all(&framed).await.is_err() {
             return;
         }
-        if sock.read_exact(&mut pre).await.is_err() {
+        if !read_exact_idle(sock, &mut pre).await {
             return;
         }
     }
+}
+
+/// `read_exact` bounded by [`DNS_TCP_IDLE`]: false on timeout or error —
+/// either way the caller closes the connection.
+async fn read_exact_idle<S>(sock: &mut S, buf: &mut [u8]) -> bool
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    matches!(
+        tokio::time::timeout(DNS_TCP_IDLE, sock.read_exact(buf)).await,
+        Ok(Ok(_))
+    )
 }
 
 fn is_http_prefix(pre: &[u8; 2]) -> bool {
@@ -1127,21 +1301,23 @@ fn is_http_prefix(pre: &[u8; 2]) -> bool {
 /// Minimal RFC 8484 HTTP/1.1 server on the DNS TCP port: POST/GET
 /// /dns-query with a wireformat body (Content-Length bounded; no
 /// chunked — DoH clients universally send Content-Length). Serves
-/// keep-alive until the peer stops sending HTTP.
-async fn serve_doh_connection(
-    sock: &mut tokio::net::TcpStream,
+/// keep-alive until the peer stops sending HTTP. Head and body reads
+/// are idle-capped like the framed path.
+async fn serve_doh_connection<S>(
+    sock: &mut S,
     dns: Arc<DnsEngine>,
     first_pre: [u8; 2],
-) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let _ = sock.set_nodelay(true);
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
     let mut pre = first_pre;
     loop {
         // Read the request head (2 method bytes already consumed).
         let mut buf = pre.to_vec();
         loop {
             let mut byte = [0u8; 1];
-            if sock.read_exact(&mut byte).await.is_err() {
+            if !read_exact_idle(sock, &mut byte).await {
                 return;
             }
             buf.push(byte[0]);
@@ -1175,7 +1351,7 @@ async fn serve_doh_connection(
         }
         let query: Option<Vec<u8>> = if method == "POST" {
             let mut body = vec![0u8; content_length];
-            if sock.read_exact(&mut body).await.is_err() {
+            if !read_exact_idle(sock, &mut body).await {
                 return;
             }
             Some(body)
@@ -1211,7 +1387,7 @@ async fn serve_doh_connection(
         if !keep_alive {
             return;
         }
-        if sock.read_exact(&mut pre).await.is_err() || !is_http_prefix(&pre) {
+        if !read_exact_idle(sock, &mut pre).await || !is_http_prefix(&pre) {
             return;
         }
     }
@@ -1931,5 +2107,155 @@ mod tests {
             Some(&None),
             "204 expected on a 404 → failed probe (None): {latencies:?}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Connection-lifecycle reapers (mihomo #921/#1703/#2897/#2560)
+    // -----------------------------------------------------------------
+
+    /// A SOCKS upstream that accepts TCP and then never speaks: the relay
+    /// must give up within DIAL_TIMEOUT and — the part mihomo #921/#2897
+    /// report — the connection-table entry must leave with it. (Test
+    /// builds shrink DIAL_TIMEOUT; see the const.)
+    #[tokio::test]
+    async fn hanging_upstream_dial_releases_the_connection_entry() {
+        // The hanging upstream: accepts and never replies.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock); // park them open, never answer
+            }
+        });
+
+        let mut cfg = minimal_config();
+        cfg.outbounds.push(socks_outbound("hang", "127.0.0.1", addr.port()));
+        cfg.rules = vec!["MATCH,hang".into()];
+        let engine = Engine::build(cfg).unwrap();
+
+        let (mut asker, gate) = tokio::io::duplex(64);
+        let source: SocketAddr = "127.0.0.1:50002".parse().unwrap();
+        let relay_engine = engine.clone();
+        let relay = tokio::spawn(async move {
+            relay_engine
+                .relay_tcp(
+                    tcp_meta(NetAddr::domain("hang.test", 443).unwrap(), source),
+                    Box::new(gate),
+                )
+                .await;
+        });
+        // The entry opens before the dial; while the dial parks the entry
+        // must be visible (that is the leak window), and once the cap
+        // fires it must be gone.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.stats().conn_count() == 0 {
+            tokio::task::yield_now().await;
+            assert!(
+                std::time::Instant::now() < deadline,
+                "entry never opened (dial did not start)"
+            );
+        }
+        // Wait for the relay to unwind (well past the dial cap).
+        tokio::time::timeout(DIAL_TIMEOUT * 6, relay)
+            .await
+            .expect("relay unwinds after the dial cap")
+            .unwrap();
+        assert_eq!(
+            engine.stats().conn_count(),
+            0,
+            "connection entry must leave the table with the relay"
+        );
+        let _ = asker.shutdown().await;
+    }
+
+    /// The CLOSE_WAIT reaper (mihomo #1703/#2897): the remote finished
+    /// (EOF propagated, write half of the client shut down) but the
+    /// client goes silent — the copy must still unwind within the grace
+    /// instead of waiting for a client EOF that never comes.
+    #[tokio::test]
+    async fn half_closed_relay_unwinds_within_the_grace() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut a_client, mut a_srv) = tokio::io::duplex(64);
+        let (mut b_client, mut b_srv) = tokio::io::duplex(64);
+
+        let copy = tokio::spawn(async move {
+            copy_bidirectional_half_close(&mut a_srv, &mut b_srv).await
+        });
+
+        // a writes, then closes: EOF crosses the relay to b.
+        a_client.write_all(b"last-bytes").await.unwrap();
+        a_client.shutdown().await.unwrap();
+        let mut got = Vec::new();
+        b_client.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"last-bytes");
+        // b deliberately stays open and silent — the WeChat shape.
+        // The copy must still unwind within the grace (not wait for a
+        // client EOF that never comes).
+        let outcome = tokio::time::timeout(HALF_CLOSE_GRACE + std::time::Duration::from_secs(5), copy)
+            .await
+            .expect("copy unwinds after the half-close grace")
+            .unwrap();
+        assert!(outcome.is_ok());
+        // The relay dropped b's write half with it: b sees EOF.
+        let n = b_client.read(&mut [0u8; 8]).await.unwrap();
+        assert_eq!(n, 0, "the silent half must be released too");
+    }
+
+    /// Both sides finishing normally still completes immediately (no
+    /// grace wait on a clean, symmetric close).
+    #[tokio::test]
+    async fn clean_bidirectional_copy_completes_without_grace() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut a_client, mut a_srv) = tokio::io::duplex(64);
+        let (mut b_client, mut b_srv) = tokio::io::duplex(64);
+        let copy = tokio::spawn(async move {
+            copy_bidirectional_half_close(&mut a_srv, &mut b_srv).await
+        });
+        a_client.write_all(b"a->b").await.unwrap();
+        b_client.write_all(b"b->a").await.unwrap();
+        let mut buf = [0u8; 8];
+        a_client.read_exact(&mut buf[..4]).await.unwrap();
+        assert_eq!(&buf[..4], b"b->a");
+        b_client.read_exact(&mut buf[..4]).await.unwrap();
+        assert_eq!(&buf[..4], b"a->b");
+        a_client.shutdown().await.unwrap();
+        b_client.shutdown().await.unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), copy)
+            .await
+            .expect("copy completes once both directions EOF")
+            .unwrap();
+        assert!(outcome.is_ok());
+    }
+
+    /// mihomo #2560's zombie-task shape: a DNS-over-TCP client that
+    /// connects and never sends must not pin the server task — the idle
+    /// cap releases it (the client sees EOF) instead of a task per
+    /// silent connection accumulating.
+    #[tokio::test]
+    async fn silent_dns_tcp_client_is_released_by_the_idle_cap() {
+        use tokio::io::AsyncReadExt;
+        let engine = Engine::build(minimal_config()).unwrap();
+        let dns = engine.dns().unwrap().clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    continue;
+                };
+                let dns = dns.clone();
+                tokio::spawn(async move {
+                    serve_dns_tcp(&mut sock, dns).await;
+                });
+            }
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Send nothing; the server side must time out and drop us.
+        let mut buf = [0u8; 16];
+        let n = client.read(&mut buf).await;
+        assert_eq!(n.unwrap_or(0), 0, "silent client must see EOF");
+        server.abort();
     }
 }

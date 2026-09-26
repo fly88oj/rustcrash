@@ -14,7 +14,9 @@ use crate::inbound::{ListenerConfig, SharedRelay, TcpMeta};
 pub async fn serve(cfg: &ListenerConfig, relay: SharedRelay) -> Result<SocketAddr> {
     let listener = TcpListener::bind((cfg.bind.as_str(), cfg.port))
         .await
-        .map_err(|e| Error::network(format!("bind {}:{}: {e}", cfg.bind, cfg.port)))?;
+        .map_err(|e| {
+            crate::inbound::bind_failure("redir", format!("{}:{}", cfg.bind, cfg.port), e)
+        })?;
     let addr = listener.local_addr().map_err(|e| Error::network(e.to_string()))?;
     let port = addr.port();
     let tag = cfg.tag.clone();

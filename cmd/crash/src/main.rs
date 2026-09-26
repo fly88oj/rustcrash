@@ -749,6 +749,12 @@ fn handle_init(platform: &Platform, force: bool, init_system: bool) -> Result<()
 
     println!("RustCrash v{}", env!("CARGO_PKG_VERSION"));
     println!();
+
+    // Migration residue (the "migrated from ShellCrash but the old one
+    // is still working" scenario): surface a live ShellCrash BEFORE the
+    // user stacks a second manager on the same ports and command.
+    print_shellcrash_residue();
+
     println!("Initializing directory structure...");
     println!("  CrashDir: {}", crash_dir);
 
@@ -984,6 +990,28 @@ fn handle_config(platform: &Platform, action: ConfigAction) -> Result<()> {
 // Firewall Handler
 // ---------------------------------------------------------------------------
 
+/// Print any detected ShellCrash migration residue (both-installed /
+/// both-running / leftover-rules classes) with deconfliction advice.
+/// Detection only — the actual rule pre-clean runs inside
+/// `Firewall::apply_full`/`cleanup`.
+fn print_shellcrash_residue() {
+    let residue = rustcrash_core::firewall::ShellCrashResidue::scan();
+    if !residue.is_present() {
+        return;
+    }
+    println!("[!] ShellCrash migration residue detected:");
+    for line in residue.summary_lines() {
+        println!("    - {line}");
+    }
+    println!("    Deconflict before continuing: stop the old instance");
+    println!("    (`/etc/ShellCrash/start.sh stop`), remove its alias from the");
+    println!("    profile files above, and note that firewall apply/cleanup now");
+    println!("    pre-clean its chains, the 'inet shellcrash' nft table and stale");
+    println!("    policy routing. Direct INPUT rules it inserted (e.g. a REJECT");
+    println!("    on the old mixed port) need a one-shot `crash firewall cleanup`.");
+    println!();
+}
+
 fn handle_firewall(platform: &Platform, action: FirewallAction) -> Result<()> {
     let firewall = Firewall::new(platform);
 
@@ -1028,6 +1056,11 @@ fn handle_firewall(platform: &Platform, action: FirewallAction) -> Result<()> {
                 println!("  Common ports: {common_ports:?}");
             }
 
+            // Migration residue: a leftover ShellCrash firewall layer
+            // would stack under these rules (apply pre-cleans it, but the
+            // user should know the old layer existed).
+            print_shellcrash_residue();
+
             // Full rule set (FR-2.5/2.8/2.9): TUN, IPv6, VM, QUIC and port
             // filters all flow through FirewallConfig -> apply_full;
             // tproxy_listen was derived above (shared derivation). The
@@ -1054,6 +1087,7 @@ fn handle_firewall(platform: &Platform, action: FirewallAction) -> Result<()> {
         FirewallAction::Cleanup => {
             platform.require_root()?;
             println!("Cleaning up firewall rules...");
+            print_shellcrash_residue();
             firewall.cleanup()?;
             println!("[OK] Firewall rules cleaned");
         }
@@ -1105,6 +1139,7 @@ fn handle_firewall(platform: &Platform, action: FirewallAction) -> Result<()> {
         FirewallAction::Apply => {
             platform.require_root()?;
             println!("Applying firewall rules...");
+            print_shellcrash_residue();
             let config = ConfigManager::new(platform).load()?;
             let fw_config = config.to_firewall_config()?;
             firewall.apply_full(&fw_config)?;
@@ -1326,6 +1361,15 @@ fn handle_debug(platform: &Platform) -> Result<()> {
             .map(|v| v.trim().to_string())
             .unwrap_or_else(|_| "unknown".into())
     );
+    println!("\n--- ShellCrash residue ---");
+    let residue = rustcrash_core::firewall::ShellCrashResidue::scan();
+    if residue.is_present() {
+        for line in residue.summary_lines() {
+            println!("{line}");
+        }
+    } else {
+        println!("(none)");
+    }
     println!("\n--- kernel log tail ---");
     for line in rustcrash_core::logging::tail_file(
         std::path::Path::new(&format!(

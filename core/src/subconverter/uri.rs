@@ -30,14 +30,57 @@ pub fn parse_uri(uri: &str) -> Option<ProxyNode> {
     }
 }
 
+/// Padding-tolerant, alphabet-tolerant base64 decode. Share links arrive
+/// URL-safe and/or unpadded from many panels and generators — a strict
+/// STANDARD decode drops the whole node, which is exactly the mihomo
+/// #3220 failure mode ("subscription parsing fails with the new share
+/// links"): one new link form and the user sees no nodes at all.
+fn b64_flex(data: &str) -> Option<Vec<u8>> {
+    let cleaned: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+    if let Ok(v) = base64::engine::general_purpose::STANDARD.decode(cleaned.as_bytes()) {
+        return Some(v);
+    }
+    if let Ok(v) = base64::engine::general_purpose::URL_SAFE.decode(cleaned.as_bytes()) {
+        return Some(v);
+    }
+    // Strip padding, normalize the alphabet, re-pad to a multiple of 4.
+    let mut buf = String::with_capacity(cleaned.len() + 4);
+    for c in cleaned.chars() {
+        match c {
+            '-' => buf.push('+'),
+            '_' => buf.push('/'),
+            '=' => {}
+            other => buf.push(other),
+        }
+    }
+    while !buf.len().is_multiple_of(4) {
+        buf.push('=');
+    }
+    base64::engine::general_purpose::STANDARD.decode(buf.as_bytes()).ok()
+}
+
+/// Split `host:port` or `[ipv6]:port`. A bare `rsplit_once(':')` on an
+/// IPv6 literal yields garbage ("server" keeps part of the address) —
+/// the same #3220 class of "node silently dropped on a link form the
+/// parser never saw".
+pub(crate) fn split_host_port(s: &str) -> Option<(String, u16)> {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']')?;
+        let port = tail.strip_prefix(':')?;
+        Some((host.to_string(), port.parse().ok()?))
+    } else {
+        let (host, port) = s.rsplit_once(':')?;
+        Some((host.to_string(), port.parse().ok()?))
+    }
+}
+
 /// Parse VMess URI
 /// Format: vmess://(base64(json))
 /// JSON fields: v, ps, add, port, id, aid, net, cl, sl, sni, spx, tls
 fn parse_vmess(uri: &str) -> Option<ProxyNode> {
     let data = uri.strip_prefix("vmess://")?;
-    let json_str = base64::engine::general_purpose::STANDARD
-        .decode(data)
-        .ok()?;
+    let json_str = b64_flex(data)?;
     let json_str = String::from_utf8(json_str).ok()?;
 
     let json: serde_json::Value = serde_json::from_str(&json_str).ok()?;
@@ -83,52 +126,48 @@ fn parse_vmess(uri: &str) -> Option<ProxyNode> {
     })
 }
 
-/// Parse Shadowsocks URI
-/// Format: ss://(base64(method:password))@server:port#name
-/// Or with @2022-blake3-aes-256-gcm:password@server:port#name
+/// Parse Shadowsocks URI (mihomo #3220: BOTH share-link shapes must
+/// parse or a panel that switches forms drops the whole subscription):
+///   SIP002:  ss://BASE64URL(method:password)@server:port#name
+///            ss://method:password@server:port#name   (percent-encoded)
+///   legacy:  ss://BASE64(method:password@server:port)#name
 fn parse_ss(uri: &str) -> Option<ProxyNode> {
     let data = uri.strip_prefix("ss://")?;
-    let data = urlencoding::decode(data).ok()?.to_string();
-
-    let (userinfo, rest) = data.split_once('@')?;
-    let (addr_port, name) = rest.split_once('#').unwrap_or((rest, ""));
-
-    let (server, port_str) = addr_port.rsplit_once(':')?;
-    let port: u16 = port_str.parse().ok()?;
-
-    // Try to parse userinfo as method:password
-    let (cipher, password): (String, String) = if userinfo.contains(':') {
-        let parts: Vec<&str> = userinfo.splitn(2, ':').collect();
-        (
-            parts.first().map(|s| s.to_string()).unwrap_or_default(),
-            parts.get(1).map(|s| s.to_string()).unwrap_or_default(),
-        )
-    } else {
-        // Try base64 decode for @2022-... format
-        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(userinfo) {
-            if let Ok(s) = String::from_utf8(decoded) {
-                let parts: Vec<&str> = s.splitn(2, ':').collect();
-                (
-                    parts.first().map(|s| s.to_string()).unwrap_or_default(),
-                    parts.get(1).map(|s| s.to_string()).unwrap_or_default(),
-                )
-            } else {
-                return None;
-            }
-        } else {
-            return None;
-        }
-    };
-    let name = if name.is_empty() {
+    // The fragment (node name) is never part of any base64 payload.
+    let (body, fragment) = data.split_once('#').unwrap_or((data, ""));
+    let name = if fragment.is_empty() {
         "Shadowsocks".to_string()
     } else {
-        urlencoding::decode(name).ok()?.to_string()
+        urlencoding::decode(fragment).ok()?.to_string()
     };
+
+    // userinfo@hostport, or the whole body base64'd (legacy form).
+    let (userinfo, hostport): (String, String) = if let Some((ui, hp)) = body.rsplit_once('@') {
+        (ui.to_string(), hp.to_string())
+    } else {
+        let decoded = b64_flex(body)?;
+        let plain = String::from_utf8(decoded).ok()?;
+        let (ui, hp) = plain.rsplit_once('@')?;
+        (ui.to_string(), hp.to_string())
+    };
+    // Panels sometimes append query params after the port — never part
+    // of the address.
+    let hostport = hostport.split('?').next().unwrap_or(&hostport).to_string();
+    let (server, port) = split_host_port(&hostport)?;
+
+    // method:password — plain (percent-encoded) or base64'd userinfo.
+    let plain_userinfo = if userinfo.contains(':') {
+        urlencoding::decode(&userinfo).ok().map(String::from)
+    } else {
+        b64_flex(&userinfo).and_then(|b| String::from_utf8(b).ok())
+    };
+    let (cipher, password) = plain_userinfo
+        .and_then(|plain| plain.split_once(':').map(|(c, p)| (c.to_string(), p.to_string())))?;
 
     Some(ProxyNode {
         name,
         protocol: ProxyProtocol::Shadowsocks,
-        server: server.to_string(),
+        server,
         port,
         extra: ProxyExtra {
             cipher: Some(cipher),
@@ -149,9 +188,7 @@ fn parse_ssr(uri: &str) -> Option<ProxyNode> {
     let (base64_part, remarks_part) = data.split_once('/').unwrap_or((data, ""));
 
     // Decode the main base64 part to get: method:password:protocol:obfs:urlbase64(host:port:protocol_param:obfs_param)
-    let main_decoded = base64::engine::general_purpose::STANDARD
-        .decode(base64_part)
-        .ok()?;
+    let main_decoded = b64_flex(base64_part)?;
     let main_str = String::from_utf8(main_decoded).ok()?;
 
     // Split to get method:password:protocol:obfs:urlbase64
@@ -167,9 +204,7 @@ fn parse_ssr(uri: &str) -> Option<ProxyNode> {
     let urlbase64 = parts.get(4).unwrap_or(&"");
 
     // Decode URL base64 to get host:port:protocol_param:obfs_param
-    let url_decoded = base64::engine::general_purpose::STANDARD
-        .decode(urlbase64)
-        .ok()?;
+    let url_decoded = b64_flex(urlbase64)?;
     let url_str = String::from_utf8(url_decoded).ok()?;
 
     // URL format: host:port:protocol_param:obfs_param
@@ -188,16 +223,9 @@ fn parse_ssr(uri: &str) -> Option<ProxyNode> {
     let name = if remarks_part.is_empty() {
         "ShadowSocksR".to_string()
     } else {
-        let remarks_decoded = base64::engine::general_purpose::STANDARD
-            .decode(remarks_part)
-            .ok();
-        if let Some(decoded) = remarks_decoded {
-            String::from_utf8(decoded)
-                .ok()
-                .unwrap_or_else(|| "ShadowSocksR".to_string())
-        } else {
-            "ShadowSocksR".to_string()
-        }
+        b64_flex(remarks_part)
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_else(|| "ShadowSocksR".to_string())
     };
 
     Some(ProxyNode {
@@ -228,8 +256,7 @@ fn parse_trojan(uri: &str) -> Option<ProxyNode> {
 
     // addr_port might contain query params
     let addr_port = addr_port.split('?').next().unwrap_or(addr_port);
-    let (server, port_str) = addr_port.rsplit_once(':')?;
-    let port: u16 = port_str.parse().ok()?;
+    let (server, port) = split_host_port(addr_port)?;
 
     let name = if name.is_empty() {
         "Trojan".to_string()
@@ -277,8 +304,7 @@ fn parse_vless(uri: &str) -> Option<ProxyNode> {
             }
         }
 
-        let (server, port_str) = host_port.rsplit_once(':')?;
-        let port: u16 = port_str.parse().ok()?;
+        let (server, port) = split_host_port(host_port)?;
 
         let name = if name.is_empty() {
             "VLESS".to_string()
@@ -303,8 +329,7 @@ fn parse_vless(uri: &str) -> Option<ProxyNode> {
         });
     }
 
-    let (server, port_str) = addr_port.rsplit_once(':')?;
-    let port: u16 = port_str.parse().ok()?;
+    let (server, port) = split_host_port(addr_port)?;
 
     let name = if name.is_empty() {
         "VLESS".to_string()
@@ -363,8 +388,7 @@ fn parse_hysteria2(uri: &str) -> Option<ProxyNode> {
         }
     }
 
-    let (server, port_str) = server_part.rsplit_once(':')?;
-    let port: u16 = port_str.parse().ok()?;
+    let (server, port) = split_host_port(server_part)?;
 
     let name = if name.is_empty() {
         "Hysteria2".to_string()
@@ -418,8 +442,7 @@ fn parse_tuic(uri: &str) -> Option<ProxyNode> {
         }
     }
 
-    let (server, port_str) = server_part.rsplit_once(':')?;
-    let port: u16 = port_str.parse().ok()?;
+    let (server, port) = split_host_port(server_part)?;
 
     let name = if name.is_empty() {
         "TUIC".to_string()
@@ -476,9 +499,12 @@ fn parse_wireguard(uri: &str) -> Option<ProxyNode> {
 
     // Extract server and port from endpoint if present
     let (server, port) = if let Some(ref ep) = endpoint {
-        let (server, port_str) = ep.rsplit_once(':')?;
-        let port: u16 = port_str.parse().unwrap_or(51820);
-        (server.to_string(), port)
+        match split_host_port(ep) {
+            Some((s, p)) => (s, p),
+            // Port-less endpoint: the WireGuard default port.
+            None if !ep.contains(':') => (ep.to_string(), 51820),
+            None => return None,
+        }
     } else {
         return None; // WireGuard requires endpoint
     };
@@ -929,5 +955,107 @@ ss://YmFkYmFkYmQ6cGFzc3dvcmQxMjM=@192.168.1.1:8388#Test-SS
         let node = parse_uri(&uri).unwrap();
         assert_eq!(node.protocol, ProxyProtocol::ShadowSocksR);
         assert_eq!(node.server, "example.com");
+    }
+
+    // ============== mihomo #3220: share-link robustness ==============
+
+    #[test]
+    fn test_ss_legacy_full_base64_form() {
+        // Panels (and Xray-based generators) emit the legacy form where
+        // the WHOLE method:password@host:port is base64'd — the old
+        // parser required an '@' in the plain text and dropped the node.
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(b"aes-256-gcm:testpassword@10.2.3.4:8388");
+        let uri = format!("ss://{encoded}#Legacy%20Node");
+        let node = parse_uri(&uri).unwrap();
+        assert_eq!(node.protocol, ProxyProtocol::Shadowsocks);
+        assert_eq!(node.server, "10.2.3.4");
+        assert_eq!(node.port, 8388);
+        assert_eq!(node.extra.cipher.as_deref(), Some("aes-256-gcm"));
+        assert_eq!(node.extra.password.as_deref(), Some("testpassword"));
+        assert_eq!(node.name, "Legacy Node");
+    }
+
+    #[test]
+    fn test_ss_unpadded_urlsafe_userinfo() {
+        // Unpadded URL-safe base64 userinfo (SIP002 as many generators
+        // emit it) must not kill the node.
+        let mut encoded = base64::engine::general_purpose::URL_SAFE
+            .encode(b"aes-128-gcm:pw123")
+            .trim_end_matches('=')
+            .replace('+', "-")
+            .replace('/', "_");
+        encoded = encoded.trim_end_matches('=').to_string();
+        let uri = format!("ss://{encoded}@example.org:9999#Edge");
+        let node = parse_uri(&uri).unwrap();
+        assert_eq!(node.server, "example.org");
+        assert_eq!(node.port, 9999);
+        assert_eq!(node.extra.cipher.as_deref(), Some("aes-128-gcm"));
+        assert_eq!(node.extra.password.as_deref(), Some("pw123"));
+    }
+
+    #[test]
+    fn test_ss_plain_percent_encoded_userinfo() {
+        // Plain userinfo where the password carries an encoded '@' and
+        // ':' — split on the LAST '@', decode AFTER splitting.
+        let uri = "ss://2022-blake3-aes-256-gcm:p%40ss%3Aword@1.2.3.4:443#Node";
+        let node = parse_uri(uri).unwrap();
+        assert_eq!(node.server, "1.2.3.4");
+        assert_eq!(node.port, 443);
+        assert_eq!(node.extra.cipher.as_deref(), Some("2022-blake3-aes-256-gcm"));
+        assert_eq!(node.extra.password.as_deref(), Some("p@ss:word"));
+    }
+
+    #[test]
+    fn test_ipv6_bracket_hosts_parse() {
+        // The "new link form" class: an IPv6 node drops silently when
+        // host:port is split on the last ':'.
+        let vless = "vless://b831381d-6324-4d53-ad4f-8cda48b30811@[2001:db8::10]:443?sni=v6.example.com&security=tls#V6";
+        let node = parse_uri(vless).unwrap();
+        assert_eq!(node.server, "2001:db8::10");
+        assert_eq!(node.port, 443);
+        assert_eq!(node.extra.sni.as_deref(), Some("v6.example.com"));
+        assert!(node.extra.tls);
+
+        let trojan = "trojan://pw@[fd00::1]:443#T6";
+        let node = parse_uri(trojan).unwrap();
+        assert_eq!(node.server, "fd00::1");
+        assert_eq!(node.port, 443);
+    }
+
+    #[test]
+    fn test_vmess_unpadded_link() {
+        // Subscription providers emit vmess:// links without base64
+        // padding — strict decode dropped every node in the list.
+        let json = r#"{"v":"2","ps":"NoPad","add":"np.example.com","port":"8443","id":"12345678-1234-1234-1234-123456789012","aid":"0","net":"tcp","tls":"tls"}"#;
+        let mut encoded = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+        while encoded.ends_with('=') {
+            encoded.pop();
+        }
+        let node = parse_uri(&format!("vmess://{encoded}")).unwrap();
+        assert_eq!(node.server, "np.example.com");
+        assert_eq!(node.port, 8443);
+        assert_eq!(node.name, "NoPad");
+        assert!(node.extra.tls);
+    }
+
+    #[test]
+    fn test_vless_unknown_params_are_ignored_not_fatal() {
+        // The literal #3220 shape: a generator adds NEW query params with
+        // a new release — unknown keys must not fail the parse.
+        let uri = "vless://b831381d-6324-4d53-ad4f-8cda48b30811@gen.example.com:443?encryption=none&flow=xtls-rprx-vision&sni=gen.example.com&security=tls&newParam2699=whatever&another=1#Gen";
+        let node = parse_uri(uri).unwrap();
+        assert_eq!(node.server, "gen.example.com");
+        assert_eq!(node.extra.vless_flow.as_deref(), Some("xtls-rprx-vision"));
+        assert!(node.extra.tls);
+    }
+
+    #[test]
+    fn test_host_port_split_forms() {
+        assert_eq!(split_host_port("a.example.com:443").unwrap(), ("a.example.com".into(), 443));
+        assert_eq!(split_host_port("[2001:db8::1]:8443").unwrap(), ("2001:db8::1".into(), 8443));
+        assert!(split_host_port("no-port.example.com").is_none());
+        assert!(split_host_port("[2001:db8::1]:notaport").is_none());
+        assert!(split_host_port("[2001:db8::1]443").is_none());
     }
 }

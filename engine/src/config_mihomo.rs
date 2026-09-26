@@ -382,13 +382,16 @@ fn parse_tun(raw: Option<&BTreeMap<String, Yaml>>) -> Result<Option<crate::inbou
         .and_then(Yaml::as_u64)
         .and_then(|m| u16::try_from(m).ok())
         .unwrap_or(9000);
-    let dns_hijack: Vec<std::net::IpAddr> = map
+    // mihomo `dns-hijack`: `any:53`, `8.8.8.8:53`, bare IPs, each with an
+    // optional udp:// scheme prefix (mihomo #1689's grammar — the port is
+    // part of the match; see tun::parse_dns_hijack_entry).
+    let dns_hijack: Vec<crate::inbound::tun::DnsHijack> = map
         .get("dns-hijack")
         .and_then(Yaml::as_sequence)
         .map(|list| {
             list.iter()
                 .filter_map(|v| v.as_str())
-                .filter_map(|s| s.trim().parse().ok())
+                .filter_map(crate::inbound::tun::parse_dns_hijack_entry)
                 .collect()
         })
         .unwrap_or_default();
@@ -1277,6 +1280,17 @@ fn parse_proxy(
     let name = yaml_str(entry, "name")
         .unwrap_or_else(|| format!("proxy-{index}"));
     let ptype = yaml_str(entry, "type").unwrap_or_default();
+    // mihomo #2426 (the dialer-proxy leak): chaining an outbound's dial
+    // through another proxy is NOT implemented here. Silently ignoring
+    // the field would dial the server DIRECTLY — the exact real-IP leak
+    // the issue describes — so the config is refused instead.
+    if let Some(dp) = yaml_str(entry, "dialer-proxy").filter(|s| !s.is_empty()) {
+        return Err(Error::config(format!(
+            "proxy {name:?}: dialer-proxy {dp:?} is not supported by the Rust engine; refusing \
+             to run because ignoring it would dial {name:?} directly and leak the real IP \
+             (mihomo #2426)"
+        )));
+    }
     // Wireguard carries server/port on peers[0], not the entry itself;
     // tailscale dials itself through the tsnet stack (no server field
     // upstream either).
@@ -2362,6 +2376,35 @@ fn ws_opts(entry: &BTreeMap<String, Yaml>) -> (String, Option<String>) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn dialer_proxy_is_refused_not_silently_ignored() {
+        // mihomo #2426: silently dropping `dialer-proxy` would dial the
+        // server directly and leak the real IP — the config must fail
+        // loudly instead of running half-configured.
+        let cfg = r#"
+mixed-port: 7890
+proxies:
+  - name: chained
+    type: trojan
+    server: t.example
+    port: 443
+    password: pw
+    dialer-proxy: front
+  - name: front
+    type: ss
+    server: f.example
+    port: 8388
+    cipher: aes-128-gcm
+    password: pw
+rules:
+  - MATCH,chained
+"#;
+        let err = load(cfg).unwrap_err().to_string();
+        assert!(err.contains("dialer-proxy"), "{err}");
+        assert!(err.contains("leak the real IP"), "{err}");
+        assert!(err.contains("chained"), "{err}");
+    }
+
     const SAMPLE_SHELLCRASH: &str = r#"
 mode: Rule
 mixed-port: 7890
@@ -3247,14 +3290,34 @@ tun:
   stack: system
   inet4-address: 172.19.0.1/30
   mtu: 1500
-  dns-hijack: [198.18.0.0]
+  dns-hijack: [198.18.0.0, "any:53", "tcp://8.8.8.8:53"]
 "#;
         let parsed = load(cfg).unwrap();
         let tun = parsed.tun.unwrap();
         assert_eq!(tun.name, "utun9");
         assert_eq!(tun.netmask, 30);
         assert_eq!(tun.mtu, 1500);
-        assert_eq!(tun.dns_hijack.len(), 1);
+        // mihomo #1689's grammar round-trips: bare IP, the any wildcard,
+        // and the scheme-prefixed host:port all carry address AND port.
+        assert_eq!(tun.dns_hijack.len(), 3);
+        assert_eq!(
+            tun.dns_hijack[0],
+            crate::inbound::tun::DnsHijack {
+                ip: Some("198.18.0.0".parse().unwrap()),
+                port: 53
+            }
+        );
+        assert_eq!(
+            tun.dns_hijack[1],
+            crate::inbound::tun::DnsHijack { ip: None, port: 53 }
+        );
+        assert_eq!(
+            tun.dns_hijack[2],
+            crate::inbound::tun::DnsHijack {
+                ip: Some("8.8.8.8".parse().unwrap()),
+                port: 53
+            }
+        );
     }
 
     #[test]

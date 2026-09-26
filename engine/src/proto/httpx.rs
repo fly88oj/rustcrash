@@ -70,6 +70,21 @@ impl HttpStream {
             .nth(1)
             .and_then(|c| c.parse::<u16>().ok())
             .ok_or_else(|| Error::protocol(format!("http proxy: malformed status line {status:?}")))?;
+        if code == 407 {
+            // sing-box #2539 shape ("auth failed, no Proxy-Authorization
+            // header"): name WHICH side lacks credentials instead of a
+            // bare 407. We always send the header when the outbound
+            // carries a username, so a 407 means rejected credentials or
+            // a username-less config against an auth-demanding proxy.
+            let auth_state = if cfg.username.as_deref().is_some_and(|u| !u.is_empty()) {
+                "the outbound DID send Proxy-Authorization — credentials rejected"
+            } else {
+                "the outbound has no username configured, so no Proxy-Authorization was sent"
+            };
+            return Err(Error::protocol(format!(
+                "http proxy: 407 Proxy Authentication Required ({auth_state})"
+            )));
+        }
         if !(200..300).contains(&code) {
             return Err(Error::protocol(format!("http proxy: CONNECT failed with {code}")));
         }
@@ -196,5 +211,91 @@ mod tests {
         let creds = base64::engine::general_purpose::STANDARD.encode("usr:pwd");
         assert_eq!(creds, "dXNyOnB3ZA==");
         assert!(cfg.username.is_some());
+    }
+
+    /// sing-box #2539 ("auth failed, no Proxy-Authorization header"):
+    /// pin the header to the WIRE — a proxy that demands auth must see
+    /// `Proxy-Authorization: Basic …` on the CONNECT.
+    #[tokio::test]
+    async fn proxy_authorization_reaches_the_wire() {
+        let (client, mut server) = tokio::io::duplex(256);
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                server.read_exact(&mut byte).await.unwrap();
+                buf.push(byte[0]);
+                if buf.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let req = String::from_utf8_lossy(&buf);
+            assert!(
+                req.contains("Proxy-Authorization: Basic dXNyOnB3ZA==\r\n"),
+                "auth header missing on the wire: {req}"
+            );
+            server
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let cfg = HttpOut {
+            server: "127.0.0.1".into(),
+            port: 1,
+            username: Some("usr".into()),
+            password: Some("pwd".into()),
+        };
+        HttpStream::handshake(
+            Box::new(client),
+            &cfg,
+            &NetAddr::domain("tunnel.test", 443).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The 407 error names which side lacks credentials (the #2539
+    /// confusion was a bare "auth failed").
+    #[tokio::test]
+    async fn auth_failure_407_names_the_credential_state() {
+        for (username, expected) in [
+            (Some("usr"), "credentials rejected"),
+            (None, "no Proxy-Authorization was sent"),
+        ] {
+            let (client, mut server) = tokio::io::duplex(256);
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut byte = [0u8; 1];
+                loop {
+                    server.read_exact(&mut byte).await.unwrap();
+                    buf.push(byte[0]);
+                    if buf.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                server
+                    .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+                    .await
+                    .unwrap();
+            });
+            let cfg = HttpOut {
+                server: "127.0.0.1".into(),
+                port: 1,
+                username: username.map(str::to_string),
+                password: Some("pwd".into()),
+            };
+            let err = match HttpStream::handshake(
+                Box::new(client),
+                &cfg,
+                &NetAddr::domain("tunnel.test", 443).unwrap(),
+            )
+            .await
+            {
+                Ok(_) => panic!("407 must fail the handshake"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains("407"), "{err}");
+            assert!(err.contains(expected), "{err}");
+        }
     }
 }

@@ -75,7 +75,7 @@ use crate::addr::NetAddr;
 use crate::dns::resolver::DnsEngine;
 use crate::error::{Error, Result};
 use crate::inbound::tun::io::{DeviceReader, TunIo};
-use crate::inbound::tun::{TunConfig, TunHooks};
+use crate::inbound::tun::{DnsHijack, TunConfig, TunHooks};
 use crate::inbound::{SharedRelay, TcpMeta};
 
 /// Read buffer per smoltcp TCP socket (also the advertised receive window).
@@ -575,11 +575,13 @@ impl UdpSessionKey {
 }
 
 /// Is this destination answered by the engine's resolver instead of the
-/// relay? Matching is by address only, in either family: `dns_hijack` is a
-/// list of UDP destinations (mihomo's `dns-hijack: [any:53]` semantics,
-/// holding `IpAddr`s so a v6 hijack address matches v6 traffic).
-pub(crate) fn is_dns_hijack(dst: SocketAddr, hijack: &[IpAddr]) -> bool {
-    hijack.iter().any(|ip| *ip == dst.ip())
+/// relay? Matched by address AND port (mihomo #1689: `any:53` is the
+/// address wildcard on port 53 only — matching by address alone captured
+/// non-DNS traffic to a hijack address), in either family.
+pub(crate) fn is_dns_hijack(dst: SocketAddr, hijack: &[DnsHijack]) -> bool {
+    hijack.iter().any(|h| {
+        h.port == dst.port() && h.ip.is_none_or(|ip| ip == dst.ip())
+    })
 }
 
 /// Facts about one live TCP socket that decide whether an arriving SYN needs
@@ -923,7 +925,7 @@ struct Netstack {
     relay: SharedRelay,
     tag: String,
     dns: Option<Arc<DnsEngine>>,
-    dns_hijack: Vec<IpAddr>,
+    dns_hijack: Vec<DnsHijack>,
     /// Listening sockets: (handle, destination port). A socket leaves this
     /// list and becomes a `Conn` once its handshake completes.
     listeners: Vec<(SocketHandle, u16)>,
@@ -1321,18 +1323,42 @@ impl Netstack {
         for (handle, source, target) in established {
             tracing::debug!(target: "engine", "tun: new tcp {source} -> {target}");
             let shared = Arc::new(StreamShared::new(self.wake.clone()));
-            self.relay.clone().handle_tcp(
-                TcpMeta {
-                    target,
-                    source,
-                    inbound: self.tag.clone(),
-                    inbound_port: None,
-                    inbound_kind: "tun",
-                },
-                Box::new(TunStream {
+            // TCP DNS hijack (mihomo `tcp://any:53` / sing-box #3878):
+            // a connection whose ORIGINAL destination is a hijack entry
+            // is answered by the engine's resolver over the same stream
+            // (length-framed wireformat), never relayed — otherwise a
+            // systemd-resolved falling back to TCP DNS (its standard
+            // reaction to UDP loss) would be relayed right back into the
+            // routing path that lost the UDP.
+            let hijacked = self
+                .dns
+                .as_ref()
+                .and_then(|_| netaddr_to_socketaddr(&target))
+                .is_some_and(|dst| is_dns_hijack(dst, &self.dns_hijack));
+            if hijacked {
+                tracing::debug!(target: "engine",
+                    "tun: hijacking tcp dns {source} -> {target}");
+                let dns = self.dns.clone().expect("checked above");
+                let mut stream: crate::stream::BoxProxyStream = Box::new(TunStream {
                     shared: shared.clone(),
-                }),
-            );
+                });
+                tokio::spawn(async move {
+                    crate::app::serve_dns_tcp(&mut stream, dns).await;
+                });
+            } else {
+                self.relay.clone().handle_tcp(
+                    TcpMeta {
+                        target,
+                        source,
+                        inbound: self.tag.clone(),
+                        inbound_port: None,
+                        inbound_kind: "tun",
+                    },
+                    Box::new(TunStream {
+                        shared: shared.clone(),
+                    }),
+                );
+            }
             self.conns.push(Conn {
                 handle,
                 shared,
@@ -2323,41 +2349,46 @@ mod tests {
     }
 
     #[test]
-    fn dns_hijack_matches_destination_ip_only() {
+    fn dns_hijack_matches_address_and_port() {
+        use crate::inbound::tun::DnsHijack;
+        let ip_a = IpAddr::V4(Ipv4Addr::new(10, 7, 0, 1));
         let hijack_v4 = vec![
-            IpAddr::V4(Ipv4Addr::new(10, 7, 0, 1)),
-            IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)),
+            DnsHijack { ip: Some(ip_a), port: 53 },
+            DnsHijack { ip: Some(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1))), port: 53 },
         ];
-        // Any port on a hijack address: this is mihomo's `any:53`.
-        for port in [53u16, 5353, 1] {
-            assert!(is_dns_hijack(
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 7, 0, 1)), port),
-                &hijack_v4
-            ));
-        }
+        // The configured destination matches on BOTH address and port...
+        assert!(is_dns_hijack(SocketAddr::new(ip_a, 53), &hijack_v4));
+        // ...and a non-DNS port on the same address is NOT captured —
+        // the mihomo #1689 over-hijack this engine used to have.
+        assert!(!is_dns_hijack(SocketAddr::new(ip_a, 5353), &hijack_v4));
+        assert!(!is_dns_hijack(SocketAddr::new(ip_a, 1), &hijack_v4));
+        // Different address, same port: no match.
         assert!(!is_dns_hijack(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 7, 0, 2)), 53),
             &hijack_v4
         ));
 
+        // `any:53`: every address, port 53 only.
+        let any53 = vec![DnsHijack { ip: None, port: 53 }];
+        assert!(is_dns_hijack(SocketAddr::new(ip_a, 53), &any53));
+        assert!(!is_dns_hijack(SocketAddr::new(ip_a, 5353), &any53));
+        assert!(is_dns_hijack(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
+            &any53
+        ));
+
         // v6 works symmetrically, and families never cross-match.
         let fd00_1 = IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1));
-        let hijack_v6 = vec![fd00_1];
+        let hijack_v6 = vec![DnsHijack { ip: Some(fd00_1), port: 53 }];
         assert!(is_dns_hijack(SocketAddr::new(fd00_1, 53), &hijack_v6));
-        assert!(is_dns_hijack(SocketAddr::new(fd00_1, 5353), &hijack_v6));
+        assert!(!is_dns_hijack(SocketAddr::new(fd00_1, 5353), &hijack_v6));
         assert!(!is_dns_hijack(
             SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2)), 53),
             &hijack_v6
         ));
         assert!(!is_dns_hijack(SocketAddr::new(fd00_1, 53), &hijack_v4));
-        assert!(!is_dns_hijack(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 7, 0, 1)), 53),
-            &hijack_v6
-        ));
-        assert!(!is_dns_hijack(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 7, 0, 1)), 53),
-            &[]
-        ));
+        assert!(!is_dns_hijack(SocketAddr::new(ip_a, 53), &hijack_v6));
+        assert!(!is_dns_hijack(SocketAddr::new(ip_a, 53), &[]));
     }
 
     #[test]
@@ -2658,7 +2689,7 @@ mod tests {
     #[tokio::test]
     async fn dns_hijack_is_answered_by_the_engine_resolver() {
         let mut cfg = test_cfg();
-        cfg.dns_hijack = vec![IpAddr::V4(Ipv4Addr::new(10, 7, 0, 1))];
+        cfg.dns_hijack = vec![IpAddr::V4(Ipv4Addr::new(10, 7, 0, 1)).into()];
         // A resolver with a static hosts entry: answering needs no upstream,
         // so this stays hermetic.
         let mut dns_cfg = crate::config::DnsConfig::default();
@@ -2929,7 +2960,7 @@ mod tests {
     async fn ipv6_dns_hijack_is_answered_by_the_engine_resolver() {
         let mut cfg = test_cfg_v6();
         let gateway_v6 = IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1));
-        cfg.dns_hijack = vec![gateway_v6];
+        cfg.dns_hijack = vec![gateway_v6.into()];
         let mut dns_cfg = crate::config::DnsConfig::default();
         let answer_v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5);
         dns_cfg
@@ -3172,7 +3203,7 @@ mod tests {
     async fn ipv6_dns_hijack_survives_extension_headers() {
         let mut cfg = test_cfg_v6();
         let gateway = IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1));
-        cfg.dns_hijack = vec![gateway];
+        cfg.dns_hijack = vec![gateway.into()];
         let mut dns_cfg = crate::config::DnsConfig::default();
         let answer_v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x55);
         dns_cfg
@@ -3509,6 +3540,98 @@ mod tests {
         task.abort();
     }
 
+    /// TCP DNS hijack end to end over the in-memory device (sing-box
+    /// #3878's shape: a resolver falling back to TCP DNS must be answered
+    /// by the engine, never relayed back into the routing path): a
+    /// completed handshake to a hijacked destination serves length-framed
+    /// DNS from the engine resolver over the bridged stream.
+    #[tokio::test]
+    async fn run_hijacks_tcp_dns_over_the_in_memory_device() {
+        let dev = LoopbackTun::new();
+        let relay = Arc::new(CaptureRelay::default());
+        let mut cfg = test_cfg_v6();
+        let gateway = IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1));
+        cfg.dns_hijack = vec![gateway.into()];
+        let mut dns_cfg = crate::config::DnsConfig::default();
+        let answer_v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x77);
+        dns_cfg
+            .hosts
+            .insert("probe-tcp.test".to_string(), vec![answer_v6.into()]);
+        let dns = DnsEngine::new(dns_cfg, crate::rule::DomainMatcher::default()).unwrap();
+
+        let io_dev: Arc<dyn TunIo> = dev.clone();
+        let task = tokio::spawn(run(
+            io_dev,
+            cfg,
+            relay.clone(),
+            TunHooks { dns: Some(dns) },
+        ));
+
+        let client = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2)),
+            40001,
+        );
+        let hijack_dst = SocketAddr::new(gateway, 53);
+
+        // Handshake to the hijacked destination.
+        dev.inject(&tcp6_packet(client, hijack_dst, 1000, None, FLAG_SYN, &[]));
+        let mut spill = Vec::new();
+        let synack = wait_egress(
+            &dev,
+            "SYN-ACK from the hijack listener",
+            |p| p[0] >> 4 == 6 && p[6] == 6 && tcp6_fields(p).4 & 0x12 == 0x12,
+            &mut spill,
+        )
+        .await;
+        let (_sp, _dp, stack_seq, ack_no, _f) = tcp6_fields(&synack);
+        assert_eq!(ack_no, 1001);
+        dev.inject(&tcp6_packet(
+            client,
+            hijack_dst,
+            ack_no,
+            Some(stack_seq + 1),
+            0,
+            &[],
+        ));
+
+        // One length-framed AAAA query for a hosts-mapped name.
+        let mut q = dns_query("probe-tcp.test", 0x0e0f);
+        let qlen = q.len();
+        q[qlen - 4] = 0x00;
+        q[qlen - 3] = 0x1c; // AAAA — matches the v6 hosts entry
+        let mut framed = (q.len() as u16).to_be_bytes().to_vec();
+        framed.extend_from_slice(&q);
+        dev.inject(&tcp6_packet(
+            client,
+            hijack_dst,
+            1001,
+            Some(stack_seq + 1),
+            0x08, // PSH
+            &framed,
+        ));
+
+        // The framed answer comes back with the resolver's data.
+        let answer = wait_egress(
+            &dev,
+            "the framed DNS answer must come back over the stream",
+            |p| {
+                p[0] >> 4 == 6 && p[6] == 6 && p.len() > 60 && p[60..].ends_with(&answer_v6.octets())
+            },
+            &mut spill,
+        )
+        .await;
+        let tcp_payload = &answer[60..];
+        let frame_len = u16::from_be_bytes([tcp_payload[0], tcp_payload[1]]) as usize;
+        let msg = crate::dns::wire::parse(&tcp_payload[2..2 + frame_len]).unwrap();
+        assert_eq!(msg.id, 0x0e0f, "transaction id echoed");
+        assert!(
+            relay.tcp.lock().unwrap().is_empty(),
+            "a hijacked TCP DNS connection must never reach the relay"
+        );
+
+        task.abort();
+    }
+
     /// DNS hijack end to end over the in-memory device, including a chained
     /// query: the reader pump, classifier, resolver and reply socket in one
     /// path — the platform-independence proof for the whole inbound.
@@ -3518,7 +3641,7 @@ mod tests {
         let relay = Arc::new(CaptureRelay::default());
         let mut cfg = test_cfg_v6();
         let gateway = IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1));
-        cfg.dns_hijack = vec![gateway];
+        cfg.dns_hijack = vec![gateway.into()];
         let mut dns_cfg = crate::config::DnsConfig::default();
         let answer_v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x66);
         dns_cfg

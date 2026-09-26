@@ -56,6 +56,17 @@ impl std::fmt::Display for Upstream {
 
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Hard cap on ONE upstream exchange, covering the phases that have no
+/// internal timeout of their own (chiefly the TCP/QUIC connect: a
+/// black-holed nameserver that drops SYNs otherwise parks the query on
+/// the OS connect timeout of ~2 minutes — the mihomo #2560 "dns 超时"
+/// shape, where every query visibly times out while goroutine-equivalents
+/// pile up). Applied by the resolver around `exchange`.
+#[cfg(not(test))]
+pub(crate) const EXCHANGE_TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+pub(crate) const EXCHANGE_TOTAL_TIMEOUT: Duration = Duration::from_millis(500);
+
 impl Upstream {
     /// Exchange one wire-format query for one response. The caller has
     /// already synced the query id.
@@ -402,6 +413,21 @@ pub fn parse_upstream(ns: &str) -> Option<Upstream> {
         }
         _ => {}
     }
+    // mihomo nameserver detour suffix (`tcp://8.8.8.8#PROXY`,
+    // `udp://1.1.1.1#DIRECT`): route DNS through a named outbound
+    // (mihomo #739's DoQ-through-tuic shape). Routing engine DNS through
+    // outbounds is not implemented, but the suffix must not silently
+    // discard the nameserver either — parse the address half and warn,
+    // so a `#tag` config keeps a working (direct) upstream instead of
+    // losing it to "skipping unsupported nameserver".
+    let ns = match ns.split_once('#') {
+        Some((addr, tag)) => {
+            tracing::warn!(target: "engine",
+                "nameserver {ns:?}: detour #{tag} is not supported (dialing direct)");
+            addr
+        }
+        None => ns,
+    };
     let (scheme, rest) = ns.split_once("://").unwrap_or(("", ns));
     match scheme {
         // rcode://success|format_error|server_failure|name_error|
@@ -698,6 +724,25 @@ mod tests {
         // resolvers/leases (environment-dependent outside tests, so only
         // the scheme-less bare-host path is asserted here).
         assert!(parse_upstream("frobnicate://x").is_none());
+    }
+
+    /// mihomo detour suffix (`...#PROXY`, mihomo #739/#1689 configs):
+    /// the nameserver must survive the suffix (dialed direct, warned)
+    /// instead of being silently skipped as unparseable.
+    #[test]
+    fn detour_suffix_strips_but_keeps_the_upstream() {
+        match parse_upstream("tcp://8.8.8.8#PROXY") {
+            Some(Upstream::Tcp(a)) => assert_eq!(a, "8.8.8.8:53".parse().unwrap()),
+            other => panic!("bad detour tcp parse: {other:?}"),
+        }
+        match parse_upstream("udp://1.1.1.1#DIRECT") {
+            Some(Upstream::Udp(a)) => assert_eq!(a, "1.1.1.1:53".parse().unwrap()),
+            other => panic!("bad detour udp parse: {other:?}"),
+        }
+        match parse_upstream("quic://1.1.1.1#节点选择") {
+            Some(Upstream::Doq { addr, .. }) => assert_eq!(addr, "1.1.1.1:853".parse().unwrap()),
+            other => panic!("bad detour doq parse: {other:?}"),
+        }
     }
 
     #[test]
