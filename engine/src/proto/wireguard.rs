@@ -1992,11 +1992,13 @@ async fn tunnel_for(cfg: &WgOut) -> Result<mpsc::Sender<Cmd>> {
     let (statics, peer_pk, psk) = cfg.keys()?;
     let endpoint = resolve_endpoint(&cfg.server, cfg.port).await?;
     let bind_addr = if endpoint.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
-    let socket = Arc::new(
-        UdpSocket::bind(bind_addr)
+    let socket = Arc::new({
+        let s = UdpSocket::bind(bind_addr)
             .await
-            .map_err(|e| Error::network(format!("wg: bind udp: {e}")))?,
-    );
+            .map_err(|e| Error::network(format!("wg: bind udp: {e}")))?;
+        crate::mark::apply(&s);
+        s
+    });
     let wake = Arc::new(Notify::new());
     let stack = Stack::new(cfg, statics, peer_pk, psk, endpoint, wake.clone())?;
     let task_socket = socket.clone();

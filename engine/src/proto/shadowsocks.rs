@@ -409,6 +409,7 @@ impl SsUdp {
             "[::]:0"
         })
         .await?;
+        crate::mark::apply(&socket);
         let aes_block = if cfg.method.is_2022() {
             Some(match cfg.method.kind() {
                 AeadKind::Aes128Gcm => {

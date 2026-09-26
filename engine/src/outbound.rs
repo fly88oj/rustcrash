@@ -443,7 +443,7 @@ impl Outbound {
             move || {
                 let server = dial_server.clone();
                 Box::pin(async move {
-                    let tcp = tokio::net::TcpStream::connect((server.as_str(), port))
+                    let tcp = crate::mark::tcp_connect(server.as_str(), port)
                         .await
                         .map_err(|e| {
                             Error::network(format!("dial {server}:{port}: {e}"))
@@ -471,7 +471,7 @@ impl Outbound {
         ech: &Option<crate::proto::ech::EchOptions>,
     ) -> Result<BoxProxyStream> {
         if let Some(user) = jls {
-            let tcp = tokio::net::TcpStream::connect((server, port))
+            let tcp = crate::mark::tcp_connect(server, port)
                 .await
                 .map_err(|e| Error::network(format!("dial {server}:{port}: {e}")))?;
             let _ = tcp.set_nodelay(true);
@@ -538,7 +538,7 @@ impl Outbound {
         transport: &TransportKind,
         tls: &TlsSettings,
     ) -> Result<BoxProxyStream> {
-        let tcp = tokio::net::TcpStream::connect((server, port))
+        let tcp = crate::mark::tcp_connect(server, port)
             .await
             .map_err(|e| Error::network(format!("dial {server}:{port}: {e}")))?;
         let _ = tcp.set_nodelay(true);
@@ -607,7 +607,7 @@ async fn vless_front(
              (ws/httpupgrade/grpc) yet",
         ));
     }
-    let tcp = tokio::net::TcpStream::connect((server, port))
+    let tcp = crate::mark::tcp_connect(server, port)
         .await
         .map_err(|e| Error::network(format!("dial {server}:{port}: {e}")))?;
     let _ = tcp.set_nodelay(true);
@@ -686,7 +686,7 @@ async fn vless_front(
         match &self.kind {
             OutboundKind::Direct => {
                 let host = target.host.to_text();
-                let tcp = tokio::net::TcpStream::connect((host.as_str(), target.port))
+                let tcp = crate::mark::tcp_connect(&host, target.port)
                     .await
                     .map_err(|e| Error::network(format!("direct dial {target}: {e}")))?;
                 let _ = tcp.set_nodelay(true);
@@ -778,7 +778,7 @@ async fn vless_front(
                 // tlsmirror-opts (vmess only, mihomo TLSMirrorOptions):
                 // the mirror carrier replaces the plain TLS dial entirely.
                 if let Some(mirror) = tlsmirror {
-                    let tcp = tokio::net::TcpStream::connect((server.as_str(), *port))
+                    let tcp = crate::mark::tcp_connect(server, *port)
                         .await
                         .map_err(|e| Error::network(format!("dial {server}:{port}: {e}")))?;
                     let _ = tcp.set_nodelay(true);
@@ -822,7 +822,7 @@ async fn vless_front(
                         && matches!(transport, TransportKind::Tcp)
                         && jls.is_none()
                     {
-                        let raw = tokio::net::TcpStream::connect((server.as_str(), *port))
+                        let raw = crate::mark::tcp_connect(server, *port)
                             .await
                             .map_err(|e| {
                                 Error::network(format!("dial {server}:{port}: {e}"))
@@ -859,7 +859,7 @@ async fn vless_front(
                     // framing wraps everything after the handshake.
                     let stream = if let Some(user) = jls {
                         // JLS + vision: cover the handshake, then frame.
-                        let tcp = tokio::net::TcpStream::connect((server.as_str(), *port))
+                        let tcp = crate::mark::tcp_connect(server, *port)
                             .await
                             .map_err(|e| {
                                 Error::network(format!("dial {server}:{port}: {e}"))
@@ -1022,7 +1022,7 @@ async fn vless_front(
             } => {
                 // Layering: raw TCP → shadowtls v3 → real TLS → inner
                 // protocol handshake. The inner outbound never dials.
-                let raw = tokio::net::TcpStream::connect((server.as_str(), *port))
+                let raw = crate::mark::tcp_connect(server, *port)
                     .await
                     .map_err(|e| Error::network(format!("dial {server}:{port}: {e}")))?;
                 let _ = raw.set_nodelay(true);
@@ -1197,7 +1197,7 @@ async fn vless_front(
                 .map(str::to_string)
                 .unwrap_or_else(|| server.clone());
             Box::pin(async move {
-                let tcp = tokio::net::TcpStream::connect((server.as_str(), port))
+                let tcp = crate::mark::tcp_connect(server.as_str(), port)
                     .await
                     .map_err(|e| Error::network(format!("dial {server}:{port}: {e}")))?;
                 let _ = tcp.set_nodelay(true);
@@ -1234,7 +1234,7 @@ async fn vless_front(
         }
         match &self.kind {
             OutboundKind::Direct => {
-                let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+                let socket = crate::mark::udp_bind_ephemeral().await?;
                 Ok(UdpChannel::Direct(socket))
             }
             OutboundKind::Socks {
@@ -1249,7 +1249,7 @@ async fn vless_front(
                     username: username.clone(),
                     password: password.clone(),
                 };
-                let tcp = tokio::net::TcpStream::connect((server.as_str(), *port))
+                let tcp = crate::mark::tcp_connect(server, *port)
                     .await
                     .map_err(|e| Error::network(format!("dial {server}:{port}: {e}")))?;
                 let socks_udp = SocksUdp::associate(tcp, &cfg).await?;

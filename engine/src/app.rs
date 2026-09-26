@@ -66,6 +66,13 @@ impl Engine {
         // that /logs should carry.
         crate::api::init_log_broadcast();
 
+        // mihomo `routing-mark`: stamp every socket the engine dials so
+        // the firewall's `meta mark <mark> return` loop-guard exempts
+        // the engine's own traffic (crate::mark). Explicitly cleared
+        // when unset — repeated builds in one process (tests) must not
+        // inherit a stale mark.
+        crate::mark::set(cfg.routing_mark.unwrap_or(0));
+
         let cfg = cfg.with_builtin_outbounds();
         let rule_table = cfg.compile_rules()?;
         let rules = rule_table.rules();
@@ -209,9 +216,15 @@ impl Engine {
         // moves a port, bind address, or allow-lan (i.e. re-spawns an
         // inbound) has no runtime path — PUT /configs rejects those fields
         // with a restart reason instead of pretending to apply them.
-        let bound =
-            crate::inbound::spawn_all(&self.cfg.listeners, self.clone() as Arc<dyn RelayHandler>)
-                .await?;
+        // `authentication` (mihomo inbound credentials) rides alongside:
+        // enforced on the mixed/socks/http listeners, ignored by the
+        // transparent ones (their clients cannot authenticate).
+        let bound = crate::inbound::spawn_all(
+            &self.cfg.listeners,
+            &self.cfg.authentication,
+            self.clone() as Arc<dyn RelayHandler>,
+        )
+        .await?;
         for (tag, addr) in &bound {
             tracing::info!(target: "engine", "inbound {tag} listening on {addr}");
         }
@@ -526,6 +539,22 @@ impl Engine {
     }
 
     async fn relay_tcp(self: Arc<Self>, meta: TcpMeta, mut client: BoxProxyStream) {
+        // Self-relay loop guard (belt under the routing-mark fix): when
+        // the recovered destination IS one of the engine's own inbound
+        // listeners on loopback, relaying it dials that listener again
+        // — the textbook case is a direct connection to the tproxy
+        // port, whose "original destination" (the accepted socket's
+        // local address) is the tproxy listener itself. Without the
+        // guard each relay spawns one more self-dial and the chain
+        // grows until FD exhaustion; mihomo avoids the whole class via
+        // its marked dials + firewall exemptions, this catches the
+        // unguarded setups (no firewall, mark not settable).
+        if is_self_relay(&self.cfg.listeners, &meta.target) {
+            tracing::warn!(target: "engine",
+                "self-relay loop detected: {} -> {} refused (destination is \
+                 this engine's own {} inbound)", meta.source, meta.target, meta.inbound_kind);
+            return;
+        }
         // Sniff the first client bytes (TLS SNI / HTTP Host) and replay
         // them loss-free; the override policy lives in apply_sniffed.
         let (target, client): (NetAddr, BoxProxyStream) = if self.cfg.sniff.enabled() {
@@ -699,6 +728,15 @@ impl Engine {
         let Some((first_target, first_data)) = uplink.recv().await else {
             return;
         };
+        // Same self-relay guard as the TCP relay: a tproxy-intercepted
+        // datagram whose original destination is the engine's own
+        // listener would loop forever.
+        if is_self_relay(&self.cfg.listeners, &first_target) {
+            tracing::warn!(target: "engine",
+                "self-relay loop detected: udp {} -> {} refused (destination is \
+                 this engine's own inbound)", source, first_target);
+            return;
+        }
         let effective = self.unfake_target(&first_target);
         // /proc scan for PROCESS/UID rules works for UDP sessions too.
         let proc_info = if self.needs_process {
@@ -797,6 +835,29 @@ impl Engine {
 
 fn format_rule(rule: &Rule) -> String {
     format_rule_target(rule, &rule.outbound)
+}
+
+/// Whether `target` is one of the engine's own inbound listeners on
+/// loopback — relaying there is always a self-relay loop (the engine
+/// would dial itself, be accepted again, and chain). mihomo-legal
+/// traffic never targets its own inbound ports; a loopback target on
+/// one of them is either a direct hit on a transparent listener (the
+/// gap the tproxy self-relay reproduction pins) or a firewall
+/// re-redirect of the engine's own dial. Remote hosts reusing the same
+/// port number are unaffected: only loopback destinations match.
+fn is_self_relay(listeners: &[crate::inbound::ListenerConfig], target: &NetAddr) -> bool {
+    let crate::addr::Host::Ip(ip) = &target.host else {
+        return false;
+    };
+    if !ip.is_loopback() {
+        return false;
+    }
+    listeners.iter().any(|l| {
+        l.port == target.port
+            && l.bind
+                .parse::<std::net::IpAddr>()
+                .map_or(true, |b| b.is_unspecified() || b == *ip)
+    })
 }
 
 /// Matcher rendering with an explicit target — action outcomes display
@@ -968,7 +1029,10 @@ fn try_load_provider(p: &crate::config::RuleProviderSpec) -> std::result::Result
 
 /// DNS hijack server (UDP + TCP with length-prefix framing).
 async fn spawn_dns_server(listen: &str, dns: Arc<DnsEngine>) -> Result<()> {
-    let addr: SocketAddr = listen
+    // Normalize mihomo's leading-colon all-interfaces shorthand
+    // (`listen: :1053`, the form ShellCrash's dns.yaml emits) before
+    // the SocketAddr parse rejects it.
+    let addr: SocketAddr = crate::config::normalize_listen(listen)
         .parse()
         .map_err(|_| Error::config(format!("bad dns listen {listen:?}")))?;
     // UDP.
@@ -1169,9 +1233,11 @@ async fn wait_for_shutdown() {
     use tokio::signal::unix::{signal, SignalKind};
     let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
     let mut int = signal(SignalKind::interrupt()).expect("SIGINT handler");
+    // Name the trigger: a manager's stop path (and every e2e suite)
+    // needs to see WHICH signal ended the run in the log.
     tokio::select! {
-        _ = term.recv() => {}
-        _ = int.recv() => {}
+        _ = term.recv() => tracing::info!(target: "engine", "SIGTERM received"),
+        _ = int.recv() => tracing::info!(target: "engine", "SIGINT received"),
     }
 }
 
@@ -1209,8 +1275,51 @@ mod tests {
             proxy_servers: vec![],
             tun: None,
             wg_endpoints: vec![],
+            authentication: Vec::new(),
+            routing_mark: None,
         }
         .with_builtin_outbounds()
+    }
+
+    #[test]
+    fn self_relay_guard_matches_own_loopback_listeners_only() {
+        use crate::addr::NetAddr;
+        use crate::inbound::{ListenerConfig, ListenerKind};
+        let listeners = vec![
+            ListenerConfig {
+                tag: "mixed".into(),
+                bind: "0.0.0.0".into(),
+                port: 7890,
+                kind: ListenerKind::Mixed,
+            },
+            ListenerConfig {
+                tag: "tproxy".into(),
+                bind: "0.0.0.0".into(),
+                port: 7893,
+                kind: ListenerKind::Tproxy,
+            },
+        ];
+        // Loopback onto one of our ports: self-relay.
+        assert!(is_self_relay(
+            &listeners,
+            &NetAddr::ip("127.0.0.1".parse().unwrap(), 7893)
+        ));
+        // Same port on a REMOTE host: fine (only loopback matches).
+        assert!(!is_self_relay(
+            &listeners,
+            &NetAddr::ip("1.2.3.4".parse().unwrap(), 7893)
+        ));
+        // Loopback onto an unrelated port (the panel API): fine.
+        assert!(!is_self_relay(
+            &listeners,
+            &NetAddr::ip("127.0.0.1".parse().unwrap(), 9999)
+        ));
+        // Domain targets never match (an engine dial by domain is not
+        // the transparent self-relay shape).
+        assert!(!is_self_relay(
+            &listeners,
+            &NetAddr::domain("self.test", 7893).unwrap()
+        ));
     }
 
     #[tokio::test]

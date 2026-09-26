@@ -2462,6 +2462,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "mihomo")]
     async fn proxy_provider_file_surface_and_reload() {
         // THE provider proof (the wave-14A rule-provider template): a
         // file vehicle installed at runtime, listed with mihomo's
@@ -2559,6 +2560,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "mihomo")]
     async fn proxy_provider_http_fetch() {
         // The HTTP vehicle against an in-test fake subscription server
         // (hermetic: loopback only), both content-length and chunked
@@ -2628,6 +2630,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "mihomo")]
     async fn proxy_provider_json_subscription() {
         // The JSON subscription dialect (`{"proxies": [...]}` — JSON is
         // a YAML subset, mihomo's yaml.Unmarshal reads both).

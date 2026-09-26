@@ -126,6 +126,7 @@ async fn dial_obfs(
     let socket = tokio::net::UdpSocket::bind(quic::family_bind_addr(remote))
         .await
         .map_err(|e| Error::network(format!("salamander bind: {e}")))?;
+    crate::mark::apply(&socket);
     let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
         quinn::EndpointConfig::default(),
         None,

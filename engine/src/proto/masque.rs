@@ -2228,8 +2228,7 @@ impl MasqueClient {
         quic_cfg.transport_config(Arc::new(transport));
 
         let remote = quic::resolve_remote(&cfg.server, cfg.port).await?;
-        let mut endpoint = quinn::Endpoint::client(quic::family_bind_addr(remote))
-            .map_err(|e| Error::network(format!("quic bind: {e}")))?;
+        let mut endpoint = quic::client_endpoint(quic::family_bind_addr(remote)).await?;
         endpoint.set_default_client_config(quic_cfg);
         let connect = endpoint
             .connect(remote, &sni)

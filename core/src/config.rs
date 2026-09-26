@@ -337,9 +337,27 @@ impl ConfigManager {
             return Ok(Config::default());
         }
         let content = fs::read_to_string(&path)?;
-        let config: Config = serde_yaml::from_str(&content)
-            .map_err(|e| Error::Config(format!("Failed to parse config: {e}")))?;
-        Ok(config)
+        match serde_yaml::from_str(&content) {
+            Ok(config) => Ok(config),
+            Err(e) => {
+                // A ShellCrash layout keeps the KERNEL config at exactly
+                // this path ($CRASHDIR/config.yaml is the symlink its
+                // clash_modify.sh maintains), so parsing it as the
+                // manager config fails. Detect that shape and name the
+                // collision precisely instead of leaking a serde
+                // "missing field `kernel`" that reads like breakage.
+                if looks_like_kernel_config(&content) {
+                    return Err(Error::Config(format!(
+                        "{path} is a KERNEL config (mihomo/sing-box dialect), not the \
+                         RustCrash manager config — this is the ShellCrash layout, where \
+                         config.yaml is the kernel's symlink. Point -c at a RustCrash \
+                         manager directory, or drive the engine directly: \
+                         `crash -t -d <dir> -f {path}` / `crash -d <dir> -f {path}`"
+                    )));
+                }
+                Err(Error::Config(format!("Failed to parse config: {e}")))
+            }
+        }
     }
 
     pub fn save(&self, config: &Config) -> Result<()> {
@@ -396,8 +414,38 @@ fn restrict_permissions(path: &str) {
     if let Ok(meta) = fs::metadata(path) {
         let mut perms = meta.permissions();
         perms.set_mode(0o600);
-        let _ = fs::set_permissions(path, perms);
+        let _ = std::fs::set_permissions(path, perms);
     }
+}
+
+/// Whether a YAML document carries the shape of a mihomo/sing-box
+/// KERNEL config (top-level `proxies:` / inbound ports / `inbounds:`)
+/// rather than the manager config (whose `kernel` field is mandatory).
+/// Used to name the ShellCrash path collision precisely: there,
+/// `$CRASHDIR/config.yaml` is the KERNEL config symlink, and the
+/// manager parse would otherwise fail with an opaque serde error.
+fn looks_like_kernel_config(content: &str) -> bool {
+    let has_kernel_field = content
+        .lines()
+        .any(|l| l.trim_start().starts_with("kernel:"));
+    if has_kernel_field {
+        return false;
+    }
+    // sing-box kernel configs are JSON documents (the manager config is
+    // YAML with a mandatory `kernel` field).
+    if content.trim_start().starts_with('{') {
+        return true;
+    }
+    content.lines().any(|l| {
+        if l.starts_with([' ', '\t', '#']) || !l.contains(':') {
+            return false; // top-level keys only
+        }
+        matches!(
+            l.split(':').next().unwrap_or_default().trim(),
+            "proxies" | "proxy-groups" | "mixed-port" | "tproxy-port" | "redir-port"
+                | "inbounds" | "listeners" | "tun"
+        )
+    })
 }
 
 #[cfg(not(unix))]
@@ -406,6 +454,52 @@ fn restrict_permissions(_path: &str) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kernel_config_collision_named_precisely() {
+        // The ShellCrash layout keeps the KERNEL config at
+        // {crash_dir}/config.yaml; loading it as the manager config must
+        // name the collision, not leak "missing field `kernel`".
+        let dir = tempfile::tempdir().unwrap();
+        let platform = crate::platform::Platform::for_crash_dir(dir.path().to_str().unwrap());
+        std::fs::write(
+            dir.path().join("config.yaml"),
+            "mixed-port: 7890\ntproxy-port: 7893\nproxies:\n  - name: a\n",
+        )
+        .unwrap();
+        let err = ConfigManager::new(&platform).load().unwrap_err().to_string();
+        assert!(err.contains("KERNEL config"), "{err}");
+        assert!(err.contains("ShellCrash"), "{err}");
+        assert!(!err.contains("missing field"), "{err}");
+
+        // A genuinely broken manager config keeps the plain parse error.
+        std::fs::write(dir.path().join("config.yaml"), "kernel: [not, a, scalar]\n").unwrap();
+        let err = ConfigManager::new(&platform).load().unwrap_err().to_string();
+        assert!(!err.contains("KERNEL config"), "{err}");
+
+        // And a file that carries `kernel:` is manager-dialect by
+        // definition — whatever else is wrong with it, it is NOT the
+        // ShellCrash kernel-config collision.
+        std::fs::write(
+            dir.path().join("config.yaml"),
+            "kernel: mihomo\nproxies: []\n",
+        )
+        .unwrap();
+        let err = ConfigManager::new(&platform).load().unwrap_err().to_string();
+        assert!(!err.contains("KERNEL config"), "{err}");
+    }
+
+    #[test]
+    fn looks_like_kernel_config_shape() {
+        assert!(looks_like_kernel_config(
+            "mode: rule\nmixed-port: 7890\nproxies:\n  - name: x\n"
+        ));
+        assert!(looks_like_kernel_config("{\"inbounds\": []}"));
+        // Manager configs (mandatory `kernel`) never match.
+        assert!(!looks_like_kernel_config("kernel: mihomo\nmode: Router\n"));
+        // Unrelated YAML is neither.
+        assert!(!looks_like_kernel_config("just: some\nyaml: doc\n"));
+    }
 
     #[test]
     fn kernel_config_paths_never_collide_with_management_config() {
