@@ -139,9 +139,10 @@ pub use state::{
     persist_rotated_node_key, FileStore, NodeIdentity, Persist, STATE_FILE_NAME,
 };
 pub use tailcfg::{
-    AddrPort, DerpMap, DerpNode, DerpRegion, DiscoKeyText, DnsConfig, Hostinfo, MachineKeyText,
-    MapRequest, MapResponse, Node, NodeKey, OverTlsPublicKeyResponse, PeerChange, Prefix,
-    RegisterRequest, RegisterResponse, RegisterResponseAuth, UserProfile, CURRENT_CAPABILITY_VERSION,
+    AddrPort, DerpMap, DerpNode, DerpRegion, DiscoKeyText, DnsConfig, FilterRule, Hostinfo,
+    MachineKeyText, MapRequest, MapResponse, NetPortRange, Node, NodeKey, OverTlsPublicKeyResponse,
+    PeerChange, Prefix, RegisterRequest, RegisterResponse, RegisterResponseAuth, UserProfile,
+    CURRENT_CAPABILITY_VERSION,
 };
 pub use wg::{DerpRoute, DiscoKeys, TsTcpStream, TsTunnel, TsTunnelConfig, TsUdp};
 
@@ -297,10 +298,13 @@ pub const NOT_IMPLEMENTED: &str = concat!(
     "tailscale: login, the netmap poll (with reconnect/backoff), the peer ",
     "data plane (direct UDP + DERP relay, disco-informed: ping/pong path ",
     "confirmation and call-me-maybe), MagicDNS, subnet-route and ",
-    "exit-node enforcement, UDP and key-expiry renewal are ported, and ",
-    "dial_tcp/dial_udp return live streams — still missing: the tailnet ",
-    "packet filter (inbound ACLs; outbound dials are unaffected) and ",
-    "interactive (browser) login — P3 continuation"
+    "exit-node enforcement, UDP, key-expiry renewal and the tailnet packet ",
+    "filter (parsed from the map, carried on the netmap, queryable via ",
+    "packet_filter_allows — an inbound ACL has nothing to reject on an ",
+    "outbound; enforcement belongs to a listener/TUN surface) are ported, ",
+    "and dial_tcp/dial_udp return live streams — still missing: ",
+    "interactive (browser) login — headless out of scope, staged as ",
+    "RegisterOutcome::NeedsBrowserAuth"
 );
 
 // ---------------------------------------------------------------------------
@@ -2964,16 +2968,18 @@ mod tests {
         };
         let err = connect(&cfg).await.unwrap_err();
         let msg = err.to_string();
+        // The filter is now parsed/carried/queryable — named as PORTED
+        // in the preamble, not in the "still missing" list.
         assert!(msg.contains("packet filter"), "{msg}");
         assert!(msg.contains("browser"), "{msg}");
-        assert!(msg.contains("P3 continuation"), "{msg}");
-        // What landed this wave must not be listed as MISSING anymore
-        // (the preamble names them as ported; the "still missing" list
+        // What landed must not be listed as MISSING anymore (the
+        // preamble names them as ported; the "still missing" list
         // must not).
         let missing = msg.split("still missing:").nth(1).unwrap_or_default();
         assert!(!missing.contains("disco"), "{missing}");
         assert!(!missing.contains("key-expiry"), "{missing}");
         assert!(!missing.contains("renewal"), "{missing}");
+        assert!(!missing.contains("packet filter"), "{missing}");
         assert!(!missing.contains("MagicDNS"), "{msg}");
         assert!(!missing.contains("reconnect"), "{missing}");
         assert!(!missing.contains("subnet-route"), "{missing}");

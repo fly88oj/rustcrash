@@ -84,11 +84,11 @@
 //!   frames (the TUN payload), encrypted per the flags. This is the
 //!   attach point for the next milestone.
 //!
-//! Secure mode (the Noise_XX `PeerConnNoiseMsg1/2/3` handshake of
-//! `peer_conn.rs:779-1170`) is NOT ported: hand-rolling snow's
-//! `Noise_XX_25519_ChaChaPoly_SHA256` is its own follow-up and only
-//! `[secure_mode]` configs need it — see [`SECURE_MODE_NOT_PORTED`]
-//! for the precise map of what it entails beyond the handshake.
+//! Secure mode WAS the follow-up and is now in-tree (M6): the Noise_XX
+//! `PeerConnNoiseMsg1/2/3` handshake (`Noise_XX_25519_ChaChaPoly_SHA256`,
+//! prologue `easytier-peerconn-noise`, hand-rolled after snow —
+//! [`NoiseXxHandshake`]) plus the per-peer session AEAD that replaces
+//! the network-secret encryption afterwards (see the M6 section below).
 //!
 //! # Second milestone — LANDED (route gossip + the userspace stack)
 //!
@@ -150,12 +150,10 @@
 //!   frames route by longest-prefix over the union LSDB (two-node
 //!   default: the first live peer), and the dhcp allocation is
 //!   node-wide.
-//! * **Secure mode — assessed, NOT ported** — the handshake is bounded
-//!   but worthless alone: after it every payload switches from the
-//!   network-secret AEAD to the per-peer session AEAD
-//!   (`PeerSessionStore` + `SecureDatagramSession`). Configuring it
-//!   fails fast with the map ([`SECURE_MODE_NOT_PORTED`]); a
-//!   NoiseHandshakeMsg1-first inbound peer is named precisely.
+//! * **Secure mode — assessed then landed in M6** — after the Noise_XX
+//!   handshake every payload switches from the network-secret AEAD to
+//!   the per-peer session AEAD (`PeerSessionStore` +
+//!   `SecureDatagramSession`); the fast-fail gate is gone.
 //!
 //! # Fourth milestone — LANDED (the QUIC + WebSocket transports)
 //!
@@ -219,10 +217,41 @@
 //! core's boringtun — verified by the ignored real-binary interop test
 //! (`real_easytier_binary_serving_wg`).
 //!
+//! # Sixth milestone — LANDED (secure mode)
+//!
+//! M6 (v2.6.4 sources, `/tmp/wave16-upstream/et264/`) ports the payload
+//! layer a `[secure_mode]` config turns on:
+//!
+//! * **The handshake** — `Noise_XX_25519_ChaChaPoly_SHA256` with the
+//!   prologue `easytier-peerconn-noise`, hand-rolled after snow
+//!   ([`NoiseXxHandshake`]; the engine's third hand-rolled Noise pattern
+//!   after wireguard's IKpsk2 and tailscale's IK): msg1 (ephemeral +
+//!   clear payload), msg2 (ephemeral, ee, the sealed static, es, the
+//!   sealed payload), msg3 (the sealed static, se, the sealed payload).
+//!   The `PeerConnNoiseMsg1/2/3Pb` protobufs ride peer packets 13/14/15
+//!   with the conn-id echo checks, the same/foreign `role_hint` rule and
+//!   the HMAC network-secret proofs over the handshake hash.
+//! * **The session AEAD** — [`SecureDatagramSession`]
+//!   (secure_datagram.rs, 1020 lines; the load-bearing subset): traffic
+//!   keys are epoch-keyed (`HMAC(prk, "et-traffic" || epoch || dir ||
+//!   0x01)` over `HMAC(0^32, root_key)`), the send nonce is
+//!   `epoch_be || seq_be` in the AEAD tail, replay is a 256-bit window
+//!   per direction with two live epochs + a far-future bound, epochs
+//!   rotate after 1M packets / 10 min, and a root-key sync keeps the
+//!   pre-sync rx epochs valid for a 5s grace window.
+//! * **The session store** — [`PeerSessionStore`] (peer_session.rs, 422
+//!   lines; the two-node subset): per-peer sessions keyed by
+//!   `(network_name, peer_id)` with the Join/Sync/Create generation
+//!   election (the responder decides) and pinned remote static keys.
+//! * **The auth subset** — `verify_remote_auth`'s proof and pinned-key
+//!   paths; the trusted-key store (credential file + OSPF key
+//!   propagation) and the foreign-network identity roles are not ported
+//!   ([`SECURE_MODE_PORTED_NOTE`]).
+//!
 //! # Remaining milestones
 //!
-//! 1. Secure mode (see the map above), the relay path, foreign
-//!    networks, and the exit-node/proxy-network pieces.
+//! 1. The relay path, foreign networks, and the exit-node/proxy-network
+//!    pieces.
 //! 2. Multi-hop OSPF (SPF over `graph_algo.rs`) — the node table and
 //!    forwarding are multi-peer now, but adjacency is still the
 //!    direct-neighbor bitmap.
@@ -249,9 +278,11 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use aes_gcm::aead::{AeadInPlace, KeyInit};
+use aes_gcm::aead::{Aead as _, AeadInPlace, KeyInit};
 use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce};
+use base64::Engine as _;
 use chacha20poly1305::ChaCha20Poly1305;
+use hmac::Mac as _;
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::{tcp, udp};
@@ -1006,8 +1037,9 @@ pub mod packet_type {
     pub const PONG: u8 = 5;
     pub const RPC_REQ: u8 = 8;
     pub const RPC_RESP: u8 = 9;
-    /// `NoiseHandshakeMsg1` (packet_def.rs:86) — received only from a
-    /// secure-mode client; named so the staged error can cite it.
+    /// `PacketType::NoiseHandshakeMsg1` (packet_def.rs:86) — the first
+    /// message of the secure-mode handshake (msg2/msg3 live in
+    /// [`noise_packet_type`], colocated with the secure-mode port).
     pub const NOISE_HANDSHAKE_MSG1: u8 = 13;
 }
 
@@ -4515,6 +4547,2038 @@ pub fn create_encryptor(algorithm: &str, enable: bool, network_secret: &str) -> 
 }
 
 // ---------------------------------------------------------------------------
+// Secure mode (M6) — the Noise_XX handshake + the per-peer session AEAD
+// (easytier-core v2.6.4: peers/peer_conn.rs:793-1218,
+// peers/secure_datagram.rs, peers/peer_session.rs, peer_rpc.proto:343-386)
+// ---------------------------------------------------------------------------
+//
+// Secure mode REPLACES the network-secret AEAD of plain mode: after the
+// three Noise_XX messages every payload packet (Data/RpcReq/RpcResp —
+// everything except the handshake itself and Ping/Pong,
+// `PeerSessionTunnelFilter::should_skip_encrypt`, peer_conn.rs:136-144) is
+// sealed by a per-peer session AEAD keyed from a root key the responder
+// generates (`SecureModeConfig` keys are static X25519 identities; the
+// network-secret proof still authenticates same-network peers).
+//
+// What the handshake exchanges (`do_noise_handshake_as_client/_as_server`,
+// peer_conn.rs:793-1218, snow `Noise_XX_25519_ChaChaPoly_SHA256`, prologue
+// `easytier-peerconn-noise`):
+//
+// * msg1 `PeerConnNoiseMsg1Pb { version, a_network_name,
+//   a_session_generation?, a_conn_id, client_encryption_algorithm }` —
+//   rides IN THE CLEAR after the 32-byte ephemeral (the first Noise_XX
+//   message has no DH, so the payload is not yet encrypted);
+// * msg2 `PeerConnNoiseMsg2Pb { b_network_name, role_hint, action
+//   (Join/Sync/Create), b_session_generation, root_key_32?, initial_epoch,
+//   b_conn_id, a_conn_id_echo, secret_proof_32?,
+//   server_encryption_algorithm }` — carries the responder's session
+//   verdict: `Create` (no prior session: fresh root key, generation 1),
+//   `Sync` (known peer, resync: the stored root key + the next epoch) or
+//   `Join` (the client's generation matches: no key material at all);
+// * msg3 `PeerConnNoiseMsg3Pb { a_conn_id_echo, b_conn_id_echo,
+//   secret_proof_32?, secret_digest }` — the client's proof and the
+//   plain-mode digest for the compat identity check.
+//
+// The two-node subset ported: the full handshake with proofs and pinned
+// keys, the `SecureDatagramSession` payload layer (epoch-keyed AEAD,
+// per-direction replay windows, epoch rotation, root-key sync with the rx
+// grace window, the decrypt-failure invalidation) and the
+// `PeerSessionStore` Join/Sync/Create state machine. NOT ported: the
+// trusted-key store behind `is_pubkey_trusted` (the credential file +
+// OSPF key propagation — a pinned config key is the trust anchor here),
+// the Relay* packet types (the relay path is not ported) and the
+// foreign-network identity machinery (`classify_remote_identity` is
+// reduced to logging the auth level).
+
+/// `PacketType::NoiseHandshakeMsg2/3` (packet_def.rs:87-88).
+pub mod noise_packet_type {
+    pub const NOISE_HANDSHAKE_MSG2: u8 = 14;
+    pub const NOISE_HANDSHAKE_MSG3: u8 = 15;
+}
+
+/// The prologue binding the handshake to the peer-conn protocol
+/// (`do_noise_handshake_as_client`, peer_conn.rs:794).
+const NOISE_PROLOGUE: &[u8] = b"easytier-peerconn-noise";
+/// `VERSION` (peer_conn.rs:66) — carried in msg1 for future protocol bumps.
+const NOISE_VERSION: u32 = 1;
+/// The 5s budget on every noise message exchange (`timeout(Duration::
+/// from_secs(5), ...)`, peer_conn.rs:842-846, 1136-1140).
+const NOISE_MSG_TIMEOUT: Duration = Duration::from_secs(5);
+/// `PeerSession::SYNC_RX_GRACE_AFTER_MS` (secure_datagram.rs:252): how
+/// long a root-key sync keeps accepting the pre-sync rx epochs.
+const SYNC_RX_GRACE_AFTER_MS: u64 = 5_000;
+/// `EVICT_IDLE_AFTER_MS` (secure_datagram.rs:251).
+const RX_SLOT_EVICT_AFTER_MS: u64 = 30_000;
+/// `ROTATE_AFTER_PACKETS` / `ROTATE_AFTER_MS` (secure_datagram.rs:253-254):
+/// the send epoch rotates after a million packets or ten minutes.
+const EPOCH_ROTATE_AFTER_PACKETS: u64 = 1_000_000;
+const EPOCH_ROTATE_AFTER_MS: u64 = 10 * 60 * 1000;
+/// `MAX_ACCEPTED_RX_EPOCH_AHEAD` (secure_datagram.rs:255): an rx epoch
+/// more than this ahead of the baseline is rejected without touching the
+/// replay window.
+const MAX_ACCEPTED_RX_EPOCH_AHEAD: u32 = 3;
+/// `DECRYPT_FAIL_THRESHOLD` (secure_datagram.rs:256): ten consecutive
+/// decrypt failures invalidate the session (which closes the connection —
+/// the peer re-handshakes).
+const DECRYPT_FAIL_THRESHOLD: u32 = 10;
+
+// -- X25519 (curve25519-dalek, the wireguard.rs pattern) ---------------------
+
+/// A static (or ephemeral) X25519 keypair (`get_keypair` over
+/// `x25519_dalek::StaticSecret`, peer_conn.rs:604-638).
+struct SecureStaticKeys {
+    sk: [u8; 32],
+    pk: [u8; 32],
+}
+
+impl SecureStaticKeys {
+    fn from_secret(sk: [u8; 32]) -> Self {
+        let pk = curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(sk).0;
+        SecureStaticKeys { sk, pk }
+    }
+
+    fn random() -> Self {
+        let mut sk = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut sk);
+        Self::from_secret(sk)
+    }
+}
+
+fn secure_x25519_dh(sk: &[u8; 32], peer: &[u8; 32]) -> Result<[u8; 32]> {
+    let shared = curve25519_dalek::montgomery::MontgomeryPoint(*peer)
+        .mul_clamped(*sk)
+        .0;
+    if shared.iter().all(|&b| b == 0) {
+        return Err(Error::crypto(
+            "easytier: X25519 peer key is a low-order point",
+        ));
+    }
+    Ok(shared)
+}
+
+// -- HMAC-SHA256 + the Noise HKDF --------------------------------------------
+
+type SecureHmac = hmac::Hmac<sha2::Sha256>;
+
+fn hmac_sha256(key: &[u8], msg_parts: &[&[u8]]) -> [u8; 32] {
+    let mut mac = <SecureHmac as hmac::Mac>::new_from_slice(key).expect("hmac accepts any key");
+    for part in msg_parts {
+        mac.update(part);
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&mac.finalize().into_bytes());
+    out
+}
+
+/// `SHA256(a || b)` — the Noise `MixHash` primitive.
+fn sha256_concat(a: &[u8], b: &[u8]) -> [u8; 32] {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(a);
+    hasher.update(b);
+    hasher.finalize().into()
+}
+
+/// The Noise `HKDF(chaining_key, ikm, 2)` of `MixKey` (snow's
+/// `hkdf` helper, RFC 5869 with the ck as the key): `temp = HMAC(ck, ikm)`,
+/// `out1 = HMAC(temp, 0x01)` (the new ck), `out2 = HMAC(temp, out1 || 0x02)`
+/// (the new k).
+fn noise_hkdf2(ck: &[u8; 32], ikm: &[u8]) -> ([u8; 32], [u8; 32]) {
+    let temp = hmac_sha256(ck, &[ikm]);
+    let out1 = hmac_sha256(&temp, &[&[0x01]]);
+    let out2 = hmac_sha256(&temp, &[&out1, &[0x02]]);
+    (out1, out2)
+}
+
+/// `get_secret_proof` (global_ctx.rs:476-483): the network-secret proof is
+/// `HMAC-SHA256(network_secret, "easytier secret proof" || challenge)` —
+/// the challenge is the Noise handshake hash at the point each side
+/// captured it.
+fn secret_proof(network_secret: &str, challenge: &[u8]) -> [u8; 32] {
+    hmac_sha256(
+        network_secret.as_bytes(),
+        &[b"easytier secret proof", challenge],
+    )
+}
+
+// -- Noise_XX_25519_ChaChaPoly_SHA256 ----------------------------------------
+
+/// One side of the `Noise_XX` handshake, hand-rolled after snow's
+/// `HandshakeState` (the engine's second hand-rolled Noise pattern —
+/// wireguard.rs owns IKpsk2). The XX pattern is:
+///
+/// ```text
+/// -> e
+/// <- e, ee, s, es
+/// -> s, se
+/// ```
+///
+/// msg1 carries its payload in the clear (no DH yet, so the cipherstate
+/// has no key); from msg2 on every static and payload is ChaChaPoly-sealed
+/// with the running chain key, AAD = the handshake hash before the token.
+struct NoiseXxHandshake {
+    /// `h` — the running handshake hash.
+    h: [u8; 32],
+    /// `ck` — the chaining key.
+    ck: [u8; 32],
+    /// `k` — the current message key (`None` until the first DH).
+    k: Option<[u8; 32]>,
+    /// `n` — the nonce counter of `k` (Noise uses 32 zero bits || u64 LE).
+    n: u64,
+    /// Our static (`s`).
+    s: SecureStaticKeys,
+    /// Our ephemeral (`e`), generated when the first message is written.
+    e: Option<SecureStaticKeys>,
+    /// Their ephemeral (`re`).
+    re: Option<[u8; 32]>,
+    /// Their static (`rs`) — learned in msg2 (initiator) / msg3 (responder).
+    rs: Option<[u8; 32]>,
+}
+
+impl NoiseXxHandshake {
+    /// `Initialize` for "Noise_XX_25519_ChaChaPoly_SHA256" with our static:
+    /// the protocol name is exactly 32 bytes, then the (empty for XX) DH
+    /// prelude and the prologue are mixed in.
+    fn new(static_keys: SecureStaticKeys) -> Self {
+        let name = b"Noise_XX_25519_ChaChaPoly_SHA256";
+        let mut h = [0u8; 32];
+        h[..name.len()].copy_from_slice(name);
+        let mut hs = NoiseXxHandshake {
+            h,
+            ck: h,
+            k: None,
+            n: 0,
+            s: static_keys,
+            e: None,
+            re: None,
+            rs: None,
+        };
+        hs.mix_hash(NOISE_PROLOGUE);
+        hs
+    }
+
+    fn mix_hash(&mut self, data: &[u8]) {
+        self.h = sha256_concat(&self.h, data);
+    }
+
+    fn mix_key(&mut self, ikim: &[u8]) {
+        let (ck, k) = noise_hkdf2(&self.ck, ikim);
+        self.ck = ck;
+        self.k = Some(k);
+        self.n = 0;
+    }
+
+    /// `EncryptAndHash` with an explicit key slot: ChaCha20-Poly1305,
+    /// nonce `0^4 || u64 LE counter`, AAD = `h` before this step, then
+    /// `MixHash(ciphertext)`. With no key yet the payload is appended in
+    /// the clear (Noise spec 5.2, `EncryptWithAd` with `HasKey() ==
+    /// false`).
+    fn encrypt_and_hash(&mut self, plaintext: &[u8]) -> Vec<u8> {
+        if let Some(key) = self.k {
+            let cipher = ChaCha20Poly1305::new_from_slice(&key).expect("32-byte key");
+            let mut nonce = [0u8; 12];
+            nonce[4..].copy_from_slice(&self.n.to_le_bytes());
+            self.n += 1;
+            let ct = cipher
+                .encrypt(
+                    (&nonce).into(),
+                    aes_gcm::aead::Payload {
+                        msg: plaintext,
+                        aad: &self.h,
+                    },
+                )
+                .expect("chacha20poly1305 seal");
+            self.mix_hash(&ct);
+            ct
+        } else {
+            let ct = plaintext.to_vec();
+            self.mix_hash(&ct);
+            ct
+        }
+    }
+
+    /// `DecryptAndHash` — the inverse; `None` maps the empty-key clear
+    /// payload, `Some` a sealed one.
+    fn decrypt_and_hash(&mut self, ciphertext: &[u8]) -> Result<Option<Vec<u8>>> {
+        let Some(key) = self.k else {
+            self.mix_hash(ciphertext);
+            return Ok(None);
+        };
+        let cipher = ChaCha20Poly1305::new_from_slice(&key).expect("32-byte key");
+        let mut nonce = [0u8; 12];
+        nonce[4..].copy_from_slice(&self.n.to_le_bytes());
+        self.n += 1;
+        let pt = cipher
+            .decrypt(
+                (&nonce).into(),
+                aes_gcm::aead::Payload {
+                    msg: ciphertext,
+                    aad: &self.h,
+                },
+            )
+            .map_err(|_| Error::crypto("easytier: noise read msg failed: decrypt failed"))?;
+        self.mix_hash(ciphertext);
+        Ok(Some(pt))
+    }
+
+    /// msg1 `-> e`: 32-byte ephemeral + the clear payload.
+    fn write_msg1(&mut self, payload: &[u8]) -> Vec<u8> {
+        let e = SecureStaticKeys::random();
+        self.mix_hash(&e.pk);
+        let e_pk = e.pk;
+        self.e = Some(e);
+        let mut out = Vec::with_capacity(32 + payload.len());
+        out.extend_from_slice(&e_pk);
+        out.extend_from_slice(&self.encrypt_and_hash(payload));
+        out
+    }
+
+    /// msg1 read: the ephemeral + the clear payload.
+    fn read_msg1(&mut self, wire: &[u8]) -> Result<Vec<u8>> {
+        if wire.len() < 32 {
+            return Err(Error::protocol("easytier: noise msg1 too short"));
+        }
+        let (e, rest) = wire.split_at(32);
+        let mut re = [0u8; 32];
+        re.copy_from_slice(e);
+        self.mix_hash(&re);
+        self.re = Some(re);
+        match self.decrypt_and_hash(rest)? {
+            // No key in msg1: `None` means the payload was clear.
+            None => Ok(rest.to_vec()),
+            Some(pt) => Ok(pt),
+        }
+    }
+
+    /// msg2 `<- e, ee, s, es` (responder writes, initiator reads).
+    fn write_msg2(&mut self, payload: &[u8]) -> Vec<u8> {
+        let e = SecureStaticKeys::random();
+        self.mix_hash(&e.pk);
+        let re = self.re.expect("msg2 needs the peer ephemeral");
+        let e_pk = e.pk;
+        let e_sk = e.sk;
+        self.e = Some(e);
+        let ee = secure_x25519_dh(&e_sk, &re).expect("fresh ephemeral");
+        self.mix_key(&ee);
+        let mut out = Vec::with_capacity(32 + 48 + 16 + payload.len());
+        out.extend_from_slice(&e_pk);
+        let s_pk = self.s.pk;
+        out.extend_from_slice(&self.encrypt_and_hash(&s_pk)); // s (48B)
+        let s_sk = self.s.sk;
+        let se = secure_x25519_dh(&s_sk, &re).expect("static dh");
+        self.mix_key(&se); // es (responder: DH(s, re))
+        out.extend_from_slice(&self.encrypt_and_hash(payload));
+        out
+    }
+
+    /// The msg2 read side: the sealed payload.
+    fn read_msg2(&mut self, wire: &[u8]) -> Result<Vec<u8>> {
+        if wire.len() < 32 + 48 {
+            return Err(Error::protocol("easytier: noise msg2 too short"));
+        }
+        let (e, rest) = wire.split_at(32);
+        let mut re = [0u8; 32];
+        re.copy_from_slice(e);
+        self.mix_hash(&re);
+        self.re = Some(re);
+        // ee: DH(our msg1 ephemeral, their msg2 ephemeral).
+        let e_sk = self.e.as_ref().expect("initiator wrote msg1").sk;
+        let ee = secure_x25519_dh(&e_sk, &re)?;
+        self.mix_key(&ee);
+        let (s_ct, payload_ct) = rest.split_at(48);
+        let s_pt = self
+            .decrypt_and_hash(s_ct)?
+            .ok_or_else(|| Error::protocol("easytier: noise msg2 static was not sealed"))?;
+        let mut rs = [0u8; 32];
+        rs.copy_from_slice(&s_pt);
+        self.rs = Some(rs);
+        // es (responder wrote DH(s_responder, e_initiator); we compute
+        // DH(s_theirs, e_ours)) — same shared secret.
+        let se = secure_x25519_dh(&e_sk, &rs)?;
+        self.mix_key(&se);
+        self.decrypt_and_hash(payload_ct)?
+            .ok_or_else(|| Error::protocol("easytier: noise msg2 payload was not sealed"))
+    }
+
+    /// msg3 `-> s, se` (initiator writes, responder reads).
+    fn write_msg3(&mut self, payload: &[u8]) -> Vec<u8> {
+        let re = self.re.expect("msg3 needs the peer ephemeral");
+        let mut out = Vec::with_capacity(48 + 16 + payload.len());
+        let s_pk = self.s.pk;
+        out.extend_from_slice(&self.encrypt_and_hash(&s_pk)); // s (48B)
+        let s_sk = self.s.sk;
+        let se = secure_x25519_dh(&s_sk, &re).expect("static dh"); // se (initiator: DH(s, re))
+        self.mix_key(&se);
+        out.extend_from_slice(&self.encrypt_and_hash(payload));
+        out
+    }
+
+    fn read_msg3(&mut self, wire: &[u8]) -> Result<Vec<u8>> {
+        if wire.len() < 48 {
+            return Err(Error::protocol("easytier: noise msg3 too short"));
+        }
+        let (s_ct, payload_ct) = wire.split_at(48);
+        let s_pt = self
+            .decrypt_and_hash(s_ct)?
+            .ok_or_else(|| Error::protocol("easytier: noise msg3 static was not sealed"))?;
+        let mut rs = [0u8; 32];
+        rs.copy_from_slice(&s_pt);
+        self.rs = Some(rs);
+        // se (initiator wrote DH(s_initiator, e_responder)); we compute
+        // DH(s_theirs, e_ours).
+        let e_sk = self.e.as_ref().expect("responder wrote msg2").sk;
+        let se = secure_x25519_dh(&e_sk, &rs)?;
+        self.mix_key(&se);
+        self.decrypt_and_hash(payload_ct)?
+            .ok_or_else(|| Error::protocol("easytier: noise msg3 payload was not sealed"))
+    }
+
+    /// `get_handshake_hash()` — the challenge domain of the secret proofs.
+    fn handshake_hash(&self) -> [u8; 32] {
+        self.h
+    }
+
+    /// `get_remote_static()`.
+    fn remote_static(&self) -> Option<[u8; 32]> {
+        self.rs
+    }
+}
+
+// -- The noise wire messages (peer_rpc.proto:328-386) -------------------------
+
+/// `PeerConnSessionActionPb` (peer_rpc.proto:334-338).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerConnSessionAction {
+    Join,
+    Sync,
+    Create,
+}
+
+impl PeerConnSessionAction {
+    fn from_wire(value: u32) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Join),
+            1 => Ok(Self::Sync),
+            2 => Ok(Self::Create),
+            _ => Err(Error::protocol("easytier: invalid session action")),
+        }
+    }
+
+    fn to_wire(self) -> u32 {
+        match self {
+            Self::Join => 0,
+            Self::Sync => 1,
+            Self::Create => 2,
+        }
+    }
+}
+
+/// `common.UUID` (common.proto:139-144): four u32 varint fields holding
+/// the 128 bits big-endian (`From<uuid::Uuid>`, common.rs:14-24).
+fn uuid_wire_parts(id: uuid::Uuid) -> [u32; 4] {
+    let (high, low) = id.as_u64_pair();
+    [
+        (high >> 32) as u32,
+        (high & 0xFFFF_FFFF) as u32,
+        (low >> 32) as u32,
+        (low & 0xFFFF_FFFF) as u32,
+    ]
+}
+
+fn uuid_from_wire_parts(parts: [u32; 4]) -> uuid::Uuid {
+    uuid::Uuid::from_u64_pair(
+        (u64::from(parts[0]) << 32) | u64::from(parts[1]),
+        (u64::from(parts[2]) << 32) | u64::from(parts[3]),
+    )
+}
+
+fn proto_put_u32_field(out: &mut Vec<u8>, field: u32, value: u32) {
+    proto_put_varint(out, (field << 3) as u64);
+    proto_put_varint(out, value as u64);
+}
+
+fn proto_put_message_field(out: &mut Vec<u8>, field: u32, body: &[u8]) {
+    proto_put_varint(out, ((field << 3) | 2) as u64);
+    proto_put_varint(out, body.len() as u64);
+    out.extend_from_slice(body);
+}
+
+fn proto_encode_uuid(id: uuid::Uuid) -> Vec<u8> {
+    let mut out = Vec::with_capacity(20);
+    for (i, part) in uuid_wire_parts(id).into_iter().enumerate() {
+        proto_put_u32_field(&mut out, i as u32 + 1, part);
+    }
+    out
+}
+
+/// Decode four u32 varint fields (part1..part4) out of a nested UUID
+/// message; unknown fields are skipped.
+fn proto_decode_uuid(buf: &[u8]) -> Result<uuid::Uuid> {
+    let mut reader = ProtoReader { buf, pos: 0 };
+    let mut parts = [0u32; 4];
+    while reader.pos < buf.len() {
+        let tag = reader.varint()?;
+        let field = (tag >> 3) as u32;
+        let wire_type = tag & 7;
+        match (field, wire_type) {
+            (1..=4, 0) => {
+                let value = reader.varint()? as u32;
+                parts[(field - 1) as usize] = value;
+            }
+            _ => reader.skip(wire_type)?,
+        }
+    }
+    Ok(uuid_from_wire_parts(parts))
+}
+
+/// `PeerConnNoiseMsg1Pb` (peer_rpc.proto:343-349).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoiseMsg1 {
+    pub version: u32,
+    pub a_network_name: String,
+    pub a_session_generation: Option<u32>,
+    pub a_conn_id: uuid::Uuid,
+    pub client_encryption_algorithm: String,
+}
+
+impl NoiseMsg1 {
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(64);
+        proto_put_u32_field(&mut out, 1, self.version);
+        proto_put_len_field(&mut out, 2, self.a_network_name.as_bytes());
+        if let Some(gen) = self.a_session_generation {
+            proto_put_u32_field(&mut out, 3, gen);
+        }
+        proto_put_message_field(&mut out, 4, &proto_encode_uuid(self.a_conn_id));
+        proto_put_len_field(&mut out, 5, self.client_encryption_algorithm.as_bytes());
+        out
+    }
+
+    fn decode(buf: &[u8]) -> Result<Self> {
+        let mut reader = ProtoReader { buf, pos: 0 };
+        let mut msg = NoiseMsg1 {
+            version: 0,
+            a_network_name: String::new(),
+            a_session_generation: None,
+            a_conn_id: uuid::Uuid::default(),
+            client_encryption_algorithm: String::new(),
+        };
+        while reader.pos < buf.len() {
+            let tag = reader.varint()?;
+            let field = (tag >> 3) as u32;
+            let wire_type = tag & 7;
+            match (field, wire_type) {
+                (1, 0) => msg.version = reader.varint()? as u32,
+                (2, 2) => {
+                    msg.a_network_name = String::from_utf8_lossy(reader.len_bytes()?).into_owned()
+                }
+                (3, 0) => msg.a_session_generation = Some(reader.varint()? as u32),
+                (4, 2) => msg.a_conn_id = proto_decode_uuid(reader.len_bytes()?)?,
+                (5, 2) => {
+                    msg.client_encryption_algorithm =
+                        String::from_utf8_lossy(reader.len_bytes()?).into_owned()
+                }
+                _ => reader.skip(wire_type)?,
+            }
+        }
+        Ok(msg)
+    }
+}
+
+/// `PeerConnNoiseMsg2Pb` (peer_rpc.proto:351-362).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoiseMsg2 {
+    pub b_network_name: String,
+    pub role_hint: u32,
+    pub action: PeerConnSessionAction,
+    pub b_session_generation: u32,
+    pub root_key_32: Option<[u8; 32]>,
+    pub initial_epoch: u32,
+    pub b_conn_id: uuid::Uuid,
+    pub a_conn_id_echo: Option<uuid::Uuid>,
+    pub secret_proof_32: Option<Vec<u8>>,
+    pub server_encryption_algorithm: String,
+}
+
+impl NoiseMsg2 {
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(160);
+        proto_put_len_field(&mut out, 1, self.b_network_name.as_bytes());
+        proto_put_u32_field(&mut out, 2, self.role_hint);
+        proto_put_u32_field(&mut out, 3, self.action.to_wire());
+        proto_put_u32_field(&mut out, 4, self.b_session_generation);
+        if let Some(root) = &self.root_key_32 {
+            proto_put_len_field(&mut out, 5, root);
+        }
+        proto_put_u32_field(&mut out, 6, self.initial_epoch);
+        proto_put_message_field(&mut out, 7, &proto_encode_uuid(self.b_conn_id));
+        if let Some(echo) = self.a_conn_id_echo {
+            proto_put_message_field(&mut out, 8, &proto_encode_uuid(echo));
+        }
+        if let Some(proof) = &self.secret_proof_32 {
+            proto_put_len_field(&mut out, 9, proof);
+        }
+        proto_put_len_field(&mut out, 10, self.server_encryption_algorithm.as_bytes());
+        out
+    }
+
+    fn decode(buf: &[u8]) -> Result<Self> {
+        let mut reader = ProtoReader { buf, pos: 0 };
+        let mut msg = NoiseMsg2 {
+            b_network_name: String::new(),
+            role_hint: 0,
+            action: PeerConnSessionAction::Join,
+            b_session_generation: 0,
+            root_key_32: None,
+            initial_epoch: 0,
+            b_conn_id: uuid::Uuid::default(),
+            a_conn_id_echo: None,
+            secret_proof_32: None,
+            server_encryption_algorithm: String::new(),
+        };
+        while reader.pos < buf.len() {
+            let tag = reader.varint()?;
+            let field = (tag >> 3) as u32;
+            let wire_type = tag & 7;
+            match (field, wire_type) {
+                (1, 2) => {
+                    msg.b_network_name = String::from_utf8_lossy(reader.len_bytes()?).into_owned()
+                }
+                (2, 0) => msg.role_hint = reader.varint()? as u32,
+                (3, 0) => msg.action = PeerConnSessionAction::from_wire(reader.varint()? as u32)?,
+                (4, 0) => msg.b_session_generation = reader.varint()? as u32,
+                (5, 2) => {
+                    let bytes = reader.len_bytes()?;
+                    if bytes.len() == 32 {
+                        let mut key = [0u8; 32];
+                        key.copy_from_slice(bytes);
+                        msg.root_key_32 = Some(key);
+                    }
+                }
+                (6, 0) => msg.initial_epoch = reader.varint()? as u32,
+                (7, 2) => msg.b_conn_id = proto_decode_uuid(reader.len_bytes()?)?,
+                (8, 2) => msg.a_conn_id_echo = Some(proto_decode_uuid(reader.len_bytes()?)?),
+                (9, 2) => msg.secret_proof_32 = Some(reader.len_bytes()?.to_vec()),
+                (10, 2) => {
+                    msg.server_encryption_algorithm =
+                        String::from_utf8_lossy(reader.len_bytes()?).into_owned()
+                }
+                _ => reader.skip(wire_type)?,
+            }
+        }
+        Ok(msg)
+    }
+}
+
+/// `PeerConnNoiseMsg3Pb` (peer_rpc.proto:381-386).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoiseMsg3 {
+    pub a_conn_id_echo: uuid::Uuid,
+    pub b_conn_id_echo: uuid::Uuid,
+    pub secret_proof_32: Option<Vec<u8>>,
+    pub secret_digest: Vec<u8>,
+}
+
+impl NoiseMsg3 {
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(120);
+        proto_put_message_field(&mut out, 1, &proto_encode_uuid(self.a_conn_id_echo));
+        proto_put_message_field(&mut out, 2, &proto_encode_uuid(self.b_conn_id_echo));
+        if let Some(proof) = &self.secret_proof_32 {
+            proto_put_len_field(&mut out, 3, proof);
+        }
+        proto_put_len_field(&mut out, 4, &self.secret_digest);
+        out
+    }
+
+    fn decode(buf: &[u8]) -> Result<Self> {
+        let mut reader = ProtoReader { buf, pos: 0 };
+        let mut msg = NoiseMsg3 {
+            a_conn_id_echo: uuid::Uuid::default(),
+            b_conn_id_echo: uuid::Uuid::default(),
+            secret_proof_32: None,
+            secret_digest: Vec::new(),
+        };
+        while reader.pos < buf.len() {
+            let tag = reader.varint()?;
+            let field = (tag >> 3) as u32;
+            let wire_type = tag & 7;
+            match (field, wire_type) {
+                (1, 2) => msg.a_conn_id_echo = proto_decode_uuid(reader.len_bytes()?)?,
+                (2, 2) => msg.b_conn_id_echo = proto_decode_uuid(reader.len_bytes()?)?,
+                (3, 2) => msg.secret_proof_32 = Some(reader.len_bytes()?.to_vec()),
+                (4, 2) => msg.secret_digest = reader.len_bytes()?.to_vec(),
+                _ => reader.skip(wire_type)?,
+            }
+        }
+        Ok(msg)
+    }
+}
+
+// -- The session AEAD (secure_datagram.rs, the load-bearing subset) ----------
+
+/// `SecureDatagramDirection` (secure_datagram.rs:23-36): the traffic
+/// direction of one packet, agreed by both sides from the peer-id order
+/// (`PeerSession::dir_for_sender`: sender < receiver -> AToB).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecureDirection {
+    AToB,
+    BToA,
+}
+
+impl SecureDirection {
+    fn idx(self) -> usize {
+        match self {
+            Self::AToB => 0,
+            Self::BToA => 1,
+        }
+    }
+}
+
+/// `ReplayWindow256` (secure_datagram.rs:67-161): a sliding 256-bit
+/// bitmap over sequence numbers below `max_seq`; new maxima shift the
+/// window, old duplicates are rejected.
+#[derive(Debug, Clone, Copy, Default)]
+struct ReplayWindow256 {
+    max_seq: u64,
+    bitmap: [u8; 32],
+    valid: bool,
+}
+
+impl ReplayWindow256 {
+    fn test_bit(&self, idx: usize) -> bool {
+        (self.bitmap[idx / 8] >> (idx % 8)) & 1 == 1
+    }
+
+    fn set_bit(&mut self, idx: usize) {
+        self.bitmap[idx / 8] |= 1u8 << (idx % 8);
+    }
+
+    fn shift_right(&mut self, shift: usize) {
+        if shift == 0 {
+            return;
+        }
+        if shift >= 256 {
+            self.bitmap.fill(0);
+            return;
+        }
+        let byte_shift = shift / 8;
+        let bit_shift = shift % 8;
+        if byte_shift > 0 {
+            for i in (0..self.bitmap.len()).rev() {
+                self.bitmap[i] = if i >= byte_shift {
+                    self.bitmap[i - byte_shift]
+                } else {
+                    0
+                };
+            }
+        }
+        if bit_shift > 0 {
+            let mut carry = 0u8;
+            for b in self.bitmap.iter_mut() {
+                let new_carry = *b >> (8 - bit_shift);
+                *b = (*b << bit_shift) | carry;
+                carry = new_carry;
+            }
+        }
+    }
+
+    fn accept(&mut self, seq: u64) -> bool {
+        if !self.valid {
+            self.valid = true;
+            self.max_seq = seq;
+            self.set_bit(0);
+            return true;
+        }
+        if seq > self.max_seq {
+            let shift = (seq - self.max_seq) as usize;
+            self.shift_right(shift);
+            self.max_seq = seq;
+            self.set_bit(0);
+            return true;
+        }
+        let delta = (self.max_seq - seq) as usize;
+        if delta >= 256 || self.test_bit(delta) {
+            return false;
+        }
+        self.set_bit(delta);
+        true
+    }
+
+    fn can_accept(&self, seq: u64) -> bool {
+        if !self.valid || seq > self.max_seq {
+            return true;
+        }
+        let delta = (self.max_seq - seq) as usize;
+        delta < 256 && !self.test_bit(delta)
+    }
+}
+
+/// `EpochRxSlot` (secure_datagram.rs:163-178): one direction's replay
+/// state for one epoch, with the idle-eviction timestamp.
+#[derive(Debug, Clone, Copy, Default)]
+struct EpochRxSlot {
+    epoch: u32,
+    window: ReplayWindow256,
+    last_rx_ms: u64,
+    valid: bool,
+}
+
+impl EpochRxSlot {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// `SyncRxGrace` (secure_datagram.rs:180-205): a snapshot of the rx
+/// slots kept valid for five seconds across a root-key sync, so in-flight
+/// packets from the pre-sync epochs still decrypt.
+#[derive(Debug, Clone, Copy, Default)]
+struct SyncRxGrace {
+    slots: [[EpochRxSlot; 2]; 2],
+    expires_at_ms: u64,
+    valid: bool,
+}
+
+impl SyncRxGrace {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn refresh(&mut self, slots: [[EpochRxSlot; 2]; 2], expires_at_ms: u64) {
+        self.slots = slots;
+        self.expires_at_ms = expires_at_ms;
+        self.valid = true;
+    }
+
+    fn maybe_expire(&mut self, now_ms: u64) {
+        if self.valid && now_ms >= self.expires_at_ms {
+            self.clear();
+        }
+    }
+}
+
+fn secure_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// One cached (epoch, generation) cipher pair of a direction
+/// (`EpochKeySlot`, secure_datagram.rs:38-65).
+struct EpochKeySlot {
+    epoch: u32,
+    generation: u32,
+    valid: bool,
+    send_cipher: Arc<PacketEncryptor>,
+    recv_cipher: Arc<PacketEncryptor>,
+}
+
+/// `SecureDatagramSession` (secure_datagram.rs:207-771) — the payload
+/// layer every post-handshake packet crosses:
+///
+/// * **Traffic keys** are epoch-keyed: `hkdf_traffic_key` extracts
+///   `HMAC-SHA256(0^32, root_key)` then expands
+///   `HMAC(prk, "et-traffic" || epoch_be || dir || 0x01)` — one 32-byte
+///   key per (epoch, direction); the send nonce is `epoch_be(4) ||
+///   seq_be(8)`, so the receiver reads the epoch straight out of the
+///   AEAD tail and never needs a counter sync.
+/// * **Replay** is a `ReplayWindow256` per direction, at most two recent
+///   rx epochs live (`MAX_ACCEPTED_RX_EPOCH_AHEAD` bounds far-future
+///   epochs without poisoning the window); a root-key sync snapshots the
+///   rx slots for the 5s grace window.
+/// * **Rotation** bumps the send epoch after a million packets or ten
+///   minutes; the receive side accepts any epoch within the ahead bound.
+/// * **Failure containment**: ten consecutive decrypt failures
+///   invalidate the session — the connection closes and re-handshakes.
+pub struct SecureDatagramSession {
+    root_key: StdMutex<[u8; 32]>,
+    session_generation: AtomicU32,
+    send_epoch: AtomicU32,
+    send_seq: [AtomicU64; 2],
+    send_epoch_started_ms: AtomicU64,
+    send_packets_since_epoch: AtomicU64,
+    rx_slots: StdMutex<[[EpochRxSlot; 2]; 2]>,
+    key_cache: StdMutex<[[Option<EpochKeySlot>; 2]; 2]>,
+    sync_rx_grace: StdMutex<SyncRxGrace>,
+    sync_rx_grace_expires_at_ms: AtomicU64,
+    send_cipher_algorithm: String,
+    recv_cipher_algorithm: String,
+    invalidated: AtomicU32,
+    decrypt_fail_count: AtomicU32,
+}
+
+impl SecureDatagramSession {
+    /// `SecureDatagramSession::new` (secure_datagram.rs:258-290).
+    pub fn new(
+        root_key: [u8; 32],
+        session_generation: u32,
+        initial_epoch: u32,
+        send_cipher_algorithm: String,
+        recv_cipher_algorithm: String,
+    ) -> Self {
+        Self {
+            root_key: StdMutex::new(root_key),
+            session_generation: AtomicU32::new(session_generation),
+            send_epoch: AtomicU32::new(initial_epoch),
+            send_seq: [AtomicU64::new(0), AtomicU64::new(0)],
+            send_epoch_started_ms: AtomicU64::new(secure_now_ms()),
+            send_packets_since_epoch: AtomicU64::new(0),
+            rx_slots: StdMutex::new([[EpochRxSlot::default(), EpochRxSlot::default()]; 2]),
+            key_cache: StdMutex::new([[None, None], [None, None]]),
+            sync_rx_grace: StdMutex::new(SyncRxGrace::default()),
+            sync_rx_grace_expires_at_ms: AtomicU64::new(0),
+            send_cipher_algorithm,
+            recv_cipher_algorithm,
+            invalidated: AtomicU32::new(0),
+            decrypt_fail_count: AtomicU32::new(0),
+        }
+    }
+
+    pub fn invalidate(&self) {
+        self.invalidated.store(1, Ordering::Relaxed);
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.invalidated.load(Ordering::Relaxed) == 0
+    }
+
+    pub fn session_generation(&self) -> u32 {
+        self.session_generation.load(Ordering::Relaxed)
+    }
+
+    fn root_key(&self) -> [u8; 32] {
+        *self.root_key.lock().unwrap()
+    }
+
+    /// `new_root_key` (secure_datagram.rs:308-312): 32 random bytes.
+    pub fn new_root_key() -> [u8; 32] {
+        let mut out = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut out);
+        out
+    }
+
+    /// `next_sync_epoch` (secure_datagram.rs:314-329): the epoch a Sync
+    /// resync restarts at — one past everything seen or sent.
+    pub fn next_sync_epoch(&self) -> u32 {
+        let send_epoch = self.send_epoch.load(Ordering::Relaxed);
+        let rx = self.rx_slots.lock().unwrap();
+        let mut max_epoch = send_epoch;
+        for dir in 0..2 {
+            for slot in &rx[dir] {
+                if slot.valid {
+                    max_epoch = max_epoch.max(slot.epoch);
+                }
+            }
+        }
+        max_epoch.wrapping_add(1)
+    }
+
+    /// `check_encrypt_algo_same` (secure_datagram.rs:331-342).
+    pub fn check_encrypt_algo_same(&self, send: &str, recv: &str) -> Result<()> {
+        if self.send_cipher_algorithm != send || self.recv_cipher_algorithm != recv {
+            return Err(Error::protocol("easytier: encrypt algorithm not same"));
+        }
+        Ok(())
+    }
+
+    /// `sync_root_key` (secure_datagram.rs:344-389): install a new
+    /// (root key, generation, initial epoch), reset the send side, clear
+    /// the rx slots — keeping the pre-sync rx epochs valid for the grace
+    /// window when the key itself did not change
+    /// (`preserve_rx_grace && old == new`).
+    pub fn sync_root_key(
+        &self,
+        root_key: [u8; 32],
+        session_generation: u32,
+        initial_epoch: u32,
+        preserve_rx_grace: bool,
+    ) {
+        let old_root_key = self.root_key();
+        let can_preserve_rx_grace = preserve_rx_grace && old_root_key == root_key;
+        *self.root_key.lock().unwrap() = root_key;
+        self.session_generation
+            .store(session_generation, Ordering::Relaxed);
+        self.send_epoch.store(initial_epoch, Ordering::Relaxed);
+        self.send_seq[0].store(0, Ordering::Relaxed);
+        self.send_seq[1].store(0, Ordering::Relaxed);
+        self.send_epoch_started_ms
+            .store(secure_now_ms(), Ordering::Relaxed);
+        self.send_packets_since_epoch.store(0, Ordering::Relaxed);
+        {
+            let mut rx = self.rx_slots.lock().unwrap();
+            let mut sync_rx_grace = self.sync_rx_grace.lock().unwrap();
+            if can_preserve_rx_grace {
+                let expires_at_ms = secure_now_ms().saturating_add(SYNC_RX_GRACE_AFTER_MS);
+                sync_rx_grace.refresh(*rx, expires_at_ms);
+                self.sync_rx_grace_expires_at_ms
+                    .store(expires_at_ms, Ordering::Relaxed);
+            } else {
+                sync_rx_grace.clear();
+                self.sync_rx_grace_expires_at_ms.store(0, Ordering::Relaxed);
+            }
+            for dir in 0..2 {
+                rx[dir][0].clear();
+                rx[dir][1].clear();
+            }
+        }
+        for dir_slots in self.key_cache.lock().unwrap().iter_mut() {
+            *dir_slots = [None, None];
+        }
+    }
+
+    /// `hkdf_traffic_key` (secure_datagram.rs:391-410).
+    fn hkdf_traffic_key(&self, epoch: u32, dir: SecureDirection) -> [u8; 32] {
+        let root_key = self.root_key();
+        let prk = hmac_sha256(&[0u8; 32], &[&root_key]);
+        let mut info = Vec::with_capacity(13);
+        info.extend_from_slice(b"et-traffic");
+        info.extend_from_slice(&epoch.to_be_bytes());
+        info.push(dir.idx() as u8);
+        hmac_sha256(&prk, &[&info, &[1u8]])
+    }
+
+    /// `create_encryptor` keyed from the HKDF output (the raw-key arm of
+    /// peers/encrypt/mod.rs:60-107: aes-gcm takes key[..16],
+    /// aes-256-gcm/chacha20 the full 32 bytes).
+    fn cipher_for(algorithm: &str, key: &[u8; 32]) -> Result<PacketEncryptor> {
+        let mut key_128 = [0u8; 16];
+        key_128.copy_from_slice(&key[..16]);
+        let Ok(algorithm) = algorithm.parse::<EncryptionAlgorithm>() else {
+            return Err(Error::config(format!(
+                "easytier: invalid encryption algorithm: {algorithm}"
+            )));
+        };
+        let cipher = match algorithm {
+            EncryptionAlgorithm::Xor => Cipher::Xor(key_128.to_vec()),
+            EncryptionAlgorithm::AesGcm => Cipher::Aes128Gcm(Box::new(
+                Aes128Gcm::new_from_slice(&key_128).expect("128-bit key"),
+            )),
+            EncryptionAlgorithm::Aes256Gcm => Cipher::Aes256Gcm(Box::new(
+                Aes256Gcm::new_from_slice(key).expect("256-bit key"),
+            )),
+            EncryptionAlgorithm::ChaCha20 => Cipher::ChaCha20(Box::new(
+                ChaCha20Poly1305::new_from_slice(key).expect("256-bit key"),
+            )),
+        };
+        Ok(PacketEncryptor { cipher })
+    }
+
+    /// `get_or_create_encryptor` (secure_datagram.rs:412-447): a two-slot
+    /// cache per direction (current + previous epoch).
+    fn get_or_create_cipher(
+        &self,
+        epoch: u32,
+        dir: SecureDirection,
+        generation: u32,
+        is_send: bool,
+    ) -> Result<Arc<PacketEncryptor>> {
+        let dir_idx = dir.idx();
+        let mut guard = self.key_cache.lock().unwrap();
+        for slot in guard[dir_idx].iter_mut().flatten() {
+            if slot.valid && slot.epoch == epoch && slot.generation == generation {
+                return Ok(if is_send {
+                    slot.send_cipher.clone()
+                } else {
+                    slot.recv_cipher.clone()
+                });
+            }
+        }
+        let key = self.hkdf_traffic_key(epoch, dir);
+        let slot = EpochKeySlot {
+            epoch,
+            generation,
+            valid: true,
+            send_cipher: Arc::new(Self::cipher_for(&self.send_cipher_algorithm, &key)?),
+            recv_cipher: Arc::new(Self::cipher_for(&self.recv_cipher_algorithm, &key)?),
+        };
+        let ret = if is_send {
+            slot.send_cipher.clone()
+        } else {
+            slot.recv_cipher.clone()
+        };
+        if guard[dir_idx][0].as_ref().is_none_or(|s| s.epoch == epoch) {
+            guard[dir_idx][0] = Some(slot);
+        } else {
+            guard[dir_idx][1] = Some(slot);
+        }
+        Ok(ret)
+    }
+
+    /// `maybe_rotate_epoch` (secure_datagram.rs:449-471).
+    fn maybe_rotate_epoch(&self, now_ms: u64) {
+        let packets = self
+            .send_packets_since_epoch
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        let started = self.send_epoch_started_ms.load(Ordering::Relaxed);
+        if packets < EPOCH_ROTATE_AFTER_PACKETS
+            && now_ms.saturating_sub(started) < EPOCH_ROTATE_AFTER_MS
+        {
+            return;
+        }
+        let cur = self.send_epoch.load(Ordering::Relaxed);
+        let next = cur.wrapping_add(1);
+        if self
+            .send_epoch
+            .compare_exchange(cur, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.send_epoch_started_ms.store(now_ms, Ordering::Relaxed);
+            self.send_packets_since_epoch.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// `next_nonce` (secure_datagram.rs:473-482): the epoch goes to the
+    /// nonce AND to the derived key, so the receiver can address the
+    /// right cipher without any sync.
+    fn next_nonce(&self, dir: SecureDirection) -> (u32, u64, [u8; 12]) {
+        let now_ms = secure_now_ms();
+        self.maybe_rotate_epoch(now_ms);
+        let epoch = self.send_epoch.load(Ordering::Relaxed);
+        let seq = self.send_seq[dir.idx()].fetch_add(1, Ordering::Relaxed);
+        let mut nonce = [0u8; 12];
+        nonce[..4].copy_from_slice(&epoch.to_be_bytes());
+        nonce[4..].copy_from_slice(&seq.to_be_bytes());
+        (epoch, seq, nonce)
+    }
+
+    fn evict_old_rx_slots(rx: &mut [[EpochRxSlot; 2]; 2], now_ms: u64) {
+        for dir_slots in rx.iter_mut() {
+            for slot in dir_slots.iter_mut() {
+                if slot.valid
+                    && slot.last_rx_ms != 0
+                    && now_ms.saturating_sub(slot.last_rx_ms) > RX_SLOT_EVICT_AFTER_MS
+                {
+                    slot.clear();
+                }
+            }
+        }
+    }
+
+    fn epoch_in_slots(slots: &[EpochRxSlot; 2], epoch: u32) -> bool {
+        slots[0].valid && slots[0].epoch == epoch || slots[1].valid && slots[1].epoch == epoch
+    }
+
+    fn sync_rx_grace_active(&self, now_ms: u64) -> bool {
+        let expires_at_ms = self.sync_rx_grace_expires_at_ms.load(Ordering::Relaxed);
+        if expires_at_ms == 0 {
+            return false;
+        }
+        if now_ms < expires_at_ms {
+            return true;
+        }
+        self.sync_rx_grace_expires_at_ms.store(0, Ordering::Relaxed);
+        false
+    }
+
+    fn take_sync_rx_grace(&self, now_ms: u64) -> Option<SyncRxGrace> {
+        if !self.sync_rx_grace_active(now_ms) {
+            return None;
+        }
+        let mut grace = self.sync_rx_grace.lock().unwrap();
+        grace.maybe_expire(now_ms);
+        if grace.valid {
+            Self::evict_old_rx_slots(&mut grace.slots, now_ms);
+            Some(*grace)
+        } else {
+            self.sync_rx_grace_expires_at_ms.store(0, Ordering::Relaxed);
+            None
+        }
+    }
+
+    /// `prune_key_cache` (secure_datagram.rs:519-537): keep only the
+    /// ciphers of the send epoch, the live rx epochs and the grace
+    /// window's epochs.
+    fn prune_key_cache(&self, rx: &[[EpochRxSlot; 2]; 2], grace: Option<&SyncRxGrace>) {
+        let send_epoch = self.send_epoch.load(Ordering::Relaxed);
+        let mut key_cache = self.key_cache.lock().unwrap();
+        for d in 0..2 {
+            for s in 0..2 {
+                let Some(slot) = key_cache[d][s].as_mut() else {
+                    continue;
+                };
+                let e = slot.epoch;
+                let allowed = e == send_epoch
+                    || rx[d][0].valid && rx[d][0].epoch == e
+                    || rx[d][1].valid && rx[d][1].epoch == e
+                    || grace.is_some_and(|g| Self::epoch_in_slots(&g.slots[d], e));
+                if !allowed {
+                    slot.valid = false;
+                }
+            }
+        }
+    }
+
+    /// `precheck_replay` (secure_datagram.rs:539-604) — the lock-free
+    /// pre-check that decides whether commit has a chance, so a decrypt
+    /// failure never consumes a sequence number
+    /// (`failed_decrypt_does_not_poison_replay_window`).
+    fn precheck_replay(&self, epoch: u32, seq: u64, dir: SecureDirection, now_ms: u64) -> bool {
+        let dir_idx = dir.idx();
+        let mut rx = self.rx_slots.lock().unwrap();
+        Self::evict_old_rx_slots(&mut rx, now_ms);
+        let grace = self.take_sync_rx_grace(now_ms);
+        if grace
+            .as_ref()
+            .is_some_and(|g| Self::epoch_in_slots(&g.slots[dir_idx], epoch))
+        {
+            for slot in &grace.expect("checked").slots[dir_idx] {
+                if slot.valid && slot.epoch == epoch {
+                    return slot.window.can_accept(seq);
+                }
+            }
+        }
+        if !rx[dir_idx][0].valid {
+            return true;
+        }
+        if rx[dir_idx][0].valid && epoch == rx[dir_idx][0].epoch {
+            return rx[dir_idx][0].window.can_accept(seq);
+        }
+        if rx[dir_idx][1].valid && epoch == rx[dir_idx][1].epoch {
+            return rx[dir_idx][1].window.can_accept(seq);
+        }
+        if rx[dir_idx][0].valid && epoch > rx[dir_idx][0].epoch {
+            let mut baseline_epoch = self.send_epoch.load(Ordering::Relaxed);
+            if rx[dir_idx][0].valid {
+                baseline_epoch = baseline_epoch.max(rx[dir_idx][0].epoch);
+            }
+            if rx[dir_idx][1].valid {
+                baseline_epoch = baseline_epoch.max(rx[dir_idx][1].epoch);
+            }
+            let max_allowed_epoch = baseline_epoch.saturating_add(MAX_ACCEPTED_RX_EPOCH_AHEAD);
+            if epoch > max_allowed_epoch {
+                return false;
+            }
+            return true;
+        }
+        false
+    }
+
+    /// `commit_replay` (secure_datagram.rs:606-688) — the state-changing
+    /// half, run only after the packet decrypted.
+    fn commit_replay(&self, epoch: u32, seq: u64, dir: SecureDirection, now_ms: u64) -> bool {
+        let dir_idx = dir.idx();
+        let mut rx = self.rx_slots.lock().unwrap();
+        Self::evict_old_rx_slots(&mut rx, now_ms);
+        let mut grace = self.take_sync_rx_grace(now_ms);
+        let accepted = if grace
+            .as_ref()
+            .is_some_and(|g| Self::epoch_in_slots(&g.slots[dir_idx], epoch))
+        {
+            let mut accepted = false;
+            for slot in grace.as_mut().expect("checked").slots[dir_idx].iter_mut() {
+                if slot.valid && slot.epoch == epoch {
+                    slot.last_rx_ms = now_ms;
+                    accepted = slot.window.accept(seq);
+                    break;
+                }
+            }
+            accepted
+        } else if !rx[dir_idx][0].valid {
+            rx[dir_idx][0] = EpochRxSlot {
+                epoch,
+                window: ReplayWindow256::default(),
+                last_rx_ms: now_ms,
+                valid: true,
+            };
+            rx[dir_idx][0].window.accept(seq)
+        } else if rx[dir_idx][0].valid && epoch == rx[dir_idx][0].epoch {
+            rx[dir_idx][0].last_rx_ms = now_ms;
+            rx[dir_idx][0].window.accept(seq)
+        } else if rx[dir_idx][1].valid && epoch == rx[dir_idx][1].epoch {
+            rx[dir_idx][1].last_rx_ms = now_ms;
+            rx[dir_idx][1].window.accept(seq)
+        } else if rx[dir_idx][0].valid && epoch > rx[dir_idx][0].epoch {
+            let mut baseline_epoch = self.send_epoch.load(Ordering::Relaxed);
+            if rx[dir_idx][0].valid {
+                baseline_epoch = baseline_epoch.max(rx[dir_idx][0].epoch);
+            }
+            if rx[dir_idx][1].valid {
+                baseline_epoch = baseline_epoch.max(rx[dir_idx][1].epoch);
+            }
+            let max_allowed_epoch = baseline_epoch.saturating_add(MAX_ACCEPTED_RX_EPOCH_AHEAD);
+            if epoch > max_allowed_epoch {
+                false
+            } else {
+                rx[dir_idx][1] = rx[dir_idx][0];
+                rx[dir_idx][0] = EpochRxSlot {
+                    epoch,
+                    window: ReplayWindow256::default(),
+                    last_rx_ms: now_ms,
+                    valid: true,
+                };
+                rx[dir_idx][0].window.accept(seq)
+            }
+        } else {
+            false
+        };
+        self.prune_key_cache(&rx, grace.as_ref());
+        accepted
+    }
+
+    /// `encrypt_payload` (secure_datagram.rs:704-720) over the engine's
+    /// header+payload shape: the chosen nonce rides the AEAD tail.
+    pub fn encrypt_payload(
+        &self,
+        dir: SecureDirection,
+        hdr: &mut PeerManagerHeader,
+        payload: &mut Vec<u8>,
+    ) -> Result<()> {
+        if !self.is_valid() {
+            return Err(Error::crypto("easytier: session invalidated"));
+        }
+        let (epoch, _seq, nonce) = self.next_nonce(dir);
+        let cipher = self.get_or_create_cipher(epoch, dir, self.session_generation(), true)?;
+        cipher.encrypt_packet_with_nonce(hdr, payload, &nonce)
+    }
+
+    /// `decrypt_payload` (secure_datagram.rs:722-759): the epoch and
+    /// sequence come from the tail nonce; the replay window is committed
+    /// only after the tag verified.
+    pub fn decrypt_payload(
+        &self,
+        dir: SecureDirection,
+        hdr: &mut PeerManagerHeader,
+        payload: &mut Vec<u8>,
+    ) -> Result<()> {
+        if !self.is_valid() {
+            return Err(Error::crypto("easytier: session invalidated"));
+        }
+        let payload_len = payload.len();
+        if payload_len < AEAD_TAIL_SIZE {
+            return Err(Error::crypto(format!(
+                "easytier: packet is too short. len: {payload_len}"
+            )));
+        }
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&payload[payload_len - 12..]);
+        let epoch = u32::from_be_bytes(nonce[..4].try_into().expect("4 bytes"));
+        let seq = u64::from_be_bytes(nonce[4..].try_into().expect("8 bytes"));
+        let now_ms = secure_now_ms();
+        if !self.precheck_replay(epoch, seq, dir, now_ms) {
+            return Err(Error::crypto("easytier: replay rejected"));
+        }
+        let cipher = self.get_or_create_cipher(epoch, dir, self.session_generation(), false)?;
+        if let Err(e) = cipher.decrypt_packet(hdr, payload) {
+            let count = self.decrypt_fail_count.fetch_add(1, Ordering::Relaxed) + 1;
+            if count >= DECRYPT_FAIL_THRESHOLD {
+                self.invalidate();
+                tracing::warn!(
+                    target: "engine",
+                    count,
+                    "easytier: secure session auto-invalidated after consecutive decrypt failures"
+                );
+            }
+            return Err(e);
+        }
+        self.decrypt_fail_count.store(0, Ordering::Relaxed);
+        if !self.commit_replay(epoch, seq, dir, now_ms) {
+            return Err(Error::crypto("easytier: replay rejected"));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn check_replay_for_test(
+        &self,
+        epoch: u32,
+        seq: u64,
+        dir: SecureDirection,
+        now_ms: u64,
+    ) -> bool {
+        self.precheck_replay(epoch, seq, dir, now_ms)
+            && self.commit_replay(epoch, seq, dir, now_ms)
+    }
+}
+
+// -- The peer session + store (peer_session.rs, two-node subset) -------------
+
+impl std::fmt::Debug for PeerSecureSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerSecureSession")
+            .field("generation", &self.session_generation())
+            .field("valid", &self.is_valid())
+            .finish()
+    }
+}
+
+/// Upstream `PeerSession` (peer_session.rs:215-367): the per-peer session
+/// (static-key pinning + the datagram layer). Named `PeerSecureSession`
+/// here because the engine's gossip side already owns `PeerSession`.
+pub struct PeerSecureSession {
+    peer_static_pubkey: StdMutex<Option<[u8; 32]>>,
+    datagram: SecureDatagramSession,
+}
+
+impl PeerSecureSession {
+    /// `PeerSession::new` (peer_session.rs:235-256).
+    pub fn new(
+        root_key: [u8; 32],
+        session_generation: u32,
+        initial_epoch: u32,
+        send_cipher_algorithm: String,
+        recv_cipher_algorithm: String,
+        peer_static_pubkey: Option<[u8; 32]>,
+    ) -> Self {
+        Self {
+            peer_static_pubkey: StdMutex::new(peer_static_pubkey),
+            datagram: SecureDatagramSession::new(
+                root_key,
+                session_generation,
+                initial_epoch,
+                send_cipher_algorithm,
+                recv_cipher_algorithm,
+            ),
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.datagram.is_valid()
+    }
+
+    pub fn invalidate(&self) {
+        self.datagram.invalidate();
+    }
+
+    pub fn session_generation(&self) -> u32 {
+        self.datagram.session_generation()
+    }
+
+    pub fn root_key(&self) -> [u8; 32] {
+        self.datagram.root_key()
+    }
+
+    pub fn new_root_key() -> [u8; 32] {
+        SecureDatagramSession::new_root_key()
+    }
+
+    pub fn next_sync_epoch(&self) -> u32 {
+        self.datagram.next_sync_epoch()
+    }
+
+    pub fn check_encrypt_algo_same(&self, send: &str, recv: &str) -> Result<()> {
+        self.datagram.check_encrypt_algo_same(send, recv)
+    }
+
+    /// `check_or_set_peer_static_pubkey` (peer_session.rs:296-312): the
+    /// first observed static pins; a different one later is an error.
+    pub fn check_or_set_peer_static_pubkey(&self, pubkey: Option<[u8; 32]>) -> Result<()> {
+        let Some(pubkey) = pubkey else {
+            return Ok(());
+        };
+        let mut guard = self.peer_static_pubkey.lock().unwrap();
+        if let Some(existing) = *guard {
+            if existing != pubkey {
+                return Err(Error::protocol("easytier: peer static pubkey mismatch"));
+            }
+            return Ok(());
+        }
+        *guard = Some(pubkey);
+        Ok(())
+    }
+
+    /// `sync_root_key` (peer_session.rs:314-327).
+    pub fn sync_root_key(
+        &self,
+        root_key: [u8; 32],
+        session_generation: u32,
+        initial_epoch: u32,
+        preserve_rx_grace: bool,
+    ) {
+        self.datagram
+            .sync_root_key(root_key, session_generation, initial_epoch, preserve_rx_grace);
+    }
+
+    /// `dir_for_sender` (peer_session.rs:329-338): the peer-id order
+    /// decides which side is "A".
+    fn dir_for_sender(sender_peer_id: PeerId, receiver_peer_id: PeerId) -> SecureDirection {
+        if sender_peer_id < receiver_peer_id {
+            SecureDirection::AToB
+        } else {
+            SecureDirection::BToA
+        }
+    }
+
+    /// `encrypt_payload` (peer_session.rs:340-351).
+    pub fn encrypt_payload(
+        &self,
+        sender_peer_id: PeerId,
+        receiver_peer_id: PeerId,
+        hdr: &mut PeerManagerHeader,
+        payload: &mut Vec<u8>,
+    ) -> Result<()> {
+        if !self.is_valid() {
+            return Err(Error::crypto("easytier: session invalidated"));
+        }
+        self.datagram.encrypt_payload(
+            Self::dir_for_sender(sender_peer_id, receiver_peer_id),
+            hdr,
+            payload,
+        )
+    }
+
+    /// `decrypt_payload` (peer_session.rs:353-366).
+    pub fn decrypt_payload(
+        &self,
+        sender_peer_id: PeerId,
+        receiver_peer_id: PeerId,
+        hdr: &mut PeerManagerHeader,
+        payload: &mut Vec<u8>,
+    ) -> Result<()> {
+        if !self.is_valid() {
+            return Err(Error::crypto("easytier: session invalidated"));
+        }
+        self.datagram.decrypt_payload(
+            Self::dir_for_sender(sender_peer_id, receiver_peer_id),
+            hdr,
+            payload,
+        )
+    }
+}
+
+/// The result of `upsert_responder_session` (peer_session.rs:15-21).
+pub struct UpsertResponderSessionReturn {
+    pub session: Arc<PeerSecureSession>,
+    pub action: PeerConnSessionAction,
+    pub session_generation: u32,
+    pub root_key: Option<[u8; 32]>,
+    pub initial_epoch: u32,
+}
+
+/// The store's session table: `(network_name, peer_id)` -> session.
+type SecureSessionMap = HashMap<(String, PeerId), Arc<PeerSecureSession>>;
+
+/// `PeerSessionStore` (peer_session.rs:46-213) — the per-node session
+/// table keyed by `(network_name, peer_id)`; the Join/Sync/Create
+/// generations live here. Shared by every connection of one node (the
+/// acceptors in `serve`, the dialer in `node_for`), so a reconnecting
+/// peer resumes its session instead of restarting at Create.
+#[derive(Clone, Default)]
+pub struct PeerSessionStore {
+    sessions: Arc<StdMutex<SecureSessionMap>>,
+}
+
+impl PeerSessionStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn get(&self, key: &(String, PeerId)) -> Option<Arc<PeerSecureSession>> {
+        let session = self.sessions.lock().unwrap().get(key).cloned()?;
+        if session.is_valid() {
+            Some(session)
+        } else {
+            self.sessions.lock().unwrap().remove(key);
+            None
+        }
+    }
+
+    /// `upsert_responder_session` (peer_session.rs:88-150): the
+    /// responder's verdict for a connecting peer — Create a fresh session
+    /// (generation 1, epoch 0, a new root key it must send), answer Join
+    /// when the client's generation matches ours (nothing to send), or
+    /// Sync our stored key at the next epoch.
+    pub fn upsert_responder_session(
+        &self,
+        key: (String, PeerId),
+        a_session_generation: Option<u32>,
+        send_algorithm: &str,
+        recv_algorithm: &str,
+        peer_static_pubkey: Option<[u8; 32]>,
+    ) -> Result<UpsertResponderSessionReturn> {
+        let existing = self.get(&key);
+        match existing {
+            None => {
+                let root_key = PeerSecureSession::new_root_key();
+                let session_generation = 1u32;
+                let initial_epoch = 0u32;
+                let session = Arc::new(PeerSecureSession::new(
+                    root_key,
+                    session_generation,
+                    initial_epoch,
+                    send_algorithm.to_owned(),
+                    recv_algorithm.to_owned(),
+                    peer_static_pubkey,
+                ));
+                self.sessions.lock().unwrap().insert(key, session.clone());
+                Ok(UpsertResponderSessionReturn {
+                    session,
+                    action: PeerConnSessionAction::Create,
+                    session_generation,
+                    root_key: Some(root_key),
+                    initial_epoch,
+                })
+            }
+            Some(session) => {
+                session.check_encrypt_algo_same(send_algorithm, recv_algorithm)?;
+                session.check_or_set_peer_static_pubkey(peer_static_pubkey)?;
+                let local_gen = session.session_generation();
+                if a_session_generation.is_some_and(|g| g == local_gen) {
+                    Ok(UpsertResponderSessionReturn {
+                        session,
+                        action: PeerConnSessionAction::Join,
+                        session_generation: local_gen,
+                        root_key: None,
+                        initial_epoch: 0,
+                    })
+                } else {
+                    let initial_epoch = session.next_sync_epoch();
+                    let root_key = session.root_key();
+                    Ok(UpsertResponderSessionReturn {
+                        session,
+                        action: PeerConnSessionAction::Sync,
+                        session_generation: local_gen,
+                        root_key: Some(root_key),
+                        initial_epoch,
+                    })
+                }
+            }
+        }
+    }
+
+    /// `apply_initiator_action` (peer_session.rs:154-212): the client
+    /// installs the responder's verdict.
+    #[allow(clippy::too_many_arguments)] // upstream parity (peer_session.rs:152-164)
+    pub fn apply_initiator_action(
+        &self,
+        key: (String, PeerId),
+        action: PeerConnSessionAction,
+        b_session_generation: u32,
+        root_key_32: Option<[u8; 32]>,
+        initial_epoch: u32,
+        send_algorithm: &str,
+        recv_algorithm: &str,
+        peer_static_pubkey: Option<[u8; 32]>,
+    ) -> Result<Arc<PeerSecureSession>> {
+        match action {
+            PeerConnSessionAction::Join => {
+                let Some(session) = self.get(&key) else {
+                    return Err(Error::protocol("easytier: no local session for JOIN"));
+                };
+                session.check_encrypt_algo_same(send_algorithm, recv_algorithm)?;
+                session.check_or_set_peer_static_pubkey(peer_static_pubkey)?;
+                if session.session_generation() != b_session_generation {
+                    return Err(Error::protocol("easytier: JOIN generation mismatch"));
+                }
+                Ok(session)
+            }
+            PeerConnSessionAction::Sync | PeerConnSessionAction::Create => {
+                let root_key = root_key_32
+                    .ok_or_else(|| Error::protocol("easytier: missing root_key"))?;
+                if self.sessions.lock().unwrap().get(&key).is_some_and(|s| !s.is_valid()) {
+                    self.sessions.lock().unwrap().remove(&key);
+                }
+                let mut guard = self.sessions.lock().unwrap();
+                let session = guard
+                    .entry(key)
+                    .or_insert_with(|| {
+                        Arc::new(PeerSecureSession::new(
+                            root_key,
+                            b_session_generation,
+                            initial_epoch,
+                            send_algorithm.to_owned(),
+                            recv_algorithm.to_owned(),
+                            peer_static_pubkey,
+                        ))
+                    })
+                    .clone();
+                drop(guard);
+                session.check_encrypt_algo_same(send_algorithm, recv_algorithm)?;
+                session.check_or_set_peer_static_pubkey(peer_static_pubkey)?;
+                session.sync_root_key(
+                    root_key,
+                    b_session_generation,
+                    initial_epoch,
+                    matches!(action, PeerConnSessionAction::Sync),
+                );
+                Ok(session)
+            }
+        }
+    }
+}
+
+// -- The auth subset + the handshake flows ------------------------------------
+
+/// `SecureAuthLevel` (peer_rpc.proto:322-328).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecureAuthLevel {
+    None,
+    EncryptedUnauthenticated,
+    PeerVerified,
+    NetworkSecretConfirmed,
+}
+
+/// The per-node secure-mode context: the static identity, the proof
+/// secret and the session store every handshake of the node shares
+/// (`SecureModeConfig` + the peer manager's `PeerSessionStore`).
+pub struct SecureModeCtx {
+    /// The network name proofs are checked against.
+    pub network_name: String,
+    /// The network secret (`None` when the config carries none — proofs
+    /// are skipped and only pinned keys can authenticate).
+    pub network_secret: Option<String>,
+    /// `local_private_key` (base64 X25519) or a fresh random identity
+    /// (`process_secure_mode_cfg`, config.rs:489-521).
+    static_keys: SecureStaticKeys,
+    /// The negotiated payload algorithm (`my_encrypt_algo` = the flags'
+    /// `encryption_algorithm`, default `aes-gcm`).
+    pub algorithm: String,
+    /// The dialed peer's `peer-public-key` pin, when the config has one.
+    pub pinned_peer_pubkey: Option<[u8; 32]>,
+    /// The node-wide session table (Join/Sync/Create generations).
+    pub store: PeerSessionStore,
+}
+
+impl SecureModeCtx {
+    /// Build the context from a validated config. `pinned_peer_pubkey`
+    /// comes from the first peer URI's `peer-public-key` query param (the
+    /// dial-side pin; `get_pinned_remote_static_pubkey_b64`,
+    /// peer_conn.rs:641-655).
+    pub fn new(
+        network_name: &str,
+        network_secret: &str,
+        local_private_key: &str,
+        algorithm: &str,
+        pinned_peer_pubkey_b64: Option<&str>,
+    ) -> Result<Self> {
+        let static_keys = if local_private_key.trim().is_empty() {
+            SecureStaticKeys::random()
+        } else {
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(local_private_key.trim())
+                .map_err(|e| Error::config(format!("easytier: local-private-key: {e}")))?;
+            let sk: [u8; 32] = raw.try_into().map_err(|_| {
+                Error::config("easytier: local-private-key must be 32 bytes base64")
+            })?;
+            SecureStaticKeys::from_secret(sk)
+        };
+        let pinned_peer_pubkey = pinned_peer_pubkey_b64
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| {
+                let raw = base64::engine::general_purpose::STANDARD
+                    .decode(s.trim())
+                    .map_err(|e| Error::config(format!("easytier: peer-public-key: {e}")))?;
+                raw.try_into().map_err(|_| {
+                    Error::config("easytier: peer-public-key must be 32 bytes base64")
+                })
+            })
+            .transpose()?;
+        Ok(SecureModeCtx {
+            network_name: network_name.to_owned(),
+            network_secret: (!network_secret.is_empty()).then(|| network_secret.to_owned()),
+            static_keys,
+            algorithm: algorithm.to_owned(),
+            pinned_peer_pubkey,
+            store: PeerSessionStore::new(),
+        })
+    }
+
+    fn has_network_secret(&self) -> bool {
+        self.network_secret.is_some()
+    }
+
+    fn proof(&self, challenge: &[u8]) -> Option<[u8; 32]> {
+        self.network_secret
+            .as_ref()
+            .map(|secret| secret_proof(secret, challenge))
+    }
+
+    /// `verify_remote_auth` (peer_conn.rs:707-762), the two-node subset:
+    /// (1) a valid proof is `NetworkSecretConfirmed`; (2) a pinned key
+    /// must match — and without a network secret the pinned config key IS
+    /// the trust anchor (upstream consults the trusted-key store here,
+    /// which is not ported); (3) an initiator without a secret keeps the
+    /// encrypted channel (`EncryptedUnauthenticated`); (4) anything else
+    /// is rejected.
+    fn verify_remote_auth(
+        &self,
+        proof: Option<&[u8]>,
+        handshake_hash: &[u8],
+        remote_pubkey: &[u8],
+        is_initiator: bool,
+    ) -> Result<SecureAuthLevel> {
+        if let (Some(proof), Some(expected)) = (proof, self.proof(handshake_hash)) {
+            if expected.as_slice() == proof {
+                return Ok(SecureAuthLevel::NetworkSecretConfirmed);
+            }
+        }
+        if let (Some(pinned), true) = (&self.pinned_peer_pubkey, is_initiator) {
+            if pinned.as_slice() != remote_pubkey {
+                return Err(Error::protocol(
+                    "easytier: pinned remote static pubkey mismatch",
+                ));
+            }
+            return Ok(SecureAuthLevel::PeerVerified);
+        }
+        if is_initiator && !self.has_network_secret() {
+            return Ok(SecureAuthLevel::EncryptedUnauthenticated);
+        }
+        Err(Error::protocol(
+            "easytier: authentication failed: invalid proof and unknown credential",
+        ))
+    }
+}
+
+/// Send one noise message as a peer packet (`send_noise_msg`,
+/// peer_conn.rs:657-683).
+async fn send_noise_msg<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    from: PeerId,
+    to: PeerId,
+    packet_type: u8,
+    wire: &[u8],
+) -> Result<()> {
+    write_frame(writer, &PeerPacket::new(from, to, packet_type, wire)).await
+}
+
+/// Read the next noise message frame with the 5s budget
+/// (`recv_next_peer_manager_packet` + the timeout, peer_conn.rs:842-846).
+async fn recv_noise_frame<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    expected: u8,
+) -> Result<PeerPacket> {
+    let packet = tokio::time::timeout(NOISE_MSG_TIMEOUT, async {
+        loop {
+            let packet = read_frame(reader)
+                .await?
+                .ok_or_else(|| Error::network("easytier: conn closed during noise handshake"))?;
+            if packet.hdr.packet_type == expected {
+                break Ok::<PeerPacket, Error>(packet);
+            }
+        }
+    })
+    .await
+    .map_err(|_| Error::network("easytier: wait noise handshake response timeout"))??;
+    Ok(packet)
+}
+
+/// The noise handshake result mapped into the plain-mode peer info plus
+/// the live session (the `NoiseHandshakeResult` fields the engine uses).
+#[derive(Debug)]
+struct NoiseHandshakeOutcome {
+    peer: PeerInfo,
+    session: Arc<PeerSecureSession>,
+    auth_level: SecureAuthLevel,
+}
+
+/// `do_noise_handshake_as_client` (peer_conn.rs:793-983).
+async fn noise_handshake_as_client<I>(
+    io: &mut I,
+    my_peer_id: PeerId,
+    ctx: &SecureModeCtx,
+) -> Result<NoiseHandshakeOutcome>
+where
+    I: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut reader, mut writer) = tokio::io::split(io);
+    let mut hs = NoiseXxHandshake::new(SecureStaticKeys {
+        sk: ctx.static_keys.sk,
+        pk: ctx.static_keys.pk,
+    });
+    let a_conn_id = uuid::Uuid::new_v4();
+    let msg1 = NoiseMsg1 {
+        version: NOISE_VERSION,
+        a_network_name: ctx.network_name.clone(),
+        // `peer_id_hint` is None on the direct dial path, so no
+        // generation is claimed (peer_conn.rs:809-815).
+        a_session_generation: None,
+        a_conn_id,
+        client_encryption_algorithm: ctx.algorithm.clone(),
+    };
+    let wire1 = hs.write_msg1(&msg1.encode());
+    send_noise_msg(
+        &mut writer,
+        my_peer_id,
+        0,
+        packet_type::NOISE_HANDSHAKE_MSG1,
+        &wire1,
+    )
+    .await?;
+    // The challenge the server's msg2 proof is checked against: the hash
+    // as of OUR msg1 (peer_conn.rs:840).
+    let server_handshake_hash = hs.handshake_hash();
+
+    let msg2_packet = recv_noise_frame(&mut reader, noise_packet_type::NOISE_HANDSHAKE_MSG2).await?;
+    let remote_peer_id = msg2_packet.hdr.from_peer_id;
+    if remote_peer_id == 0 {
+        return Err(Error::protocol("easytier: noise msg2 missing src peer id"));
+    }
+    let payload2 = hs.read_msg2(&msg2_packet.payload)?;
+    let msg2 = NoiseMsg2::decode(&payload2)?;
+    if msg2.a_conn_id_echo != Some(a_conn_id) {
+        return Err(Error::protocol("easytier: noise msg2 conn_id_echo mismatch"));
+    }
+    let remote_network_name = msg2.b_network_name.clone();
+    if remote_network_name == ctx.network_name && msg2.role_hint != 1 {
+        return Err(Error::protocol(
+            "easytier: role_hint must be 1 when network_name is same",
+        ));
+    }
+    // Our msg3 proof is computed over the hash as of THEIR msg2
+    // (peer_conn.rs:875-879).
+    let handshake_hash_for_proof = hs.handshake_hash();
+    let msg3 = NoiseMsg3 {
+        a_conn_id_echo: a_conn_id,
+        b_conn_id_echo: msg2.b_conn_id,
+        secret_proof_32: ctx.proof(&handshake_hash_for_proof).map(|p| p.to_vec()),
+        secret_digest: network_secret_digest(
+            &ctx.network_name,
+            ctx.network_secret.as_deref().unwrap_or(""),
+        )
+        .to_vec(),
+    };
+    let wire3 = hs.write_msg3(&msg3.encode());
+    send_noise_msg(
+        &mut writer,
+        my_peer_id,
+        remote_peer_id,
+        noise_packet_type::NOISE_HANDSHAKE_MSG3,
+        &wire3,
+    )
+    .await?;
+
+    let remote_static = hs.remote_static().unwrap_or_default();
+    // The initiator saw the server's static in msg2; the pin and the
+    // proof both authenticate it. The no-pin EncryptedUnauthenticated
+    // fast path (peer_conn.rs:918-920) only applies to cross-network
+    // servers, which the two-node mesh never sees.
+    let auth_level = ctx.verify_remote_auth(
+        msg2.secret_proof_32.as_deref(),
+        &server_handshake_hash,
+        &remote_static,
+        true,
+    )?;
+    let session = ctx.store.apply_initiator_action(
+        (ctx.network_name.clone(), remote_peer_id),
+        msg2.action,
+        msg2.b_session_generation,
+        msg2.root_key_32,
+        msg2.initial_epoch,
+        &ctx.algorithm,
+        &msg2.server_encryption_algorithm,
+        hs.remote_static(),
+    )?;
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&msg3.secret_digest);
+    Ok(NoiseHandshakeOutcome {
+        peer: PeerInfo {
+            peer_id: remote_peer_id,
+            network_name: remote_network_name,
+            // `we have authorized the peer with noise handshake, so just
+            // set secret digest same as us` (peer_conn.rs:976-977).
+            network_secret_digest: digest,
+            features: Vec::new(),
+            version: NOISE_VERSION,
+        },
+        session,
+        auth_level,
+    })
+}
+
+/// `do_noise_handshake_as_server` (peer_conn.rs:1043-1218): the first
+/// frame (already read by the caller's handshake dispatch) is the
+/// client's msg1.
+async fn noise_handshake_as_server<I>(
+    io: &mut I,
+    my_peer_id: PeerId,
+    ctx: &SecureModeCtx,
+    first_msg1: PeerPacket,
+) -> Result<NoiseHandshakeOutcome>
+where
+    I: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut reader, mut writer) = tokio::io::split(io);
+    let mut hs = NoiseXxHandshake::new(SecureStaticKeys {
+        sk: ctx.static_keys.sk,
+        pk: ctx.static_keys.pk,
+    });
+    let remote_peer_id = first_msg1.hdr.from_peer_id;
+    if remote_peer_id == 0 {
+        return Err(Error::protocol("easytier: noise msg1 must have src peer id"));
+    }
+    let payload1 = hs.read_msg1(&first_msg1.payload)?;
+    let msg1 = NoiseMsg1::decode(&payload1)?;
+    let remote_network_name = msg1.a_network_name.clone();
+    // `role_hint` 1 = same network (with proof), 2 = foreign
+    // (peer_conn.rs:1082-1091).
+    let (role_hint, secret_proof_32) = if msg1.a_network_name == ctx.network_name {
+        (1, ctx.proof(&hs.handshake_hash()).map(|p| p.to_vec()))
+    } else {
+        (2, None)
+    };
+    let upsert = ctx.store.upsert_responder_session(
+        (remote_network_name.clone(), remote_peer_id),
+        msg1.a_session_generation,
+        &ctx.algorithm,
+        &msg1.client_encryption_algorithm,
+        None,
+    )?;
+    let b_conn_id = uuid::Uuid::new_v4();
+    let msg2 = NoiseMsg2 {
+        b_network_name: ctx.network_name.clone(),
+        role_hint,
+        action: upsert.action,
+        b_session_generation: upsert.session_generation,
+        root_key_32: upsert.root_key,
+        initial_epoch: upsert.initial_epoch,
+        b_conn_id,
+        a_conn_id_echo: Some(msg1.a_conn_id),
+        secret_proof_32,
+        server_encryption_algorithm: ctx.algorithm.clone(),
+    };
+    let wire2 = hs.write_msg2(&msg2.encode());
+    send_noise_msg(
+        &mut writer,
+        my_peer_id,
+        remote_peer_id,
+        noise_packet_type::NOISE_HANDSHAKE_MSG2,
+        &wire2,
+    )
+    .await?;
+    // The challenge the client's msg3 proof is checked against: the hash
+    // as of OUR msg2 (peer_conn.rs:1134).
+    let handshake_hash_for_proof = hs.handshake_hash();
+
+    let msg3_packet = recv_noise_frame(&mut reader, noise_packet_type::NOISE_HANDSHAKE_MSG3).await?;
+    let payload3 = hs.read_msg3(&msg3_packet.payload)?;
+    let msg3 = NoiseMsg3::decode(&payload3)?;
+    if msg3.a_conn_id_echo != msg1.a_conn_id {
+        return Err(Error::protocol("easytier: noise msg3 a_conn_id mismatch"));
+    }
+    if msg3.b_conn_id_echo != b_conn_id {
+        return Err(Error::protocol("easytier: noise msg3 b_conn_id mismatch"));
+    }
+    let remote_static = hs.remote_static();
+    upsert
+        .session
+        .check_or_set_peer_static_pubkey(remote_static)?;
+    let auth_level = if role_hint == 1 {
+        ctx.verify_remote_auth(
+            msg3.secret_proof_32.as_deref(),
+            &handshake_hash_for_proof,
+            &remote_static.unwrap_or_default(),
+            false,
+        )?
+    } else {
+        SecureAuthLevel::EncryptedUnauthenticated
+    };
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&msg3.secret_digest);
+    Ok(NoiseHandshakeOutcome {
+        peer: PeerInfo {
+            peer_id: remote_peer_id,
+            network_name: remote_network_name,
+            network_secret_digest: digest,
+            features: Vec::new(),
+            version: msg1.version,
+        },
+        session: upsert.session,
+        auth_level,
+    })
+}
+// ---------------------------------------------------------------------------
 // The peer RPC framework — the minimal client+server subset
 // (easytier-core/src/rpc/packet.rs + client.rs + server.rs +
 // service_registry.rs + peers/peer_rpc.rs; the wire messages are
@@ -5612,6 +7676,12 @@ struct ConnState {
     my_peer_id: PeerId,
     peer_id: PeerId,
     encryptor: PacketEncryptor,
+    /// The secure-mode session: when set, every payload-bearing packet
+    /// crosses THIS AEAD instead of the network-secret `encryptor`
+    /// (`PeerSessionTunnelFilter` with `enabled = true`, peer_conn.rs:
+    /// 147-248 — the peer manager skips its own encryptor in secure
+    /// mode, peer_manager.rs:103-104).
+    secure: Option<Arc<PeerSecureSession>>,
     sink: mpsc::Sender<PeerPacket>,
     pong_tx: broadcast::Sender<PeerPacket>,
     data_tx: mpsc::Sender<Vec<u8>>,
@@ -5630,6 +7700,19 @@ impl ConnState {
             self.closed.notify_one();
         }
     }
+
+    /// Seal one outbound payload packet — the secure-mode session AEAD
+    /// when the connection has one, the network-secret AEAD otherwise
+    /// (`PeerSessionTunnelFilter::before_send` vs the peer manager's
+    /// `encryptor.encrypt`, gated by `!is_secure_mode_enabled`).
+    fn seal_outgoing(&self, hdr: &mut PeerManagerHeader, payload: &mut Vec<u8>) -> Result<()> {
+        if let Some(session) = &self.secure {
+            // The filter skips the handshake/relay/ping/pong types; every
+            // packet reaching this seam is a payload type.
+            return session.encrypt_payload(self.my_peer_id, self.peer_id, hdr, payload);
+        }
+        self.encryptor.encrypt_packet(hdr, payload)
+    }
 }
 
 /// The recv loop (`start_recv_loop`, peer_conn.rs:1286-1366): Ping →
@@ -5644,7 +7727,12 @@ impl ConnState {
 /// peer (peers/peer_manager.rs:153-169) and `handle_packet` decrypts
 /// them on the self-destined receive path (peers/peer_manager.rs:
 /// 3170-3192); Ping/Pong stay plaintext (`should_skip_encrypt`,
-/// peers/conn/peer_conn.rs:125-133).
+/// peers/conn/peer_conn.rs:125-133). In secure mode the session AEAD
+/// replaces the network-secret one on BOTH seams
+/// (`PeerSessionTunnelFilter::after_received`, peer_conn.rs:190-245):
+/// a transient failure drops the packet, an invalidated session (ten
+/// consecutive decrypt failures) closes the connection so the peer
+/// re-handshakes.
 async fn run_recv_loop<R: AsyncRead + Unpin>(mut reader: R, state: Arc<ConnState>) {
     loop {
         let packet = match read_frame(&mut reader).await {
@@ -5674,11 +7762,22 @@ async fn run_recv_loop<R: AsyncRead + Unpin>(mut reader: R, state: Arc<ConnState
             {
                 continue;
             }
-            if state
-                .encryptor
-                .decrypt_packet(&mut packet.hdr, &mut packet.payload)
-                .is_err()
-            {
+            let decrypted = match &state.secure {
+                Some(session) => session.decrypt_payload(
+                    state.peer_id,
+                    state.my_peer_id,
+                    &mut packet.hdr,
+                    &mut packet.payload,
+                ),
+                None => state
+                    .encryptor
+                    .decrypt_packet(&mut packet.hdr, &mut packet.payload),
+            };
+            if let Err(e) = decrypted {
+                if state.secure.as_ref().is_some_and(|s| !s.is_valid()) {
+                    tracing::warn!(target: "engine", "easytier: session invalidated, closing connection: {e}");
+                    break;
+                }
                 continue;
             }
             if packet.hdr.packet_type == packet_type::DATA {
@@ -5889,7 +7988,8 @@ impl EasyTierNode {
     /// peer_manager.rs:2641-2660) and `RpcReq`/`RpcResp`
     /// (`RpcTransport::send` → `encryptor.encrypt`, peer_manager.rs:
     /// 153-169) both leave the node sealed by the network-secret
-    /// encryptor in plain (non-secure) mode.
+    /// encryptor in plain (non-secure) mode, or by the per-peer session
+    /// AEAD in secure mode.
     async fn send_packet(&self, packet_type: u8, payload: &[u8]) -> Result<()> {
         let mut hdr = PeerManagerHeader {
             from_peer_id: self.my_peer_id,
@@ -5901,9 +8001,7 @@ impl EasyTierNode {
             len: payload.len() as u32,
         };
         let mut payload = payload.to_vec();
-        self.state
-            .encryptor
-            .encrypt_packet(&mut hdr, &mut payload)?;
+        self.state.seal_outgoing(&mut hdr, &mut payload)?;
         self.state
             .sink
             .send(PeerPacket { hdr, payload })
@@ -6046,6 +8144,7 @@ async fn spawn_connection_halves<I>(
     my_peer_id: PeerId,
     peer: &PeerInfo,
     encryptor: PacketEncryptor,
+    secure: Option<Arc<PeerSecureSession>>,
 ) -> SessionHalves
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -6058,6 +8157,7 @@ where
         my_peer_id,
         peer_id: peer.peer_id,
         encryptor,
+        secure,
         sink,
         pong_tx,
         data_tx,
@@ -6184,33 +8284,41 @@ where
     })
 }
 
-/// `do_handshake_as_server_ext` (peer_conn.rs:1186-1243), plain mode: the
-/// first packet must be a handshake; the reply carries our real digest
-/// only when the client's identity equals ours (`send_handshake`'s
-/// `send_secret_digest`, peer_conn.rs:1225-1227).
+/// `do_handshake_as_server_ext` (peer_conn.rs:1234-1281): read the first
+/// packet under the 5s timeout and dispatch on its type — a
+/// `NoiseHandshakeMsg1` first packet routes into the secure-mode
+/// handshake when (and only when) this node runs secure mode
+/// (peer_conn.rs:1252-1264); a plain `HandShake` runs the plain reply
+/// either way; anything else is `unexpected packet type during
+/// handshake` (peer_conn.rs:1277-1281). Returns the peer info plus the
+/// live secure session when the noise path ran.
 async fn handshake_as_server<I>(
     io: &mut I,
     my_peer_id: PeerId,
     network_name: &str,
     digest: &NetworkSecretDigest,
-) -> Result<PeerInfo>
+    secure: Option<&SecureModeCtx>,
+) -> Result<(PeerInfo, Option<Arc<PeerSecureSession>>)>
 where
     I: AsyncRead + AsyncWrite + Unpin,
 {
-    // `recv_next_peer_manager_packet` reads exactly once under the 5s
-    // timeout (peer_conn.rs:1193-1196); a non-handshake first packet is
-    // `unexpected packet type during handshake` (peer_conn.rs:1228-1233).
     let packet = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         let packet = read_frame(io)
             .await?
             .ok_or_else(|| Error::network("easytier: conn closed during wait handshake"))?;
-        if packet.hdr.packet_type == packet_type::HANDSHAKE {
+        if packet.hdr.packet_type == packet_type::HANDSHAKE
+            || (packet.hdr.packet_type == packet_type::NOISE_HANDSHAKE_MSG1
+                && secure.is_some())
+        {
             Ok(packet)
         } else if packet.hdr.packet_type == packet_type::NOISE_HANDSHAKE_MSG1 {
-            // A secure-mode client opens with the Noise_XX msg1 instead of
-            // the plain handshake (`do_noise_handshake_as_server`,
-            // peer_conn.rs:1252-1255).
-            Err(Error::config(SECURE_MODE_NOT_PORTED))
+            // A secure-mode client opened with the Noise_XX msg1 but this
+            // node is not configured for secure mode — the generic
+            // unexpected-type error of peer_conn.rs:1277-1281, with the
+            // cause named.
+            Err(Error::protocol(
+                "easytier: unexpected packet type during handshake: 13 (NoiseHandshakeMsg1 — the peer runs secure mode, this node does not)",
+            ))
         } else {
             Err(Error::protocol(format!(
                 "easytier: unexpected packet type during handshake: {}",
@@ -6220,6 +8328,18 @@ where
     })
     .await
     .map_err(|_| Error::network("easytier: wait handshake timeout"))??;
+
+    if packet.hdr.packet_type == packet_type::NOISE_HANDSHAKE_MSG1 {
+        let ctx = secure.expect("dispatch checked");
+        let outcome = noise_handshake_as_server(io, my_peer_id, ctx, packet).await?;
+        tracing::debug!(
+            target: "engine",
+            "easytier: secure-mode peer {} authenticated at {:?}",
+            outcome.peer.peer_id,
+            outcome.auth_level
+        );
+        return Ok((outcome.peer, Some(outcome.session)));
+    }
 
     let req = HandshakeRequest::decode(&packet.payload)
         .map_err(|e| Error::protocol(format!("easytier: decode handshake response error: {e}")))?;
@@ -6238,13 +8358,16 @@ where
     write_frame(io, &reply)
         .await
         .map_err(|_| Error::network("easytier: send handshake request error"))?;
-    Ok(PeerInfo {
-        peer_id: req.my_peer_id,
-        network_name: req.network_name,
-        network_secret_digest: client_digest,
-        features: req.features,
-        version: req.version,
-    })
+    Ok((
+        PeerInfo {
+            peer_id: req.my_peer_id,
+            network_name: req.network_name,
+            network_secret_digest: client_digest,
+            features: req.features,
+            version: req.version,
+        },
+        None,
+    ))
 }
 
 /// The transport of one parsed peer URI (the `IpScheme` arms the peer
@@ -6386,6 +8509,7 @@ pub async fn connect_peer(
         network_name,
         network_secret,
         encryptor,
+        None,
     )
     .await
 }
@@ -6393,26 +8517,33 @@ pub async fn connect_peer(
 /// [`connect_peer`] under a caller-chosen `my_peer_id` — every
 /// connection of ONE overlay node shares the node's peer id (upstream:
 /// one `PeerId` per node, all its `PeerConn`s carry it), so the
-/// multi-peer node and the listener pass theirs here.
+/// multi-peer node and the listener pass theirs here. `secure` switches
+/// the handshake to the Noise_XX flow.
 pub async fn connect_peer_as(
     endpoint: &PeerEndpoint,
     my_peer_id: PeerId,
     network_name: &str,
     network_secret: &str,
     encryptor: PacketEncryptor,
+    secure: Option<&SecureModeCtx>,
 ) -> Result<EasyTierNode> {
-    let halves = dial_session(endpoint, my_peer_id, network_name, network_secret, encryptor).await?;
+    let halves =
+        dial_session(endpoint, my_peer_id, network_name, network_secret, encryptor, secure)
+            .await?;
     Ok(halves.into_node(network_name.to_owned()))
 }
 
 /// The [`connect_peer_as`] path returning the raw session halves — what
-/// the multi-peer overlay node attaches.
+/// the multi-peer overlay node attaches. `secure` switches the client
+/// handshake to the Noise_XX flow (`add_tunnel_as_client` on a
+/// secure-mode node).
 async fn dial_session(
     endpoint: &PeerEndpoint,
     my_peer_id: PeerId,
     network_name: &str,
     network_secret: &str,
     encryptor: PacketEncryptor,
+    secure: Option<&SecureModeCtx>,
 ) -> Result<SessionHalves> {
     let digest = network_secret_digest(network_name, network_secret);
     match endpoint.transport {
@@ -6423,21 +8554,21 @@ async fn dial_session(
             )
             .await
             .map_err(|_| Error::network("easytier: direct connect timeout"))??;
-            client_session(stream, my_peer_id, network_name, &digest, encryptor).await
+            client_session(stream, my_peer_id, network_name, &digest, encryptor, secure).await
         }
         PeerTransport::Udp => {
             let addr = resolve_peer_addr(endpoint).await?;
             let stream = tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, connect_udp_tunnel(addr))
                 .await
                 .map_err(|_| Error::network("easytier: udp connect timeout"))??;
-            client_session(stream, my_peer_id, network_name, &digest, encryptor).await
+            client_session(stream, my_peer_id, network_name, &digest, encryptor, secure).await
         }
         PeerTransport::Quic => {
             let addr = resolve_peer_addr(endpoint).await?;
             let stream = tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, connect_quic_tunnel(addr))
                 .await
                 .map_err(|_| Error::network("easytier: quic connect timeout"))??;
-            client_session(stream, my_peer_id, network_name, &digest, encryptor).await
+            client_session(stream, my_peer_id, network_name, &digest, encryptor, secure).await
         }
         PeerTransport::Wg => {
             let addr = resolve_peer_addr(endpoint).await?;
@@ -6447,13 +8578,13 @@ async fn dial_session(
             )
             .await
             .map_err(|_| Error::network("easytier: wg connect timeout"))??;
-            client_session(stream, my_peer_id, network_name, &digest, encryptor).await
+            client_session(stream, my_peer_id, network_name, &digest, encryptor, secure).await
         }
         PeerTransport::Ws | PeerTransport::Wss => {
             let stream = tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, connect_ws_tunnel(endpoint))
                 .await
                 .map_err(|_| Error::network("easytier: ws connect timeout"))??;
-            client_session(stream, my_peer_id, network_name, &digest, encryptor).await
+            client_session(stream, my_peer_id, network_name, &digest, encryptor, secure).await
         }
     }
 }
@@ -6465,14 +8596,27 @@ async fn client_session<I>(
     network_name: &str,
     digest: &NetworkSecretDigest,
     encryptor: PacketEncryptor,
+    secure: Option<&SecureModeCtx>,
 ) -> Result<SessionHalves>
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut stream = io;
-    let peer = handshake_as_client(&mut stream, my_peer_id, network_name, digest).await?;
+    let (peer, session) = match secure {
+        Some(ctx) => {
+            let outcome = noise_handshake_as_client(&mut stream, my_peer_id, ctx).await?;
+            tracing::debug!(
+                target: "engine",
+                "easytier: secure-mode peer {} authenticated at {:?}",
+                outcome.peer.peer_id,
+                outcome.auth_level
+            );
+            (outcome.peer, Some(outcome.session))
+        }
+        None => (handshake_as_client(&mut stream, my_peer_id, network_name, digest).await?, None),
+    };
     check_network_identity(network_name, digest, &peer)?;
-    let halves = spawn_connection_halves(stream, my_peer_id, &peer, encryptor).await;
+    let halves = spawn_connection_halves(stream, my_peer_id, &peer, encryptor, session).await;
     // The liveness ping (`do_pingpong_once` via the client connect path).
     conn_ping(&halves.state).await?;
     Ok(halves)
@@ -6489,25 +8633,37 @@ pub async fn serve_peer(
     encryptor: PacketEncryptor,
 ) -> Result<(EasyTierNode, PeerInfo)> {
     let my_peer_id = random_peer_id();
-    let (halves, peer) =
-        serve_peer_as(stream, my_peer_id, network_name, network_secret, encryptor).await?;
+    let (halves, peer) = serve_peer_as(
+        stream,
+        my_peer_id,
+        network_name,
+        network_secret,
+        encryptor,
+        None,
+    )
+    .await?;
     Ok((halves.into_node(network_name.to_owned()), peer))
 }
 
 /// [`serve_peer`] under a caller-chosen `my_peer_id` (the shared node
-/// identity of the listener), returning the raw halves.
+/// identity of the listener), returning the raw halves. `secure` enables
+/// the Noise_XX server handshake for secure-mode clients (plain clients
+/// are still accepted, peer_conn.rs:1252-1275).
 pub async fn serve_peer_as(
     stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
     my_peer_id: PeerId,
     network_name: &str,
     network_secret: &str,
     encryptor: PacketEncryptor,
+    secure: Option<&SecureModeCtx>,
 ) -> Result<(SessionHalves, PeerInfo)> {
     let digest = network_secret_digest(network_name, network_secret);
     let mut stream = stream;
-    let peer = handshake_as_server(&mut stream, my_peer_id, network_name, &digest).await?;
+    let (peer, session) =
+        handshake_as_server(&mut stream, my_peer_id, network_name, &digest, secure).await?;
     check_network_identity(network_name, &digest, &peer)?;
-    let halves = spawn_connection_halves(stream, my_peer_id, &peer, encryptor).await;
+    let halves =
+        spawn_connection_halves(stream, my_peer_id, &peer, encryptor, session).await;
     Ok((halves, peer))
 }
 
@@ -6521,52 +8677,45 @@ fn random_peer_id() -> PeerId {
     }
 }
 
-/// Secure mode, assessed and deliberately NOT ported (M3). Upstream
-/// secure mode is NOT just the Noise_XX handshake: the three messages
-/// ride in peer packets `NoiseHandshakeMsg1/2/3` (types 13/14/15,
-/// packet_def.rs:86-88) with snow's `Noise_XX_25519_ChaChaPoly_SHA256`
-/// and the prologue `easytier-peerconn-noise`
-/// (`do_noise_handshake_as_client/_as_server`, peer_conn.rs:793-1170 on
-/// the v2.6.4 tag):
+/// Secure mode — LANDED (M6, v2.6.4 sources). The Noise_XX
+/// `PeerConnNoiseMsg1/2/3` handshake (snow
+/// `Noise_XX_25519_ChaChaPoly_SHA256`, prologue
+/// `easytier-peerconn-noise`, hand-rolled in [`NoiseXxHandshake`]) plus
+/// the per-peer session AEAD that replaces the network-secret encryption
+/// afterwards ([`SecureDatagramSession`] + [`PeerSessionStore`]). What
+/// the two-node subset keeps and skips:
 ///
-/// * `PeerConnNoiseMsg1Pb { version, a_network_name, a_session_generation?,
-///   a_conn_id(UUID), client_encryption_algorithm }` (peer_rpc.proto:343-349);
-/// * `PeerConnNoiseMsg2Pb { b_network_name, role_hint, action(Join/Sync/Create),
-///   b_session_generation, root_key_32?, initial_epoch, b_conn_id,
-///   a_conn_id_echo, secret_proof_32?, server_encryption_algorithm }`
-///   (peer_rpc.proto:351-362);
-/// * `PeerConnNoiseMsg3Pb { a_conn_id_echo, b_conn_id_echo, secret_proof_32?,
-///   secret_digest }` (peer_rpc.proto:381-386).
-///
-/// The handshake itself is bounded (the engine has hand-rolled Noise IK
-/// in wireguard.rs), but it is worthless alone: after it, EVERY payload
-/// packet stops using the network-secret AEAD of M1 and switches to the
-/// session AEAD — `PeerSession::encrypt_payload`/`decrypt_payload`
-/// (peer_conn.rs:167-232) over `SecureDatagramSession`
-/// (peers/secure_datagram.rs, 1020 lines: epoch-keyed AEAD with replay
-/// windows, epoch rotation and root-key sync with rx grace) driven by
-/// the `PeerSessionStore` state machine (peers/peer_session.rs, 422
-/// lines: per-peer sessions, Join/Sync/Create generations, pinned
-/// remote static keys) plus the auth/identity classification
-/// (`verify_remote_auth` + `classify_remote_identity`, peer_conn.rs:
-/// 700-791: HMAC secret proofs, Admin/Credential/SharedNode). A
-/// handshake-only port would complete msg1-3 and then fail every Data
-/// packet. What a real port additionally needs: X25519 (in-tree only as
-/// the wireguard/tailscale hand-rolled curves), UUID wire encoding, the
-/// session store, the datagram layer, and the rekey/sync RPCs.
-pub const SECURE_MODE_NOT_PORTED: &str = concat!(
-    "easytier: secure mode (config [secure_mode]/secure-mode) is not ported: ",
-    "it is the Noise_XX PeerConnNoiseMsg1/2/3 handshake (peer_conn.rs:799-1170) ",
-    "PLUS the per-peer session AEAD that replaces the network-secret ",
-    "encryption afterwards (PeerSessionStore + SecureDatagramSession, ",
-    "peer_session.rs + secure_datagram.rs) — without the session layer a ",
-    "completed handshake cannot carry data. Remove secure-mode/local-private-key/",
-    "peer-public-key to run the plain (still AEAD-encrypted) mesh"
+/// * **Kept** — the full three-message handshake with the conn-id echo
+///   checks, the `role_hint` same/foreign-network rule, the
+///   network-secret HMAC proofs over the handshake hash
+///   (`NetworkSecretConfirmed`), the `peer-public-key` pin
+///   (`PeerVerified`), the Join/Sync/Create generation state machine
+///   with static-key pinning, the epoch-keyed traffic-key HKDF, the
+///   256-bit per-direction replay windows (two live epochs + the
+///   far-future bound), epoch rotation (1M packets / 10 min), root-key
+///   sync with the 5s rx grace window, and the decrypt-failure
+///   invalidation that closes the connection.
+/// * **Skipped** — the trusted-key store behind `is_pubkey_trusted`
+///   (the credential-file + OSPF key propagation: a pinned config key is
+///   the trust anchor), the foreign-network identity machinery
+///   (`classify_remote_identity`'s Admin/Credential/SharedNode roles —
+///   the auth level is logged instead), the relay noise messages
+///   (`RelayNoiseMsg1/2Pb` — the relay path is not ported) and the
+///   `HMAC_SECRET_DIGEST` global-var branch (msg3 carries the
+///   plain-mode digest, the default).
+pub const SECURE_MODE_PORTED_NOTE: &str = concat!(
+    "easytier: secure mode is ported: the Noise_XX handshake ",
+    "(Noise_XX_25519_ChaChaPoly_SHA256, prologue easytier-peerconn-noise) ",
+    "plus the per-peer session AEAD (epoch-keyed HKDF traffic keys, ",
+    "per-direction 256-bit replay windows, root-key sync with rx grace, ",
+    "Join/Sync/Create generations). Not ported within it: the trusted-key ",
+    "store (credential file + OSPF key propagation — a pinned config key ",
+    "is the trust anchor) and the foreign-network identity roles"
 );
 
-/// What is still missing after the WireGuard transport landed (M5):
-/// the mesh roles beyond the direct neighborhood. The message names
-/// the next milestones precisely.
+/// What is still missing after secure mode landed (M6): the mesh roles
+/// beyond the direct neighborhood. The message names the next milestones
+/// precisely.
 pub const NOT_PORTED: &str = concat!(
     "easytier: the direct TCP peer tunnel (M1: handshake + framing + ",
     "AEAD packet encryption + ping/pong), the route layer (M2: the ",
@@ -6586,8 +8735,12 @@ pub const NOT_PORTED: &str = concat!(
     "[payload] framing, the connector's handshake-initiation-first ",
     "connect and the listener's per-address peer table; DELTAs: no ",
     "cookie replies under load, one in-flight handshake vs boringtun's ",
-    "two) are in-tree; NOT ported: secure mode ",
-    "(see SECURE_MODE_NOT_PORTED), the relay path + foreign networks ",
+    "two), and the M6 secure mode (the Noise_XX handshake with proofs ",
+    "and pinned keys + the per-peer session AEAD + the Join/Sync/Create ",
+    "session store; see SECURE_MODE_PORTED_NOTE for the subset) are ",
+    "in-tree; NOT ported: the trusted-key store (credential file + ",
+    "OSPF-propagated keys) and the foreign-network identity roles of ",
+    "secure mode, the relay path + foreign networks ",
     "(RouteForeignNetworkInfos), multi-hop OSPF convergence (graph_algo.rs ",
     "SPF beyond the direct-neighbor adjacency), IPv6 overlay addressing ",
     "(RoutePeerInfo.ipv6_addr field 15, peer_rpc.proto, through the same ",
@@ -6610,12 +8763,47 @@ pub const NOT_PORTED: &str = concat!(
 /// config is validated exactly like the rendered TOML demands, and the
 /// packet encryption follows the core defaults (`enable_encryption:
 /// true`, `aes-gcm`, config/toml.rs:34,64).
+/// Build the secure-mode context of a config (`process_secure_mode_cfg`:
+/// a missing `local_private_key` becomes a fresh random identity) — the
+/// dial-side pin comes from the first supported peer URI's
+/// `peer-public-key` query (`get_pinned_remote_static_pubkey_b64`).
+fn secure_mode_ctx(
+    config: &EasyTierConfig,
+    structured: &EasyTierTomlConfig,
+) -> Result<Option<SecureModeCtx>> {
+    if !structured.secure_mode_enabled() {
+        return Ok(None);
+    }
+    let algorithm = config
+        .encryption_algorithm
+        .clone()
+        .unwrap_or_else(|| EncryptionAlgorithm::default().as_str().to_owned());
+    let peers = structured.parsed_peers()?;
+    let pinned = peers
+        .iter()
+        .find(|p| parse_peer_endpoint(p.uri.trim()).is_ok())
+        .map(|p| p.peer_public_key.as_str());
+    Ok(Some(SecureModeCtx::new(
+        &config.network_name,
+        &config.network_secret,
+        &structured.local_private_key,
+        &algorithm,
+        pinned,
+    )?))
+}
+
+/// Bring the mesh up against the first `tcp://`/`udp://` peer and
+/// return the joined peer connection — the counterpart of upstream
+/// `NewEasyTier` + `ensureStarted` + the direct connector's first task
+/// (adapter cached lines 172-209; connectivity/direct/mod.rs). The
+/// config is validated exactly like the rendered TOML demands, and the
+/// packet encryption follows the core defaults (`enable_encryption:
+/// true`, `aes-gcm`, config/toml.rs:34,64); a `secure-mode` config runs
+/// the Noise_XX handshake and the session AEAD instead.
 pub async fn connect(config: &EasyTierConfig) -> Result<EasyTierNode> {
     let structured = config.structured_config();
     structured.validate()?;
-    if structured.secure_mode_enabled() {
-        return Err(Error::config(SECURE_MODE_NOT_PORTED));
-    }
+    let secure = secure_mode_ctx(config, &structured)?;
     let peers = structured.parsed_peers()?;
     let peer = peers
         .iter()
@@ -6635,7 +8823,15 @@ pub async fn connect(config: &EasyTierConfig) -> Result<EasyTierNode> {
         &config.network_secret,
     )?;
     let endpoint = parse_peer_endpoint(&peer.uri)?;
-    connect_peer(&endpoint, &config.network_name, &config.network_secret, encryptor).await
+    connect_peer_as(
+        &endpoint,
+        random_peer_id(),
+        &config.network_name,
+        &config.network_secret,
+        encryptor,
+        secure.as_ref(),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -7303,7 +9499,8 @@ impl PeerSession {
     /// peer_manager.rs:2641-2660) and `RpcReq`/`RpcResp`
     /// (`RpcTransport::send` → `encryptor.encrypt`, peer_manager.rs:
     /// 153-169) both leave the node sealed by the network-secret
-    /// encryptor in plain (non-secure) mode.
+    /// encryptor in plain (non-secure) mode, or by the per-peer session
+    /// AEAD in secure mode.
     async fn send_packet(&self, packet_type: u8, payload: &[u8]) -> Result<()> {
         let mut hdr = PeerManagerHeader {
             from_peer_id: self.state.my_peer_id,
@@ -7315,9 +9512,7 @@ impl PeerSession {
             len: payload.len() as u32,
         };
         let mut payload = payload.to_vec();
-        self.state
-            .encryptor
-            .encrypt_packet(&mut hdr, &mut payload)?;
+        self.state.seal_outgoing(&mut hdr, &mut payload)?;
         self.state
             .sink
             .send(PeerPacket { hdr, payload })
@@ -8383,9 +10578,7 @@ fn static_overlay_address(cfg: &EasyTierConfig) -> Result<Option<(Ipv4Addr, u32)
 async fn node_for(cfg: &EasyTierConfig) -> Result<mpsc::Sender<Cmd>> {
     let structured = cfg.structured_config();
     structured.validate()?;
-    if structured.secure_mode_enabled() {
-        return Err(Error::config(SECURE_MODE_NOT_PORTED));
-    }
+    let secure = secure_mode_ctx(cfg, &structured)?;
     let key = node_cache_key(cfg);
     let cache = NODES.get_or_init(Default::default);
     let mut map = cache.lock().await;
@@ -8442,6 +10635,7 @@ async fn node_for(cfg: &EasyTierConfig) -> Result<mpsc::Sender<Cmd>> {
             &cfg.network_name,
             &cfg.network_secret,
             encryptor,
+            secure.as_ref(),
         )
         .await?;
         stack.attach_session(halves, true, &events_tx);
@@ -8734,9 +10928,10 @@ async fn listener_local_addr(listener: &mut BoundListener) -> Result<SocketAddr>
 pub async fn serve(cfg: &EasyTierConfig) -> Result<EasyTierServer> {
     let structured = cfg.structured_config();
     structured.validate()?;
-    if structured.secure_mode_enabled() {
-        return Err(Error::config(SECURE_MODE_NOT_PORTED));
-    }
+    // One shared context per node: the same static identity and the same
+    // session store for the outbound dial and every acceptor, so a
+    // reconnecting secure-mode peer resumes its session.
+    let secure = secure_mode_ctx(cfg, &structured)?.map(Arc::new);
     let listener_uris = structured.listeners();
     if listener_uris.is_empty() {
         return Err(Error::config(
@@ -8825,6 +11020,7 @@ pub async fn serve(cfg: &EasyTierConfig) -> Result<EasyTierServer> {
                         &cfg.network_name,
                         &cfg.network_secret,
                         peer_encryptor,
+                        secure.as_deref(),
                     )
                     .await
                     {
@@ -8864,6 +11060,7 @@ pub async fn serve(cfg: &EasyTierConfig) -> Result<EasyTierServer> {
             .clone()
             .unwrap_or_else(|| EncryptionAlgorithm::default().as_str().to_owned());
         let enable_encryption = cfg.enable_encryption.unwrap_or(true);
+        let secure = secure.clone();
         let my_peer_id = cmd_my_peer_id(&cmd).await;
         let acceptor = tokio::spawn(async move {
             loop {
@@ -8893,6 +11090,7 @@ pub async fn serve(cfg: &EasyTierConfig) -> Result<EasyTierServer> {
                     &network_name,
                     &network_secret,
                     encryptor,
+                    secure.as_deref(),
                 )
                 .await
                 {
@@ -9370,15 +11568,17 @@ mod tests {
         };
         let err = connect(&cfg).await.unwrap_err().to_string();
         assert!(err.contains("no tcp://, udp://, quic://, wg://, ws:// or wss:// peer"), "{err}");
-        // Secure mode is refused with the staged map.
+        // Secure mode runs the Noise_XX handshake now (its hermetic
+        // round-trip tests are below); an invalid key still fails the
+        // config before the dial.
         let cfg = EasyTierConfig {
             peers: vec!["tcp://192.0.2.10:11010".into()],
             secure_mode: Some(true),
+            local_private_key: Some("not-base64!!".to_owned()),
             ..EasyTierConfig::new("et", "net")
         };
         let err = connect(&cfg).await.unwrap_err().to_string();
-        assert!(err.contains("secure mode"), "{err}");
-        assert!(err.contains("PeerConnNoiseMsg1/2/3"), "{err}");
+        assert!(err.contains("local-private-key"), "{err}");
         // An unknown encryption algorithm fails the dial (peer_manager.rs:
         // 902-908 validate_algorithm).
         let cfg = EasyTierConfig {
@@ -9751,11 +11951,12 @@ mod tests {
         let mut client_io = client_io;
         let mut server_io = server_io;
         let server = tokio::spawn(async move {
-            handshake_as_server(&mut server_io, 0xdead_beef, "mesh", &digest).await
+            handshake_as_server(&mut server_io, 0xdead_beef, "mesh", &digest, None).await
         });
         let client_peer =
             handshake_as_client(&mut client_io, 0x0000_0042, "mesh", &digest).await.unwrap();
-        let server_peer = server.await.unwrap().unwrap();
+        let (server_peer, secure) = server.await.unwrap().unwrap();
+        assert!(secure.is_none());
         // Each side sees the other's id and the shared identity.
         assert_eq!(client_peer.peer_id, 0xdead_beef);
         assert_eq!(server_peer.peer_id, 0x0000_0042);
@@ -9782,7 +11983,7 @@ mod tests {
         // connection close.
         let (mut client_io, mut server_io) = tokio::io::duplex(4096);
         let server = tokio::spawn(async move {
-            handshake_as_server(&mut server_io, 0x42, "mesh", &digest).await
+            handshake_as_server(&mut server_io, 0x42, "mesh", &digest, None).await
         });
         let err = handshake_as_client(&mut client_io, 0x42, "mesh", &digest)
             .await
@@ -10004,6 +12205,7 @@ mod tests {
             my_peer_id: 1,
             peer_id: 2,
             encryptor: create_encryptor("aes-gcm", true, "s").unwrap(),
+            secure: None,
             sink,
             pong_tx: broadcast::channel(8).0,
             data_tx: mpsc::channel(8).0,
@@ -10049,9 +12251,11 @@ mod tests {
             // Handshake, then keep the socket open while swallowing
             // every ping without answering (the connection stays alive;
             // only the keepalive can tear it down).
-            let peer = handshake_as_server(&mut stream, 0xaa, network, &digest)
-                .await
-                .unwrap();
+            let (peer, secure) =
+                handshake_as_server(&mut stream, 0xaa, network, &digest, None)
+                    .await
+                    .unwrap();
+            assert!(secure.is_none());
             drop(peer);
             while matches!(read_frame(&mut stream).await, Ok(Some(_))) {}
         });
@@ -10068,6 +12272,7 @@ mod tests {
             my_peer_id,
             &peer_info,
             create_encryptor("aes-gcm", true, &secret).unwrap(),
+            None,
         )
         .await
         .into_node(peer_info.network_name.clone());
@@ -10436,7 +12641,7 @@ mod tests {
                     tokio::spawn(async move {
                         let encryptor = create_encryptor("aes-gcm", true, &secret).unwrap();
                         let Ok((halves, _peer_info)) =
-                            serve_peer_as(stream, random_peer_id(), &network, &secret, encryptor)
+                            serve_peer_as(stream, random_peer_id(), &network, &secret, encryptor, None)
                                 .await
                         else {
                             return;
@@ -10884,7 +13089,7 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let encryptor = create_encryptor("aes-gcm", true, &server_secret).unwrap();
             let (halves, _peer_info) =
-                serve_peer_as(stream, random_peer_id(), network, &server_secret, encryptor)
+                serve_peer_as(stream, random_peer_id(), network, &server_secret, encryptor, None)
                     .await
                     .unwrap();
             let mut stack = EtStack::new(
@@ -11323,7 +13528,7 @@ mod tests {
                     tokio::spawn(async move {
                         let encryptor = create_encryptor("aes-gcm", true, &secret).unwrap();
                         let Ok((halves, _peer_info)) =
-                            serve_peer_as(stream, random_peer_id(), &network, &secret, encryptor)
+                            serve_peer_as(stream, random_peer_id(), &network, &secret, encryptor, None)
                                 .await
                         else {
                             return;
@@ -11410,7 +13615,7 @@ mod tests {
             };
             let encryptor = create_encryptor("aes-gcm", true, &secret).unwrap();
             let Ok(halves) =
-                dial_session(&endpoint, random_peer_id(), &network, &secret, encryptor).await
+                dial_session(&endpoint, random_peer_id(), &network, &secret, encryptor, None).await
             else {
                 return;
             };
@@ -11515,7 +13720,7 @@ mod tests {
                 };
                 let encryptor = create_encryptor("aes-gcm", true, &secret).unwrap();
                 let Ok(halves) =
-                    dial_session(&endpoint, random_peer_id(), &network, &secret, encryptor).await
+                    dial_session(&endpoint, random_peer_id(), &network, &secret, encryptor, None).await
                 else {
                     return;
                 };
@@ -11562,14 +13767,15 @@ mod tests {
         };
         let err = serve(&cfg).await.unwrap_err().to_string();
         assert!(err.contains("nothing to accept on"), "{err}");
-        // Secure mode is the staged map.
+        // A bad secure-mode key still fails the config.
         let cfg = EasyTierConfig {
             listeners: vec!["tcp://127.0.0.1:0".into()],
             secure_mode: Some(true),
+            local_private_key: Some("not-base64!!".to_owned()),
             ..EasyTierConfig::new("et-m3-secure", "net")
         };
         let err = serve(&cfg).await.unwrap_err().to_string();
-        assert!(err.contains("PeerConnNoiseMsg1/2/3"), "{err}");
+        assert!(err.contains("local-private-key"), "{err}");
         // An unhandled listener scheme names the missing transports
         // (wg:// binds now — its hermetic listener test is below).
         let cfg = EasyTierConfig {
@@ -11582,9 +13788,11 @@ mod tests {
 
     #[tokio::test]
     async fn secure_mode_noise_first_packet_is_named() {
-        // A secure-mode client opens with NoiseHandshakeMsg1; the server
-        // handshake cites the staged map instead of a generic type error
-        // (`do_noise_handshake_as_server`, peer_conn.rs:1252-1255).
+        // A secure-mode client opens with NoiseHandshakeMsg1; a PLAIN-mode
+        // server answers the generic unexpected-type error with the cause
+        // named (upstream's `unexpected packet type during handshake`,
+        // peer_conn.rs:1277-1281 — the noise path only runs when this node
+        // is itself in secure mode, peer_conn.rs:1252).
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -11595,12 +13803,616 @@ mod tests {
         });
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let digest = network_secret_digest("net", "secret");
-        let err = handshake_as_server(&mut stream, 7, "net", &digest)
+        let err = handshake_as_server(&mut stream, 7, "net", &digest, None)
             .await
             .unwrap_err()
             .to_string();
+        assert!(err.contains("unexpected packet type during handshake: 13"), "{err}");
         assert!(err.contains("secure mode"), "{err}");
-        assert!(err.contains("Noise_XX"), "{err}");
+    }
+
+    // ------------------------------------------------ M6: secure mode
+
+    fn secure_test_ctx(network: &str, secret: &str, pinned: Option<&str>) -> SecureModeCtx {
+        SecureModeCtx::new(network, secret, "", "aes-gcm", pinned).unwrap()
+    }
+
+    #[test]
+    fn noise_wire_messages_proto_roundtrip() {
+        // The three protobufs round-trip through the engine codec,
+        // optional fields included (peer_rpc.proto:343-386).
+        let a_conn_id = uuid::Uuid::new_v4();
+        let msg1 = NoiseMsg1 {
+            version: 1,
+            a_network_name: "net-1".to_owned(),
+            a_session_generation: Some(7),
+            a_conn_id,
+            client_encryption_algorithm: "aes-gcm".to_owned(),
+        };
+        let decoded1 = NoiseMsg1::decode(&msg1.encode()).unwrap();
+        assert_eq!(decoded1, msg1);
+        assert!(decoded1.encode().len() >= 32 + 4 + 8, "uuid + varints");
+
+        let root_key: [u8; 32] = core::array::from_fn(|i| i as u8);
+        let b_conn_id = uuid::Uuid::new_v4();
+        let msg2 = NoiseMsg2 {
+            b_network_name: "net-1".to_owned(),
+            role_hint: 1,
+            action: PeerConnSessionAction::Create,
+            b_session_generation: 1,
+            root_key_32: Some(root_key),
+            initial_epoch: 0,
+            b_conn_id,
+            a_conn_id_echo: Some(a_conn_id),
+            secret_proof_32: Some(vec![0xab; 32]),
+            server_encryption_algorithm: "aes-gcm".to_owned(),
+        };
+        assert_eq!(NoiseMsg2::decode(&msg2.encode()).unwrap(), msg2);
+        // Omitted optionals decode as None (proto3).
+        let bare = NoiseMsg2 {
+            root_key_32: None,
+            secret_proof_32: None,
+            a_conn_id_echo: None,
+            ..msg2.clone()
+        };
+        let decoded = NoiseMsg2::decode(&bare.encode()).unwrap();
+        assert_eq!(decoded.root_key_32, None);
+        assert_eq!(decoded.secret_proof_32, None);
+
+        let msg3 = NoiseMsg3 {
+            a_conn_id_echo: a_conn_id,
+            b_conn_id_echo: b_conn_id,
+            secret_proof_32: Some(vec![1u8; 32]),
+            secret_digest: vec![2u8; 32],
+        };
+        assert_eq!(NoiseMsg3::decode(&msg3.encode()).unwrap(), msg3);
+        // The UUID wire form is four BE u32 varints (common.rs:14-24).
+        let parts = uuid_wire_parts(a_conn_id);
+        assert_eq!(uuid_from_wire_parts(parts), a_conn_id);
+    }
+
+    #[test]
+    fn secure_hkdf_traffic_key_matches_upstream_shape() {
+        // secure_datagram.rs:391-410: prk = HMAC-SHA256(0^32, root_key);
+        // key = HMAC(prk, "et-traffic" || epoch_be || dir || 0x01).
+        let root_key: [u8; 32] = core::array::from_fn(|i| (i * 7) as u8);
+        let session = SecureDatagramSession::new(
+            root_key,
+            1,
+            0,
+            "aes-gcm".to_owned(),
+            "aes-gcm".to_owned(),
+        );
+        // Direction 0, epoch 0x0102_0304.
+        session.sync_root_key(root_key, 1, 0x0102_0304, false);
+        let got = session.hkdf_traffic_key(0x0102_0304, SecureDirection::AToB);
+        let prk = hmac_sha256(&[0u8; 32], &[&root_key]);
+        let mut info = Vec::new();
+        info.extend_from_slice(b"et-traffic");
+        info.extend_from_slice(&0x0102_0304u32.to_be_bytes());
+        info.push(0);
+        let expected = hmac_sha256(&prk, &[&info, &[1u8]]);
+        assert_eq!(got, expected, "the HKDF info string must stay stable");
+        // Different direction derives a different key.
+        assert_ne!(
+            session.hkdf_traffic_key(0x0102_0304, SecureDirection::BToA),
+            expected
+        );
+    }
+
+    #[test]
+    fn replay_window_shift_preserves_bits() {
+        // secure_datagram.rs:906-918.
+        let mut w = ReplayWindow256::default();
+        for i in 0..10u64 {
+            assert!(w.accept(i), "seq {i} should be accepted");
+        }
+        assert_eq!(w.max_seq, 9);
+        for i in 0..10u64 {
+            assert!(!w.accept(i), "seq {i} should be rejected as replay");
+        }
+        assert!(w.accept(10));
+    }
+
+    #[test]
+    fn replay_window_out_of_order_within_window() {
+        // secure_datagram.rs:920-932.
+        let mut w = ReplayWindow256::default();
+        for i in (0..=20u64).step_by(2) {
+            assert!(w.accept(i));
+        }
+        for i in (1..=19u64).step_by(2) {
+            assert!(w.accept(i), "out-of-order within 256 must pass");
+        }
+        for i in 0..=20u64 {
+            assert!(!w.accept(i));
+        }
+    }
+
+    #[test]
+    fn secure_session_roundtrip_replay_and_tamper() {
+        // The two halves of one session exchange traffic both ways, a
+        // replayed ciphertext is rejected, and a tampered tail fails
+        // without poisoning the window (secure_datagram.rs:846-903).
+        let root_key = PeerSecureSession::new_root_key();
+        let a = PeerSecureSession::new(
+            root_key,
+            1,
+            0,
+            "aes-gcm".to_owned(),
+            "aes-gcm".to_owned(),
+            None,
+        );
+        let b = PeerSecureSession::new(
+            root_key,
+            1,
+            0,
+            "aes-gcm".to_owned(),
+            "aes-gcm".to_owned(),
+            None,
+        );
+        let a_id: PeerId = 10;
+        let b_id: PeerId = 20;
+
+        let plaintext = b"secure payload over the mesh";
+        let mut hdr = PeerManagerHeader {
+            from_peer_id: a_id,
+            to_peer_id: b_id,
+            packet_type: packet_type::DATA,
+            flags: 0,
+            forward_counter: 1,
+            reserved: 0,
+            len: plaintext.len() as u32,
+        };
+        let mut payload = plaintext.to_vec();
+        a.encrypt_payload(a_id, b_id, &mut hdr, &mut payload).unwrap();
+        assert!(hdr.is_encrypted());
+        assert_eq!(payload.len(), plaintext.len() + AEAD_TAIL_SIZE);
+        let mut decrypted_hdr = hdr;
+        let mut decrypted = payload.clone();
+        b.decrypt_payload(a_id, b_id, &mut decrypted_hdr, &mut decrypted)
+            .unwrap();
+        assert_eq!(decrypted, plaintext);
+        assert!(!decrypted_hdr.is_encrypted());
+
+        // Replaying the same ciphertext is rejected (same epoch+seq).
+        let mut replay_hdr = hdr;
+        let mut replay = payload.clone();
+        assert!(
+            b.decrypt_payload(a_id, b_id, &mut replay_hdr, &mut replay)
+                .is_err()
+        );
+
+        // A tampered nonce (far-future epoch) fails without poisoning:
+        // the next honest packet still decrypts.
+        let mut forged_hdr = hdr;
+        let mut forged = plaintext.to_vec();
+        a.encrypt_payload(a_id, b_id, &mut forged_hdr, &mut forged).unwrap();
+        let len = forged.len();
+        forged[len - 12..len - 8].copy_from_slice(&1000u32.to_be_bytes());
+        assert!(
+            b.decrypt_payload(a_id, b_id, &mut forged_hdr, &mut forged)
+                .is_err()
+        );
+        let mut next_hdr = PeerManagerHeader {
+            from_peer_id: a_id,
+            to_peer_id: b_id,
+            packet_type: packet_type::DATA,
+            flags: 0,
+            forward_counter: 1,
+            reserved: 0,
+            len: plaintext.len() as u32,
+        };
+        let mut next = plaintext.to_vec();
+        a.encrypt_payload(a_id, b_id, &mut next_hdr, &mut next).unwrap();
+        b.decrypt_payload(a_id, b_id, &mut next_hdr, &mut next).unwrap();
+        assert_eq!(next, plaintext);
+
+        // The reverse direction derives the BToA keys.
+        let mut back_hdr = PeerManagerHeader {
+            from_peer_id: b_id,
+            to_peer_id: a_id,
+            packet_type: packet_type::RPC_REQ,
+            flags: 0,
+            forward_counter: 1,
+            reserved: 0,
+            len: 4,
+        };
+        let mut back = b"ping?".to_vec();
+        b.encrypt_payload(b_id, a_id, &mut back_hdr, &mut back).unwrap();
+        a.decrypt_payload(b_id, a_id, &mut back_hdr, &mut back).unwrap();
+        assert_eq!(back, b"ping?");
+    }
+
+    #[test]
+    fn sync_root_key_grace_keeps_then_expires_old_epochs() {
+        // secure_datagram.rs:954-1000: after a same-key sync the
+        // pre-sync rx epochs stay acceptable for the 5s grace window,
+        // then expire; a CHANGED root key gets no grace.
+        let s = SecureDatagramSession::new(
+            PeerSecureSession::new_root_key(),
+            1,
+            0,
+            "aes-gcm".to_owned(),
+            "aes-gcm".to_owned(),
+        );
+        let now = secure_now_ms();
+        assert!(s.check_replay_for_test(0, 0, SecureDirection::AToB, now));
+        assert!(s.check_replay_for_test(1, 0, SecureDirection::AToB, now + 1));
+
+        let root_key = s.root_key();
+        s.sync_root_key(root_key, 2, 2, true);
+        assert!(s.check_replay_for_test(2, 0, SecureDirection::AToB, now + 2));
+        // Grace: the old epochs still accept NEW sequences.
+        assert!(s.check_replay_for_test(1, 1, SecureDirection::AToB, now + 3));
+        assert!(s.check_replay_for_test(0, 1, SecureDirection::AToB, now + 4));
+        // After the window they are gone.
+        assert!(!s.check_replay_for_test(
+            0,
+            2,
+            SecureDirection::AToB,
+            now + SYNC_RX_GRACE_AFTER_MS + 3,
+        ));
+
+        // A different root key never gets the grace window.
+        s.sync_root_key(PeerSecureSession::new_root_key(), 3, 5, true);
+        assert!(s.check_replay_for_test(5, 0, SecureDirection::AToB, now + 10));
+        assert!(!s.check_replay_for_test(2, 0, SecureDirection::AToB, now + 11));
+    }
+
+    #[test]
+    fn far_future_epoch_rejected_without_poisoning() {
+        // secure_datagram.rs:826-844.
+        let s = SecureDatagramSession::new(
+            PeerSecureSession::new_root_key(),
+            1,
+            0,
+            "aes-gcm".to_owned(),
+            "aes-gcm".to_owned(),
+        );
+        let now = secure_now_ms();
+        assert!(s.check_replay_for_test(0, 1, SecureDirection::AToB, now));
+        assert!(s.check_replay_for_test(0, 2, SecureDirection::AToB, now));
+        assert!(!s.check_replay_for_test(1000, 1, SecureDirection::AToB, now));
+        // The far-future packet did not shift the window.
+        assert!(s.check_replay_for_test(1, 1, SecureDirection::AToB, now + 1));
+        assert!(s.check_replay_for_test(1, 2, SecureDirection::AToB, now + 2));
+    }
+
+    #[test]
+    fn session_store_join_sync_create_election() {
+        // peer_session.rs:88-212: a first responder contact Creates with
+        // a fresh root key; a matching generation Joins (no key); a
+        // mismatched generation Syncs the stored key at the next epoch.
+        let store = PeerSessionStore::new();
+        let key = ("net".to_owned(), 42u32);
+
+        let first = store
+            .upsert_responder_session(key.clone(), None, "aes-gcm", "aes-gcm", None)
+            .unwrap();
+        assert_eq!(first.action, PeerConnSessionAction::Create);
+        assert_eq!(first.session_generation, 1);
+        let created_root_key = first.root_key;
+        assert!(created_root_key.is_some());
+
+        // The client installs the Create verdict.
+        let client_session = store
+            .apply_initiator_action(
+                key.clone(),
+                PeerConnSessionAction::Create,
+                first.session_generation,
+                created_root_key,
+                first.initial_epoch,
+                "aes-gcm",
+                "aes-gcm",
+                None,
+            )
+            .unwrap();
+        assert_eq!(client_session.root_key(), created_root_key.unwrap());
+
+        // Same generation claimed by the client → Join, no key material.
+        let second = store
+            .upsert_responder_session(key.clone(), Some(1), "aes-gcm", "aes-gcm", None)
+            .unwrap();
+        assert_eq!(second.action, PeerConnSessionAction::Join);
+        assert_eq!(second.root_key, None);
+
+        // Join with the wrong generation on the client side is fatal.
+        assert!(
+            store
+                .apply_initiator_action(
+                    key.clone(),
+                    PeerConnSessionAction::Join,
+                    99,
+                    None,
+                    0,
+                    "aes-gcm",
+                    "aes-gcm",
+                    None,
+                )
+                .is_err()
+        );
+
+        // A client without a generation hint (the engine's dial path)
+        // gets a Sync of the stored key.
+        let third = store
+            .upsert_responder_session(key.clone(), None, "aes-gcm", "aes-gcm", None)
+            .unwrap();
+        assert_eq!(third.action, PeerConnSessionAction::Sync);
+        assert_eq!(third.root_key, created_root_key);
+
+        // Static-key pinning: the first key sticks, a different one is
+        // rejected (peer_session.rs:296-312).
+        let pinned: [u8; 32] = core::array::from_fn(|i| i as u8);
+        store
+            .upsert_responder_session(key.clone(), Some(1), "aes-gcm", "aes-gcm", Some(pinned))
+            .unwrap();
+        let clash = store.upsert_responder_session(
+            key.clone(),
+            Some(1),
+            "aes-gcm",
+            "aes-gcm",
+            Some([9u8; 32]),
+        );
+        assert!(clash.is_err());
+    }
+
+    #[tokio::test]
+    async fn noise_handshake_roundtrip_over_duplex() {
+        // The full three-message exchange between our own client and
+        // server halves over a memory duplex: proofs verified both ways
+        // (NetworkSecretConfirmed), the responder's Create verdict
+        // installed by the client, and BOTH sides end on the same
+        // session (same root key, same generation).
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let mut client_io = client_io;
+        let mut server_io = server_io;
+        let client_ctx = secure_test_ctx("sec-net", "sec-secret", None);
+        let server_ctx = secure_test_ctx("sec-net", "sec-secret", None);
+        let server_peer_id: PeerId = 0xfeed_face;
+        let client_peer_id: PeerId = 0x1234_5678;
+
+        let server = tokio::spawn(async move {
+            let first = recv_noise_frame(&mut server_io, packet_type::NOISE_HANDSHAKE_MSG1)
+                .await
+                .unwrap();
+            noise_handshake_as_server(&mut server_io, server_peer_id, &server_ctx, first).await
+        });
+        let client =
+            noise_handshake_as_client(&mut client_io, client_peer_id, &client_ctx).await.unwrap();
+        let server = server.await.unwrap().unwrap();
+
+        assert_eq!(client.peer.peer_id, server_peer_id);
+        assert_eq!(server.peer.peer_id, client_peer_id);
+        assert_eq!(client.auth_level, SecureAuthLevel::NetworkSecretConfirmed);
+        assert_eq!(server.auth_level, SecureAuthLevel::NetworkSecretConfirmed);
+        // The Create verdict gave both sides the same root key.
+        assert_eq!(client.session.root_key(), server.session.root_key());
+        assert_eq!(
+            client.session.session_generation(),
+            server.session.session_generation()
+        );
+        // The identity digest carried in msg3 matches the plain-mode
+        // digest of the shared secret.
+        assert_eq!(
+            client.peer.network_secret_digest,
+            network_secret_digest("sec-net", "sec-secret")
+        );
+
+        // The sessions carry traffic for each other immediately.
+        let mut hdr = PeerManagerHeader {
+            from_peer_id: client_peer_id,
+            to_peer_id: server_peer_id,
+            packet_type: packet_type::DATA,
+            flags: 0,
+            forward_counter: 1,
+            reserved: 0,
+            len: 5,
+        };
+        let mut payload = b"hello".to_vec();
+        client
+            .session
+            .encrypt_payload(client_peer_id, server_peer_id, &mut hdr, &mut payload)
+            .unwrap();
+        server
+            .session
+            .decrypt_payload(client_peer_id, server_peer_id, &mut hdr, &mut payload)
+            .unwrap();
+        assert_eq!(payload, b"hello");
+    }
+
+    #[tokio::test]
+    async fn noise_handshake_rejects_wrong_secret() {
+        // A client holding a DIFFERENT network secret fails the
+        // server's proof check (verify_remote_auth rule 5).
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let mut client_io = client_io;
+        let mut server_io = server_io;
+        let client_ctx = secure_test_ctx("sec-net", "client-secret", None);
+        let server_ctx = secure_test_ctx("sec-net", "server-secret", None);
+
+        let server = tokio::spawn(async move {
+            let first = recv_noise_frame(&mut server_io, packet_type::NOISE_HANDSHAKE_MSG1)
+                .await
+                .unwrap();
+            noise_handshake_as_server(&mut server_io, 0xfeed_face, &server_ctx, first).await
+        });
+        let err = noise_handshake_as_client(&mut client_io, 0x42, &client_ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        let server_result = server.await.unwrap();
+        // Either side rejects: the client cannot verify the server's
+        // msg2 proof, the server cannot verify the client's msg3 proof.
+        assert!(
+            err.contains("authentication failed") || err.contains("proof"),
+            "client error: {err}"
+        );
+        if let Err(server_err) = server_result {
+            assert!(
+                server_err.to_string().contains("authentication failed"),
+                "server error: {server_err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn noise_handshake_pinned_key_mismatch_is_rejected() {
+        // The dial-side pin (`peer-public-key`): with no network secret
+        // the proof path cannot fire, so a pinned remote static that does
+        // not match fails the handshake (verify_remote_auth rule 2,
+        // peer_conn.rs:726-731). With a shared secret the proof wins
+        // first — upstream checks in that order (peer_conn.rs:717-743).
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let mut client_io = client_io;
+        let mut server_io = server_io;
+        let wrong_pin = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        let client_ctx = secure_test_ctx("sec-net", "", Some(&wrong_pin));
+        let server_ctx = secure_test_ctx("sec-net", "", None);
+
+        let server = tokio::spawn(async move {
+            let first = recv_noise_frame(&mut server_io, packet_type::NOISE_HANDSHAKE_MSG1)
+                .await
+                .unwrap();
+            let _ = noise_handshake_as_server(&mut server_io, 0x99, &server_ctx, first).await;
+        });
+        let err = noise_handshake_as_client(&mut client_io, 0x42, &client_ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pinned remote static pubkey mismatch"), "{err}");
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn serve_secure_mode_two_node_relay() {
+        // THE secure-mode listener proof: `serve` with secure-mode
+        // enabled, our own client dialing with a secure context — the
+        // Noise_XX handshake, the session AEAD carrying the route RPC
+        // gossip AND overlay data, ping/pong in the clear, all end to
+        // end.
+        let secret = format!("sec-{}", rand::random::<u64>());
+        let network = "sec-relay";
+        let port = 31000 + rand::random::<u16>() % 20000;
+        let cfg = EasyTierConfig {
+            listeners: vec![format!("tcp://127.0.0.1:{port}")],
+            network_secret: secret.clone(),
+            ipv4: Some("10.155.10.1/24".to_owned()),
+            dhcp: false,
+            hostname: Some("secure-serve".to_owned()),
+            secure_mode: Some(true),
+            ..EasyTierConfig::new("et-m6-secure-serve", network)
+        };
+        let server = serve(&cfg).await.unwrap();
+
+        // The secure-mode mimic client (spawn_mimic_client's secure
+        // sibling): same shape, dial_session with a SecureModeCtx.
+        let overlay: Ipv4Addr = "10.155.10.2".parse().unwrap();
+        let network_owned = network.to_owned();
+        let secret_clone = secret.clone();
+        let learned: LearnedRoutes = Arc::new(StdMutex::new(HashMap::new()));
+        let accepted = Arc::new(AtomicU32::new(0));
+        let echo_port = 9081u16;
+        tokio::spawn(async move {
+            let endpoint = PeerEndpoint {
+                transport: PeerTransport::Tcp,
+                host: "127.0.0.1".to_owned(),
+                port,
+            };
+            let ctx = SecureModeCtx::new(&network_owned, &secret_clone, "", "aes-gcm", None)
+                .unwrap();
+            let encryptor = create_encryptor("aes-gcm", true, &secret_clone).unwrap();
+            let Ok(halves) = dial_session(
+                &endpoint,
+                random_peer_id(),
+                &network_owned,
+                &secret_clone,
+                encryptor,
+                Some(&ctx),
+            )
+            .await
+            else {
+                return;
+            };
+            let mut stack = EtStack::new(
+                halves.state.my_peer_id,
+                &network_owned,
+                "secure-mimic",
+                DEFAULT_MTU,
+                Some(overlay),
+                24,
+                false,
+                vec![],
+            );
+            let (events_tx, events_rx) = mpsc::channel::<PeerEvent>(64);
+            stack.attach_session(halves, true, &events_tx);
+            run_mimic(stack, events_rx, learned, accepted, echo_port, echo_port + 1).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(15), server.wait_ready())
+            .await
+            .expect("secure-mode inbound peer did not sync in time")
+            .unwrap();
+        let nodes = server.overlay_nodes().await.unwrap();
+        assert!(
+            nodes.iter().any(|n| n.ipv4 == overlay),
+            "node table {nodes:?} lacks the secure peer {overlay}"
+        );
+        // Overlay traffic through the session AEAD both ways.
+        let target = SocketAddr::V4(SocketAddrV4::new(overlay, echo_port));
+        let mut stream =
+            tokio::time::timeout(Duration::from_secs(15), connect_tcp(&cfg, &target))
+                .await
+                .expect("dial through the secure peer")
+                .expect("connect_tcp via the secure listener");
+        stream.write_all(b"secure-relay").await.unwrap();
+        let mut buf = [0u8; 16];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"secure-relay");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn serve_secure_mode_accepts_plain_peer_too() {
+        // A secure-enabled server still accepts a PLAIN handshake
+        // (peer_conn.rs:1252-1275: the noise path only claims a msg1
+        // first packet).
+        let secret = format!("secmix-{}", rand::random::<u64>());
+        let network = "sec-mixed";
+        let port = 31000 + rand::random::<u16>() % 20000;
+        let cfg = EasyTierConfig {
+            listeners: vec![format!("tcp://127.0.0.1:{port}")],
+            network_secret: secret.clone(),
+            ipv4: Some("10.156.10.1/24".to_owned()),
+            dhcp: false,
+            hostname: Some("mixed-serve".to_owned()),
+            secure_mode: Some(true),
+            ..EasyTierConfig::new("et-m6-mixed", network)
+        };
+        let server = serve(&cfg).await.unwrap();
+        let (mimic_ip, echo_port) = spawn_mimic_client(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
+            network,
+            &secret,
+            "10.156.10.2",
+            24,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(15), server.wait_ready())
+            .await
+            .expect("plain peer did not sync in time")
+            .unwrap();
+        let target = SocketAddr::V4(SocketAddrV4::new(mimic_ip, echo_port));
+        let mut stream =
+            tokio::time::timeout(Duration::from_secs(15), connect_tcp(&cfg, &target))
+                .await
+                .expect("dial through the plain peer")
+                .expect("connect_tcp via the mixed listener");
+        stream.write_all(b"plain-still-works").await.unwrap();
+        let mut buf = [0u8; 24];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"plain-still-works");
+        server.shutdown().await;
     }
 
     /// Run the real binary with the common interop flags; returns the
@@ -11630,8 +14442,8 @@ mod tests {
     /// The SOCKS5-greeting proof used by every real-binary test: dial
     /// the binary's socks5 port through the overlay and read the
     /// no-auth method selection.
-    async fn assert_socks5_through_overlay(cfg: &EasyTierConfig) {
-        let socks5: SocketAddr = "10.126.126.1:1080".parse().unwrap();
+    async fn assert_socks5_on_overlay(cfg: &EasyTierConfig, socks5_port: u16) {
+        let socks5: SocketAddr = format!("10.126.126.1:{socks5_port}").parse().unwrap();
         let mut stream =
             tokio::time::timeout(Duration::from_secs(25), connect_tcp(cfg, &socks5))
                 .await
@@ -11641,6 +14453,13 @@ mod tests {
         let mut greeting = [0u8; 2];
         stream.read_exact(&mut greeting).await.unwrap();
         assert_eq!(&greeting, &[0x05, 0x00], "socks5 greeting");
+    }
+
+    /// [`assert_socks5_through_overlay`] at the conventional socks5 port
+    /// (the secure-mode interops bind distinct ports so their binaries
+    /// may run concurrently).
+    async fn assert_socks5_through_overlay(cfg: &EasyTierConfig) {
+        assert_socks5_on_overlay(cfg, 1080).await;
     }
 
     /// A local non-loopback IPv4 the real binary can dial. Its v2.6.4
@@ -11748,6 +14567,108 @@ mod tests {
             ..EasyTierConfig::new("et-real-udp", &network)
         };
         assert_socks5_through_overlay(&cfg).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a real easytier-core binary; set EASYTIER_BIN to enable"]
+    async fn real_easytier_binary_secure_mode_serving() {
+        // THE M6 interop (client direction): the real binary runs a
+        // secure-mode network (`--secure-mode`); our node dials it with
+        // the Noise_XX handshake, the session AEAD carries the route RPC
+        // gossip and the overlay traffic end to end.
+        let Ok(bin) = std::env::var("EASYTIER_BIN") else {
+            eprintln!("skipping: EASYTIER_BIN is not set");
+            return;
+        };
+        let network = format!("itnet-{}", rand::random::<u32>());
+        let secret = format!("itsec-{}", rand::random::<u64>());
+        let port = 31000 + rand::random::<u16>() % 20000;
+        // A random socks5 port: the interops may run concurrently and the
+        // conventional 1080 (plus any fixed port) can be taken by another
+        // test's binary or an unrelated local service.
+        let socks5_port: u16 = 21000 + rand::random::<u16>() % 20000;
+        let _child = spawn_real_binary(
+            &bin,
+            &network,
+            &secret,
+            &[
+                "-l",
+                &format!("tcp://127.0.0.1:{port}"),
+                "--secure-mode",
+                "--no-tun",
+                "-i",
+                "10.126.126.1",
+                "--hostname",
+                "real-sec-node",
+                "--socks5",
+                &socks5_port.to_string(),
+            ],
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let cfg = EasyTierConfig {
+            peers: vec![format!("tcp://127.0.0.1:{port}")],
+            network_secret: secret,
+            ipv4: Some("10.126.126.2/24".to_owned()),
+            dhcp: false,
+            hostname: Some("rustcrash-m6-sec".to_owned()),
+            secure_mode: Some(true),
+            ..EasyTierConfig::new("et-real-secure", &network)
+        };
+        assert_socks5_on_overlay(&cfg, socks5_port).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a real easytier-core binary; set EASYTIER_BIN to enable"]
+    async fn real_easytier_binary_secure_mode_dials_our_listener() {
+        // THE M6 interop (server direction): WE serve a secure-mode
+        // network; the real binary connects with `--secure-mode` and its
+        // msg1 goes through our responder handshake (Create verdict, the
+        // session AEAD from the store).
+        let Ok(bin) = std::env::var("EASYTIER_BIN") else {
+            eprintln!("skipping: EASYTIER_BIN is not set");
+            return;
+        };
+        let Some(lan_ip) = dialable_lan_ip() else {
+            eprintln!("skipping: no dialable non-loopback local IP");
+            return;
+        };
+        let network = format!("itnet-{}", rand::random::<u32>());
+        let secret = format!("itsec-{}", rand::random::<u64>());
+        let port = 31000 + rand::random::<u16>() % 20000;
+        let _child = spawn_real_binary(
+            &bin,
+            &network,
+            &secret,
+            &[
+                "-p",
+                &format!("tcp://{lan_ip}:{port}"),
+                "--secure-mode",
+                "--no-listener",
+                "--no-tun",
+                "-i",
+                "10.126.126.1",
+                "--hostname",
+                "real-sec-node",
+                "--socks5",
+                "1080",
+            ],
+        );
+        let cfg = EasyTierConfig {
+            listeners: vec![format!("tcp://0.0.0.0:{port}")],
+            network_secret: secret,
+            ipv4: Some("10.126.126.2/24".to_owned()),
+            dhcp: false,
+            hostname: Some("rustcrash-m6-serve".to_owned()),
+            secure_mode: Some(true),
+            ..EasyTierConfig::new("et-real-secure-serve", &network)
+        };
+        let server = serve(&cfg).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(25), server.wait_ready())
+            .await
+            .expect("the real secure node did not sync in time")
+            .unwrap();
+        assert_socks5_through_overlay(&cfg).await;
+        server.shutdown().await;
     }
 
     #[tokio::test]
@@ -11922,7 +14843,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let tunnel = listener.accept().await.unwrap();
             let (mut halves, peer) =
-                serve_peer_as(tunnel, 0xdead_beef, "mesh", &server_secret, encryptor)
+                serve_peer_as(tunnel, 0xdead_beef, "mesh", &server_secret, encryptor, None)
                     .await
                     .unwrap();
             assert_eq!(peer.peer_id, 0x0000_0042);
@@ -11940,6 +14861,7 @@ mod tests {
             "mesh",
             &secret,
             create_encryptor("aes-gcm", true, &secret).unwrap(),
+            None,
         )
         .await
         .unwrap();
@@ -12116,6 +15038,7 @@ mod tests {
                 "mesh",
                 &server_secret,
                 create_encryptor("aes-gcm", true, &server_secret).unwrap(),
+                None,
             )
             .await
             .unwrap();
@@ -12128,6 +15051,7 @@ mod tests {
             "mesh",
             &secret,
             create_encryptor("aes-gcm", true, &secret).unwrap(),
+            None,
         )
         .await
         .unwrap();
@@ -12535,7 +15459,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let tunnel = listener.accept().await.unwrap();
             let (mut halves, peer) =
-                serve_peer_as(tunnel, 0xdead_beef, "mesh", &server_secret, encryptor)
+                serve_peer_as(tunnel, 0xdead_beef, "mesh", &server_secret, encryptor, None)
                     .await
                     .unwrap();
             assert_eq!(peer.peer_id, 0x0000_0042);
@@ -12553,6 +15477,7 @@ mod tests {
             "mesh",
             &secret,
             create_encryptor("aes-gcm", true, &secret).unwrap(),
+            None,
         )
         .await
         .unwrap();

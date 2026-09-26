@@ -615,6 +615,81 @@ pub struct DnsConfig {
     pub proxied: bool,
 }
 
+/// `tailcfg.FilterRule` (tailcfg.go:1223-1246) — one inbound-ACL rule:
+/// "'src' is the source IPs, 'dst' is the destination ranges
+/// (IP + port). An allowed packet is then one with a source in 'src'
+/// and a destination in 'dst' for one of the protocols in 'ipproto'
+/// (empty means all)".
+///
+/// On the wire the prefixes ride as CIDR strings (Go's `IPPrefix`
+/// custom MarshalJSON, tailcfg.go:397-412) and the port ranges as
+/// `{"ip": "...", "ports": [lo, hi]}` objects. `caps` (capability
+/// grants) is carried opaquely — the filter matcher never reads it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FilterRule {
+    /// Source CIDRs ("100.64.0.1/32" style).
+    #[serde(rename = "src", default, skip_serializing_if = "Vec::is_empty")]
+    pub src: Vec<String>,
+    /// Capability grants, opaque to this port.
+    #[serde(rename = "caps", default, skip_serializing_if = "Vec::is_empty")]
+    pub caps: Vec<serde_json::Value>,
+    /// Destination IP+port ranges.
+    #[serde(rename = "dst", default, skip_serializing_if = "Vec::is_empty")]
+    pub dst: Vec<NetPortRange>,
+    /// IP protocol numbers (6 = TCP, 17 = UDP, 1 = ICMP...); empty
+    /// means all protocols.
+    #[serde(rename = "ipproto", default, skip_serializing_if = "Vec::is_empty")]
+    pub ipproto: Vec<i64>,
+}
+
+/// `tailcfg.NetPortRange` (tailcfg.go:1241-1246): one destination
+/// CIDR plus an inclusive `[lo, hi]` port window (`Ports[0] == 0 &&
+/// Ports[1] == 0` never appears on the wire — control sends the full
+/// `[0, 65535]` window for a wildcard).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetPortRange {
+    /// The destination CIDR, string form.
+    #[serde(rename = "ip", default)]
+    pub ip: String,
+    /// The inclusive port window.
+    #[serde(rename = "ports", default)]
+    pub ports: [u16; 2],
+}
+
+impl NetPortRange {
+    /// The parsed CIDR (`ip/bits`), or `None` on a malformed entry
+    /// (upstream would fail the whole map unmarshal; the matcher
+    /// treats a bad entry as never-matching instead of dropping the
+    /// filter).
+    pub fn prefix(&self) -> Option<Prefix> {
+        parse_cidr(&self.ip)
+    }
+}
+
+/// `netip.ParsePrefix`'s acceptance for the filter's string CIDRs:
+/// `ip/bits` with family-sane bits.
+fn parse_cidr(s: &str) -> Option<Prefix> {
+    let (ip, bits) = s.rsplit_once('/')?;
+    let ip: IpAddr = ip.parse().ok()?;
+    let bits: u8 = bits.parse().ok()?;
+    match ip {
+        IpAddr::V4(_) if bits <= 32 => Some(Prefix::new(ip, bits)),
+        IpAddr::V6(_) if bits <= 128 => Some(Prefix::new(ip, bits)),
+        _ => None,
+    }
+}
+
+impl FilterRule {
+    /// Does `src_ip` fall inside this rule's source prefixes?
+    pub fn src_matches(&self, src_ip: std::net::IpAddr) -> bool {
+        self.src.iter().any(|cidr| {
+            parse_cidr(cidr)
+                .map(|p| p.contains(&src_ip))
+                .unwrap_or(false)
+        })
+    }
+}
+
 /// `tailcfg.MapResponse` (tailcfg.go:2006-2200) — the fields the session
 /// applies; everything else ignored on decode.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -666,10 +741,15 @@ pub struct MapResponse {
     /// MapResponse.DNSConfig as meaning unchanged", tailcfg.go:66).
     #[serde(rename = "DNSConfig", default, skip_serializing_if = "Option::is_none")]
     pub dns_config: Option<DnsConfig>,
-    /// "the firewall rules" — carried for a future filter port, not
-    /// enforced (see the gap list).
+    /// "the firewall rules" — typed (wave 16): the tailnet packet
+    /// filter, parsed into [`FilterRule`]s and carried on the netmap
+    /// (see `NetMap::packet_filter_allows`). Enforcement semantics:
+    /// this is an INBOUND ACL (what other tailnet nodes may send us);
+    /// an outbound-only proxy never receives unsolicited traffic, so
+    /// the engine carries and exposes the rules and leaves host-side
+    /// enforcement to a listener/TUN surface.
     #[serde(rename = "PacketFilter", default, skip_serializing_if = "Option::is_none")]
-    pub packet_filter: Option<serde_json::Value>,
+    pub packet_filter: Option<Vec<FilterRule>>,
     /// "if non-zero, is the current timestamp according to the control
     /// server" (RFC3339 pass-through).
     #[serde(rename = "ControlTime", default, skip_serializing_if = "Option::is_none")]

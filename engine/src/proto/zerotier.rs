@@ -186,15 +186,36 @@
 //! class as easytier's pre-M2 state (the wire is transcribed and
 //! cross-validated, the live network is not dialed from CI).
 //!
+//! # What landed (milestone 3: direct paths, state, moons)
+//!
+//! * **Direct-path learning / NAT-t** — VERB_RENDEZVOUS (0x05, the
+//!   root's introduction) and VERB_PUSH_DIRECT_PATHS (0x10, the
+//!   trusted-peer address push) with the probe-confirm flow: a 4-byte
+//!   NAT-opener junk datagram, a plain HELLO at the candidate
+//!   address, and the armored OK(HELLO) — echoing a packet id we
+//!   await, from the probed address — confirms the path and releases
+//!   the root relay (`Peer::introduce` / `attemptToContactAt` /
+//!   `_doPUSH_DIRECT_PATHS`, IncomingPacket.cpp:736-761 + 1364-1431).
+//! * **State persistence** — `state-dir` now holds the Node.cpp state
+//!   objects: `identity.secret` (generated once, reloaded on restart
+//!   — the openvpn/wireguard state-store precedent) and
+//!   `peers.d/<addr>` (learned identities + last paths, so a restart
+//!   skips the WHOIS round trips).
+//! * **Moon gossip** — HELLO tails list pending `orbit:` seeds at
+//!   timestamp 0; the OK(HELLO) world-update block is parsed and
+//!   signed moons whose roots contain a configured seed are adopted
+//!   as extra upstreams (`Topology::addWorld` +
+//!   `shouldAcceptWorldUpdateFrom`).
+//!
 //! # What remains ([`NOT_PORTED`])
 //!
-//! Bonds/multipath policies, direct-path learning (PUSH_DIRECT_PATHS,
-//! RENDEZVOUS, NAT-t) — this port stays relayed via roots —, multicast
-//! groups (MULTICAST_LIKE/GATHER/MULTICAST_FRAME and ARP/NDP
-//! emulation), tap/L2 semantics for bridged nodes, the TCP fallback
-//! relay, on-disk state (identity/peer persistence in state-dir), SSO
-//! netconf auth, cluster verbs, QoS/flow hashing, trusted paths, and
-//! the AES-CTR extended-armor HELLO tail.
+//! Bonds/multipath policies, multicast groups (MULTICAST_LIKE/GATHER/
+//! MULTICAST_FRAME and ARP/NDP emulation), tap/L2 semantics for
+//! bridged nodes, capabilities/tags rules enforcement, SSO netconf
+//! auth, cluster verbs, QoS/flow hashing, trusted paths, and the
+//! AES-CTR extended-armor HELLO tail. The TCP fallback relay no
+//! longer exists upstream (node/, 1.14.x) — the config fields parse
+//! inertly, exactly like a current upstream node treats them.
 //!
 //! # Config surface
 //!
@@ -212,6 +233,7 @@ use crate::error::{Error, Result};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1014,10 +1036,12 @@ pub enum Verb {
     Error,
     Ok,
     Whois,
+    Rendezvous,
     Frame,
     Echo,
     NetworkConfigRequest,
     NetworkConfig,
+    PushDirectPaths,
 }
 
 impl Verb {
@@ -1028,10 +1052,14 @@ impl Verb {
             Verb::Error => 0x02,
             Verb::Ok => 0x03,
             Verb::Whois => 0x04,
+            Verb::Rendezvous => 0x05,
             Verb::Frame => 0x06,
             Verb::Echo => 0x08,
             Verb::NetworkConfigRequest => 0x0b,
             Verb::NetworkConfig => 0x0c,
+            // `VERB_PUSH_DIRECT_PATHS` (node/Packet.hpp:946 — 0x10, not
+            // the 0x07 slot VERB_EXT_FRAME occupies).
+            Verb::PushDirectPaths => 0x10,
         }
     }
 
@@ -1042,10 +1070,12 @@ impl Verb {
             0x02 => Ok(Verb::Error),
             0x03 => Ok(Verb::Ok),
             0x04 => Ok(Verb::Whois),
+            0x05 => Ok(Verb::Rendezvous),
             0x06 => Ok(Verb::Frame),
             0x08 => Ok(Verb::Echo),
             0x0b => Ok(Verb::NetworkConfigRequest),
             0x0c => Ok(Verb::NetworkConfig),
+            0x10 => Ok(Verb::PushDirectPaths),
             other => Err(Error::crypto(format!("zerotier: unknown verb 0x{other:02x}"))),
         }
     }
@@ -1608,6 +1638,23 @@ pub fn build_ok_hello(
     physical: PhysAddr,
     key: &[u8; SYMMETRIC_KEY_SIZE],
 ) -> Result<WirePacket> {
+    build_ok_hello_with_worlds(from, to_hello, hello_packet_id, to_address, physical, &[], key)
+}
+
+/// [`build_ok_hello`] with a world-update block — the responder side
+/// of `_doHELLO`'s gossip (IncomingPacket.cpp:541-557): the newest
+/// copy of a world the REQUESTER listed in its HELLO tail travels in
+/// the OK, u16-length-prefixed.
+#[allow(clippy::too_many_arguments)]
+pub fn build_ok_hello_with_worlds(
+    from: &NodeIdentity,
+    to_hello: &Hello,
+    hello_packet_id: u64,
+    to_address: u64,
+    physical: PhysAddr,
+    worlds: &[World],
+    key: &[u8; SYMMETRIC_KEY_SIZE],
+) -> Result<WirePacket> {
     let mut pkt = WirePacket::new(to_address, from.address(), Verb::Ok);
     let mut physical_bytes = Vec::new();
     physical.serialize_into(&mut physical_bytes);
@@ -1619,7 +1666,15 @@ pub fn build_ok_hello(
         .push_u8(SOFTWARE_VERSION.1)
         .push_u16(SOFTWARE_VERSION.2)
         .push_bytes(&physical_bytes)
-        .push_u16(0); // empty world-update block
+        .push_u16(0); // world-update length slot (filled below)
+    let len_at = pkt.len() - 2;
+    let mut update = Vec::new();
+    for w in worlds {
+        w.serialize(false, &mut update);
+    }
+    pkt.payload_mut().extend_from_slice(&update);
+    let total = pkt.len() - len_at - 2;
+    pkt.buf[len_at..len_at + 2].copy_from_slice(&(total as u16).to_be_bytes());
     pkt.armor(key, true);
     Ok(pkt)
 }
@@ -2360,6 +2415,200 @@ impl FragmentAssembler {
 /// payload is 5-byte addresses, as many as fit). Unarmored — callers
 /// armor (and fragment) via [`armor_and_fragment`] so the fragmented
 /// flag lands before the MAC does.
+/// `ZT_DIRECT_PATH_PUSH_INTERVAL` (node/Constants.hpp:568), ms — how
+/// often our direct paths are pushed to a peer we have **no** direct
+/// path to yet (`Peer::sendHELLO`'s push block, Peer.cpp:200-236).
+pub const DIRECT_PATH_PUSH_INTERVAL: Duration = Duration::from_millis(15_000);
+/// `ZT_DIRECT_PATH_PUSH_INTERVAL_HAVEPATH` (node/Constants.hpp:573), ms.
+pub const DIRECT_PATH_PUSH_INTERVAL_HAVEPATH: Duration = Duration::from_millis(120_000);
+/// `ZT_MIN_UNITE_INTERVAL` (node/Constants.hpp:542), ms — a root's
+/// rate limit for introducing the same (source, destination) pair
+/// (`Switch::_shouldUnite`, Switch.cpp:1079-1088).
+pub const MIN_UNITE_INTERVAL: Duration = Duration::from_millis(30_000);
+/// `ZT_PUSH_DIRECT_PATHS_FLAG_FORGET_PATH` (node/Packet.hpp:216).
+pub const PUSH_DIRECT_PATHS_FLAG_FORGET_PATH: u8 = 0x01;
+/// `ZT_PUSH_DIRECT_PATHS_FLAG_CLUSTER_REDIRECT` (node/Packet.hpp:221).
+pub const PUSH_DIRECT_PATHS_FLAG_CLUSTER_REDIRECT: u8 = 0x02;
+/// `ZT_PUSH_DIRECT_PATHS_MAX_PER_SCOPE_AND_FAMILY`
+/// (node/Constants.hpp:613) — probes honored per push, per scope and
+/// family.
+pub const PUSH_DIRECT_PATHS_MAX_PER_SCOPE: usize = 8;
+/// `ZT_PUSH_DIRECT_PATHS_CUTOFF_TIME` (node/Constants.hpp:578), ms —
+/// the rolling window of the push-receive rate gate.
+pub const PUSH_DIRECT_PATHS_CUTOFF: Duration = Duration::from_millis(30_000);
+/// `ZT_PUSH_DIRECT_PATHS_CUTOFF_LIMIT` (node/Constants.hpp:608).
+pub const PUSH_DIRECT_PATHS_CUTOFF_LIMIT: usize = 8;
+/// How long a probe's OK(HELLO) may take to land (this port's bound
+/// on the probe table; upstream keeps `Path` candidates with quality
+/// bookkeeping instead).
+pub const PROBE_TTL: Duration = Duration::from_secs(10);
+
+// ---------------------------------------------------------------------------
+// VERB_RENDEZVOUS + VERB_PUSH_DIRECT_PATHS — direct-path learning (NAT-t)
+// ---------------------------------------------------------------------------
+
+/// A `VERB_RENDEZVOUS` (0x05): a trusted upstream's introduction —
+/// "peer `zt_address` is at `sock`; go contact it directly"
+/// (`Peer::introduce`, node/Peer.cpp:291-407; parsed by
+/// `_doRENDEZVOUS`, node/IncomingPacket.cpp:736-761). Wire
+/// (`ZT_PROTO_VERB_RENDEZVOUS_IDX_*`, node/Packet.hpp:284-288):
+/// `flags(1) || zt_address(5) || port(2) || addr_len(1: 4|16) || ip`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rendezvous {
+    /// Always 0 from `Peer::introduce` (kept for 1:1 parse).
+    pub flags: u8,
+    /// The introduced peer's ZeroTier address.
+    pub zt_address: u64,
+    /// Where to reach it (one of its live physical paths).
+    pub sock: SocketAddr,
+}
+
+/// Build a RENDEZVOUS like `Peer::introduce` does — armored suite 1
+/// (encrypted; Peer.cpp:399), sent over the introducer's path to `to`.
+pub fn build_rendezvous(
+    from: &NodeIdentity,
+    to: u64,
+    msg: &Rendezvous,
+    key: &[u8; SYMMETRIC_KEY_SIZE],
+) -> WirePacket {
+    let mut pkt = WirePacket::new(to, from.address(), Verb::Rendezvous);
+    let ip: Vec<u8> = match msg.sock {
+        SocketAddr::V4(v4) => v4.ip().octets().to_vec(),
+        SocketAddr::V6(v6) => v6.ip().octets().to_vec(),
+    };
+    pkt.push_u8(msg.flags)
+        .push_bytes(&msg.zt_address.to_be_bytes()[3..8])
+        .push_u16(msg.sock.port())
+        .push_u8(if msg.sock.is_ipv4() { 4 } else { 16 })
+        .push_bytes(&ip);
+    pkt.armor(key, true);
+    pkt
+}
+
+/// Parse a (dearmored) RENDEZVOUS. Callers must gate the sender to an
+/// upstream first — `_doRENDEZVOUS` only honors introductions from
+/// roots (`isUpstream(peer->identity())`).
+pub fn parse_rendezvous(pkt: &WirePacket) -> Result<Rendezvous> {
+    let p = pkt.payload();
+    if p.len() < 10 {
+        return Err(Error::crypto("zerotier: truncated RENDEZVOUS"));
+    }
+    let flags = p[0];
+    let zt_address = be40(&p[1..6]);
+    let port = u16::from_be_bytes([p[6], p[7]]);
+    let alen = p[8] as usize;
+    if (alen != 4 && alen != 16) || p.len() < 9 + alen {
+        return Err(Error::crypto("zerotier: RENDEZVOUS bad address"));
+    }
+    let sock = match alen {
+        4 => SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(p[9], p[10], p[11], p[12]),
+            port,
+        )),
+        _ => {
+            let octets: [u8; 16] = p[9..25].try_into().unwrap();
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(octets), port, 0, 0))
+        }
+    };
+    Ok(Rendezvous { flags, zt_address, sock })
+}
+
+/// One `VERB_PUSH_DIRECT_PATHS` (0x10) record. Wire (the writer,
+/// `Peer.cpp:217-232`): `flags(1) || ext_len(2: 0) || addr_type(1:
+/// 4|6) || addr_len(1: 6|18 — ip bytes + port) || ip(4|16) || port(2)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectPath {
+    /// `ZT_PUSH_DIRECT_PATHS_FLAG_*` bits; 0 for a plain path.
+    pub flags: u8,
+    /// The advertised physical address.
+    pub sock: SocketAddr,
+}
+
+/// Build a PUSH_DIRECT_PATHS advertising `paths` — compressed and
+/// armored suite 1 exactly like the upstream sender (Peer.cpp:231-232).
+pub fn build_push_direct_paths(
+    from: &NodeIdentity,
+    to: u64,
+    paths: &[DirectPath],
+    key: &[u8; SYMMETRIC_KEY_SIZE],
+) -> WirePacket {
+    let mut pkt = WirePacket::new(to, from.address(), Verb::PushDirectPaths);
+    pkt.push_u16(paths.len() as u16);
+    for p in paths {
+        let (ty, ip): (u8, Vec<u8>) = match p.sock {
+            SocketAddr::V4(v4) => (4, v4.ip().octets().to_vec()),
+            SocketAddr::V6(v6) => (6, v6.ip().octets().to_vec()),
+        };
+        // addr_len counts ip bytes + the trailing u16 port (6 / 18).
+        pkt.push_u8(p.flags)
+            .push_u16(0)
+            .push_u8(ty)
+            .push_u8(if ty == 4 { 6 } else { 18 })
+            .push_bytes(&ip)
+            .push_u16(p.sock.port());
+    }
+    // Compressed like the upstream sender (`outp->compress()`,
+    // Peer.cpp:231) — the port's literal-run LZ4 block (the same
+    // encoder the netconf OK uses; a documented delta: no back-
+    // reference search, spec-conformant output).
+    let encoded = lz4_literal_encode(pkt.payload());
+    pkt.set_payload(&encoded);
+    pkt.set_compressed(true);
+    pkt.armor(key, true);
+    pkt
+}
+
+/// Parse a (dearmored, uncompressed-by-the-caller) PUSH_DIRECT_PATHS
+/// — the reader walk of `_doPUSH_DIRECT_PATHS`
+/// (IncomingPacket.cpp:1378-1431), including the extension skip.
+pub fn parse_push_direct_paths(pkt: &WirePacket) -> Result<Vec<DirectPath>> {
+    let p = pkt.payload();
+    if p.len() < 2 {
+        return Err(Error::crypto("zerotier: truncated PUSH_DIRECT_PATHS"));
+    }
+    let count = u16::from_be_bytes([p[0], p[1]]) as usize;
+    let mut at = 2usize;
+    let mut out = Vec::with_capacity(count.min(16));
+    for _ in 0..count {
+        if at + 3 > p.len() {
+            return Err(Error::crypto("zerotier: truncated PUSH_DIRECT_PATHS record"));
+        }
+        let flags = p[at];
+        at += 1;
+        let ext = u16::from_be_bytes([p[at], p[at + 1]]) as usize;
+        at += 2;
+        if at + ext + 2 > p.len() {
+            return Err(Error::crypto("zerotier: truncated PUSH_DIRECT_PATHS extension"));
+        }
+        at += ext;
+        let ty = p[at];
+        at += 1;
+        let alen = p[at] as usize;
+        at += 1;
+        match ty {
+            4 if at + 6 <= p.len() && alen >= 6 => {
+                let ip = Ipv4Addr::new(p[at], p[at + 1], p[at + 2], p[at + 3]);
+                let port = u16::from_be_bytes([p[at + 4], p[at + 5]]);
+                out.push(DirectPath { flags, sock: SocketAddr::V4(SocketAddrV4::new(ip, port)) });
+                at += alen;
+            }
+            6 if at + 18 <= p.len() && alen >= 18 => {
+                let octets: [u8; 16] = p[at..at + 16].try_into().unwrap();
+                let port = u16::from_be_bytes([p[at + 16], p[at + 17]]);
+                out.push(DirectPath {
+                    flags,
+                    sock: SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(octets), port, 0, 0)),
+                });
+                at += alen;
+            }
+            // Unknown family: skip the record (upstream's switch falls
+            // through the same way).
+            _ => at += alen,
+        }
+    }
+    Ok(out)
+}
+
 pub fn build_whois(from: &NodeIdentity, upstream: u64, who: u64) -> WirePacket {
     let mut pkt = WirePacket::new(upstream, from.address(), Verb::Whois);
     pkt.push_bytes(&who.to_be_bytes()[3..8]);
@@ -2662,16 +2911,24 @@ fn zt_now_ms() -> i64 {
 }
 
 /// One learned peer: identity, pairwise key, the endpoint when known
-/// (a root's comes from the planet; others' would come from direct
-/// path learning — see [`NOT_PORTED`]), and a small duplicate-packet
-/// filter (the packet-id half of Switch's RX-queue identity; replays
-/// of a whole packet are dropped like duplicate fragments are).
+/// (a root's comes from the planet; others' arrive through direct-path
+/// learning — RENDEZVOUS introductions and PUSH_DIRECT_PATHS probes),
+/// and a small duplicate-packet filter (the packet-id half of Switch's
+/// RX-queue identity; replays of a whole packet are dropped like
+/// duplicate fragments are).
 struct PeerEntry {
     identity: NodeIdentity,
     key: [u8; SYMMETRIC_KEY_SIZE],
     endpoint: Option<SocketAddr>,
     last_seen: Instant,
     recent_ids: VecDeque<u64>,
+    /// When we last pushed our direct paths to this peer
+    /// (`_lastDirectPathPushSent`, Peer.cpp:209-211's interval gate).
+    last_push_sent: Option<Instant>,
+    /// The push-receive rate gate (`rateGatePushDirectPaths`,
+    /// Peer.hpp:387-398): consecutive pushes inside the cutoff window.
+    push_recv_streak: u8,
+    last_push_recv: Option<Instant>,
 }
 
 impl PeerEntry {
@@ -2682,6 +2939,9 @@ impl PeerEntry {
             endpoint: None,
             last_seen: Instant::now(),
             recent_ids: VecDeque::new(),
+            last_push_sent: None,
+            push_recv_streak: 0,
+            last_push_recv: None,
         }
     }
 
@@ -3004,9 +3264,33 @@ struct ZtStack {
     /// queue: smoltcp may emit SYNs the moment addresses exist, but a
     /// fast dial can outrun the join).
     prejoin_tx: VecDeque<Vec<u8>>,
+    /// Adopted moon worlds (Topology::_moons) — extra upstreams once
+    /// their signed definitions arrive (the OK(HELLO) world-update
+    /// block).
+    moons: Vec<World>,
+    /// Pending moon seeds (`Topology::_moonSeeds`): (world id, seed
+    /// address) from the config's `orbit:` entries, consumed when the
+    /// matching signed world lands.
+    moon_seeds: Vec<(u64, u64)>,
+    /// Our external surface as a trusted peer observed it — the
+    /// OK(HELLO) `physical` field (SelfAwareness's whoami input,
+    /// IncomingPacket.cpp:531-539). What PUSH_DIRECT_PATHS advertises.
+    my_surface: Option<SocketAddr>,
+    /// The socket's local address (the LAN-scope path we advertise).
+    local_addr: Option<SocketAddr>,
+    /// Probes in flight: (peer, candidate address) → when sent. Only
+    /// an OK(HELLO) arriving physically from a probed address confirms
+    /// a direct path — a relayed OK arrives from the ROOT's address
+    /// and must not become the peer's endpoint (upstream records the
+    /// physical arrival path the same way, `Peer::gotPacket`).
+    probing: HashMap<(u64, SocketAddr), Instant>,
+    /// The state store, when `state-dir` is usable (identity + peer
+    /// persistence across restarts).
+    state: Option<NodeStateStore>,
 }
 
 impl ZtStack {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         identity: NodeIdentity,
         world: World,
@@ -3014,6 +3298,9 @@ impl ZtStack {
         path_mtu: usize,
         udp_enabled: bool,
         wake: Arc<Notify>,
+        orbit: Vec<(u64, u64)>,
+        local_addr: Option<SocketAddr>,
+        state: Option<NodeStateStore>,
     ) -> Self {
         let mut shim = Shim::new(DEFAULT_NETWORK_MTU);
         let mut iface_cfg = IfaceConfig::new(HardwareAddress::Ip);
@@ -3049,6 +3336,12 @@ impl ZtStack {
             last_root_hello: Instant::now(),
             pump_buf: vec![0u8; ZT_PUMP_CHUNK],
             prejoin_tx: VecDeque::new(),
+            moons: Vec::new(),
+            moon_seeds: orbit,
+            my_surface: None,
+            local_addr,
+            probing: HashMap::new(),
+            state,
         }
     }
 
@@ -3069,28 +3362,105 @@ impl ZtStack {
         }
     }
 
-    /// The root peers of our planet, in planet order (`Topology`
-    /// seeds its root peer set from exactly these).
+    /// The root peers of our planet **and adopted moons**, in world
+    /// order (`Topology::_memoizeUpstreams` seeds its root peer set
+    /// from exactly these — planet roots first, then moon roots).
     fn root_endpoints(&self) -> Vec<(u64, NodeIdentity, SocketAddr)> {
-        self.world
-            .roots
-            .iter()
-            .filter_map(|r| {
-                let ep = r.endpoints.iter().find_map(|e| e.to_socket_addr())?;
-                Some((r.identity.address(), r.identity.clone(), ep))
-            })
-            .collect()
+        let mut out = Vec::new();
+        for world in [&self.world].into_iter().chain(self.moons.iter()) {
+            for r in &world.roots {
+                if let Some(ep) = r.endpoints.iter().find_map(|e| e.to_socket_addr()) {
+                    out.push((r.identity.address(), r.identity.clone(), ep));
+                }
+            }
+        }
+        out
+    }
+
+    /// Is `addr` an upstream — a planet root or a moon root
+    /// (`Topology::isUpstream`)? Gates RENDEZVOUS acceptance and world
+    /// updates.
+    fn is_upstream(&self, addr: u64) -> bool {
+        self.root_endpoints().iter().any(|(a, _, _)| *a == addr)
+            || self.moon_seeds.iter().any(|(_, seed)| *seed == addr)
+    }
+
+    /// The HELLO moon tail: adopted moons (id, timestamp) plus pending
+    /// seeds at timestamp 0 — "we want this world" (`Peer::sendHELLO`
+    /// lists both the same way; a zero timestamp makes any holder of a
+    /// newer copy send it back in the OK(HELLO) world-update block).
+    fn moon_tail(&self) -> Vec<(u64, u64)> {
+        let mut out: Vec<(u64, u64)> = self.moons.iter().map(|m| (m.id, m.timestamp)).collect();
+        for (world, _) in &self.moon_seeds {
+            if !out.iter().any(|(id, _)| id == world) {
+                out.push((*world, 0));
+            }
+        }
+        out
     }
 
     fn learn_peer(&mut self, identity: NodeIdentity, endpoint: Option<SocketAddr>) {
         let key = self.identity.agree(&identity).unwrap_or([0u8; SYMMETRIC_KEY_SIZE]);
-        let entry = self
-            .peers
-            .entry(identity.address())
-            .or_insert_with(|| PeerEntry::new(identity.clone(), key));
-        entry.last_seen = Instant::now();
-        if let Some(ep) = endpoint {
-            entry.endpoint = Some(ep);
+        match self.peers.entry(identity.address()) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                // New identity: persist it (`Topology::_savePeer` —
+                // best-effort, failure only costs a WHOIS on restart).
+                if let Some(state) = &self.state {
+                    state.save_peer(&identity, endpoint);
+                }
+                let mut entry = PeerEntry::new(identity, key);
+                entry.endpoint = endpoint;
+                slot.insert(entry);
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                let entry = slot.get_mut();
+                entry.last_seen = Instant::now();
+                if let Some(ep) = endpoint {
+                    if entry.endpoint != Some(ep) {
+                        if let Some(state) = &self.state {
+                            state.save_peer(&entry.identity, Some(ep));
+                        }
+                    }
+                    entry.endpoint = Some(ep);
+                }
+            }
+        }
+    }
+
+    /// `Peer::attemptToContactAt` — the NAT-t probe: a 4-byte junk
+    /// datagram to open the local NAT/stateful firewall, then a plain
+    /// suite-0 HELLO straight at the candidate address. The peer's
+    /// OK(HELLO) reply, armored under the pairwise key and echoing a
+    /// packet id we await, confirms the path.
+    async fn attempt_contact(&mut self, socket: &UdpSocket, dest: u64, at: SocketAddr) {
+        let Some(peer) = self.peers.get(&dest) else { return };
+        let key = peer.key;
+        // `_doRENDEZVOUS`'s junk packet (IncomingPacket.cpp:757-758).
+        // Delta: upstream sends it with TTL 2; the port has no
+        // per-packet TTL knob on the shared socket, and the opener's
+        // purpose (open the local NAT) is served at default TTL.
+        let junk = rand::random::<u32>();
+        let _ = socket.send_to(&junk.to_be_bytes(), at).await;
+        // Bounded probe bookkeeping (see `probing`).
+        if self.probing.len() > 128 {
+            let now = Instant::now();
+            self.probing.retain(|_, at_instant| now.duration_since(*at_instant) < PROBE_TTL);
+        }
+        self.probing.insert((dest, at), Instant::now());
+        let moons = self.moon_tail();
+        if let Ok(hello) = build_hello(
+            &self.identity,
+            dest,
+            PhysAddr::from_socket_addr(at),
+            (self.world.id, self.world.timestamp),
+            &moons,
+            zt_now_ms(),
+            &key,
+        ) {
+            self.expecting.insert(hello.packet_id());
+            if let Err(e) = socket.send_to(hello.as_bytes(), at).await {
+                tracing::debug!(target: "engine", "zt: probe to {at} failed: {e}");
+            }
         }
     }
 
@@ -3230,12 +3600,13 @@ impl ZtStack {
         self.learn_peer(identity, Some(ep));
         self.last_root_hello = Instant::now();
         let key = self.peers[&addr].key;
+        let moons = self.moon_tail();
         let hello = build_hello(
             &self.identity,
             addr,
             PhysAddr::from_socket_addr(ep),
             (self.world.id, self.world.timestamp),
-            &[],
+            &moons,
             zt_now_ms(),
             &key,
         );
@@ -3330,6 +3701,16 @@ impl ZtStack {
                 self.request_whois(socket, spec).await;
             }
         }
+        // WHOIS pending moon seeds through the roots too — a live seed
+        // answers with its identity, and the root's RENDEZVOUS
+        // introduction (or a relayed frame meeting it) hands us the
+        // path whose OK(HELLO) carries the signed moon world
+        // (Topology::_moonSeeds + shouldAcceptWorldUpdateFrom).
+        for (_, seed) in self.moon_seeds.clone() {
+            if !self.peers.contains_key(&seed) {
+                self.request_whois(socket, seed).await;
+            }
+        }
         let queued: Vec<Vec<u8>> = self.prejoin_tx.drain(..).collect();
         for pkt in queued {
             self.send_frame(socket, &pkt).await;
@@ -3398,20 +3779,21 @@ impl ZtStack {
             tracing::debug!(target: "engine", "zt: uncompress failed: {e}");
             return;
         }
-        self.dispatch(socket, pkt).await;
+        self.dispatch(socket, pkt, from).await;
     }
 
     /// Verb dispatch (`IncomingPacket::tryDecode`'s switch) — the
     /// subset this node speaks (HELLO is handled pre-dispatch, where
-    /// the peer is learned).
-    async fn dispatch(&mut self, socket: &UdpSocket, pkt: WirePacket) {
+    /// the peer is learned). `from` is the physical source — the
+    /// direct-path confirmation signal for OK(HELLO).
+    async fn dispatch(&mut self, socket: &UdpSocket, pkt: WirePacket, from: SocketAddr) {
         let verb = match pkt.verb() {
             Ok(v) => v,
             Err(_) => return,
         };
         let source = pkt.source();
         match verb {
-            Verb::Ok => self.on_ok(socket, pkt).await,
+            Verb::Ok => self.on_ok(socket, pkt, from).await,
             Verb::Whois => self.on_whois(socket, pkt).await,
             Verb::Echo => {
                 // `_doECHO`: OK echoing the payload verbatim.
@@ -3422,6 +3804,8 @@ impl ZtStack {
                     .push_bytes(&payload);
                 self.send_packet(socket, ok, source).await;
             }
+            Verb::Rendezvous => self.on_rendezvous(socket, pkt).await,
+            Verb::PushDirectPaths => self.on_push_direct_paths(socket, pkt).await,
             Verb::Frame => {
                 let Ok(frame) = parse_frame(&pkt) else { return };
                 if frame.network_id != self.network_id {
@@ -3439,6 +3823,194 @@ impl ZtStack {
                 }
             }
             Verb::Error | Verb::Hello | Verb::NetworkConfig | Verb::NetworkConfigRequest | Verb::Nop => {}
+        }
+    }
+
+    /// `_doRENDEZVOUS` (IncomingPacket.cpp:736-761): only a trusted
+    /// upstream may introduce; the introduced peer must already be
+    /// known (we WHOIS every specialist before frames flow); then the
+    /// NAT-t probe fires at the given address.
+    async fn on_rendezvous(&mut self, socket: &UdpSocket, pkt: WirePacket) {
+        let source = pkt.source();
+        if !self.is_upstream(source) {
+            return;
+        }
+        let Ok(rd) = parse_rendezvous(&pkt) else {
+            return;
+        };
+        if rd.sock.port() == 0 || !self.peers.contains_key(&rd.zt_address) {
+            return;
+        }
+        tracing::debug!(
+            target: "engine",
+            "zt: rendezvous — peer {:010x} at {}/{}, probing direct",
+            rd.zt_address,
+            rd.sock.ip(),
+            rd.sock.port()
+        );
+        self.attempt_contact(socket, rd.zt_address, rd.sock).await;
+    }
+
+    /// `_doPUSH_DIRECT_PATHS` (IncomingPacket.cpp:1364-1431): the
+    /// rate gate, then probe every advertised address we do not
+    /// already have a path to (up to the per-scope cap). FORGET_PATH
+    /// and CLUSTER_REDIRECT records are skipped — neither is sent on a
+    /// client mesh (cluster redirect is root-cluster machinery).
+    async fn on_push_direct_paths(&mut self, socket: &UdpSocket, pkt: WirePacket) {
+        let source = pkt.source();
+        let now = Instant::now();
+        {
+            let Some(peer) = self.peers.get_mut(&source) else { return };
+            let streak = match peer.last_push_recv {
+                Some(at) if now.duration_since(at) < PUSH_DIRECT_PATHS_CUTOFF => {
+                    peer.push_recv_streak + 1
+                }
+                _ => 0,
+            };
+            peer.last_push_recv = Some(now);
+            peer.push_recv_streak = streak;
+            if streak >= PUSH_DIRECT_PATHS_CUTOFF_LIMIT as u8 {
+                return; // rateGatePushDirectPaths: drop the push
+            }
+        }
+        let Ok(paths) = parse_push_direct_paths(&pkt) else { return };
+        let current = self.peers.get(&source).and_then(|p| p.endpoint);
+        let mut probed = 0usize;
+        for p in paths {
+            if p.flags
+                & (PUSH_DIRECT_PATHS_FLAG_FORGET_PATH | PUSH_DIRECT_PATHS_FLAG_CLUSTER_REDIRECT)
+                != 0
+            {
+                continue;
+            }
+            if p.sock.port() == 0 || Some(p.sock) == current {
+                continue;
+            }
+            if probed >= PUSH_DIRECT_PATHS_MAX_PER_SCOPE {
+                break;
+            }
+            probed += 1;
+            self.attempt_contact(socket, source, p.sock).await;
+        }
+    }
+
+    /// Send our PUSH_DIRECT_PATHS to `dest` — `Peer::sendHELLO`'s
+    /// push block (Peer.cpp:200-236): trusted peers get our address
+    /// set (the socket's local address + our observed external
+    /// surface) at the HAVEPATH interval once a path exists, the short
+    /// interval before that.
+    async fn push_direct_paths_to(&mut self, socket: &UdpSocket, dest: u64) {
+        let now = Instant::now();
+        let key = {
+            let Some(peer) = self.peers.get_mut(&dest) else { return };
+            let interval = if peer.endpoint.is_some() {
+                DIRECT_PATH_PUSH_INTERVAL_HAVEPATH
+            } else {
+                DIRECT_PATH_PUSH_INTERVAL
+            };
+            if let Some(at) = peer.last_push_sent {
+                if now.duration_since(at) < interval {
+                    return;
+                }
+            }
+            peer.last_push_sent = Some(now);
+            peer.key
+        };
+        let mut paths: Vec<DirectPath> = Vec::new();
+        for cand in [self.local_addr, self.my_surface].into_iter().flatten() {
+            if cand.port() != 0 && !cand.ip().is_unspecified() && !paths.iter().any(|p| p.sock == cand)
+            {
+                paths.push(DirectPath { flags: 0, sock: cand });
+            }
+        }
+        if paths.is_empty() {
+            return;
+        }
+        let pkt = build_push_direct_paths(&self.identity, dest, &paths, &key);
+        let via = self
+            .peers
+            .get(&dest)
+            .and_then(|p| p.endpoint)
+            .or_else(|| self.root_endpoints().first().map(|(_, _, ep)| *ep));
+        if let Some(via) = via {
+            if let Err(e) = socket.send_to(pkt.as_bytes(), via).await {
+                tracing::debug!(target: "engine", "zt: push-direct-paths send failed: {e}");
+            }
+        }
+    }
+
+    /// Adopt a world from an OK(HELLO) world-update block
+    /// (`Topology::addWorld` + `shouldAcceptWorldUpdateFrom`,
+    /// Topology.cpp:162-172, 229-281): planets only from planet roots
+    /// and only newer copies of OUR planet; moons when the signature
+    /// verifies, the id matches a pending seed, and the roots contain
+    /// that seed. The seed is consumed on adoption.
+    fn adopt_worlds(&mut self, from: u64, block: &[u8]) {
+        let is_planet_root = self.world.roots.iter().any(|r| r.identity.address() == from);
+        let mut at = 0usize;
+        while at < block.len() {
+            match World::from_bytes(&block[at..]) {
+                Ok((world, used)) if used > 0 => {
+                    at += used;
+                    if world.world_type == WORLD_TYPE_MOON && world.signature_is_valid() {
+                        // `shouldAcceptWorldUpdateFrom` (Topology.cpp:
+                        // 162-172): the update must come from a planet
+                        // root or the pending seed itself — the seed
+                        // gate is what binds a self-signed moon world
+                        // to the operator's configured seed identity.
+                        let sender_ok = is_planet_root
+                            || self
+                                .moon_seeds
+                                .iter()
+                                .any(|(id, seed)| *id == world.id && *seed == from)
+                            || self.moons.iter().any(|m| {
+                                m.id == world.id
+                                    && m.roots.iter().any(|r| r.identity.address() == from)
+                            });
+                        if !sender_ok {
+                            continue;
+                        }
+                        let seeds = self.moon_seeds.clone();
+                        if let Some((idx, _)) = seeds.iter().enumerate().find(|(_, (id, seed))| {
+                            *id == world.id
+                                && world.roots.iter().any(|r| r.identity.address() == *seed)
+                        }) {
+                            let (world_id, _) = seeds[idx];
+                            self.moon_seeds.remove(idx);
+                            // Only accept newer copies of an adopted moon.
+                            if !self
+                                .moons
+                                .iter()
+                                .any(|m| m.id == world_id && m.timestamp >= world.timestamp)
+                            {
+                                self.moons.retain(|m| m.id != world_id);
+                                tracing::debug!(
+                                    target: "engine",
+                                    "zt: adopted moon world {:016x} ({} roots)",
+                                    world.id,
+                                    world.roots.len()
+                                );
+                                for r in &world.roots {
+                                    if let Some(ep) =
+                                        r.endpoints.iter().find_map(|e| e.to_socket_addr())
+                                    {
+                                        self.learn_peer(r.identity.clone(), Some(ep));
+                                    }
+                                }
+                                self.moons.push(world);
+                            }
+                        }
+                    } else if world.world_type == WORLD_TYPE_PLANET
+                        && is_planet_root
+                        && world.id == self.world.id
+                        && world.timestamp > self.world.timestamp
+                        && world.signature_is_valid()
+                    {
+                        self.world = world;
+                    }
+                }
+                _ => break, // trailing garbage: stop adopting
+            }
         }
     }
 
@@ -3514,7 +4086,7 @@ impl ZtStack {
 
     /// `_doOK`: correlate the in-re packet id against what we await,
     /// then handle the HELLO/WHOIS/NET_CONFIG_REQUEST variants.
-    async fn on_ok(&mut self, socket: &UdpSocket, mut pkt: WirePacket) {
+    async fn on_ok(&mut self, socket: &UdpSocket, mut pkt: WirePacket, from: SocketAddr) {
         match ok_in_re_packet_id(&pkt) {
             Ok(id) if self.expecting.remove(&id) => {}
             _ => return, // not expecting a reply to this — drop
@@ -3523,14 +4095,51 @@ impl ZtStack {
         match Verb::from_byte(in_re_verb) {
             Ok(Verb::Hello) => {
                 let source = pkt.source();
+                // The OK's `physical` field is OUR address as the
+                // replier sees it — SelfAwareness's whoami input
+                // (IncomingPacket.cpp:531-539): what we advertise in
+                // PUSH_DIRECT_PATHS.
+                if let Ok(ok) = parse_ok_hello(&pkt) {
+                    if let Some(ep) = ok.physical.to_socket_addr() {
+                        self.my_surface = Some(ep);
+                    }
+                    // Moon/planet world updates ride the same block
+                    // (`_doHELLO`'s worldUpdate, IncomingPacket.cpp:541-557).
+                    if let Some(block) = ok.world_update {
+                        self.adopt_worlds(source, &block);
+                    }
+                }
+                // A direct path is CONFIRMED when the reply arrives
+                // physically from an address we probed: the packet
+                // dearmored under the pairwise key (authentic) and
+                // echoes a packet id we were expecting (not a replay).
+                // A reply that arrives RELAYED (physically from the
+                // root) proves only the relay — upstream records the
+                // arrival path the same way (`Peer::gotPacket`).
+                let confirmed_direct = self.probing.remove(&(source, from)).is_some();
                 if let Some(peer) = self.peers.get_mut(&source) {
                     peer.last_seen = Instant::now();
+                    if confirmed_direct && peer.endpoint != Some(from) {
+                        peer.endpoint = Some(from);
+                        if let Some(state) = &self.state {
+                            state.save_peer(&peer.identity, Some(from));
+                        }
+                        tracing::debug!(
+                            target: "engine",
+                            "zt: direct path confirmed — peer {:010x} at {} (relay released)",
+                            source,
+                            from
+                        );
+                    }
                 }
                 // The root path is proven; move the join along.
                 if matches!(self.join, Join::HelloRoot { .. }) {
                     self.join = Join::Netconf { at: self.std_now(), attempts: 0 };
                     self.send_netconf_request(socket).await;
                 }
+                // Trust established → tell this peer where we are
+                // (Peer::sendHELLO's push block).
+                self.push_direct_paths_to(socket, source).await;
             }
             Ok(Verb::Whois) => {
                 let Ok(ids) = parse_ok_whois(&pkt) else { return };
@@ -3865,6 +4474,11 @@ impl ZtStack {
     async fn on_timer(&mut self, socket: &UdpSocket) {
         self.drive_join(socket).await;
         self.frags.expire();
+        // Expire unanswered probes.
+        if !self.probing.is_empty() {
+            let now = Instant::now();
+            self.probing.retain(|_, at| now.duration_since(*at) < PROBE_TTL);
+        }
         // `ZT_PATH_HEARTBEAT_PERIOD`: keep the root path alive with a
         // periodic HELLO once joined (the reply doubles as the ack).
         if matches!(self.join, Join::Applied)
@@ -3982,6 +4596,10 @@ fn zt_cache_key(cfg: &ZeroTierConfig) -> String {
         cfg.planet.as_deref().unwrap_or(""),
         &cfg.primary_port.to_string(),
         &cfg.physical_mtu.to_string(),
+        // The state dir participates: two configs over one network
+        // with different state dirs are different nodes (different
+        // persisted identities).
+        &cfg.effective_state_dir(),
     ]
     .join("\u{1f}")
 }
@@ -3998,14 +4616,25 @@ async fn zt_tunnel_for(cfg: &ZeroTierConfig) -> Result<mpsc::Sender<ZtCmd>> {
     }
     let network_id = parse_network_id(&cfg.network)?;
 
-    // The identity: from config when provided, generated (PoW search)
-    // otherwise — `Node::New` does exactly this against its state store.
+    // The state store under state-dir (the Node.cpp state objects).
+    // Opening it fails loudly — a state-dir that cannot exist is a
+    // config error, never a silent degradation.
+    let state = NodeStateStore::open(&cfg.effective_state_dir())?;
+
+    // The identity: from config when provided (explicit wins, like
+    // mihomo's identity-secret), else the persisted one, else a fresh
+    // PoW search persisted on the spot — `Node::New` against its
+    // state store, exactly.
     let identity = match &cfg.identity_secret {
-        Some(secret) => NodeIdentity::from_str_form(secret)?,
-        None => {
-            tracing::debug!(target: "engine", "zt: no identity-secret, generating (PoW search)");
-            NodeIdentity::generate()?
+        Some(secret) => {
+            let id = NodeIdentity::from_str_form(secret)?;
+            // The state store holds the node's identity regardless of
+            // where it came from (`Node`'s ZT_STATE_OBJECT_IDENTITY
+            // write) — a restart without the config field reuses it.
+            state.save_identity(&id)?;
+            id
         }
+        None => state.load_or_create_identity()?,
     };
 
     // The planet: the operator's file, else the built-in Earth world
@@ -4017,6 +4646,13 @@ async fn zt_tunnel_for(cfg: &ZeroTierConfig) -> Result<mpsc::Sender<ZtCmd>> {
     };
     let world = World::parse_planet(&planet_bytes)?;
 
+    // The orbit entries (moons): pending (world id, seed address)
+    // pairs until each signed world arrives (`Topology::orbit`).
+    let mut orbit = Vec::new();
+    for entry in &cfg.orbit {
+        orbit.push((entry.world, parse_node_address(&entry.seed)?));
+    }
+
     let bind = if cfg.primary_port > 0 && cfg.primary_port <= 65535 {
         format!("0.0.0.0:{}", cfg.primary_port)
     } else {
@@ -4027,6 +4663,10 @@ async fn zt_tunnel_for(cfg: &ZeroTierConfig) -> Result<mpsc::Sender<ZtCmd>> {
             .await
             .map_err(|e| Error::network(format!("zerotier: bind udp: {e}")))?,
     );
+    let local_addr = match socket.local_addr() {
+        Ok(sa) if !sa.ip().is_unspecified() => Some(sa),
+        _ => None,
+    };
     // The path MTU: the config's physical-mtu, else the ZT default.
     let path_mtu = if cfg.physical_mtu > 0 {
         cfg.physical_mtu as usize
@@ -4034,7 +4674,23 @@ async fn zt_tunnel_for(cfg: &ZeroTierConfig) -> Result<mpsc::Sender<ZtCmd>> {
         DEFAULT_PHYSICAL_MTU
     };
     let wake = Arc::new(Notify::new());
-    let stack = ZtStack::new(identity, world, network_id, path_mtu, cfg.udp, wake.clone());
+    let mut stack = ZtStack::new(
+        identity,
+        world,
+        network_id,
+        path_mtu,
+        cfg.udp,
+        wake.clone(),
+        orbit,
+        local_addr,
+        Some(state),
+    );
+    // Reload persisted peers (`Node::New`'s ZT_STATE_OBJECT_PEER
+    // pass): identities re-derive their pairwise keys via `agree`, so
+    // a restart skips the WHOIS round trips for previously met peers.
+    for (peer_id, endpoint) in stack.state.as_ref().expect("state present").load_peers() {
+        stack.learn_peer(peer_id, endpoint);
+    }
     let (tx, rx) = mpsc::channel::<ZtCmd>(64);
     let task_socket = socket.clone();
     tokio::spawn(async move {
@@ -4428,35 +5084,179 @@ impl ZeroTierConfig {
     }
 }
 
-/// What still separates this port from a full ZeroTier node (the wire
-/// core and the node runtime — planet, UDP loop, WHOIS, relay,
-/// fragmentation, netconf→smoltcp, the dial — are rust-native, see
-/// [`MILESTONE_1`]/[`MILESTONE_2`]):
+// ---------------------------------------------------------------------------
+// On-disk node state (state-dir): identity + peer persistence
+// ---------------------------------------------------------------------------
+
+/// The name upstream stores the node identity under
+/// (`ZT_STATE_OBJECT_IDENTITY` → `identity.secret`, node/Node.cpp's
+/// stateObjectPut; the content is `zerotier-idtool`'s textual secret
+/// form — exactly [`NodeIdentity::to_secret_str`]).
+pub const STATE_FILE_IDENTITY: &str = "identity.secret";
+/// The peer-cache directory (`ZT_STATE_OBJECT_PEER` → `peers.d/<hex>`,
+/// node/Topology.cpp:423-435 `_savePeer`).
+pub const STATE_DIR_PEERS: &str = "peers.d";
+
+/// The node's persistent state under `state-dir` — the bounded
+/// `Node.cpp` state objects: the identity survives restarts (the
+/// openvpn/wireguard state-store precedent in this engine), and
+/// learned peers are cached the way `Topology::_savePeer` caches them
+/// (identity + last path) so a restart skips the WHOIS round trips.
 ///
-/// * direct-path learning and NAT-t (PUSH_DIRECT_PATHS, RENDEZVOUS,
-///   port prediction) — every packet currently travels through a
-///   planet root, the legitimate-but-slow relay path;
-/// * multipath/bonding policies (`node/Bond.cpp`), QoS/flow hashing;
+/// Deltas vs upstream (documented, wire-invisible): one file per peer
+/// instead of `Peer::serializeForCache`'s full path-quality block, and
+/// pairwise keys are never written (they re-derive from the two
+/// identities via [`NodeIdentity::agree`], upstream re-derives the
+/// same way).
+pub struct NodeStateStore {
+    dir: PathBuf,
+}
+
+impl NodeStateStore {
+    /// Open (and create) the state directory. Fails loudly — a
+    /// configured state-dir that cannot exist is a config error, not a
+    /// silent degradation (the audit's standing rule).
+    pub fn open(dir: &str) -> Result<Self> {
+        let dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| Error::config(format!("zerotier: state-dir {dir:?}: {e}")))?;
+        Ok(NodeStateStore { dir })
+    }
+
+    fn identity_path(&self) -> PathBuf {
+        self.dir.join(STATE_FILE_IDENTITY)
+    }
+
+    fn peers_dir(&self) -> PathBuf {
+        self.dir.join(STATE_DIR_PEERS)
+    }
+
+    /// The node identity: loaded from `identity.secret` when present
+    /// and valid, freshly generated (the PoW search) and persisted
+    /// otherwise — `Node`'s identity lifecycle against its state
+    /// store. A corrupt file fails loudly rather than silently
+    /// re-keying the node.
+    pub fn load_or_create_identity(&self) -> Result<NodeIdentity> {
+        match std::fs::read_to_string(self.identity_path()) {
+            Ok(raw) => self.load_identity_from(&raw),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let id = NodeIdentity::generate()?;
+                self.save_identity(&id)?;
+                Ok(id)
+            }
+            Err(e) => Err(Error::config(format!(
+                "zerotier: read {}: {e}",
+                self.identity_path().display()
+            ))),
+        }
+    }
+
+    /// Parse + validate an identity file's contents.
+    fn load_identity_from(&self, raw: &str) -> Result<NodeIdentity> {
+        let id = NodeIdentity::from_str_form(raw.trim())?;
+        if !id.locally_validate() {
+            return Err(Error::config(
+                "zerotier: state identity.secret failed hashcash validation",
+            ));
+        }
+        Ok(id)
+    }
+
+    /// Persist the node identity (write-then-rename: a half-written
+    /// identity file must never shadow a good one — the fakeip
+    /// store's atomic precedent).
+    pub fn save_identity(&self, id: &NodeIdentity) -> Result<()> {
+        let secret = id.to_secret_str()?;
+        let tmp = self.dir.join(format!(".identity.secret.{}", std::process::id()));
+        std::fs::write(&tmp, secret.as_bytes())
+            .map_err(|e| Error::config(format!("zerotier: write identity: {e}")))?;
+        std::fs::rename(&tmp, self.identity_path())
+            .map_err(|e| Error::config(format!("zerotier: commit identity: {e}")))?;
+        Ok(())
+    }
+
+    /// Every persisted peer: the identity (public half) and its
+    /// last-known endpoint, when one was ever learned.
+    pub fn load_peers(&self) -> Vec<(NodeIdentity, Option<SocketAddr>)> {
+        let Ok(entries) = std::fs::read_dir(self.peers_dir()) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let Ok(raw) = std::fs::read(entry.path()) else { continue };
+            let Ok((identity, used)) = NodeIdentity::deserialize_bin(&raw) else { continue };
+            if !identity.locally_validate() || used != 71 {
+                continue; // cache poison / non-public form: drop the entry
+            }
+            let endpoint = if raw.len() > used {
+                PhysAddr::deserialize_from(&raw, used).ok().and_then(|(a, _)| a.to_socket_addr())
+            } else {
+                None
+            };
+            out.push((identity, endpoint));
+        }
+        out
+    }
+
+    /// Persist one peer (best-effort — a cache write failure logs and
+    /// keeps the node running, exactly like upstream's `_savePeer`
+    /// `catch (...) {}`).
+    pub fn save_peer(&self, identity: &NodeIdentity, endpoint: Option<SocketAddr>) {
+        let dir = self.peers_dir();
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let mut buf = identity.serialize_bin(false);
+        if let Some(ep) = endpoint {
+            PhysAddr::from_socket_addr(ep).serialize_into(&mut buf);
+        }
+        let path = dir.join(format!("{:010x}", identity.address()));
+        let tmp = dir.join(format!(".{:010x}.{}", identity.address(), std::process::id()));
+        if std::fs::write(&tmp, &buf).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+}
+
+/// What still separates this port from a full ZeroTier node after
+/// wave 16 (the wire core, the node runtime, direct-path learning
+/// with NAT-t, state persistence and moon gossip are rust-native —
+/// see [`MILESTONE_1`]/[`MILESTONE_2`]/[`MILESTONE_3`]):
+///
 /// * multicast groups (MULTICAST_LIKE/GATHER/MULTICAST_FRAME) and the
 ///   ARP/NDP emulation built on them — unicast is bridged via the
 ///   netconf's active-bridge specialists instead;
+/// * multipath/bonding policies (`node/Bond.cpp`), QoS/flow hashing;
 /// * tap/L2 semantics for bridged hosts (`VERB_EXT_FRAME`, MAC
 ///   forwarding), capabilities/tags rules enforcement, SSO netconf
 ///   authentication, cluster verbs, trusted paths;
 /// * the AES-CTR extended-armor HELLO tail (off by default upstream —
 ///   `encrypted-hello:` config parses but stays inert) and the
 ///   AES-GMAC-SIV suite (avoided by advertising protocol 11);
-/// * the TCP fallback relay, on-disk state (identity/peer persistence
-///   under `state-dir`), moon *gossip* (moons parse and can be
-///   authored, but are not announced via HELLO tails yet).
+/// * the TCP fallback relay — REMOVED upstream (node/ has no
+///   tcpFallback machinery in 1.14.x; only the standalone tcp-proxy
+///   docker sidecar remains); the config fields parse inertly,
+///   matching what a current upstream node would do with them.
 pub const NOT_PORTED: &str = concat!(
     "zerotier: wire core + node runtime are rust-native (planet, UDP loop, ",
     "WHOIS via roots, relay, fragmentation, netconf->smoltcp link, dial — see ",
-    "proto::zerotier::MILESTONE_2); remaining: direct-path learning/NAT-t ",
-    "(traffic is root-relayed), bonds/multipath, multicast groups + ARP/NDP ",
-    "emulation, tap/L2 bridging, rules enforcement, SSO auth, cluster verbs, ",
-    "the AES extended-armor HELLO tail, TCP fallback, on-disk state persistence"
+    "proto::zerotier::MILESTONE_2); wave 16: direct-path learning/NAT-t ",
+    "(PUSH_DIRECT_PATHS 0x10 + RENDEZVOUS 0x05 probes, relay released on ",
+    "confirmed paths), state-dir persistence (identity.secret + peers.d) and ",
+    "moon orbit gossip (OK(HELLO) world-update adoption) landed — see ",
+    "proto::zerotier::MILESTONE_3; remaining: multicast groups + ARP/NDP ",
+    "emulation, bonds/multipath, tap/L2 bridging, rules enforcement, SSO auth, ",
+    "cluster verbs, the AES extended-armor HELLO tail; the TCP fallback relay ",
+    "no longer exists upstream (node/, 1.14.x)"
 );
+
+/// Marker for the wave-16 milestone: direct-path learning and NAT-t
+/// (PUSH_DIRECT_PATHS probes + root RENDEZVOUS introductions, relay
+/// released on confirmed paths), `state-dir` persistence
+/// (`identity.secret` + `peers.d`), and moon orbit gossip (the
+/// OK(HELLO) world-update block adopting signed moons whose roots
+/// contain a configured seed).
+pub const MILESTONE_3: &str = "zerotier direct paths + NAT-t + state persistence + moon gossip (rust-native)";
 
 #[cfg(test)]
 mod tests {
@@ -5168,10 +5968,19 @@ mod tests {
 
     #[test]
     fn not_ported_shrunk_to_the_runtime_gaps() {
-        // Milestone 2 landed the runtime; the remainder is the honest
-        // gap list (relay-only paths, multicast, tap semantics...).
-        assert!(NOT_PORTED.contains("MILESTONE_2"), "{NOT_PORTED}");
-        assert!(NOT_PORTED.contains("root-relayed"), "{NOT_PORTED}");
+        // Milestone 2 landed the runtime; milestone 3 landed direct
+        // paths, state persistence and moon gossip. The remainder is
+        // the honest gap list (multicast, tap semantics...).
+        assert!(NOT_PORTED.contains("MILESTONE_3"), "{NOT_PORTED}");
+        assert!(NOT_PORTED.contains("PUSH_DIRECT_PATHS"), "{NOT_PORTED}");
+        assert!(NOT_PORTED.contains("state-dir persistence"), "{NOT_PORTED}");
+        assert!(NOT_PORTED.contains("moon orbit gossip"), "{NOT_PORTED}");
+        // The landed items must be GONE from the gap list.
+        assert!(!NOT_PORTED.contains("root-relayed)"), "{NOT_PORTED}");
+        assert!(
+            !NOT_PORTED.contains("TCP fallback, on-disk state"),
+            "{NOT_PORTED}"
+        );
         assert!(NOT_PORTED.contains("multicast"), "{NOT_PORTED}");
         assert!(!NOT_PORTED.contains("transport loop"), "{NOT_PORTED}");
         assert!(!NOT_PORTED.contains("world/planet parsing"), "{NOT_PORTED}");
@@ -5612,6 +6421,12 @@ mod tests {
         /// Per-mimic fragment queue (packet ids are globally unique, so
         /// one queue per mimic is all the separation needed).
         frags: FragmentAssembler,
+        /// Pairs already introduced (the root's `_shouldUnite` gate,
+        /// once per pair for the test's lifetime).
+        introduced: std::collections::HashSet<(u64, u64)>,
+        /// A moon this mimic serves to peers listing it in their HELLO
+        /// tail (the `_doHELLO` world-update block).
+        moon: Option<World>,
     }
 
     impl Mimic {
@@ -5663,6 +6478,31 @@ mod tests {
                         | ((fwd[PACKET_IDX_FLAGS] + 1) & 0x07);
                 }
                 let _ = self.socket.send_to(&fwd, ep).await;
+                // Switch.cpp:205-208: after a successful direct relay,
+                // introduce the two parties to each other
+                // (`_shouldUnite`-gated) — a RENDEZVOUS to each, naming
+                // the other's live path (`Peer::introduce`).
+                if self.introduced.insert((source, dest)) {
+                    let known = self.known.lock().unwrap().clone();
+                    if let (Some((src_id, src_ep)), Some((dst_id, dst_ep))) =
+                        (known.get(&source).cloned(), known.get(&dest).cloned())
+                    {
+                        let to_dst = build_rendezvous(
+                            &self.identity,
+                            dest,
+                            &Rendezvous { flags: 0, zt_address: source, sock: src_ep },
+                            &self.identity.agree(&dst_id).unwrap(),
+                        );
+                        let _ = self.socket.send_to(to_dst.as_bytes(), ep).await;
+                        let to_src = build_rendezvous(
+                            &self.identity,
+                            source,
+                            &Rendezvous { flags: 0, zt_address: dest, sock: dst_ep },
+                            &self.identity.agree(&src_id).unwrap(),
+                        );
+                        let _ = self.socket.send_to(to_src.as_bytes(), src_ep).await;
+                    }
+                }
                 return;
             }
             if source == self.identity.address() {
@@ -5699,12 +6539,14 @@ mod tests {
                     .lock()
                     .unwrap()
                     .insert(source, (hello.identity.clone(), from));
-                let ok = build_ok_hello(
+                let worlds: Vec<World> = self.moon.iter().cloned().collect();
+                let ok = build_ok_hello_with_worlds(
                     &self.identity,
                     &hello,
                     pkt.packet_id(),
                     source,
                     PhysAddr::from_socket_addr(from),
+                    &worlds,
                     &key,
                 )
                 .unwrap();
@@ -5804,6 +6646,55 @@ mod tests {
                     let Some(stack) = bridge else { return };
                     let Ok(frame) = parse_frame(&pkt) else { return };
                     stack.ingress(source, &frame.frame);
+                }
+                Verb::PushDirectPaths => {
+                    // `_doPUSH_DIRECT_PATHS`'s probe: HELLO every
+                    // advertised address we do not already have.
+                    let Ok(paths) = parse_push_direct_paths(&pkt) else { return };
+                    let known_ep = self.known.lock().unwrap().get(&source).map(|(_, e)| *e);
+                    let Some((peer_id, _)) = self.known.lock().unwrap().get(&source).cloned()
+                    else {
+                        return;
+                    };
+                    let key = self.identity.agree(&peer_id).unwrap();
+                    for p in paths {
+                        if Some(p.sock) == known_ep || p.sock.port() == 0 {
+                            continue;
+                        }
+                        let hello = build_hello(
+                            &self.identity,
+                            source,
+                            PhysAddr::from_socket_addr(p.sock),
+                            self.world,
+                            &[],
+                            zt_now_ms(),
+                            &key,
+                        )
+                        .unwrap();
+                        let _ = self.socket.send_to(hello.as_bytes(), p.sock).await;
+                    }
+                }
+                Verb::Rendezvous => {
+                    // `_doRENDEZVOUS` on a leaf: probe the introduced
+                    // peer at the given address (junk omitted — the
+                    // mimic needs no NAT opening on loopback).
+                    let Ok(rd) = parse_rendezvous(&pkt) else { return };
+                    let Some((peer_id, _)) = self.known.lock().unwrap().get(&rd.zt_address).cloned()
+                    else {
+                        return;
+                    };
+                    let key = self.identity.agree(&peer_id).unwrap();
+                    let hello = build_hello(
+                        &self.identity,
+                        rd.zt_address,
+                        PhysAddr::from_socket_addr(rd.sock),
+                        self.world,
+                        &[],
+                        zt_now_ms(),
+                        &key,
+                    )
+                    .unwrap();
+                    let _ = self.socket.send_to(hello.as_bytes(), rd.sock).await;
                 }
                 _ => {}
             }
@@ -5921,6 +6812,20 @@ mod tests {
                     let _ = sock.send_slice(&self.pump_buf[..n], meta);
                 }
             }
+            // A real echo server serves many connections: finish the
+            // half-closed one (peer FIN) and re-arm the listener when
+            // the socket reaches Closed — without this the second dial
+            // of the direct-path test would be RST by a consumed
+            // listener (smoltcp listeners are single-connection).
+            {
+                let sock = self.sockets.get_mut::<tcp::Socket>(self.tcp);
+                if matches!(sock.state(), tcp::State::CloseWait) && !sock.can_recv() {
+                    sock.close();
+                }
+                if sock.state() == tcp::State::Closed {
+                    sock.listen(IpListenEndpoint { addr: None, port: E2E_TCP_ECHO }).unwrap();
+                }
+            }
             self.iface.poll(self.now(), &mut self.shim, &mut self.sockets);
             let egress: Vec<Vec<u8>> = self.shim.egress.drain(..).collect();
             let mut out = Vec::new();
@@ -5983,6 +6888,8 @@ mod tests {
             root: None,
             world: (world.id, world.timestamp),
             frags: FragmentAssembler::default(),
+            introduced: std::collections::HashSet::new(),
+            moon: None,
         };
         let root_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 65_536];
@@ -6000,6 +6907,8 @@ mod tests {
             root: Some((root_id.address(), root_id.clone(), root_ep)),
             world: (world.id, world.timestamp),
             frags: FragmentAssembler::default(),
+            introduced: std::collections::HashSet::new(),
+            moon: None,
         };
         // The root's identity is planet knowledge — known from the
         // start, like the runtime's peer table seeds its roots.
@@ -6028,6 +6937,8 @@ mod tests {
             root: Some((root_id.address(), root_id.clone(), root_ep)),
             world: (world.id, world.timestamp),
             frags: FragmentAssembler::default(),
+            introduced: std::collections::HashSet::new(),
+            moon: None,
         };
         bridge_mimic
             .known
@@ -6067,11 +6978,17 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // -- the node under test ------------------------------------------
+        let state_dir = std::env::temp_dir().join(format!(
+            "rustcrash-zt-state-{}-{:?}",
+            std::process::id(),
+            root_ep.port()
+        ));
         let cfg = ZeroTierConfig {
             name: "e2e-node".into(),
             network: format!("{nwid:016x}"),
             identity_secret: Some(node_id.to_secret_str().unwrap()),
             planet: Some(planet_path.to_string_lossy().into_owned()),
+            state_dir: Some(state_dir.to_string_lossy().into_owned()),
             physical_mtu: 1280, // path MTU — fragments every ~2.7 KiB segment
             udp: true,
             ..ZeroTierConfig::new("e2e-node", format!("{nwid:016x}"))
@@ -6117,5 +7034,450 @@ mod tests {
         ctrl_task.abort();
         bridge_task.abort();
         std::fs::remove_file(&planet_path).ok();
+        // State landed: the identity was persisted even though it came
+        // from config (the Node state-object write), and the met
+        // peers are cached.
+        let identity_file = state_dir.join(STATE_FILE_IDENTITY);
+        let persisted = std::fs::read_to_string(&identity_file).unwrap();
+        assert_eq!(persisted.trim(), node_id.to_secret_str().unwrap().trim());
+        let peers = std::fs::read_dir(state_dir.join(STATE_DIR_PEERS)).unwrap().flatten().count();
+        assert!(peers >= 2, "root + bridge should be persisted, got {peers}");
+        std::fs::remove_dir_all(&state_dir).ok();
+    }
+
+    // -----------------------------------------------------------------
+    // Wave 16: direct-path learning + state persistence + moons
+    // -----------------------------------------------------------------
+
+    /// VERB_RENDEZVOUS and VERB_PUSH_DIRECT_PATHS round-trip on the
+    /// wire, byte-faithful to the upstream layouts
+    /// (Packet.hpp:284-288 / Peer.cpp:217-232).
+    #[test]
+    fn rendezvous_and_push_direct_paths_wire() {
+        let a = synth_identity(1, 0x1111111111);
+        let b = synth_identity(2, 0x2222222222);
+        let key = a.agree(&b).unwrap();
+
+        let rd = Rendezvous {
+            flags: 0,
+            zt_address: 0x0123456789,
+            sock: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 9993)),
+        };
+        let pkt = build_rendezvous(&a, b.address(), &rd, &key);
+        // Suite-1 armor encrypts the verb byte (armor's stream starts
+        // at PACKET_IDX_VERB) — the verb is readable post-dearmor,
+        // exactly as the receiver sees it.
+        let mut back = pkt.clone();
+        back.dearmor(&key).unwrap();
+        assert_eq!(back.verb().unwrap(), Verb::Rendezvous);
+        assert_eq!(back.verb().unwrap().to_byte(), 0x05);
+        let parsed = parse_rendezvous(&back).unwrap();
+        assert_eq!(parsed, rd);
+        // The zt address rides as 5 big-endian bytes right after flags.
+        let p = back.payload();
+        assert_eq!(&p[1..6], &rd.zt_address.to_be_bytes()[3..8]);
+        assert_eq!(u16::from_be_bytes([p[6], p[7]]), 9993);
+        assert_eq!(p[8], 4);
+
+        // v6 rendezvous, and the addrlen-16 arm of the parser.
+        let rd6 = Rendezvous {
+            flags: 0,
+            zt_address: 0xdeadbeefba,
+            sock: SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+                4444,
+                0,
+                0,
+            )),
+        };
+        let pkt6 = build_rendezvous(&a, b.address(), &rd6, &key);
+        let mut back6 = pkt6;
+        back6.dearmor(&key).unwrap();
+        assert_eq!(parse_rendezvous(&back6).unwrap(), rd6);
+
+        // PUSH_DIRECT_PATHS: two paths (v4 + v6), compressed payload,
+        // armor suite 1 — dearmor + uncompress then parse.
+        let paths = vec![
+            DirectPath {
+                flags: 0,
+                sock: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 41234)),
+            },
+            DirectPath {
+                flags: 0,
+                sock: SocketAddr::V6(SocketAddrV6::new(
+                    Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 9),
+                    41235,
+                    0,
+                    0,
+                )),
+            },
+        ];
+        let push = build_push_direct_paths(&a, b.address(), &paths, &key);
+        let mut push_back = push;
+        push_back.dearmor(&key).unwrap();
+        // Both the verb bits and the compressed flag live on the verb
+        // byte, which suite-1 armor encrypts — readable post-dearmor.
+        assert_eq!(push_back.verb().unwrap().to_byte(), 0x10);
+        assert!(push_back.compressed());
+        push_back.uncompress().unwrap();
+        assert!(!push_back.compressed());
+        assert_eq!(parse_push_direct_paths(&push_back).unwrap(), paths);
+        // The record layout: flags(1) ext(2)=0 type(1) len(1)=6/18 ip port.
+        let p = push_back.payload();
+        assert_eq!(u16::from_be_bytes([p[0], p[1]]), 2); // count
+        assert_eq!(p[2], 0); // flags
+        assert_eq!(u16::from_be_bytes([p[3], p[4]]), 0); // no extensions
+        assert_eq!(p[5], 4); // addrType
+        assert_eq!(p[6], 6); // addrLen: ip(4) + port(2)
+        assert_eq!(&p[7..11], &[10, 1, 2, 3]);
+        assert_eq!(u16::from_be_bytes([p[11], p[12]]), 41234);
+
+        // The reader skips unknown extension bytes exactly like
+        // _doPUSH_DIRECT_PATHS's `ptr += extLen`.
+        let mut odd = WirePacket::new(b.address(), a.address(), Verb::PushDirectPaths);
+        odd.push_u16(1)
+            .push_u8(0)
+            .push_u16(4) // 4 extension bytes
+            .push_bytes(&[0xde, 0xad, 0xbe, 0xef])
+            .push_u8(4)
+            .push_u8(6)
+            .push_bytes(&[192, 0, 2, 1])
+            .push_u16(53);
+        let parsed = parse_push_direct_paths(&odd).unwrap();
+        assert_eq!(
+            parsed,
+            vec![DirectPath {
+                flags: 0,
+                sock: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 53))
+            }]
+        );
+    }
+
+    /// The state store: identity generation persists and reloads
+    /// byte-identically; peers round-trip with their endpoints; a
+    /// corrupt identity fails loudly instead of silently re-keying.
+    #[test]
+    fn state_store_identity_and_peer_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustcrash-zt-store-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = NodeStateStore::open(dir.to_str().unwrap()).unwrap();
+
+        // Identity: generated once, reloaded identically.
+        let first = store.load_or_create_identity().unwrap();
+        assert!(first.locally_validate());
+        let second = store.load_or_create_identity().unwrap();
+        assert_eq!(first.to_secret_str().unwrap(), second.to_secret_str().unwrap());
+
+        // Peers: save + load round-trip (real identities — the loader
+        // validates hashcash, so synthesized keys are cache poison).
+        let peer = NodeIdentity::generate().unwrap();
+        let ep = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 4), 31337));
+        store.save_peer(&peer, Some(ep));
+        let loaded = store.load_peers();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].0.address(), peer.address());
+        assert_eq!(loaded[0].1, Some(ep));
+        // Without an endpoint the identity alone loads (endpoint None).
+        let peer2 = NodeIdentity::generate().unwrap();
+        store.save_peer(&peer2, None);
+        let loaded = store.load_peers();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.iter().any(|(id, e)| id.address() == peer2.address() && e.is_none()));
+
+        // A corrupt identity.secret is a loud config error, never a
+        // silent identity rotation.
+        std::fs::write(store.dir.join(STATE_FILE_IDENTITY), b"garbage\n").unwrap();
+        let err = store.load_or_create_identity().unwrap_err();
+        assert!(
+            err.to_string().contains("state") || err.to_string().contains("identity"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Moon adoption (`Topology::addWorld` + shouldAcceptWorldUpdateFrom):
+    /// a signed moon world whose roots contain our pending seed is
+    /// adopted, the seed consumed, the moon's roots become upstreams;
+    /// worlds for unknown ids, wrong ids, or bad signatures are not.
+    #[test]
+    fn adopt_worlds_moon_orbit() {
+        let moon_authority = synth_identity(3, 0x3333333333);
+        let moon_root = synth_identity(4, 0x4444444444);
+        let moon_ep = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 99), 9990));
+        let moon = World::make(
+            WORLD_TYPE_MOON,
+            0xfeedface01,
+            77,
+            &moon_authority,
+            vec![WorldRoot {
+                identity: moon_root.clone(),
+                endpoints: vec![PhysAddr::from_socket_addr(moon_ep)],
+            }],
+        )
+        .unwrap();
+        let mut world_bytes = Vec::new();
+        moon.serialize(false, &mut world_bytes);
+
+        let me = synth_identity(5, 0x5555555555);
+        let planet = World::parse_planet(default_planet()).unwrap();
+        let planet_root = planet.roots[0].identity.address();
+        let wake = Arc::new(Notify::new());
+        let mut stack = ZtStack::new(
+            me,
+            planet,
+            0x0123456789abcdef,
+            DEFAULT_PHYSICAL_MTU,
+            true,
+            wake,
+            vec![(0xfeedface01, moon_root.address())],
+            None,
+            None,
+        );
+        // Before: one pending seed, no moons, the moon root unknown.
+        assert_eq!(stack.moon_seeds.len(), 1);
+        assert!(stack.root_endpoints().len() == stack.world.roots.len());
+
+        // A world for an id we did not ask about: ignored.
+        let other = World::make(
+            WORLD_TYPE_MOON,
+            0xbadbadbad1,
+            1,
+            &moon_authority,
+            vec![WorldRoot { identity: moon_root.clone(), endpoints: vec![] }],
+        )
+        .unwrap();
+        let mut other_bytes = Vec::new();
+        other.serialize(false, &mut other_bytes);
+        stack.adopt_worlds(planet_root, &other_bytes);
+        assert_eq!(stack.moon_seeds.len(), 1);
+        assert!(stack.moons.is_empty());
+
+        // The asked-for moon, delivered by a planet root: adopted.
+        stack.adopt_worlds(planet_root, &world_bytes);
+        assert!(stack.moon_seeds.is_empty(), "seed consumed");
+        assert_eq!(stack.moons.len(), 1);
+        assert_eq!(stack.moons[0].id, 0xfeedface01);
+        assert!(stack.is_upstream(moon_root.address()));
+        assert!(stack.root_endpoints().iter().any(|(a, _, ep)| {
+            *a == moon_root.address() && *ep == moon_ep
+        }));
+        // The moon root entered the peer table with its endpoint.
+        assert_eq!(
+            stack.peers.get(&moon_root.address()).and_then(|p| p.endpoint),
+            Some(moon_ep)
+        );
+
+        // An older copy of the same moon does not replace it.
+        let older = World::make(
+            WORLD_TYPE_MOON,
+            0xfeedface01,
+            7,
+            &moon_authority,
+            vec![WorldRoot { identity: moon_root.clone(), endpoints: vec![] }],
+        )
+        .unwrap();
+        let mut older_bytes = Vec::new();
+        older.serialize(false, &mut older_bytes);
+        stack.adopt_worlds(planet_root, &older_bytes);
+        assert_eq!(stack.moons[0].timestamp, 77);
+    }
+
+    /// The live direct-path proof: after the root relays the node's
+    /// first frames it introduces both parties (RENDEZVOUS); the node
+    /// probes the bridge directly, the OK(HELLO) confirms the path —
+    /// and when the ROOT DIES, dials keep working through the direct
+    /// path. Root-relay-only would fail this the moment the root
+    /// task aborts.
+    #[tokio::test]
+    async fn overlay_e2e_direct_path_survives_root_death() {
+        let authority = NodeIdentity::generate().unwrap();
+        let root_id = NodeIdentity::generate().unwrap();
+        let controller_id = NodeIdentity::generate().unwrap();
+        let bridge_id = NodeIdentity::generate().unwrap();
+
+        let root_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ctrl_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let bridge_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let root_ep = root_sock.local_addr().unwrap();
+
+        let world = World::make(
+            WORLD_TYPE_PLANET,
+            0x00c0ffee02,
+            43,
+            &authority,
+            vec![WorldRoot {
+                identity: root_id.clone(),
+                endpoints: vec![PhysAddr::from_socket_addr(root_ep)],
+            }],
+        )
+        .unwrap();
+        let planet_path = std::env::temp_dir().join(format!(
+            "rustcrash-zt-planet2-{}-{:?}.bin",
+            std::process::id(),
+            root_ep.port()
+        ));
+        std::fs::write(&planet_path, world.to_bytes()).unwrap();
+
+        let nwid = (controller_id.address() << 24) | 2;
+        let registry: Arc<std::sync::Mutex<HashMap<u64, (NodeIdentity, SocketAddr)>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        let mut root_mimic = Mimic {
+            identity: root_id.clone(),
+            socket: root_sock.clone(),
+            known: registry.clone(),
+            root: None,
+            world: (world.id, world.timestamp),
+            frags: FragmentAssembler::default(),
+            introduced: std::collections::HashSet::new(),
+            moon: None,
+        };
+        let root_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65_536];
+            loop {
+                let Ok((n, from)) = root_sock.recv_from(&mut buf).await else { break };
+                root_mimic.on_datagram(&buf[..n], from, None, None).await;
+            }
+        });
+
+        let mut ctrl_mimic = Mimic {
+            identity: controller_id.clone(),
+            socket: ctrl_sock.clone(),
+            known: registry.clone(),
+            root: Some((root_id.address(), root_id.clone(), root_ep)),
+            world: (world.id, world.timestamp),
+            frags: FragmentAssembler::default(),
+            introduced: std::collections::HashSet::new(),
+            moon: None,
+        };
+        ctrl_mimic
+            .known
+            .lock()
+            .unwrap()
+            .insert(root_id.address(), (root_id.clone(), root_ep));
+        let netconf_info = (nwid, bridge_id.address(), 2800u64);
+        let ctrl_task = tokio::spawn(async move {
+            ctrl_mimic.hello_root().await;
+            let mut buf = vec![0u8; 65_536];
+            loop {
+                let Ok((n, from)) = ctrl_sock.recv_from(&mut buf).await else { break };
+                ctrl_mimic
+                    .on_datagram(&buf[..n], from, Some(&netconf_info), None)
+                    .await;
+            }
+        });
+
+        let mut bridge_mimic = Mimic {
+            identity: bridge_id.clone(),
+            socket: bridge_sock.clone(),
+            known: registry.clone(),
+            root: Some((root_id.address(), root_id.clone(), root_ep)),
+            world: (world.id, world.timestamp),
+            frags: FragmentAssembler::default(),
+            introduced: std::collections::HashSet::new(),
+            moon: None,
+        };
+        bridge_mimic
+            .known
+            .lock()
+            .unwrap()
+            .insert(root_id.address(), (root_id.clone(), root_ep));
+        let bridge_task = tokio::spawn(async move {
+            bridge_mimic.hello_root().await;
+            let mut stack = BridgeStack::new();
+            let bridge_id = bridge_mimic.identity.clone();
+            let mut buf = vec![0u8; 65_536];
+            loop {
+                tokio::select! {
+                    r = bridge_sock.recv_from(&mut buf) => {
+                        let Ok((n, from)) = r else { break };
+                        bridge_mimic.on_datagram(&buf[..n], from, None, Some(&mut stack)).await;
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+                for (dest, et, frame) in stack.step() {
+                    let key = bridge_mimic
+                        .known
+                        .lock()
+                        .unwrap()
+                        .get(&dest)
+                        .map(|(id, _)| bridge_id.agree(id).unwrap())
+                        .unwrap_or([0u8; SYMMETRIC_KEY_SIZE]);
+                    let mut pkt = build_frame(&bridge_id, dest, nwid, et, &frame);
+                    bridge_mimic.send_to(dest, &key, &mut pkt, DEFAULT_PHYSICAL_MTU).await;
+                }
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let state_dir = std::env::temp_dir().join(format!(
+            "rustcrash-zt-state2-{}-{:?}",
+            std::process::id(),
+            root_ep.port()
+        ));
+        let cfg = ZeroTierConfig {
+            name: "e2e-direct".into(),
+            network: format!("{nwid:016x}"),
+            state_dir: Some(state_dir.to_string_lossy().into_owned()),
+            planet: Some(planet_path.to_string_lossy().into_owned()),
+            physical_mtu: 2800,
+            udp: true,
+            ..ZeroTierConfig::new("e2e-direct", format!("{nwid:016x}"))
+        };
+        let target = NetAddr::ip(IpAddr::V4(E2E_BRIDGE_IP), E2E_TCP_ECHO);
+
+        // Phase 1: dial + echo while the root lives. The relayed SYN
+        // triggers the root's introduce; the probes confirm a direct
+        // path during this exchange.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut first = tokio::time::timeout(Duration::from_secs(40), connect(&cfg, &target))
+            .await
+            .expect("first dial timed out")
+            .expect("first dial failed");
+        let hello: Vec<u8> = (0..4096u32).map(|i| (i % 241) as u8).collect();
+        first.write_all(&hello).await.unwrap();
+        let mut got = vec![0u8; hello.len()];
+        first.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, hello, "relayed echo differs");
+        // Graceful close so the bridge's listener retires the old
+        // connection and re-arms (the second dial needs a listener).
+        // Draining to EOF is the deterministic proof both sides
+        // retired the connection — no timing window.
+        first.shutdown().await.unwrap();
+        let mut eof = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(5), first.read(&mut eof))
+            .await
+            .expect("EOF never arrived after shutdown")
+            .unwrap();
+        assert_eq!(n, 0, "expected EOF after graceful close, got {n} bytes");
+        drop(first);
+
+        // Phase 2: the root dies. A fresh dial + echo must still work
+        // — only a learned direct path can carry it now. (The graceful
+        // close above needs a moment to retire the bridge's listener
+        // before the witness disappears; the direct path itself was
+        // confirmed during phase 1.)
+        root_task.abort();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let mut second = tokio::time::timeout(Duration::from_secs(20), connect(&cfg, &target))
+            .await
+            .expect("post-root-death dial timed out (direct path was not learned)")
+            .expect("post-root-death dial failed");
+        let payload: Vec<u8> = (0..5000u32).map(|i| (i % 199) as u8).collect();
+        second.write_all(&payload).await.unwrap();
+        let mut got2 = vec![0u8; payload.len()];
+        second.read_exact(&mut got2).await.unwrap();
+        assert_eq!(got2, payload, "direct-path echo differs");
+
+        drop(second);
+        ctrl_task.abort();
+        bridge_task.abort();
+        std::fs::remove_file(&planet_path).ok();
+        std::fs::remove_dir_all(&state_dir).ok();
     }
 }

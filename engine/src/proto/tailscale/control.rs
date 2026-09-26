@@ -50,7 +50,7 @@ use crate::transport::{tls_connect, TlsSettings};
 
 use super::controlhttp::ControlHttpDialer;
 use super::noise::{MachinePublicKey, NoiseConn};
-use super::tailcfg::{
+use super::tailcfg::{FilterRule, 
     DerpMap, DnsConfig, Hostinfo, MapRequest, MapResponse, Node, NodeKey, Prefix, RegisterRequest,
     RegisterResponse, RegisterResponseAuth, UserProfile,
 };
@@ -730,6 +730,10 @@ pub struct NetMap {
     pub user_profiles: BTreeMap<i64, UserProfile>,
     /// The tailnet domain (`MapResponse.Domain`).
     pub domain: String,
+    /// The tailnet packet filter (`MapResponse.PacketFilter`,
+    /// last-write-wins like the DNS config). An INBOUND ACL — see
+    /// [`Self::packet_filter_allows`] for the enforcement stance.
+    pub packet_filter: Vec<FilterRule>,
 }
 
 /// The default routes an exit node advertises in AllowedIPs —
@@ -920,6 +924,42 @@ impl NetMap {
             Some((_, rest)) => rest.to_string(),
             None => name.to_string(),
         }
+    }
+
+    /// Would the tailnet packet filter admit an INBOUND packet
+    /// `src_ip → (dst_ip, proto, port)`? — `filter.matches`'s rule
+    /// walk (filter/filter.go:429-461): some rule whose source CIDRs
+    /// cover `src_ip`, whose (empty = all) protocol list contains
+    /// `proto`, and whose destination ranges cover `dst_ip` with
+    /// `lo <= port <= hi`.
+    ///
+    /// **Enforcement stance (the honest boundary):** this is the
+    /// ACL for what OTHER tailnet nodes may send THIS node. The
+    /// engine's tailscale surface is outbound-only — dials originate
+    /// and receive only solicited replies, governed by cryptokey
+    /// routing — so nothing here rejects our own traffic. The parsed
+    /// rules are carried and queryable for a future listener/TUN
+    /// surface (the point where inbound traffic exists to filter);
+    /// a headless outbound has no such surface.
+    pub fn packet_filter_allows(
+        &self,
+        src_ip: std::net::IpAddr,
+        dst_ip: std::net::IpAddr,
+        proto: u8,
+        port: u16,
+    ) -> bool {
+        self.packet_filter.iter().any(|rule| {
+            if !rule.src_matches(src_ip) {
+                return false;
+            }
+            if !rule.ipproto.is_empty() && !rule.ipproto.contains(&(proto as i64)) {
+                return false;
+            }
+            rule.dst.iter().any(|d| {
+                let Some(prefix) = d.prefix() else { return false };
+                prefix.contains(&dst_ip) && port >= d.ports[0] && port <= d.ports[1]
+            })
+        })
     }
 
     /// The search domains DNS queries expand bare names with: the
@@ -1157,6 +1197,7 @@ pub struct MapSession {
     last_dns_config: Option<DnsConfig>,
     last_user_profiles: BTreeMap<i64, UserProfile>,
     last_domain: String,
+    last_packet_filter: Option<Vec<FilterRule>>,
     node_key: NodeKey,
 }
 
@@ -1297,6 +1338,11 @@ impl MapSession {
         if let Some(dns) = resp.dns_config.clone() {
             self.last_dns_config = Some(dns);
         }
+        // PacketFilter, last-write-wins (map.go:461-462 keeps
+        // `lastPacketFilter`; nil means unchanged).
+        if let Some(pf) = resp.packet_filter.clone() {
+            self.last_packet_filter = Some(pf);
+        }
         if !resp.domain.is_empty() {
             self.last_domain = resp.domain.clone();
         }
@@ -1314,6 +1360,7 @@ impl MapSession {
             dns_config: self.last_dns_config.clone().unwrap_or_default(),
             user_profiles: self.last_user_profiles.clone(),
             domain: self.last_domain.clone(),
+            packet_filter: self.last_packet_filter.clone().unwrap_or_default(),
         }
     }
 }
@@ -1508,6 +1555,69 @@ mod tests {
         })
         .unwrap();
         assert_eq!(ms.netmap().dns_config, DnsConfig::default());
+    }
+
+    #[test]
+    fn packet_filter_parses_carries_and_matches() {
+        // A Go-control-shaped PacketFilter: JSON wire exactly as Go's
+        // tailcfg marshals it (CIDR strings + {ip, ports} objects).
+        let wire = r#"{
+            "KeepAlive": false,
+            "Domain": "corp.example",
+            "PacketFilter": [
+                {
+                    "src": ["100.101.102.103/32", "100.64.0.0/10"],
+                    "dst": [
+                        {"ip": "100.110.0.1/32", "ports": [22, 22]},
+                        {"ip": "100.110.0.2/32", "ports": [0, 65535]}
+                    ],
+                    "ipproto": [6]
+                },
+                {
+                    "src": ["0.0.0.0/0"],
+                    "dst": [{"ip": "100.110.0.3/32", "ports": [53, 53]}],
+                    "ipproto": [17],
+                    "caps": [{"cap": 3, "dst": ["100.110.0.3/32"]}]
+                }
+            ]
+        }"#;
+        let resp: MapResponse = serde_json::from_str(wire).unwrap();
+        let pf = resp.packet_filter.as_ref().unwrap();
+        assert_eq!(pf.len(), 2);
+        assert_eq!(pf[0].src, vec!["100.101.102.103/32", "100.64.0.0/10"]);
+        assert_eq!(pf[0].dst[0].ports, [22, 22]);
+        assert!(pf[0].dst[1].prefix().is_some(), "CIDR parse");
+        assert_eq!(pf[0].ipproto, vec![6]);
+
+        // The session carries it onto the netmap (last-write-wins like
+        // the DNS config; nil keeps the last filter).
+        let self_key = NodeKey(gen_pub());
+        let mut ms = MapSession::new(self_key);
+        ms.handle_response(&resp).unwrap();
+        let nm = ms.netmap();
+        assert_eq!(nm.packet_filter.len(), 2);
+        ms.handle_response(&MapResponse { peers_removed: vec![9], ..Default::default() })
+            .unwrap();
+        assert_eq!(ms.netmap().packet_filter.len(), 2);
+
+        // The matcher (filter/filter.go's walk): allowed tuples.
+        let peer_v4: std::net::IpAddr = "100.101.102.103".parse().unwrap();
+        let us: std::net::IpAddr = "100.110.0.1".parse().unwrap();
+        let us2: std::net::IpAddr = "100.110.0.2".parse().unwrap();
+        let us3: std::net::IpAddr = "100.110.0.3".parse().unwrap();
+        let any_src: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        assert!(nm.packet_filter_allows(peer_v4, us, 6, 22), "tailnet src, TCP 22");
+        assert!(nm.packet_filter_allows(peer_v4, us2, 6, 65535), "any port in window");
+        assert!(nm.packet_filter_allows(any_src, us3, 17, 53), "any src, UDP 53");
+        // Denied: wrong proto, wrong port, wrong dst.
+        assert!(!nm.packet_filter_allows(peer_v4, us, 17, 22), "UDP not in TCP rule");
+        assert!(!nm.packet_filter_allows(peer_v4, us, 6, 23), "port outside window");
+        assert!(!nm.packet_filter_allows(peer_v4, us3, 6, 22), "dst not in TCP rule's ranges");
+        assert!(!nm.packet_filter_allows(any_src, us, 6, 22), "src outside any rule");
+        // An empty filter denies everything (default-deny, exactly like
+        // a nil Go filter).
+        let empty = NetMap::default();
+        assert!(!empty.packet_filter_allows(peer_v4, us, 6, 22));
     }
 
     #[test]
