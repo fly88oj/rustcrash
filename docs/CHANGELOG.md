@@ -27,6 +27,35 @@ All notable changes to RustCrash. Format based on
   passthrough (the framing half of the splice; the raw-transport
   rebind is tracked).
 
+### tests/docker-shellcrash — the real ShellCrash migration e2e
+
+A Docker suite that installs the REAL ShellCrash (dev @1.9.5beta3) in a
+container, configures it the way a user does, runs it with the real
+mihomo kernel (baseline), then swaps the kernel to the Rust engine and
+proves the same ShellCrash flow keeps working — 65 checks: install,
+nftables firewall (DNS hijack/REDIRECT/loop-guards), per-node relay
+(ss/vmess/vmess-ws) both kernels, the subscription shape, the CLI
+surface, a full raw-binary drop-in cycle, restart/stop.
+
+**All 9 engine gaps it found are fixed**:
+- `mode: Rule` (ShellCrash hardcodes the capitalized form) — lowercased.
+- dns `listen: :1053` / `external-controller: :9999` — the
+  leading-colon all-interfaces shorthand accepted everywhere.
+- `fake-ip-filter: ['+.*']` — match-all suffix.
+- `authentication` — now ENFORCED on the http/socks/mixed listeners
+  (407 + Basic challenge / RFC 1929), closing an open-proxy hole.
+- `routing-mark` — SO_MARK applied to every outbound TCP/UDP/QUIC dial
+  (the firewall loop-guard finally exempts the engine's own traffic),
+  plus an inbound self-relay belt: a direct tproxy-port connection
+  previously cascaded into 1000+ half-open connections and FD
+  exhaustion within seconds; now 0.
+- SIGTERM: the engine exits within ~1s (bounded teardown).
+- the mihomo kernel CLI (`-t/-d/-f/-v/-h`) — a compat layer in the
+  crash binary, so the RAW binary swap works: ShellCrash's own
+  core_check/core_find/start flow runs the engine unchanged.
+- the manager-config collision on a ShellCrash layout — a precise
+  error naming the layout and the right commands.
+
 ### Engine — wave 16 (closing): dns-tag fix, easytier secure mode, proxy providers, zerotier direct paths + moons
 
 - **The sing-box `dns` tag maps to the real `dns` outbound** (was
