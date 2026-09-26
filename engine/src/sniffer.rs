@@ -68,6 +68,28 @@ impl SniffConfig {
     fn port_allowed(ports: &[u16], port: u16) -> bool {
         ports.is_empty() || ports.contains(&port)
     }
+
+    /// Narrow this config to the protocol subset a sing-box
+    /// `action: sniff` rule requests (RouteActionSniff `sniffer: [...]`
+    /// — empty means "all sniffers enabled by default", per the docs).
+    /// The returned config ENABLES exactly the listed protocols
+    /// regardless of the global toggles (upstream's action sniffs
+    /// independently of any inbound sniff flag), while inheriting the
+    /// skip/force/override policy and port gates.
+    pub fn for_action(&self, sniffer: &[String]) -> SniffConfig {
+        let wants = |name: &str| sniffer.is_empty() || sniffer.iter().any(|s| s == name);
+        SniffConfig {
+            tls: wants("tls"),
+            http: wants("http"),
+            quic: wants("quic"),
+            override_destination: self.override_destination,
+            skip_domains: self.skip_domains.clone(),
+            force_domains: self.force_domains.clone(),
+            tls_ports: self.tls_ports.clone(),
+            http_ports: self.http_ports.clone(),
+            quic_ports: self.quic_ports.clone(),
+        }
+    }
 }
 
 /// The maximum prefix examined: a full ClientHello first flight fits well
@@ -897,5 +919,55 @@ mod tests {
             apply_sniffed(&target, &SniffResult::Quic("q.test".into()), &quic_cfg()).unwrap();
         assert_eq!(applied.host, Host::Domain("q.test".into()));
         assert_eq!(applied.port, 443);
+    }
+
+    // --- action-sniff narrowing -----------------------------------------
+
+    #[test]
+    fn for_action_selects_protocols_independent_of_globals() {
+        // Global sniff fully disabled.
+        let global = SniffConfig::default();
+        assert!(!global.enabled());
+
+        // Empty subset = "all sniffers enabled by default" (docs).
+        let all = global.for_action(&[]);
+        assert!(all.tls && all.http && all.quic);
+
+        // A subset enables exactly the listed protocols.
+        let tls_only = global.for_action(&["tls".to_string()]);
+        assert!(tls_only.tls && !tls_only.http && !tls_only.quic);
+        let mixed = global.for_action(&["http".to_string(), "quic".to_string()]);
+        assert!(!mixed.tls && mixed.http && mixed.quic);
+
+        // Policy and port gates inherit from the global config.
+        let base = SniffConfig {
+            tls: false,
+            http: true,
+            quic: false,
+            override_destination: true,
+            skip_domains: vec!["skip.test".into()],
+            force_domains: vec!["force.test".into()],
+            tls_ports: vec![443],
+            http_ports: vec![],
+            quic_ports: vec![],
+        };
+        let narrowed = base.for_action(&["tls".to_string()]);
+        assert!(narrowed.tls && !narrowed.http);
+        assert!(narrowed.override_destination);
+        assert_eq!(narrowed.skip_domains, vec!["skip.test".to_string()]);
+        assert_eq!(narrowed.force_domains, vec!["force.test".to_string()]);
+        assert_eq!(narrowed.tls_ports, vec![443]);
+
+        // The narrowed config actually drives sniff(): TLS hello passes
+        // with ["tls"], an HTTP request on the same config does not.
+        let hello = client_hello("narrow.test");
+        assert_eq!(
+            sniff(&hello, &narrowed, 443),
+            SniffResult::Tls("narrow.test".into())
+        );
+        assert_eq!(
+            sniff(b"GET / HTTP/1.1\r\nHost: narrow.test\r\n\r\n", &narrowed, 80),
+            SniffResult::Unknown
+        );
     }
 }

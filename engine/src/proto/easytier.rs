@@ -25,14 +25,14 @@
 //!   adapter, cached lines 407-408).
 //!
 //! Those map onto EasyTier's Rust crates: the peer/peer-manager (mesh
-//! membership, gossip), the tcp/udp tunnels (direct transports), the
-//! quinn-based QUIC tunnel + KCP/WS proxies behind the
-//! `enable-*-proxy` flags, and the rpc layer feeding ShowNodeInfo/
-//! ListRoute. The core is not vendored; the **direct TCP peer tunnel**
-//! (the first milestone) is now ported natively into this file — see
-//! the milestone section below — and everything pure-Go around the
-//! core is ported below and is the load-bearing config path (the
-//! rendered TOML is byte-compatible with upstream's `RenderTOML` +
+//! membership, gossip), the tcp/udp/quic/ws tunnels (direct
+//! transports — all four ported, see the milestone sections), the KCP
+//! proxy behind the `enable-*-proxy` flags, and the rpc layer feeding
+//! ShowNodeInfo/ListRoute. The core is not vendored; the **direct TCP
+//! peer tunnel** (the first milestone) is ported natively into this
+//! file — see the milestone section below — and everything pure-Go
+//! around the core is ported below and is the load-bearing config path
+//! (the rendered TOML is byte-compatible with upstream's `RenderTOML` +
 //! `ApplyRequiredFlags`).
 //!
 //! # Ported this wave (component/easytier, verbatim behaviour)
@@ -157,15 +157,48 @@
 //!   fails fast with the map ([`SECURE_MODE_NOT_PORTED`]); a
 //!   NoiseHandshakeMsg1-first inbound peer is named precisely.
 //!
+//! # Fourth milestone — LANDED (the QUIC + WebSocket transports)
+//!
+//! M4 (sources cached under `/tmp/wave14-upstream/`, the v2.6.4 tag
+//! clone `et264/`) adds the two remaining real-binary transports:
+//!
+//! * **QUIC** — `tunnel/quic.rs`: one QUIC connection per peer carrying
+//!   EXACTLY ONE bidirectional stream with the M1 TCP framing on it,
+//!   connected with the server name `localhost`. The crypto is NOT TLS:
+//!   easytier builds on the `quinn-plaintext` crate — no encryption, no
+//!   header protection, an 8-byte SeaHash checksum tag per packet and
+//!   the QUIC transport parameters exchanged as the raw CRYPTO-stream
+//!   content. The crate is re-implemented in-tree ([`quic_plaintext`],
+//!   after quinn-plaintext-0.3.0/src/lib.rs) against the engine's
+//!   quinn/quinn-proto, verified against digests produced by the real
+//!   crate. Transport settings mirror upstream (BBR, 5s keep-alive,
+//!   MTU 1200) ([`connect_quic_tunnel`], [`QuicVtListener`]).
+//! * **WebSocket** — `tunnel/websocket.rs`: `ws://`/`wss://` peers ride
+//!   a hand-rolled RFC 6455 client (the sudoku precedent) with an
+//!   insecure-TLS `wss` (SNI `localhost` for IPs); every binary message
+//!   is one `[PeerManagerHeader][payload]` frame — NO length prefix
+//!   (the message is self-delimiting) — which [`WsPeerStream`] adapts
+//!   to/from the byte framing the session machinery speaks. The
+//!   listener serves the upgrade (101 + computed accept) behind a
+//!   process-global self-signed `wss` cert ([`connect_ws_tunnel`],
+//!   [`WsVtListener`]).
+//! * **wg — assessed, NOT ported** — WireGuard-as-transport drags
+//!   boringtun's whole `Tunn` endpoint state machine as the tunnel
+//!   (shared digest-derived static keys, synthetic IPv4 headers, the
+//!   update_timers routine); the engine's hand-rolled Noise_IKpsk2
+//!   layer in `proto/wireguard.rs` exists but is woven into its
+//!   netstack client behind module-private seams. The precise recipe
+//!   is mapped in [`NOT_PORTED`].
+//!
 //! # Remaining milestones
 //!
-//! 1. The remaining transports (`wg`/`quic`/`ws`, the quinn QUIC tunnel
-//!    + the websocket upgrader behind `enable-kcp/quic-proxy`).
-//! 2. Secure mode (see the map above), the relay path, foreign
+//! 1. Secure mode (see the map above), the relay path, foreign
 //!    networks, and the exit-node/proxy-network pieces.
-//! 3. Multi-hop OSPF (SPF over `graph_algo.rs`) — the node table and
+//! 2. Multi-hop OSPF (SPF over `graph_algo.rs`) — the node table and
 //!    forwarding are multi-peer now, but adjacency is still the
 //!    direct-neighbor bitmap.
+//! 3. The `wg://` transport and the hole-punch connector paths (see
+//!    [`NOT_PORTED`]).
 //!
 //! # Config surface
 //!
@@ -1694,6 +1727,1440 @@ async fn run_udp_listener(
             // plain listener port).
             _ => {}
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The QUIC peer transport (easytier-core/src/tunnel/quic.rs, v2.6.4)
+// ---------------------------------------------------------------------------
+//
+// A `quic://host:port` peer URI rides **one QUIC connection per peer
+// connection**: the client `connect`s with the server name `localhost`
+// (QuicTunnelConnector::connect, quic.rs:583, `endpoint.connect(addr,
+// "localhost")`), opens EXACTLY ONE bidirectional stream (`open_bi`,
+// quic.rs:587-590), and the plain TCP framing of M1 — `[u32 LE body_len]
+// [PeerManagerHeader][payload]` — rides that stream untouched
+// (`FramedReader::new_with_associate_data(r, 4500, ...)` +
+// `FramedWriter::new_with_associate_data(w, ...)`, quic.rs:606-608). The
+// listener is the mirror: accept the connection, `accept_bi`
+// (quic.rs:482-493 — the CLIENT opens the stream, the server waits for
+// it), wrap the pair with the same framing (max packet size 2000
+// server-side, quic.rs:509). Dropping the tunnel closes the connection
+// with error code 0 / reason `done` (`ConnWrapper::drop`, quic.rs:461-465).
+//
+// **The crypto is the special part**: easytier's QUIC is NOT TLS. Both
+// `server_config()` and `client_config()` (quic.rs:41-51) are built on
+// the `quinn-plaintext` crate (easytier Cargo.toml:84, quinn-plaintext
+// 0.3.0) — a quinn crypto provider with NO encryption and NO header
+// protection whose only wire presence is an 8-byte **SeaHash checksum
+// tag** appended to every packet (`PlaintextPacketKey`, tag_len 8):
+//
+// * the tag = SeaHash (seahash 4.1.0, default seeds) of
+//   `Hash for [u8]`-hashed header then payload — i.e. per member
+//   `write_usize(len)` followed by `write(bytes)` (std's slice Hash
+//   writes the length prefix first), digest big-endian in the last 8
+//   bytes of the datagram;
+// * the QUIC transport parameters are exchanged as the CRYPTO-stream
+//   content directly (`PlaintextSession::write_handshake` /
+//   `read_handshake`: `TransportParameters::write` / `::read` — no
+//   TLS records at all), Initial keys are the same plaintext keys as
+//   1-RTT keys, and `next_1rtt_keys` hands out fresh plaintext keys
+//   forever (quinn-plaintext src/lib.rs:38-341).
+//
+// The engine cannot take the crate (no new dependencies), so the provider
+// is re-implemented in-tree below ([`quic_plaintext`]) after the crate's
+// published source (MIT OR Apache-2.0,
+// quinn-plaintext-0.3.0/src/lib.rs), against the engine's quinn-proto
+// 0.11.18 trait surface — the same seam the engine's own TLS 1.3 QUIC
+// stack implements (`quic::tls13`). The transport settings mirror
+// `transport_config` (quic.rs:26-39): 255 concurrent bidi streams, NO
+// uni streams, 5s keep-alive, `initial_mtu(1200)`/`min_mtu(1200)`,
+// segmentation offload, and the BBR congestion controller.
+//
+// DELTA vs upstream: `QuicEndpointManager`'s process-global endpoint
+// pools (quic.rs:222-455, one shared client endpoint per IP family,
+// stopped-endpoint recycling) are collapsed into one endpoint per dial
+// and one per listener — a fresh `0.0.0.0:0`/`[::]:0` bind per
+// connection, no pooling. On the wire both are QUIC v1 endpoints; only
+// local socket usage differs.
+
+/// The in-tree `quinn-plaintext` port: the null QUIC crypto easytier's
+/// `quic://` tunnel speaks (quinn-plaintext-0.3.0/src/lib.rs, cited per
+/// item). Wire-visible behaviour only — the SeaHash tag and the
+/// transport-parameter CRYPTO choreography — is load-bearing; the rest
+/// is the quinn `crypto` trait plumbing.
+mod quic_plaintext {
+    use std::any::Any;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use bytes::BytesMut;
+
+    use quinn_proto::crypto::{
+        ClientConfig as QuinnClientConfig, CryptoError, ExportKeyingMaterialError, HeaderKey,
+        KeyPair, Keys, PacketKey, ServerConfig as QuinnServerConfig, Session,
+    };
+    use quinn_proto::congestion::BbrConfig;
+    use quinn_proto::transport_parameters::TransportParameters;
+    use quinn_proto::{ConnectError, Side, TransportError};
+
+    // -- SeaHash (seahash-4.1.0 src/stream.rs + src/helper.rs) ------------
+    //
+    // The streaming hash whose digest is every packet's integrity tag.
+    // Implemented byte-at-a-time (gather 8 LE bytes into `tail`, push),
+    // which is mathematically identical to the crate's block-unrolled
+    // `push_bytes` — the reference test `chunked_equiv` asserts exactly
+    // this streaming equivalence — and verified against digests produced
+    // by the real crate (see `quic_plaintext_seahash_reference_vectors`).
+
+    /// `diffuse` (helper.rs:79-92): the PCG-round bijection.
+    fn diffuse(mut x: u64) -> u64 {
+        x = x.wrapping_mul(0x6eed0e9da4d94a4f);
+        let a = x >> 32;
+        let b = x >> 60;
+        x ^= a >> b;
+        x.wrapping_mul(0x6eed0e9da4d94a4f)
+    }
+
+    /// The streaming SeaHasher (`SeaHasher::default` seeds, stream.rs:19-28).
+    struct SeaHasher {
+        state: [u64; 4],
+        written: u64,
+        tail: u64,
+        ntail: usize,
+    }
+
+    impl SeaHasher {
+        fn new() -> Self {
+            SeaHasher {
+                state: [
+                    0x16f11fe89b0d677c,
+                    0xb480a793d8e6c86c,
+                    0x6fe2e5aaf078ebc9,
+                    0x14f994a4c5259381,
+                ],
+                written: 0,
+                tail: 0,
+                ntail: 0,
+            }
+        }
+
+        /// `SeaHasher::push` (stream.rs:48-56).
+        fn push(&mut self, x: u64) {
+            let a = diffuse(self.state[0] ^ x);
+            self.state[0] = self.state[1];
+            self.state[1] = self.state[2];
+            self.state[2] = self.state[3];
+            self.state[3] = a;
+            self.written += 8;
+        }
+
+        /// `Hasher::write` (stream.rs:178-180).
+        fn write(&mut self, bytes: &[u8]) {
+            for &b in bytes {
+                self.tail |= (b as u64) << (8 * self.ntail);
+                self.ntail += 1;
+                if self.ntail == 8 {
+                    let x = self.tail;
+                    self.push(x);
+                    self.tail = 0;
+                    self.ntail = 0;
+                }
+            }
+        }
+
+        /// `Hasher::write_usize` (stream.rs:198-200): 8 LE bytes on
+        /// 64-bit — what std's `write_length_prefix` default emits, i.e.
+        /// the length prefix of `Hash for [u8]`.
+        fn write_usize(&mut self, n: usize) {
+            self.write(&(n as u64).to_le_bytes());
+        }
+
+        /// `Hasher::finish` (stream.rs:166-176): note the reference's
+        /// `a ^ ... ^ written + ntail` parses as `^ (written + ntail)`.
+        fn finish(&self) -> u64 {
+            let a = if self.ntail > 0 {
+                diffuse(self.state[0] ^ self.tail)
+            } else {
+                self.state[0]
+            };
+            diffuse(a ^ self.state[1] ^ self.state[2] ^ self.state[3] ^ (self.written + self.ntail as u64))
+        }
+    }
+
+    /// The packet integrity tag: `SeaHasher` over the `Hash for [u8]`
+    /// sequence of header then payload (`PlaintextPacketKey::encrypt`,
+    /// quinn-plaintext src/lib.rs:281-297 — `header.hash(&mut hasher);
+    /// payload.hash(&mut hasher)`).
+    pub(super) fn packet_tag(header: &[u8], payload: &[u8]) -> u64 {
+        let mut hasher = SeaHasher::new();
+        hasher.write_usize(header.len());
+        hasher.write(header);
+        hasher.write_usize(payload.len());
+        hasher.write(payload);
+        hasher.finish()
+    }
+
+    /// `PlaintextHeaderKey` (quinn-plaintext src/lib.rs:38-65): no header
+    /// protection at all.
+    struct PlaintextHeaderKey;
+
+    impl HeaderKey for PlaintextHeaderKey {
+        fn decrypt(&self, _pn_offset: usize, _packet: &mut [u8]) {}
+        fn encrypt(&self, _pn_offset: usize, _packet: &mut [u8]) {}
+        fn sample_size(&self) -> usize {
+            0
+        }
+    }
+
+    /// `PlaintextPacketKey` (quinn-plaintext src/lib.rs:280-341): the
+    /// 8-byte SeaHash tag, nothing else.
+    pub(super) struct PlaintextPacketKey;
+
+    impl PacketKey for PlaintextPacketKey {
+        fn encrypt(&self, _packet: u64, buf: &mut [u8], header_len: usize) {
+            let (header, payload_tag) = buf.split_at_mut(header_len);
+            let (payload, tag_storage) = payload_tag.split_at_mut(payload_tag.len() - self.tag_len());
+            let checksum = packet_tag(header, payload);
+            tag_storage.copy_from_slice(&checksum.to_be_bytes());
+        }
+
+        fn decrypt(
+            &self,
+            _packet: u64,
+            header: &[u8],
+            payload: &mut BytesMut,
+        ) -> Result<(), CryptoError> {
+            let tag_start = payload
+                .len()
+                .checked_sub(self.tag_len())
+                .ok_or(CryptoError)?;
+            let tag_storage = payload.split_off(tag_start);
+            let expected =
+                u64::from_be_bytes(tag_storage.as_ref().try_into().map_err(|_| CryptoError)?);
+            let checksum = packet_tag(header, payload);
+            if checksum != expected {
+                return Err(CryptoError);
+            }
+            Ok(())
+        }
+
+        fn tag_len(&self) -> usize {
+            8
+        }
+
+        fn confidentiality_limit(&self) -> u64 {
+            u64::MAX
+        }
+
+        fn integrity_limit(&self) -> u64 {
+            1 << 36
+        }
+    }
+
+    fn header_keypair() -> KeyPair<Box<dyn HeaderKey>> {
+        KeyPair {
+            local: Box::new(PlaintextHeaderKey),
+            remote: Box::new(PlaintextHeaderKey),
+        }
+    }
+
+    fn packet_keypair() -> KeyPair<Box<dyn PacketKey>> {
+        KeyPair {
+            local: Box::new(PlaintextPacketKey),
+            remote: Box::new(PlaintextPacketKey),
+        }
+    }
+
+    /// `crypto_keys` (quinn-plaintext src/lib.rs:95-100): identical
+    /// plaintext keys for every packet space and both directions.
+    fn crypto_keys() -> Keys {
+        Keys {
+            header: header_keypair(),
+            packet: packet_keypair(),
+        }
+    }
+
+    /// `PlaintextSession` (quinn-plaintext src/lib.rs:117-240): the QUIC
+    /// transport parameters ARE the handshake — written to / read from
+    /// the CRYPTO stream verbatim, with two key-phase transitions
+    /// (initial keys, then handshake keys) that carry the same plaintext
+    /// keys.
+    struct PlaintextSession {
+        side: Side,
+        params: TransportParameters,
+        peer_params: Option<TransportParameters>,
+        wrote_transporter_params: bool,
+        initial_keys: Option<Keys>,
+        handshake_keys: Option<Keys>,
+    }
+
+    impl PlaintextSession {
+        fn new(side: Side, params: TransportParameters) -> Self {
+            PlaintextSession {
+                side,
+                params,
+                peer_params: None,
+                wrote_transporter_params: false,
+                initial_keys: Some(crypto_keys()),
+                handshake_keys: Some(crypto_keys()),
+            }
+        }
+    }
+
+    impl Session for PlaintextSession {
+        fn initial_keys(&self, _dst_cid: &quinn_proto::ConnectionId, _side: Side) -> Keys {
+            crypto_keys()
+        }
+
+        fn handshake_data(&self) -> Option<Box<dyn Any>> {
+            self.peer_params.map(|tp| Box::new(tp) as Box<dyn Any>)
+        }
+
+        fn peer_identity(&self) -> Option<Box<dyn Any>> {
+            None
+        }
+
+        fn early_crypto(&self) -> Option<(Box<dyn HeaderKey>, Box<dyn PacketKey>)> {
+            None
+        }
+
+        fn early_data_accepted(&self) -> Option<bool> {
+            Some(false)
+        }
+
+        /// `is_handshaking` (lib.rs:167-172): until the peer's parameters
+        /// arrived AND our own were written AND both key phases were
+        /// handed over.
+        fn is_handshaking(&self) -> bool {
+            self.peer_params.is_none()
+                || !self.wrote_transporter_params
+                    && (self.initial_keys.is_some() || self.handshake_keys.is_some())
+        }
+
+        fn read_handshake(&mut self, buf: &[u8]) -> Result<bool, TransportError> {
+            if self.peer_params.is_none() {
+                let mut cursor = buf;
+                self.peer_params = Some(
+                    TransportParameters::read(self.side, &mut cursor).map_err(|e| {
+                        TransportError {
+                            code: quinn_proto::TransportErrorCode::crypto(0x28),
+                            frame: None,
+                            reason: format!("easytier quic: bad transport parameters: {e}"),
+                        }
+                    })?,
+                );
+            }
+            Ok(true)
+        }
+
+        fn transport_parameters(&self) -> Result<Option<TransportParameters>, TransportError> {
+            Ok(self.peer_params)
+        }
+
+        /// `write_handshake` (lib.rs:193-219): the client emits its
+        /// parameters on the FIRST call (Initial space) and returns the
+        /// initial keys; the second call returns the handshake keys. The
+        /// server writes its parameters when the handshake keys are taken
+        /// (its first flight has nothing to send — it answers).
+        fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<Keys> {
+            if self.side.is_client() && !self.wrote_transporter_params {
+                self.params.write(buf);
+                self.wrote_transporter_params = true;
+            }
+            match self.initial_keys.take() {
+                Some(k) => Some(k),
+                None => match self.handshake_keys.take() {
+                    Some(k) => {
+                        if self.side.is_server() && !self.wrote_transporter_params {
+                            self.params.write(buf);
+                            self.wrote_transporter_params = true;
+                        }
+                        Some(k)
+                    }
+                    None => None,
+                },
+            }
+        }
+
+        fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>> {
+            Some(packet_keypair())
+        }
+
+        fn is_valid_retry(
+            &self,
+            _orig_dst_cid: &quinn_proto::ConnectionId,
+            _header: &[u8],
+            _payload: &[u8],
+        ) -> bool {
+            // The listener never issues retries (ServerConfig default),
+            // so nothing to verify.
+            true
+        }
+
+        fn export_keying_material(
+            &self,
+            _output: &mut [u8],
+            _label: &[u8],
+            _context: &[u8],
+        ) -> Result<(), ExportKeyingMaterialError> {
+            Ok(())
+        }
+    }
+
+    /// `PlaintextClientConfig` (lib.rs:242-252).
+    #[derive(Default)]
+    struct PlaintextClientConfig;
+
+    impl QuinnClientConfig for PlaintextClientConfig {
+        fn start_session(
+            self: Arc<Self>,
+            _version: u32,
+            _server_name: &str,
+            params: &TransportParameters,
+        ) -> Result<Box<dyn Session>, ConnectError> {
+            Ok(Box::new(PlaintextSession::new(Side::Client, *params)))
+        }
+    }
+
+    /// `PlaintextServerConfig` (lib.rs:254-278).
+    #[derive(Default)]
+    struct PlaintextServerConfig;
+
+    impl QuinnServerConfig for PlaintextServerConfig {
+        fn initial_keys(
+            &self,
+            _version: u32,
+            _dst_cid: &quinn_proto::ConnectionId,
+        ) -> Result<Keys, quinn_proto::crypto::UnsupportedVersion> {
+            Ok(crypto_keys())
+        }
+
+        fn retry_tag(&self, _version: u32, _orig_dst_cid: &quinn_proto::ConnectionId, _packet: &[u8]) -> [u8; 16] {
+            [0u8; 16]
+        }
+
+        fn start_session(
+            self: Arc<Self>,
+            _version: u32,
+            params: &TransportParameters,
+        ) -> Box<dyn Session> {
+            Box::new(PlaintextSession::new(Side::Server, *params))
+        }
+    }
+
+    // -- The easytier configs on top (tunnel/quic.rs:26-57) ---------------
+
+    /// `transport_config` (quic.rs:26-39).
+    fn transport_config() -> Arc<quinn::TransportConfig> {
+        let mut config = quinn::TransportConfig::default();
+        config
+            .max_concurrent_bidi_streams(u8::MAX.into())
+            .max_concurrent_uni_streams(0u8.into())
+            .keep_alive_interval(Some(Duration::from_secs(5)))
+            .initial_mtu(1200)
+            .min_mtu(1200)
+            .enable_segmentation_offload(true)
+            .congestion_controller_factory(Arc::new(BbrConfig::default()));
+        Arc::new(config)
+    }
+
+    /// `server_config` (quic.rs:41-45).
+    pub(super) fn server_config() -> quinn::ServerConfig {
+        let mut config = quinn::ServerConfig::with_crypto(Arc::new(PlaintextServerConfig));
+        config.transport_config(transport_config());
+        config
+    }
+
+    /// `client_config` (quic.rs:47-51).
+    pub(super) fn client_config() -> quinn::ClientConfig {
+        let mut config = quinn::ClientConfig::new(Arc::new(PlaintextClientConfig));
+        config.transport_config(transport_config());
+        config
+    }
+
+    /// `endpoint_config` (quic.rs:53-57).
+    pub(super) fn endpoint_config() -> quinn::EndpointConfig {
+        let mut config = quinn::EndpointConfig::default();
+        config.max_udp_payload_size(1200).unwrap();
+        config
+    }
+}
+
+/// One `quic://` peer tunnel stream: the single bi-stream of one QUIC
+/// connection plus the connection itself (kept alive for the stream's
+/// lifetime; dropped streams close it with code 0 / `done`, the
+/// `ConnWrapper` of quic.rs:457-465).
+pub struct EtQuicStream {
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    conn: Option<quinn::Connection>,
+}
+
+impl EtQuicStream {
+    fn pair(send: quinn::SendStream, recv: quinn::RecvStream, conn: quinn::Connection) -> Self {
+        EtQuicStream {
+            send,
+            recv,
+            conn: Some(conn),
+        }
+    }
+}
+
+impl Drop for EtQuicStream {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            conn.close(0u32.into(), b"done");
+        }
+    }
+}
+
+impl AsyncRead for EtQuicStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        AsyncRead::poll_read(Pin::new(&mut self.recv), cx, buf)
+    }
+}
+
+impl AsyncWrite for EtQuicStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        AsyncWrite::poll_write(Pin::new(&mut self.send), cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        AsyncWrite::poll_flush(Pin::new(&mut self.send), cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        AsyncWrite::poll_shutdown(Pin::new(&mut self.send), cx)
+    }
+}
+
+/// The quinn endpoint boot shared by both roles: a bound UDP socket
+/// wrapped by the tokio runtime's UDP stack (upstream:
+/// `QuicEndpointManager::try_create`, quic.rs:233-249).
+fn quic_endpoint(
+    bind: SocketAddr,
+    server: Option<quinn::ServerConfig>,
+) -> Result<quinn::Endpoint> {
+    let socket = std::net::UdpSocket::bind(bind)
+        .map_err(|e| Error::network(format!("easytier: quic bind {bind}: {e}")))?;
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| Error::network("easytier: quic: no async runtime found"))?;
+    let wrapped = runtime
+        .wrap_udp_socket(socket)
+        .map_err(|e| Error::network(format!("easytier: quic socket: {e}")))?;
+    quinn::Endpoint::new_with_abstract_socket(
+        quic_plaintext::endpoint_config(),
+        server,
+        wrapped,
+        runtime,
+    )
+    .map_err(|e| Error::network(format!("easytier: quic endpoint: {e}")))
+}
+
+/// `QuicTunnelConnector::connect` (quic.rs:578-610): connect with the
+/// server name `localhost`, open the one bi-stream, return it under the
+/// M1 framing. The caller owns the 3s direct-connect budget.
+pub async fn connect_quic_tunnel(addr: SocketAddr) -> Result<EtQuicStream> {
+    let bind = if addr.is_ipv6() {
+        SocketAddr::from(([0u8; 16], 0))
+    } else {
+        SocketAddr::from(([0, 0, 0, 0], 0))
+    };
+    let mut endpoint = quic_endpoint(bind, None)?;
+    endpoint.set_default_client_config(quic_plaintext::client_config());
+    let connecting = endpoint
+        .connect(addr, "localhost")
+        .map_err(|e| Error::network(format!("easytier: quic connect to {addr}: {e}")))?;
+    let conn = connecting
+        .await
+        .map_err(|e| Error::network(format!("easytier: quic connect to {addr}: {e}")))?;
+    let (send, recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| Error::network(format!("easytier: quic open_bi: {e}")))?;
+    Ok(EtQuicStream::pair(send, recv, conn))
+}
+
+/// `QuicTunnelListener` (quic.rs:467-556): a bound QUIC endpoint whose
+/// `accept` completes a connection and takes the client's first
+/// bi-stream.
+pub struct QuicVtListener {
+    endpoint: quinn::Endpoint,
+    local: SocketAddr,
+}
+
+impl QuicVtListener {
+    /// `QuicTunnelListener::listen` (quic.rs:530-539).
+    pub fn bind(addr: SocketAddr) -> Result<Self> {
+        let endpoint = quic_endpoint(addr, Some(quic_plaintext::server_config()))?;
+        let local = endpoint
+            .local_addr()
+            .map_err(|e| Error::network(format!("easytier: quic local addr: {e}")))?;
+        Ok(QuicVtListener { endpoint, local })
+    }
+
+    /// The bound address (port 0 resolves, `local_url`, quic.rs:553-556).
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local
+    }
+
+    /// `QuicTunnelListener::accept` (quic.rs:482-551): accept, await the
+    /// connection, take the client-opened bi-stream; a failed inbound
+    /// retries after 1ms instead of failing the listener.
+    pub async fn accept(&mut self) -> Result<EtQuicStream> {
+        loop {
+            let incoming = match self.endpoint.accept().await {
+                Some(incoming) => incoming,
+                None => {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    continue;
+                }
+            };
+            let conn = match incoming.await {
+                Ok(conn) => conn,
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    continue;
+                }
+            };
+            match conn.accept_bi().await {
+                Ok((send, recv)) => return Ok(EtQuicStream::pair(send, recv, conn)),
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    continue;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The WebSocket peer transport (easytier-core/src/tunnel/websocket.rs, v2.6.4)
+// ---------------------------------------------------------------------------
+//
+// A `ws://`/`wss://` peer URI is the SAME peer protocol over a WebSocket:
+// the connector dials TCP (`TcpSocket::connect` + nodelay,
+// websocket.rs:217-225), optionally wraps it in TLS for `wss` — an
+// INSECURE rustls client config with SNI `localhost` when the URI has no
+// domain (`get_insecure_tls_client_config` + the SNI comment,
+// websocket.rs:244-256) — then runs the RFC 6455 client upgrade
+// (`ClientBuilder::from_uri` of the `ws://` URI: `GET <path> HTTP/1.1`
+// with Host/Upgrade/Connection/Sec-WebSocket-Key/Sec-WebSocket-Version,
+// websocket.rs:243,261) and maps the stream: **every WebSocket BINARY
+// message is one tunnel payload** — `[PeerManagerHeader][payload]` with
+// NO length prefix, because the message is self-delimiting
+// (`sink_from_zc_packet` sends `msg.tunnel_payload_bytes()` and
+// `map_from_ws_message` re-buffers each binary message as one ZCPacket,
+// websocket.rs:36-64). A close message ends the stream; non-binary
+// messages are an error; `Limits::unlimited()` server-side
+// (websocket.rs:114). The listener is the TCP (or TLS) mirror: upstream
+// serves `wss` with a process-global self-signed cert
+// (`get_insecure_tls_cert`) and completes the upgrade with the computed
+// `Sec-WebSocket-Accept`, then hands the same message mapping to the
+// peer manager (websocket.rs:94-158, accept retries after failures with
+// a 3s per-accept budget, websocket.rs:177-191).
+//
+// The engine has no websocket dependency; per the sudoku precedent
+// (proto/sudoku.rs `ws_build_frame`/`ws_read_frame` + transport.rs's
+// `ws_connect`), the handshake and framing are hand-rolled here. The
+// session machinery of M1 speaks the TCP byte framing
+// (`[u32][PeerManagerHeader][payload]`, `write_frame`/`read_frame`), so
+// [`WsPeerStream`] is the adapter: outgoing it STRIPS the u32 length
+// prefix and sends the body as one binary message; incoming it re-adds
+// the prefix in front of each message body — the byte stream the peer
+// machinery reads is byte-identical to the TCP tunnel while the WIRE
+// carries upstream's message mapping.
+//
+// DELTA vs upstream: the `Forwarded`/`X-Forwarded-For` remote-address
+// rewrite for trusted proxies (websocket.rs:66-78, 118-141 — TunnelInfo
+// bookkeeping only, nothing on the peer wire) is not carried; the wss
+// certificate is generated once per process (upstream's global
+// `LazyLock` cert) but roles and ciphers are identical.
+
+/// The largest inbound WS message accepted (upstream: `Limits::unlimited()`
+/// on the listener; a peer frame never legitimately exceeds the ~2 KB
+/// packet budget, so 1 MiB is generous headroom against garbage).
+const WS_MAX_MESSAGE: usize = 1 << 20;
+
+/// RFC 6455 opcodes this transport cares about.
+const WS_OP_CONT: u8 = 0x0;
+const WS_OP_TEXT: u8 = 0x1;
+const WS_OP_BINARY: u8 = 0x2;
+const WS_OP_CLOSE: u8 = 0x8;
+const WS_OP_PING: u8 = 0x9;
+const WS_OP_PONG: u8 = 0xa;
+/// The RFC 6455 GUID folded into `Sec-WebSocket-Accept`.
+const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+/// `Sec-WebSocket-Accept` = base64(SHA-1(key || GUID)) (RFC 6455 §4.2.2).
+fn ws_accept_key(key: &str) -> String {
+    use base64::Engine as _;
+    use sha1::{Digest as _, Sha1};
+    let mut h = Sha1::new();
+    h.update(key.as_bytes());
+    h.update(WS_GUID);
+    base64::engine::general_purpose::STANDARD.encode(h.finalize())
+}
+
+/// Read one CRLF-terminated HTTP/1.1 head (up to the blank line) from a
+/// fresh stream, bounded by `cap` bytes.
+async fn ws_read_http_head<S>(io: &mut S, cap: usize) -> Result<String>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut buf = Vec::with_capacity(1024);
+    let mut byte = [0u8; 1];
+    loop {
+        match io.read(&mut byte).await {
+            Ok(0) => break,
+            Ok(_) => {
+                buf.push(byte[0]);
+                if buf.ends_with(b"\r\n\r\n") {
+                    buf.truncate(buf.len() - 4);
+                    break;
+                }
+                if buf.len() > cap {
+                    return Err(Error::protocol("easytier: ws handshake head too long"));
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Case-insensitive header lookup over a parsed head.
+fn ws_header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.split("\r\n").find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        k.trim()
+            .eq_ignore_ascii_case(name)
+            .then(|| v.trim())
+    })
+}
+
+/// Serialize one RFC 6455 frame; `mask` per the client role (clients mask,
+/// servers do not). Mirrors the engine's sudoku/transport.rs builders.
+fn ws_frame(opcode: u8, payload: &[u8], mask: bool) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(payload.len() + 14);
+    frame.push(0x80 | opcode); // FIN + opcode (easytier never fragments)
+    match payload.len() {
+        n if n < 126 => frame.push(if mask { 0x80 | n as u8 } else { n as u8 }),
+        n if n <= 0xffff => {
+            frame.push(if mask { 0x80 | 126 } else { 126 });
+            frame.extend_from_slice(&(n as u16).to_be_bytes());
+        }
+        n => {
+            frame.push(if mask { 0x80 | 127 } else { 127 });
+            frame.extend_from_slice(&(n as u64).to_be_bytes());
+        }
+    }
+    if mask {
+        let mask = rand::random::<u32>().to_le_bytes();
+        frame.extend_from_slice(&mask);
+        for (i, b) in payload.iter().enumerate() {
+            frame.push(b ^ mask[i % 4]);
+        }
+    } else {
+        frame.extend_from_slice(payload);
+    }
+    frame
+}
+
+/// One parsed inbound frame (both maskings accepted, RFC §5.1 enforced
+/// only on our own client).
+struct WsParsedFrame {
+    fin: bool,
+    opcode: u8,
+    payload: Vec<u8>,
+    /// Bytes consumed from the front of `buf`.
+    used: usize,
+}
+
+/// Try to parse one frame off the front of `buf`.
+fn ws_parse_frame(buf: &[u8]) -> Result<Option<WsParsedFrame>> {
+    if buf.len() < 2 {
+        return Ok(None);
+    }
+    let b0 = buf[0];
+    let b1 = buf[1];
+    if b0 & 0x70 != 0 {
+        return Err(Error::protocol("easytier: ws frame with RSV bits"));
+    }
+    let fin = b0 & 0x80 != 0;
+    let opcode = b0 & 0x0f;
+    let masked = b1 & 0x80 != 0;
+    let mut off = 2usize;
+    let len = match b1 & 0x7f {
+        126 => {
+            if buf.len() < 4 {
+                return Ok(None);
+            }
+            off = 4;
+            u16::from_be_bytes([buf[2], buf[3]]) as usize
+        }
+        127 => {
+            if buf.len() < 10 {
+                return Ok(None);
+            }
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&buf[2..10]);
+            off = 10;
+            u64::from_be_bytes(b) as usize
+        }
+        n => n as usize,
+    };
+    if len > WS_MAX_MESSAGE {
+        return Err(Error::protocol("easytier: ws message too long"));
+    }
+    let mask_len = if masked { 4 } else { 0 };
+    let total = off + mask_len + len;
+    if buf.len() < total {
+        return Ok(None);
+    }
+    let mask = if masked {
+        let mut m = [0u8; 4];
+        m.copy_from_slice(&buf[off..off + 4]);
+        m
+    } else {
+        [0u8; 4]
+    };
+    let mut payload = buf[off + mask_len..total].to_vec();
+    if masked {
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b ^= mask[i % 4];
+        }
+    }
+    Ok(Some(WsParsedFrame {
+        fin,
+        opcode,
+        payload,
+        used: total,
+    }))
+}
+
+/// The WS peer stream: the engine-side byte framing in, RFC 6455 binary
+/// messages out (and the reverse on read). See the section header for
+/// the mapping.
+pub struct WsPeerStream {
+    io: BoxProxyStream,
+    /// The client role masks its frames (RFC 6455 §5.1).
+    client: bool,
+    // Receive side: raw socket bytes → frames → assembled messages →
+    // the reconstructed [u32 len][body] byte stream.
+    rbuf: Vec<u8>,
+    pending: Vec<u8>,
+    pending_pos: usize,
+    msg_buf: Vec<u8>,
+    eof: bool,
+    // Send side.
+    tx_buf: Vec<u8>,
+    tx_pos: usize,
+    /// The plain length the in-flight `tx_buf` frame stands for (what
+    /// `poll_write` must report once the frame is handed off).
+    tx_plain: usize,
+    ctrl: Vec<u8>,
+    /// How much of `ctrl` already reached the socket (control-frame
+    /// writes may interleave with pending data-frame writes).
+    ctrl_pos: usize,
+    closed: bool,
+}
+
+impl WsPeerStream {
+    fn new(io: BoxProxyStream, client: bool) -> Self {
+        WsPeerStream {
+            io,
+            client,
+            rbuf: Vec::new(),
+            pending: Vec::new(),
+            pending_pos: 0,
+            msg_buf: Vec::new(),
+            eof: false,
+            tx_buf: Vec::new(),
+            tx_pos: 0,
+            tx_plain: 0,
+            ctrl: Vec::new(),
+            ctrl_pos: 0,
+            closed: false,
+        }
+    }
+
+    /// Read-side: fold one newly completed message into `pending`,
+    /// re-adding the u32 length prefix the WS mapping drops.
+    fn message_done(&mut self) {
+        let mut framed = Vec::with_capacity(4 + self.msg_buf.len());
+        framed.extend_from_slice(&(self.msg_buf.len() as u32).to_le_bytes());
+        framed.append(&mut self.msg_buf);
+        self.pending = framed;
+        self.pending_pos = 0;
+    }
+
+    /// Build the outgoing frame for `buf`, stripping the u32 length
+    /// prefix when `buf` is exactly one engine frame (always the case
+    /// from `write_frame`'s `write_all`).
+    fn outgoing_frame(&self, buf: &[u8]) -> Vec<u8> {
+        let body = if buf.len() >= 4 {
+            let declared = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+            if declared + 4 == buf.len() {
+                &buf[4..]
+            } else {
+                buf
+            }
+        } else {
+            buf
+        };
+        ws_frame(WS_OP_BINARY, body, self.client)
+    }
+
+    /// Push as much of the buffer at `pos` through the socket as it
+    /// accepts right now.
+    fn pump_write(
+        io: &mut BoxProxyStream,
+        buf: &mut [u8],
+        pos: &mut usize,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<usize>> {
+        while *pos < buf.len() {
+            match Pin::new(&mut **io).poll_write(cx, &buf[*pos..]) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "easytier: ws transport accepted zero bytes",
+                    )))
+                }
+                Poll::Ready(Ok(n)) => *pos += n,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Poll::Ready(Ok(0))
+    }
+
+    /// Flush the queued control frames; `Ok(true)` when the queue is
+    /// fully drained (`ctrl_pos` keeps the progress across Pending).
+    fn pump_ctrl(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
+        let mut pos = self.ctrl_pos;
+        match Self::pump_write(&mut self.io, &mut self.ctrl, &mut pos, cx) {
+            Poll::Ready(Ok(_)) => {
+                self.ctrl.clear();
+                self.ctrl_pos = 0;
+                Ok(true)
+            }
+            Poll::Ready(Err(e)) => Err(e),
+            Poll::Pending => {
+                self.ctrl_pos = pos;
+                Ok(false)
+            }
+        }
+    }
+}
+
+impl AsyncRead for WsPeerStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        loop {
+            // Serve the reconstructed byte stream first.
+            if this.pending_pos < this.pending.len() {
+                let n = (this.pending.len() - this.pending_pos).min(buf.remaining());
+                buf.put_slice(&this.pending[this.pending_pos..this.pending_pos + n]);
+                this.pending_pos += n;
+                return Poll::Ready(Ok(()));
+            }
+            if this.eof {
+                return Poll::Ready(Ok(()));
+            }
+            if buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            // Opportunistically flush queued control frames.
+            if !this.ctrl.is_empty() {
+                if let Err(e) = this.pump_ctrl(cx) {
+                    return Poll::Ready(Err(e));
+                }
+            }
+            match ws_parse_frame(&this.rbuf).map_err(ws_io_err)? {
+                Some(frame) => {
+                    this.rbuf.drain(..frame.used);
+                    match frame.opcode {
+                        WS_OP_BINARY | WS_OP_TEXT | WS_OP_CONT => {
+                            this.msg_buf.extend_from_slice(&frame.payload);
+                            if frame.fin {
+                                if frame.opcode == WS_OP_TEXT {
+                                    // `map_from_ws_message`: only binary
+                                    // messages are peer packets.
+                                    return Poll::Ready(Err(ws_io_err(Error::protocol(
+                                        "easytier: ws: non-binary message",
+                                    ))));
+                                }
+                                this.message_done();
+                            }
+                        }
+                        WS_OP_PING => {
+                            this.ctrl
+                                .extend_from_slice(&ws_frame(WS_OP_PONG, &frame.payload, this.client));
+                        }
+                        WS_OP_PONG => {}
+                        WS_OP_CLOSE => {
+                            // `recv close message from websocket` ends the
+                            // stream (websocket.rs:49-52).
+                            if !this.closed {
+                                this.closed = true;
+                                this.ctrl
+                                    .extend_from_slice(&ws_frame(WS_OP_CLOSE, &frame.payload, this.client));
+                            }
+                            this.eof = true;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                None => {
+                    let mut tmp = [0u8; 16 * 1024];
+                    let mut rb = ReadBuf::new(&mut tmp);
+                    match Pin::new(&mut this.io).poll_read(cx, &mut rb) {
+                        Poll::Ready(Ok(())) => {
+                            if rb.filled().is_empty() {
+                                this.eof = true;
+                                return Poll::Ready(Ok(()));
+                            }
+                            this.rbuf.extend_from_slice(rb.filled());
+                        }
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl AsyncWrite for WsPeerStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if this.closed || this.eof {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "easytier: ws tunnel closed",
+            )));
+        }
+        // Finish the in-flight frame first (`write_all` re-polls with the
+        // same slice until its full plain length is acknowledged).
+        if this.tx_pos < this.tx_buf.len() {
+            match Self::pump_write(&mut this.io, &mut this.tx_buf, &mut this.tx_pos, cx) {
+                Poll::Ready(Ok(_)) => {
+                    let n = this.tx_plain;
+                    this.tx_buf.clear();
+                    this.tx_pos = 0;
+                    this.tx_plain = 0;
+                    return Poll::Ready(Ok(n));
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        // Queued control frames go out before the next data frame.
+        if !this.ctrl.is_empty() {
+            match this.pump_ctrl(cx) {
+                Ok(true) => {}
+                Ok(false) => return Poll::Pending,
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        this.tx_buf = this.outgoing_frame(buf);
+        this.tx_pos = 0;
+        this.tx_plain = buf.len();
+        match Self::pump_write(&mut this.io, &mut this.tx_buf, &mut this.tx_pos, cx) {
+            Poll::Ready(Ok(_)) => {
+                let n = this.tx_plain;
+                this.tx_buf.clear();
+                this.tx_pos = 0;
+                this.tx_plain = 0;
+                Poll::Ready(Ok(n))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        while this.tx_pos < this.tx_buf.len() || this.ctrl_pos < this.ctrl.len() {
+            if this.tx_pos < this.tx_buf.len() {
+                match Self::pump_write(&mut this.io, &mut this.tx_buf, &mut this.tx_pos, cx) {
+                    Poll::Ready(Ok(_)) => {
+                        this.tx_buf.clear();
+                        this.tx_pos = 0;
+                        this.tx_plain = 0;
+                    }
+                    other => return other.map(|r| r.map(|_| ())),
+                }
+            }
+            if this.ctrl_pos < this.ctrl.len() {
+                match this.pump_ctrl(cx) {
+                    Ok(_) => {}
+                    Err(e) => return Poll::Ready(Err(e)),
+                }
+            }
+        }
+        Pin::new(&mut this.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if !this.closed {
+            this.closed = true;
+            let frame = ws_frame(WS_OP_CLOSE, &1000u16.to_be_bytes(), this.client);
+            this.ctrl.extend_from_slice(&frame);
+        }
+        // Best-effort close frame, then the transport shutdown.
+        match this.pump_ctrl(cx) {
+            Ok(true) => Pin::new(&mut this.io).poll_shutdown(cx),
+            Ok(false) => Poll::Pending,
+            Err(_) => Pin::new(&mut this.io).poll_shutdown(cx),
+        }
+    }
+}
+
+fn ws_io_err(e: Error) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+}
+
+/// `WsTunnelConnector::connect` (websocket.rs:198-266): TCP connect,
+/// optional insecure TLS for `wss` (SNI = the URI's domain, else
+/// `localhost`), then the client upgrade. The caller owns the connect
+/// budget.
+pub async fn connect_ws_tunnel(endpoint: &PeerEndpoint) -> Result<WsPeerStream> {
+    let addr = resolve_peer_addr(endpoint).await?;
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .map_err(|e| Error::network(format!("easytier: ws connect {addr}: {e}")))?;
+    let _ = stream.set_nodelay(true);
+    let mut io: BoxProxyStream = Box::new(stream);
+    if endpoint.transport == PeerTransport::Wss {
+        let sni = if endpoint.host.parse::<std::net::IpAddr>().is_ok() {
+            // "use localhost as SNI for url without domain" (websocket.rs:248-252)
+            "localhost".to_owned()
+        } else {
+            endpoint.host.clone()
+        };
+        let settings = crate::transport::TlsSettings {
+            enabled: true,
+            server_name: None,
+            skip_cert_verify: true,
+            alpn: Vec::new(),
+        };
+        io = crate::transport::tls_connect(io, &sni, &settings).await?;
+    }
+    // The upgrade (ClientBuilder::from_uri over the ws:// URI — the easytier
+    // peer URI carries no path, so `GET /`).
+    use base64::Engine as _;
+    let mut key_bytes = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key_bytes);
+    let key = base64::engine::general_purpose::STANDARD.encode(key_bytes);
+    let host_header = format!("{}:{}", endpoint.host, endpoint.port);
+    let req = format!(
+        "GET / HTTP/1.1\r\nHost: {host_header}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
+    io.write_all(req.as_bytes()).await?;
+    let head = ws_read_http_head(&mut io, 16 * 1024).await?;
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse::<u16>().ok())
+        .ok_or_else(|| Error::protocol(format!("easytier: ws bad status line {head:?}")))?;
+    if status != 101 {
+        return Err(Error::network(format!(
+            "easytier: ws upgrade rejected with {status}"
+        )));
+    }
+    let accept = ws_header(&head, "sec-websocket-accept").unwrap_or_default();
+    if accept != ws_accept_key(&key) {
+        return Err(Error::protocol("easytier: ws Sec-WebSocket-Accept mismatch"));
+    }
+    Ok(WsPeerStream::new(io, true))
+}
+
+/// The process-global self-signed `wss` server certificate
+/// (`get_insecure_tls_cert`, a LazyLock upstream — one key per process).
+/// The engine has no cert generator in its library dependencies, so this
+/// is the minimal self-signed ECDSA P-256 DER builder of the JLS
+/// camouflage path (`proto/jls.rs::generate_camouflage_cert`): random
+/// serial + CN, ~8y validity, `ecdsa-with-SHA256`. Nothing verifies it
+/// (every easytier `wss` client is insecure by design), so the minimal
+/// shape suffices.
+static WSS_INSECURE_SERVER: std::sync::OnceLock<Option<Arc<rustls::ServerConfig>>> =
+    std::sync::OnceLock::new();
+
+/// One DER TLV (`der_put` of proto/jls.rs).
+fn ws_der_put(out: &mut Vec<u8>, tag: u8, body: &[u8]) {
+    out.push(tag);
+    if body.len() < 0x80 {
+        out.push(body.len() as u8);
+    } else if body.len() <= 0xff {
+        out.push(0x81);
+        out.push(body.len() as u8);
+    } else {
+        out.push(0x82);
+        out.push((body.len() >> 8) as u8);
+        out.push(body.len() as u8);
+    }
+    out.extend_from_slice(body);
+}
+
+/// One DER UTCTime (Hinnant's civil-from-days, as in proto/jls.rs).
+fn ws_der_utctime(unix_secs: i64) -> Vec<u8> {
+    let days = unix_secs.div_euclid(86_400);
+    let secs = unix_secs.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 146_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let (h, mi, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    format!("{:02}{m:02}{d:02}{h:02}{mi:02}{s:02}Z", y.rem_euclid(100)).into_bytes()
+}
+
+/// Build the (cert, key) pair rustls serves for `wss`.
+fn ws_self_signed_pair(
+) -> Result<(
+    rustls::pki_types::CertificateDer<'static>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+)> {
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+        &rng,
+    )
+    .map_err(|_| Error::crypto("easytier: wss key generation failed"))?;
+    let pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+        pkcs8.as_ref(),
+        &rng,
+    )
+    .map_err(|_| Error::crypto("easytier: wss key parse failed"))?;
+
+    // SubjectPublicKeyInfo: ecPublicKey + prime256v1, uncompressed point.
+    let mut alg = Vec::new();
+    ws_der_put(&mut alg, 0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]);
+    ws_der_put(&mut alg, 0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]);
+    let mut alg_id = Vec::new();
+    ws_der_put(&mut alg_id, 0x30, &alg);
+    let mut spki_bitstring = Vec::new();
+    spki_bitstring.push(0x00);
+    spki_bitstring.extend_from_slice(ring::signature::KeyPair::public_key(&pair).as_ref());
+    let mut spki_body = alg_id;
+    let mut bit = Vec::new();
+    ws_der_put(&mut bit, 0x03, &spki_bitstring);
+    spki_body.extend_from_slice(&bit);
+    let mut spki = Vec::new();
+    ws_der_put(&mut spki, 0x30, &spki_body);
+
+    // ecdsa-with-SHA256 (1.2.840.10045.4.3.2).
+    let mut sig_alg = Vec::new();
+    ws_der_put(
+        &mut sig_alg,
+        0x30,
+        &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02],
+    );
+
+    // Random CN, positive minimal serial.
+    let mut cn_bytes = [0u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut cn_bytes);
+    let cn: String = cn_bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let mut cn_body = Vec::new();
+    ws_der_put(&mut cn_body, 0x0c, cn.as_bytes()); // UTF8String
+    let mut rdn = Vec::new();
+    ws_der_put(&mut rdn, 0x31, &cn_body); // RDNSequence set
+    let mut name = Vec::new();
+    ws_der_put(&mut name, 0x30, &rdn);
+    let mut serial_bytes = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut serial_bytes);
+    let mut serial: Vec<u8> = serial_bytes.to_vec();
+    while serial.first() == Some(&0) {
+        serial.remove(0);
+    }
+    if serial.is_empty() || serial[0] & 0x80 != 0 {
+        serial.insert(0, 0x00);
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut validity = Vec::new();
+    ws_der_put(&mut validity, 0x17, &ws_der_utctime(now - 86_400));
+    ws_der_put(&mut validity, 0x17, &ws_der_utctime(now + 8 * 365 * 86_400));
+
+    let mut tbs = Vec::with_capacity(512);
+    ws_der_put(&mut tbs, 0xa0, &[0x02, 0x01, 0x02]); // v3
+    ws_der_put(&mut tbs, 0x02, &serial);
+    tbs.extend_from_slice(&sig_alg);
+    tbs.extend_from_slice(&name); // issuer (self-signed)
+    let mut validity_seq = Vec::new();
+    ws_der_put(&mut validity_seq, 0x30, &validity);
+    tbs.extend_from_slice(&validity_seq);
+    tbs.extend_from_slice(&name); // subject
+    tbs.extend_from_slice(&spki);
+
+    let signature = pair
+        .sign(&rng, &tbs)
+        .map_err(|_| Error::crypto("easytier: wss cert signing failed"))?;
+    // Certificate ::= SEQUENCE { tbsCertificate SEQUENCE,
+    // signatureAlgorithm, signatureValue BIT STRING } — the TBS gets its
+    // own wrapper and the signature covers exactly its content.
+    let mut tbs_seq = Vec::with_capacity(tbs.len() + 4);
+    ws_der_put(&mut tbs_seq, 0x30, &tbs);
+    let mut body = tbs_seq;
+    body.extend_from_slice(&sig_alg);
+    let mut sig_bits = Vec::new();
+    sig_bits.push(0x00);
+    sig_bits.extend_from_slice(signature.as_ref());
+    ws_der_put(&mut body, 0x03, &sig_bits);
+    let mut cert = Vec::with_capacity(body.len() + 4);
+    ws_der_put(&mut cert, 0x30, &body);
+    Ok((
+        rustls::pki_types::CertificateDer::from(cert),
+        rustls::pki_types::PrivateKeyDer::Pkcs8(pkcs8.as_ref().to_vec().into()),
+    ))
+}
+
+fn wss_insecure_server() -> Option<&'static Arc<rustls::ServerConfig>> {
+    WSS_INSECURE_SERVER.get_or_init(|| {
+        let (cert, key) = ws_self_signed_pair().ok()?;
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .ok()
+            .map(Arc::new)
+    })
+    .as_ref()
+}
+
+/// `WsTunnelListener` (websocket.rs:81-196): a TCP listener whose accept
+/// completes the server upgrade (optionally behind the insecure `wss`
+/// TLS) and returns the message-mapped stream.
+pub struct WsVtListener {
+    listener: tokio::net::TcpListener,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    local: SocketAddr,
+}
+
+impl WsVtListener {
+    /// `WsTunnelListener::listen` (websocket.rs:163-175).
+    pub async fn bind(endpoint: &PeerEndpoint) -> Result<Self> {
+        let addr = resolve_peer_addr(endpoint).await?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| Error::network(format!("easytier: ws listen {addr}: {e}")))?;
+        let local = listener
+            .local_addr()
+            .map_err(|e| Error::network(format!("easytier: ws local addr: {e}")))?;
+        let tls = if endpoint.transport == PeerTransport::Wss {
+            Some(
+                wss_insecure_server().cloned().ok_or_else(|| {
+                    Error::crypto("easytier: wss listener: self-signed cert generation failed")
+                })?,
+            )
+        } else {
+            None
+        };
+        Ok(WsVtListener {
+            listener,
+            tls,
+            local,
+        })
+    }
+
+    /// The bound address (port 0 resolves, `local_url`).
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local
+    }
+
+    /// `WsTunnelListener::accept` (websocket.rs:177-196): each inbound
+    /// gets 3s to complete the upgrade; failures are logged and the
+    /// listener lives on.
+    pub async fn accept(&mut self) -> Result<WsPeerStream> {
+        loop {
+            let (stream, _peer) = self
+                .listener
+                .accept()
+                .await
+                .map_err(|e| Error::network(format!("easytier: ws accept: {e}")))?;
+            let _ = stream.set_nodelay(true);
+            match tokio::time::timeout(
+                Duration::from_secs(3),
+                self.try_accept(stream),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => return Ok(stream),
+                Ok(Err(e)) => {
+                    tracing::debug!(target: "engine", "easytier: ws accept: {e}");
+                }
+                Err(_) => {
+                    tracing::debug!(target: "engine", "easytier: ws accept: upgrade timed out");
+                }
+            }
+        }
+    }
+
+    /// `try_accept` (websocket.rs:94-158) minus the Forwarded rewrite.
+    async fn try_accept(&self, stream: tokio::net::TcpStream) -> Result<WsPeerStream> {
+        let mut io: BoxProxyStream = Box::new(stream);
+        if let Some(config) = &self.tls {
+            let acceptor = tokio_rustls::TlsAcceptor::from(config.clone());
+            let tls = acceptor
+                .accept(io)
+                .await
+                .map_err(|e| Error::network(format!("easytier: wss accept: {e}")))?;
+            io = Box::new(tls);
+        }
+        // The server upgrade (`ServerBuilder::accept`): validate the
+        // request, answer 101 with the computed accept key.
+        let head = ws_read_http_head(&mut io, 16 * 1024).await?;
+        let upgrade = ws_header(&head, "upgrade").unwrap_or_default();
+        if !upgrade.eq_ignore_ascii_case("websocket") {
+            return Err(Error::protocol("easytier: ws: not a websocket upgrade"));
+        }
+        if ws_header(&head, "sec-websocket-version").map(|v| v.trim()) != Some("13") {
+            return Err(Error::protocol("easytier: ws: unsupported Sec-WebSocket-Version"));
+        }
+        let key = ws_header(&head, "sec-websocket-key")
+            .ok_or_else(|| Error::protocol("easytier: ws: missing Sec-WebSocket-Key"))?
+            .to_owned();
+        let response = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+            ws_accept_key(&key)
+        );
+        io.write_all(response.as_bytes()).await?;
+        Ok(WsPeerStream::new(io, false))
     }
 }
 
@@ -3889,16 +5356,18 @@ where
 }
 
 /// The transport of one parsed peer URI (the `IpScheme` arms the peer
-/// connector dispatches on, connector/mod.rs:239-248; `ws`/`wss` ride
-/// TCP but behind the websocket upgrader, `quic` behind quinn — both
-/// stay unported).
+/// connector dispatches on, connector/mod.rs:247-268: `Tcp`, `Udp`,
+/// `Quic`, `Wg`, `Ws | Wss`; `wg` stays unported — see NOT_PORTED).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerTransport {
     Tcp,
     Udp,
+    Quic,
+    Ws,
+    Wss,
 }
 
-/// One parsed `tcp://`/`udp://` peer endpoint.
+/// One parsed `tcp://`/`udp://`/`quic://`/`ws://`/`wss://` peer endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerEndpoint {
     pub transport: PeerTransport,
@@ -3910,19 +5379,41 @@ pub struct PeerEndpoint {
 /// via `protocol_port_offset`: 11010 + 0.
 pub const DEFAULT_PEER_PORT: u16 = 11010;
 
-/// Parse a peer URI down to transport + host + port. The plain TCP and
-/// UDP schemes are live; anything else names the unported transports.
+/// The per-scheme default port (`IpScheme::default_port`, tunnel/mod.rs:334-342):
+/// `ws` 80, `wss` 443, everything else `11010 + port_offset` with the
+/// offsets `tcp` 0 / `udp` 0 / `quic` 2 / `ws` 1 / `wss` 2
+/// (tunnel/mod.rs:306-328 — only `ws`/`wss` special-case the well-known
+/// ports).
+pub fn transport_default_port(transport: PeerTransport) -> u16 {
+    match transport {
+        PeerTransport::Tcp | PeerTransport::Udp => DEFAULT_PEER_PORT,
+        PeerTransport::Quic => DEFAULT_PEER_PORT + 2,
+        PeerTransport::Ws => 80,
+        PeerTransport::Wss => 443,
+    }
+}
+
+/// Parse a peer URI down to transport + host + port. The TCP, UDP, QUIC
+/// and WebSocket schemes are live; anything else names the unported
+/// transports.
 pub fn parse_peer_endpoint(uri: &str) -> Result<PeerEndpoint> {
     let (transport, rest) = if let Some(rest) = uri.strip_prefix("tcp://") {
         (PeerTransport::Tcp, rest)
     } else if let Some(rest) = uri.strip_prefix("udp://") {
         (PeerTransport::Udp, rest)
+    } else if let Some(rest) = uri.strip_prefix("quic://") {
+        (PeerTransport::Quic, rest)
+    } else if let Some(rest) = uri.strip_prefix("ws://") {
+        (PeerTransport::Ws, rest)
+    } else if let Some(rest) = uri.strip_prefix("wss://") {
+        (PeerTransport::Wss, rest)
     } else {
         let scheme = uri.split("://").next().unwrap_or(uri);
         return Err(Error::config(format!(
-            "easytier: unsupported peer transport scheme {scheme:?} in {uri:?} (the quic/ws/wg transports are not ported yet)"
+            "easytier: unsupported peer transport scheme {scheme:?} in {uri:?} (the wg transport is not ported yet)"
         )));
     };
+    let default_port = transport_default_port(transport);
     let rest = rest.split('/').next().unwrap_or(rest);
     let (host, port) = if let Some(rest) = rest.strip_prefix('[') {
         // IPv6 literal: `[::1]:port`.
@@ -3937,7 +5428,7 @@ pub fn parse_peer_endpoint(uri: &str) -> Result<PeerEndpoint> {
                 })
             })
             .transpose()?
-            .unwrap_or(DEFAULT_PEER_PORT);
+            .unwrap_or(default_port);
         (host.to_string(), port)
     } else {
         match rest.rsplit_once(':') {
@@ -3947,7 +5438,7 @@ pub fn parse_peer_endpoint(uri: &str) -> Result<PeerEndpoint> {
                 })?;
                 (host.to_string(), port)
             }
-            None => (rest.to_string(), DEFAULT_PEER_PORT),
+            None => (rest.to_string(), default_port),
         }
     };
     if host.is_empty() {
@@ -3972,12 +5463,15 @@ async fn resolve_peer_addr(endpoint: &PeerEndpoint) -> Result<SocketAddr> {
     Ok(addr)
 }
 
-/// Dial one `tcp://`/`udp://` peer and run the plain-mode client
-/// handshake — the `PeerManager::add_tunnel_as_client` path
-/// (peers/peer_manager.rs:1990-2021): TCP over `TcpStream::connect`,
+/// Dial one `tcp://`/`udp://`/`quic://`/`ws://` peer and run the
+/// plain-mode client handshake — the `PeerManager::add_tunnel_as_client`
+/// path (peers/peer_manager.rs:1990-2021): TCP over `TcpStream::connect`,
 /// UDP over the datagram virtual circuit (`UdpTunnelConnector`, the
-/// connector's `IpScheme::Udp` arm, connector/mod.rs:248), both with the
-/// direct connector's 3s budget (connectivity/direct/mod.rs:64). DELTA:
+/// connector's `IpScheme::Udp` arm, connector/mod.rs:248), QUIC over the
+/// plaintext quinn tunnel (`IpScheme::Quic`, connector/mod.rs:250-253),
+/// WS/WSS over the websocket tunnel (`IpScheme::Ws | Wss`,
+/// connector/mod.rs:264-267), all with the direct connector's 3s budget
+/// (connectivity/direct/mod.rs:64). DELTA:
 /// after the channel is up, one explicit ping confirms liveness —
 /// upstream's `ensureStarted` equivalent — which also fails the dial
 /// fast when the peer rejects our identity right after its handshake
@@ -4038,6 +5532,19 @@ async fn dial_session(
             let stream = tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, connect_udp_tunnel(addr))
                 .await
                 .map_err(|_| Error::network("easytier: udp connect timeout"))??;
+            client_session(stream, my_peer_id, network_name, &digest, encryptor).await
+        }
+        PeerTransport::Quic => {
+            let addr = resolve_peer_addr(endpoint).await?;
+            let stream = tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, connect_quic_tunnel(addr))
+                .await
+                .map_err(|_| Error::network("easytier: quic connect timeout"))??;
+            client_session(stream, my_peer_id, network_name, &digest, encryptor).await
+        }
+        PeerTransport::Ws | PeerTransport::Wss => {
+            let stream = tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, connect_ws_tunnel(endpoint))
+                .await
+                .map_err(|_| Error::network("easytier: ws connect timeout"))??;
             client_session(stream, my_peer_id, network_name, &digest, encryptor).await
         }
     }
@@ -4149,24 +5656,43 @@ pub const SECURE_MODE_NOT_PORTED: &str = concat!(
     "peer-public-key to run the plain (still AEAD-encrypted) mesh"
 );
 
-/// What is still missing after the listener + UDP transport landed
-/// (M3): the remaining transports and the mesh roles beyond the direct
+/// What is still missing after the QUIC + WebSocket transports landed
+/// (M4): the WireGuard transport and the mesh roles beyond the direct
 /// neighborhood. The message names the next milestones precisely.
 pub const NOT_PORTED: &str = concat!(
     "easytier: the direct TCP peer tunnel (M1: handshake + framing + ",
     "AEAD packet encryption + ping/pong), the route layer (M2: the ",
     "peer RPC framework subset + OspfRouteRpc.SyncRouteInfo gossip + the ",
-    "smoltcp userspace stack + connect_tcp/EasyTierUdp dials), and the ",
+    "smoltcp userspace stack + connect_tcp/EasyTierUdp dials), the ",
     "M3 listener + UDP transport (serve(cfg) accepting tcp:// and udp:// ",
     "peers into the same node, the udp:// peer dial over the SYN/SACK ",
-    "datagram circuit) are in-tree; NOT ported: the quic/ws/wg peer ",
-    "transports (the quinn QUIC tunnel + the websocket upgrader + the ",
-    "wireguard tunnel), secure mode (see SECURE_MODE_NOT_PORTED), the ",
-    "relay path + foreign networks (RouteForeignNetworkInfos), multi-hop ",
-    "OSPF convergence (graph_algo.rs SPF beyond the direct-neighbor ",
-    "adjacency), IPv6 overlay addressing, exit-node/proxy-network policy ",
-    "(proxy_networks are announced but not routed), and MagicDNS serving ",
-    "(the resolver helpers are ported; the dns server is not)"
+    "datagram circuit), and the M4 QUIC + WebSocket transports (the ",
+    "quic:// peer dial and listener over the in-tree port of ",
+    "quinn-plaintext — SeaHash-tagged plaintext QUIC, one bi-stream per ",
+    "peer — and the ws:// wss:// peer dial and listener, one binary ",
+    "message per peer frame) are in-tree; NOT ported: the wg:// peer ",
+    "transport (WireGuard-as-transport: keys are ",
+    "generate_digest_from_str(network_name, network_secret) — one SHARED ",
+    "static keypair on every node of the network, my_public == ",
+    "peer_public — with boringtun `Tunn` per peer over one UDP socket ",
+    "(tunnel/wireguard.rs), InternalUse framing ",
+    "[20-byte synthetic IPv4 header (0x45, total len, TTL 64, zeros)] ",
+    "[PeerManagerHeader][payload] encapsulated as WireGuard IP packets, ",
+    "the connector's synchronous handshake-initiation-first connect ",
+    "(wireguard.rs:626-691) and the listener's per-remote-address peer ",
+    "table with the 250ms update_timers routine task (handshake retry, ",
+    "keepalive, expiry re-initiation, wireguard.rs:261-352); the engine ",
+    "has the Noise_IKpsk2 handshake + transport sessions in ",
+    "proto/wireguard.rs but woven into its netstack client behind ",
+    "module-private seams — porting wg means promoting/duplicating that ",
+    "crypto as a raw packet pump, deliberately not done), secure mode ",
+    "(see SECURE_MODE_NOT_PORTED), the relay path + foreign networks ",
+    "(RouteForeignNetworkInfos), multi-hop OSPF convergence (graph_algo.rs ",
+    "SPF beyond the direct-neighbor adjacency), IPv6 overlay addressing, ",
+    "exit-node/proxy-network policy (proxy_networks are announced but not ",
+    "routed), MagicDNS serving (the resolver helpers are ported; the dns ",
+    "server is not), and the hole-punch/punch-client connector paths ",
+    "(the udp listener's STUN and loopback forwards, tunnel/udp.rs:182-241)"
 );
 
 /// Bring the mesh up against the first `tcp://`/`udp://` peer and
@@ -4185,13 +5711,10 @@ pub async fn connect(config: &EasyTierConfig) -> Result<EasyTierNode> {
     let peers = structured.parsed_peers()?;
     let peer = peers
         .iter()
-        .find(|p| {
-            let uri = p.uri.trim().to_ascii_lowercase();
-            uri.starts_with("tcp://") || uri.starts_with("udp://")
-        })
+        .find(|p| parse_peer_endpoint(p.uri.trim()).is_ok())
         .ok_or_else(|| {
             Error::config(
-                "easytier: no tcp:// or udp:// peer to dial for the direct tunnel; the quic/ws/wg transports are not ported yet",
+                "easytier: no tcp://, udp://, quic://, ws:// or wss:// peer to dial for the direct tunnel (the wg transport is not ported)",
             )
         })?;
     let algorithm = config
@@ -6001,10 +7524,7 @@ async fn node_for(cfg: &EasyTierConfig) -> Result<mpsc::Sender<Cmd>> {
     let peers = structured.parsed_peers()?;
     let supported = peers
         .iter()
-        .find(|p| {
-            let uri = p.uri.trim().to_ascii_lowercase();
-            uri.starts_with("tcp://") || uri.starts_with("udp://")
-        })
+        .find(|p| parse_peer_endpoint(p.uri.trim()).is_ok())
         .map(|p| p.uri.clone());
     if let Some(uri) = supported {
         let endpoint = parse_peer_endpoint(&uri)?;
@@ -6066,23 +7586,29 @@ async fn wait_ready(tunnel: &mpsc::Sender<Cmd>) -> Result<()> {
 // The listener side (instance/listeners.rs of the v2.6.4 core: the
 // `create_listener_by_url` dispatch — `IpScheme::Tcp =>
 // TcpTunnelListener`, `IpScheme::Udp => UdpTunnelListener`,
-// listeners.rs:26-59 — plus `ListenerManager::run_listener`'s accept
-// loop feeding every accepted tunnel to the SAME peer manager,
-// listeners.rs:179-256)
+// `IpScheme::Quic => QuicTunnelListener`, `IpScheme::Ws | Wss =>
+// WsTunnelListener`, listeners.rs:26-59 — plus
+// `ListenerManager::run_listener`'s accept loop feeding every accepted
+// tunnel to the SAME peer manager, listeners.rs:179-256)
 // ---------------------------------------------------------------------------
 
 /// One bound listener of the serving node.
 enum BoundListener {
     Tcp(tokio::net::TcpListener),
     Udp(UdpVtListener),
+    Quic(QuicVtListener),
+    Ws(WsVtListener),
 }
 
-/// The inbound stream of one accepted peer: a TCP connection or an
-/// established UDP circuit (`Box<dyn Tunnel>` upstream — the tunnel
-/// trait's stream side).
+/// The inbound stream of one accepted peer: a TCP connection, an
+/// established UDP circuit, the bi-stream of one QUIC connection, or a
+/// upgraded WebSocket (`Box<dyn Tunnel>` upstream — the tunnel trait's
+/// stream side).
 pub enum InboundPeerStream {
     Tcp(tokio::net::TcpStream),
     Udp(UdpVtStream),
+    Quic(EtQuicStream),
+    Ws(WsPeerStream),
 }
 
 impl AsyncRead for InboundPeerStream {
@@ -6094,6 +7620,8 @@ impl AsyncRead for InboundPeerStream {
         match self.get_mut() {
             InboundPeerStream::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
             InboundPeerStream::Udp(stream) => Pin::new(stream).poll_read(cx, buf),
+            InboundPeerStream::Quic(stream) => Pin::new(stream).poll_read(cx, buf),
+            InboundPeerStream::Ws(stream) => Pin::new(stream).poll_read(cx, buf),
         }
     }
 }
@@ -6107,6 +7635,8 @@ impl AsyncWrite for InboundPeerStream {
         match self.get_mut() {
             InboundPeerStream::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
             InboundPeerStream::Udp(stream) => Pin::new(stream).poll_write(cx, buf),
+            InboundPeerStream::Quic(stream) => Pin::new(stream).poll_write(cx, buf),
+            InboundPeerStream::Ws(stream) => Pin::new(stream).poll_write(cx, buf),
         }
     }
 
@@ -6114,6 +7644,8 @@ impl AsyncWrite for InboundPeerStream {
         match self.get_mut() {
             InboundPeerStream::Tcp(stream) => Pin::new(stream).poll_flush(cx),
             InboundPeerStream::Udp(stream) => Pin::new(stream).poll_flush(cx),
+            InboundPeerStream::Quic(stream) => Pin::new(stream).poll_flush(cx),
+            InboundPeerStream::Ws(stream) => Pin::new(stream).poll_flush(cx),
         }
     }
 
@@ -6121,6 +7653,8 @@ impl AsyncWrite for InboundPeerStream {
         match self.get_mut() {
             InboundPeerStream::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
             InboundPeerStream::Udp(stream) => Pin::new(stream).poll_shutdown(cx),
+            InboundPeerStream::Quic(stream) => Pin::new(stream).poll_shutdown(cx),
+            InboundPeerStream::Ws(stream) => Pin::new(stream).poll_shutdown(cx),
         }
     }
 }
@@ -6139,6 +7673,14 @@ impl BoundListener {
             BoundListener::Udp(listener) => {
                 let stream = listener.accept().await?;
                 Ok(InboundPeerStream::Udp(stream))
+            }
+            BoundListener::Quic(listener) => {
+                let stream = listener.accept().await?;
+                Ok(InboundPeerStream::Quic(stream))
+            }
+            BoundListener::Ws(listener) => {
+                let stream = listener.accept().await?;
+                Ok(InboundPeerStream::Ws(stream))
             }
         }
     }
@@ -6201,9 +7743,9 @@ impl EasyTierServer {
     }
 }
 
-/// `create_listener_by_url` (listeners.rs:26-59) reduced to the two
-/// direct transports: parse the URI, bind it. Unhandled schemes name
-/// the unported transports.
+/// `create_listener_by_url` (listeners.rs:26-59) over the four direct
+/// transports: parse the URI, bind it. Unhandled schemes name the
+/// unported transports.
 async fn bind_listener_uri(uri: &str) -> Result<BoundListener> {
     let endpoint = parse_peer_endpoint(uri)?;
     match endpoint.transport {
@@ -6219,6 +7761,13 @@ async fn bind_listener_uri(uri: &str) -> Result<BoundListener> {
             let addr = resolve_peer_addr(&endpoint).await?;
             Ok(BoundListener::Udp(UdpVtListener::bind(addr).await?))
         }
+        PeerTransport::Quic => {
+            let addr = resolve_peer_addr(&endpoint).await?;
+            Ok(BoundListener::Quic(QuicVtListener::bind(addr)?))
+        }
+        PeerTransport::Ws | PeerTransport::Wss => {
+            Ok(BoundListener::Ws(WsVtListener::bind(&endpoint).await?))
+        }
     }
 }
 
@@ -6229,6 +7778,8 @@ async fn listener_local_addr(listener: &mut BoundListener) -> Result<SocketAddr>
             .local_addr()
             .map_err(|e| Error::network(format!("easytier: tcp local addr: {e}"))),
         BoundListener::Udp(l) => Ok(l.local_addr()),
+        BoundListener::Quic(l) => Ok(l.local_addr()),
+        BoundListener::Ws(l) => Ok(l.local_addr()),
     }
 }
 
@@ -6320,10 +7871,7 @@ pub async fn serve(cfg: &EasyTierConfig) -> Result<EasyTierServer> {
         let peers = structured.parsed_peers()?;
         let supported = peers
             .iter()
-            .find(|p| {
-                let uri = p.uri.trim().to_ascii_lowercase();
-                uri.starts_with("tcp://") || uri.starts_with("udp://")
-            })
+            .find(|p| parse_peer_endpoint(p.uri.trim()).is_ok())
             .map(|p| p.uri.clone());
         if let Some(uri) = supported {
             let dial = parse_peer_endpoint(&uri).and_then(|endpoint| {
@@ -6880,13 +8428,14 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("peers is required when listeners are empty"), "{err}");
-        // A quic peer names the not-yet-ported transports; udp now dials.
+        // A wg peer names the not-yet-ported transport; the quic/ws
+        // transports dial now.
         let cfg = EasyTierConfig {
-            peers: vec!["quic://192.0.2.10:11010".into()],
+            peers: vec!["wg://192.0.2.10:11010".into()],
             ..EasyTierConfig::new("et", "net")
         };
         let err = connect(&cfg).await.unwrap_err().to_string();
-        assert!(err.contains("no tcp:// or udp:// peer"), "{err}");
+        assert!(err.contains("no tcp://, udp://, quic://, ws:// or wss:// peer"), "{err}");
         // Secure mode is refused with the staged map.
         let cfg = EasyTierConfig {
             peers: vec!["tcp://192.0.2.10:11010".into()],
@@ -7197,8 +8746,50 @@ mod tests {
                 port: 11010
             }
         );
-        let err = parse_peer_endpoint("quic://192.0.2.10").unwrap_err().to_string();
-        assert!(err.contains("quic"), "{err}");
+        // `IpScheme::default_port` (tunnel/mod.rs:334-342): quic 11012
+        // (offset 2), ws 80 / wss 443 (the well-known ports).
+        assert_eq!(
+            parse_peer_endpoint("quic://192.0.2.10").unwrap(),
+            PeerEndpoint {
+                transport: PeerTransport::Quic,
+                host: "192.0.2.10".into(),
+                port: 11012
+            }
+        );
+        assert_eq!(
+            parse_peer_endpoint("quic://[2001:db8::2]:11020").unwrap(),
+            PeerEndpoint {
+                transport: PeerTransport::Quic,
+                host: "2001:db8::2".into(),
+                port: 11020
+            }
+        );
+        assert_eq!(
+            parse_peer_endpoint("ws://node.example.com").unwrap(),
+            PeerEndpoint {
+                transport: PeerTransport::Ws,
+                host: "node.example.com".into(),
+                port: 80
+            }
+        );
+        assert_eq!(
+            parse_peer_endpoint("wss://192.0.2.10").unwrap(),
+            PeerEndpoint {
+                transport: PeerTransport::Wss,
+                host: "192.0.2.10".into(),
+                port: 443
+            }
+        );
+        assert_eq!(
+            parse_peer_endpoint("ws://192.0.2.10:11011/some/path").unwrap(),
+            PeerEndpoint {
+                transport: PeerTransport::Ws,
+                host: "192.0.2.10".into(),
+                port: 11011
+            }
+        );
+        let err = parse_peer_endpoint("wg://192.0.2.10").unwrap_err().to_string();
+        assert!(err.contains("wg"), "{err}");
         assert!(parse_peer_endpoint("tcp://:11010").is_err());
         assert!(parse_peer_endpoint("tcp://host:notaport").is_err());
         assert!(parse_peer_endpoint("tcp://[::1:11010").is_err());
@@ -9038,11 +10629,11 @@ mod tests {
         assert!(err.contains("PeerConnNoiseMsg1/2/3"), "{err}");
         // An unhandled listener scheme names the missing transports.
         let cfg = EasyTierConfig {
-            listeners: vec!["quic://127.0.0.1:0".into()],
-            ..EasyTierConfig::new("et-m3-quic", "net")
+            listeners: vec!["wg://127.0.0.1:0".into()],
+            ..EasyTierConfig::new("et-m3-wg", "net")
         };
         let err = serve(&cfg).await.unwrap_err().to_string();
-        assert!(err.contains("quic"), "{err}");
+        assert!(err.contains("wg"), "{err}");
     }
 
     #[tokio::test]
@@ -9255,6 +10846,646 @@ mod tests {
             dhcp: false,
             hostname: Some("rustcrash-m3".to_owned()),
             ..EasyTierConfig::new("et-real-udp-listener", &network)
+        };
+        let server = serve(&cfg).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(25), server.wait_ready())
+            .await
+            .expect("the real node did not sync in time")
+            .unwrap();
+        assert_socks5_through_overlay(&cfg).await;
+        server.shutdown().await;
+    }
+
+    // ========================================================================
+    // M4: the QUIC + WebSocket transports
+    // ========================================================================
+    // (The four interop tests below each spawn the real binary with
+    // `--socks5 1080` — the shared assertion port — so the ignored set
+    // must run with `--test-threads=1` when more than one is enabled.)
+
+    #[test]
+    fn quic_plaintext_seahash_matches_reference_crate() {
+        // Digests produced by the REAL seahash 4.1.0 driven exactly the
+        // way quinn-plaintext 0.3.0 drives it (`header.hash(&mut hasher);
+        // payload.hash(&mut hasher)` over std's `Hash for [u8]`, i.e.
+        // write_usize(len) + write(bytes) per member): the in-tree
+        // SeaHasher must reproduce them bit for bit or every packet the
+        // real binary sends fails its integrity check.
+        let cases: &[(&[u8], &[u8], u64)] = &[
+            (&[], &[], 15605663169668837975),
+            (&[0x45, 0, 0, 10], &[1, 2, 3, 4, 5, 6], 14432687309312439075),
+            (
+                &0u64.to_le_bytes(),
+                b"abcdefgh",
+                2896981824816784093,
+            ),
+            (&[0x11u8; 3], &0u64.to_le_bytes(), 4620115072304201297),
+            (&1200u64.to_le_bytes(), &[0xabu8; 1200], 15336253554449442413),
+            (&8u64.to_le_bytes(), &[0u8; 8], 4785788110206384021),
+            (&16u64.to_le_bytes(), &[0xffu8; 16], 681446427028685233),
+            (&5u64.to_le_bytes(), &[9, 8, 7, 6, 5], 11526691439214515923),
+            (&0u64.to_le_bytes(), &[], 11560770652361694180),
+            (
+                &[1, 2, 3, 4, 5, 6, 7],
+                &[
+                    8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+                    27, 28, 29, 30, 31, 32, 33, 34, 35,
+                ],
+                1067341436300427410,
+            ),
+        ];
+        for (header, payload, expected) in cases {
+            let got = quic_plaintext::packet_tag(header, payload);
+            assert_eq!(got, *expected, "header {header:?} payload len {}", payload.len());
+        }
+    }
+
+    #[test]
+    fn quic_plaintext_encrypt_decrypt_roundtrip() {
+        // One packet: header || payload || tag, like quinn hands it to
+        // PacketKey::encrypt — and the decrypt mirror strips and checks
+        // the tag (`PlaintextPacketKey`, quinn-plaintext lib.rs:281-325).
+        use quinn_proto::crypto::PacketKey as _;
+        let key = quic_plaintext::PlaintextPacketKey;
+        assert_eq!(key.tag_len(), 8);
+        let header = [0x40u8, 0x01, 0x02, 0x03, 0x04];
+        let payload = b"easytier plaintext quic".to_vec();
+        let mut buf = header.to_vec();
+        buf.extend_from_slice(&payload);
+        buf.extend_from_slice(&[0u8; 8]); // tag space
+        // encrypt writes only the tag into the tail (payload untouched).
+        key.encrypt(0, &mut buf, header.len());
+        assert_eq!(&buf[..header.len()], &header);
+        assert_eq!(&buf[header.len()..header.len() + payload.len()], &payload);
+        let tag = &buf[buf.len() - 8..];
+        assert_eq!(
+            u64::from_be_bytes(tag.try_into().unwrap()),
+            quic_plaintext::packet_tag(&header, &payload)
+        );
+        // The decrypt mirror strips and verifies the tag (quinn hands
+        // PacketKey::decrypt the payload WITHOUT the header).
+        let mut bytes = bytes::BytesMut::from(&buf[header.len()..]);
+        key.decrypt(0, &header, &mut bytes).unwrap();
+        assert_eq!(&bytes[..], &payload[..]);
+        let mut bad = bytes::BytesMut::from(&buf[header.len()..]);
+        let last = bad.len() - 1;
+        bad[last] ^= 0x01;
+        assert!(key.decrypt(0, &header, &mut bad).is_err());
+    }
+
+    #[tokio::test]
+    async fn quic_tunnel_pingpong() {
+        // QuicTunnelListener + QuicTunnelConnector over the in-tree
+        // plaintext crypto: both directions of the M1 framing over the
+        // one bi-stream (upstream `quic_pingpong`, quic.rs:661-669).
+        let mut listener = QuicVtListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr();
+        let server = tokio::spawn(async move {
+            let mut tunnel = listener.accept().await.unwrap();
+            let packet = read_frame(&mut tunnel).await.unwrap().unwrap();
+            write_frame(&mut tunnel, &packet).await.unwrap();
+            // Hold the connection until the client is done reading
+            // (dropping closes it with 0/"done", which discards
+            // unacknowledged stream data — the ConnWrapper semantics).
+            let _ = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut tunnel)).await;
+        });
+        let mut client = tokio::time::timeout(Duration::from_secs(5), connect_quic_tunnel(addr))
+            .await
+            .expect("quic connect timeout")
+            .unwrap();
+        let original = PeerPacket::new(0x1111, 0x2222, packet_type::DATA, b"quic-echo");
+        write_frame(&mut client, &original).await.unwrap();
+        let echoed = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut client))
+            .await
+            .expect("quic echo timeout")
+            .unwrap()
+            .unwrap();
+        assert_eq!(echoed, original);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn quic_transport_peer_session() {
+        // The full client/server peer session over quic:// — handshake,
+        // identity check, the post-dial liveness ping and a Data packet
+        // through the AEAD packet encryption (the `add_tunnel_as_client`
+        // / `add_tunnel_as_server` pair on the QUIC transport).
+        let mut listener = QuicVtListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr();
+        let secret = test_secret();
+        let encryptor = create_encryptor("aes-gcm", true, &secret).unwrap();
+        let server_secret = secret.clone();
+        let server = tokio::spawn(async move {
+            let tunnel = listener.accept().await.unwrap();
+            let (mut halves, peer) =
+                serve_peer_as(tunnel, 0xdead_beef, "mesh", &server_secret, encryptor)
+                    .await
+                    .unwrap();
+            assert_eq!(peer.peer_id, 0x0000_0042);
+            let frame = halves.data_rx.recv().await.unwrap();
+            (peer, frame)
+        });
+        let endpoint = PeerEndpoint {
+            transport: PeerTransport::Quic,
+            host: "127.0.0.1".into(),
+            port: addr.port(),
+        };
+        let node = connect_peer_as(
+            &endpoint,
+            0x0000_0042,
+            "mesh",
+            &secret,
+            create_encryptor("aes-gcm", true, &secret).unwrap(),
+        )
+        .await
+        .unwrap();
+        let latency = node.ping().await.unwrap();
+        assert!(latency < Duration::from_secs(2));
+        node.send_packet(packet_type::DATA, b"quic-ip-frame")
+            .await
+            .unwrap();
+        let (peer, frame) = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server session timed out")
+            .unwrap();
+        assert_eq!(peer.network_name, "mesh");
+        assert_eq!(frame, b"quic-ip-frame");
+        node.close().await;
+    }
+
+    #[test]
+    fn ws_accept_key_rfc6455_vector() {
+        // The RFC 6455 §4.2.2 sample: the same computation the listener
+        // answers upgrades with (and the client validates).
+        assert_eq!(
+            ws_accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
+    }
+
+    #[test]
+    fn ws_frame_build_parse_roundtrip() {
+        // Masked (client) and unmasked (server) forms, both lengths forms
+        // the peer frames can use.
+        let payloads: [Vec<u8>; 3] = [Vec::new(), b"x".to_vec(), vec![7u8; 200]];
+        for payload in &payloads {
+            let masked = ws_frame(WS_OP_BINARY, payload, true);
+            assert_eq!(masked[1] & 0x80, 0x80, "client frame is masked");
+            let parsed = ws_parse_frame(&masked).unwrap().unwrap();
+            assert_eq!(parsed.opcode, WS_OP_BINARY);
+            assert!(parsed.fin);
+            assert_eq!(parsed.payload, *payload);
+            let plain = ws_frame(WS_OP_BINARY, payload, false);
+            assert_eq!(plain[1] & 0x80, 0, "server frame is unmasked");
+            let parsed = ws_parse_frame(&plain).unwrap().unwrap();
+            assert_eq!(parsed.payload, *payload);
+        }
+        // Truncated frames wait for more bytes.
+        let frame = ws_frame(WS_OP_BINARY, &vec![1u8; 300], false);
+        assert!(ws_parse_frame(&frame[..frame.len() - 1]).unwrap().is_none());
+        // RSV bits are refused (no extensions negotiated).
+        let mut bad = ws_frame(WS_OP_BINARY, b"x", false);
+        bad[0] |= 0x40;
+        assert!(ws_parse_frame(&bad).is_err());
+    }
+
+    #[tokio::test]
+    async fn ws_wire_message_has_no_length_prefix() {
+        // THE ws mapping (`sink_from_zc_packet`): one binary message per
+        // peer frame, WITHOUT the u32 length prefix the TCP tunnel
+        // carries — asserted on the raw wire by a hand-rolled server
+        // that answers the upgrade itself and inspects the first frame.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tap_addr = listener.local_addr().unwrap();
+        let observed = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt as _;
+            let (mut raw, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            // The upgrade request.
+            loop {
+                raw.read_exact(&mut byte).await.unwrap();
+                buf.push(byte[0]);
+                if buf.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head = String::from_utf8_lossy(&buf).into_owned();
+            let key = ws_header(&head, "sec-websocket-key").unwrap().to_owned();
+            raw.write_all(
+                format!(
+                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                     Connection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+                    ws_accept_key(&key)
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            // First frame header: opcode + masked length.
+            let mut hdr = [0u8; 2];
+            raw.read_exact(&mut hdr).await.unwrap();
+            (hdr[0] & 0x0f, hdr[1] & 0x7f)
+        });
+        let mut client = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_ws_tunnel(&PeerEndpoint {
+                transport: PeerTransport::Ws,
+                host: "127.0.0.1".into(),
+                port: tap_addr.port(),
+            }),
+        )
+        .await
+        .expect("ws connect timeout")
+        .unwrap();
+        let packet = PeerPacket::new(1, 2, packet_type::DATA, b"abcd");
+        write_frame(&mut client, &packet).await.unwrap();
+        let (opcode, len) = tokio::time::timeout(Duration::from_secs(5), observed)
+            .await
+            .expect("tap timed out")
+            .unwrap();
+        assert_eq!(opcode, WS_OP_BINARY);
+        // 16-byte PeerManagerHeader + 4 payload, NO 4-byte length prefix.
+        assert_eq!(len as usize, PEER_MANAGER_HEADER_SIZE + 4);
+    }
+
+    #[tokio::test]
+    async fn ws_tunnel_pingpong() {
+        // WsVtListener + connect_ws_tunnel: both directions of the peer
+        // framing through the message adapter (upstream `ws_pingpong`,
+        // websocket.rs:341-346).
+        let mut listener = WsVtListener::bind(&PeerEndpoint {
+            transport: PeerTransport::Ws,
+            host: "127.0.0.1".into(),
+            port: 0,
+        })
+        .await
+        .unwrap();
+        let endpoint = PeerEndpoint {
+            transport: PeerTransport::Ws,
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().port(),
+        };
+        let server = tokio::spawn(async move {
+            let mut tunnel = listener.accept().await.unwrap();
+            let packet = read_frame(&mut tunnel).await.unwrap().unwrap();
+            write_frame(&mut tunnel, &packet).await.unwrap();
+        });
+        let mut client = tokio::time::timeout(Duration::from_secs(5), connect_ws_tunnel(&endpoint))
+            .await
+            .expect("ws connect timeout")
+            .unwrap();
+        let original = PeerPacket::new(0x1111, 0x2222, packet_type::DATA, b"ws-echo");
+        write_frame(&mut client, &original).await.unwrap();
+        let echoed = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut client))
+            .await
+            .expect("ws echo timeout")
+            .unwrap()
+            .unwrap();
+        assert_eq!(echoed, original);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ws_transport_peer_session() {
+        // The full peer session over ws:// — the quic session test's
+        // twin.
+        let mut listener = WsVtListener::bind(&PeerEndpoint {
+            transport: PeerTransport::Ws,
+            host: "127.0.0.1".into(),
+            port: 0,
+        })
+        .await
+        .unwrap();
+        let endpoint = PeerEndpoint {
+            transport: PeerTransport::Ws,
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().port(),
+        };
+        let secret = test_secret();
+        let server_secret = secret.clone();
+        let server = tokio::spawn(async move {
+            let tunnel = listener.accept().await.unwrap();
+            let (mut halves, peer) = serve_peer_as(
+                tunnel,
+                0xdead_beef,
+                "mesh",
+                &server_secret,
+                create_encryptor("aes-gcm", true, &server_secret).unwrap(),
+            )
+            .await
+            .unwrap();
+            let frame = halves.data_rx.recv().await.unwrap();
+            (peer, frame)
+        });
+        let node = connect_peer_as(
+            &endpoint,
+            0x0000_0042,
+            "mesh",
+            &secret,
+            create_encryptor("aes-gcm", true, &secret).unwrap(),
+        )
+        .await
+        .unwrap();
+        node.ping().await.unwrap();
+        node.send_packet(packet_type::DATA, b"ws-ip-frame")
+            .await
+            .unwrap();
+        let (peer, frame) = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server session timed out")
+            .unwrap();
+        assert_eq!(peer.peer_id, 0x0000_0042);
+        assert_eq!(frame, b"ws-ip-frame");
+        node.close().await;
+    }
+
+    #[tokio::test]
+    async fn wss_transport_client_to_our_listener() {
+        // wss end to end against the in-tree self-signed cert: rustls
+        // client (insecure, like every easytier wss peer) over the
+        // hand-rolled DER certificate, then the message-mapped frames.
+        let mut listener = WsVtListener::bind(&PeerEndpoint {
+            transport: PeerTransport::Wss,
+            host: "127.0.0.1".into(),
+            port: 0,
+        })
+        .await
+        .unwrap();
+        let endpoint = PeerEndpoint {
+            transport: PeerTransport::Wss,
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().port(),
+        };
+        let server = tokio::spawn(async move {
+            let mut tunnel = listener.accept().await.unwrap();
+            let packet = read_frame(&mut tunnel).await.unwrap().unwrap();
+            write_frame(&mut tunnel, &packet).await.unwrap();
+        });
+        let mut client = tokio::time::timeout(Duration::from_secs(5), connect_ws_tunnel(&endpoint))
+            .await
+            .expect("wss connect timeout")
+            .unwrap();
+        let original = PeerPacket::new(1, 2, packet_type::PING, &[1, 2, 3, 4]);
+        write_frame(&mut client, &original).await.unwrap();
+        let echoed = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut client))
+            .await
+            .expect("wss echo timeout")
+            .unwrap()
+            .unwrap();
+        assert_eq!(echoed, original);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_quic_listener_two_node_mesh() {
+        // The M3 mesh pattern on the QUIC transport: serve() binds
+        // quic://, the client comes up through the registry path
+        // (`EasyTierUdp::bind` — the node that attaches the route
+        // gossip), dials it, the inbound peer joins the node and the
+        // route exchange completes on BOTH ends.
+        let network = format!("mesh-{}", rand::random::<u32>());
+        let secret = test_secret();
+        let server_cfg = EasyTierConfig {
+            listeners: vec!["quic://127.0.0.1:0".into()],
+            network_secret: secret.clone(),
+            ipv4: Some("10.144.144.1/24".to_owned()),
+            dhcp: false,
+            hostname: Some("rustcrash-m4-quic".to_owned()),
+            ..EasyTierConfig::new("et-m4-quic", &network)
+        };
+        let server = serve(&server_cfg).await.unwrap();
+        let port = server.local_addrs()[0].port();
+        let client_cfg = EasyTierConfig {
+            peers: vec![format!("quic://127.0.0.1:{port}")],
+            network_secret: secret,
+            ipv4: Some("10.144.144.2/24".to_owned()),
+            dhcp: false,
+            hostname: Some("rustcrash-m4-quic-b".to_owned()),
+            ..EasyTierConfig::new("et-m4-quic-b", &network)
+        };
+        // The client's own readiness IS the route-exchange proof (it
+        // waits for a finished gossip round against the server).
+        let _udp = tokio::time::timeout(Duration::from_secs(20), EasyTierUdp::bind(&client_cfg))
+            .await
+            .expect("quic mesh route exchange timed out")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(20), server.wait_ready())
+            .await
+            .expect("server route exchange timed out")
+            .unwrap();
+        let nodes = server.overlay_nodes().await.unwrap();
+        assert_eq!(nodes.len(), 2, "both overlay nodes gossiped");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn serve_ws_listener_two_node_mesh() {
+        // The same proof over ws://.
+        let network = format!("mesh-{}", rand::random::<u32>());
+        let secret = test_secret();
+        let server_cfg = EasyTierConfig {
+            listeners: vec!["ws://127.0.0.1:0".into()],
+            network_secret: secret.clone(),
+            ipv4: Some("10.144.145.1/24".to_owned()),
+            dhcp: false,
+            hostname: Some("rustcrash-m4-ws".to_owned()),
+            ..EasyTierConfig::new("et-m4-ws", &network)
+        };
+        let server = serve(&server_cfg).await.unwrap();
+        let port = server.local_addrs()[0].port();
+        let client_cfg = EasyTierConfig {
+            peers: vec![format!("ws://127.0.0.1:{port}")],
+            network_secret: secret,
+            ipv4: Some("10.144.145.2/24".to_owned()),
+            dhcp: false,
+            hostname: Some("rustcrash-m4-ws-b".to_owned()),
+            ..EasyTierConfig::new("et-m4-ws-b", &network)
+        };
+        let _udp = tokio::time::timeout(Duration::from_secs(20), EasyTierUdp::bind(&client_cfg))
+            .await
+            .expect("ws mesh route exchange timed out")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(20), server.wait_ready())
+            .await
+            .expect("server route exchange timed out")
+            .unwrap();
+        let nodes = server.overlay_nodes().await.unwrap();
+        assert_eq!(nodes.len(), 2, "both overlay nodes gossiped");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a real easytier-core binary; set EASYTIER_BIN to enable"]
+    async fn real_easytier_binary_serving_quic() {
+        // The real binary's QUIC listener: our quic:// peer dial rides
+        // the plaintext-QUIC tunnel into the real core — the proof the
+        // in-tree quinn-plaintext port is wire-identical.
+        let Ok(bin) = std::env::var("EASYTIER_BIN") else {
+            eprintln!("skipping: EASYTIER_BIN is not set");
+            return;
+        };
+        let network = format!("itnet-{}", rand::random::<u32>());
+        let secret = format!("itsec-{}", rand::random::<u64>());
+        let port = 31000 + rand::random::<u16>() % 20000;
+        let _child = spawn_real_binary(
+            &bin,
+            &network,
+            &secret,
+            &[
+                "-l",
+                &format!("quic://127.0.0.1:{port}"),
+                "--no-tun",
+                "-i",
+                "10.126.126.1",
+                "--hostname",
+                "real-quic-node",
+                "--socks5",
+                "1080",
+            ],
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let cfg = EasyTierConfig {
+            peers: vec![format!("quic://127.0.0.1:{port}")],
+            network_secret: secret,
+            ipv4: Some("10.126.126.2/24".to_owned()),
+            dhcp: false,
+            hostname: Some("rustcrash-m4-quic".to_owned()),
+            ..EasyTierConfig::new("et-real-quic", &network)
+        };
+        assert_socks5_through_overlay(&cfg).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a real easytier-core binary; set EASYTIER_BIN to enable"]
+    async fn real_easytier_binary_serving_ws() {
+        // The real binary's WebSocket listener: our ws:// peer dial
+        // through the hand-rolled RFC 6455 client.
+        let Ok(bin) = std::env::var("EASYTIER_BIN") else {
+            eprintln!("skipping: EASYTIER_BIN is not set");
+            return;
+        };
+        let network = format!("itnet-{}", rand::random::<u32>());
+        let secret = format!("itsec-{}", rand::random::<u64>());
+        let port = 31000 + rand::random::<u16>() % 20000;
+        let _child = spawn_real_binary(
+            &bin,
+            &network,
+            &secret,
+            &[
+                "-l",
+                &format!("ws://127.0.0.1:{port}"),
+                "--no-tun",
+                "-i",
+                "10.126.126.1",
+                "--hostname",
+                "real-ws-node",
+                "--socks5",
+                "1080",
+            ],
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let cfg = EasyTierConfig {
+            peers: vec![format!("ws://127.0.0.1:{port}")],
+            network_secret: secret,
+            ipv4: Some("10.126.126.2/24".to_owned()),
+            dhcp: false,
+            hostname: Some("rustcrash-m4-ws".to_owned()),
+            ..EasyTierConfig::new("et-real-ws", &network)
+        };
+        assert_socks5_through_overlay(&cfg).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a real easytier-core binary; set EASYTIER_BIN to enable"]
+    async fn real_easytier_binary_dials_our_quic_listener() {
+        // The reverse: the real binary's QUIC connector into OUR
+        // quic:// listener (dialed on the LAN address — the v2.6.4
+        // connector's bind-addrs racing, see `dialable_lan_ip`).
+        let Ok(bin) = std::env::var("EASYTIER_BIN") else {
+            eprintln!("skipping: EASYTIER_BIN is not set");
+            return;
+        };
+        let Some(lan_ip) = dialable_lan_ip() else {
+            eprintln!("skipping: no dialable non-loopback local IP");
+            return;
+        };
+        let network = format!("itnet-{}", rand::random::<u32>());
+        let secret = format!("itsec-{}", rand::random::<u64>());
+        let port = 31000 + rand::random::<u16>() % 20000;
+        let _child = spawn_real_binary(
+            &bin,
+            &network,
+            &secret,
+            &[
+                "-p",
+                &format!("quic://{lan_ip}:{port}"),
+                "--no-listener",
+                "--no-tun",
+                "-i",
+                "10.126.126.1",
+                "--hostname",
+                "real-node",
+                "--socks5",
+                "1080",
+            ],
+        );
+        let cfg = EasyTierConfig {
+            listeners: vec![format!("quic://0.0.0.0:{port}")],
+            network_secret: secret,
+            ipv4: Some("10.126.126.2/24".to_owned()),
+            dhcp: false,
+            hostname: Some("rustcrash-m4".to_owned()),
+            ..EasyTierConfig::new("et-real-quic-listener", &network)
+        };
+        let server = serve(&cfg).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(25), server.wait_ready())
+            .await
+            .expect("the real node did not sync in time")
+            .unwrap();
+        assert_socks5_through_overlay(&cfg).await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a real easytier-core binary; set EASYTIER_BIN to enable"]
+    async fn real_easytier_binary_dials_our_ws_listener() {
+        // The real binary's WebSocket connector into OUR ws:// listener.
+        let Ok(bin) = std::env::var("EASYTIER_BIN") else {
+            eprintln!("skipping: EASYTIER_BIN is not set");
+            return;
+        };
+        let Some(lan_ip) = dialable_lan_ip() else {
+            eprintln!("skipping: no dialable non-loopback local IP");
+            return;
+        };
+        let network = format!("itnet-{}", rand::random::<u32>());
+        let secret = format!("itsec-{}", rand::random::<u64>());
+        let port = 31000 + rand::random::<u16>() % 20000;
+        let _child = spawn_real_binary(
+            &bin,
+            &network,
+            &secret,
+            &[
+                "-p",
+                &format!("ws://{lan_ip}:{port}"),
+                "--no-listener",
+                "--no-tun",
+                "-i",
+                "10.126.126.1",
+                "--hostname",
+                "real-node",
+                "--socks5",
+                "1080",
+            ],
+        );
+        let cfg = EasyTierConfig {
+            listeners: vec![format!("ws://0.0.0.0:{port}")],
+            network_secret: secret,
+            ipv4: Some("10.126.126.2/24".to_owned()),
+            dhcp: false,
+            hostname: Some("rustcrash-m4".to_owned()),
+            ..EasyTierConfig::new("et-real-ws-listener", &network)
         };
         let server = serve(&cfg).await.unwrap();
         tokio::time::timeout(Duration::from_secs(25), server.wait_ready())

@@ -183,12 +183,41 @@ pub struct EngineConfig {
     /// sing-box `endpoints` of type wireguard (the WG SERVER mode:
     /// handshake responder + cryptokey routing into the engine).
     pub wg_endpoints: Vec<crate::proto::wireguard::WgEndpointCfg>,
+    /// Per-group health-check options (mihomo `lazy` /
+    /// `expected-status`), keyed by group name. The mihomo loader fills
+    /// an entry for EVERY group; the sing-box loader leaves it empty —
+    /// see [`EngineConfig::group_health`].
+    pub group_health: std::collections::HashMap<String, GroupHealth>,
+    /// sing-box route rule actions, keyed by index into `rules`
+    /// (attached by [`EngineConfig::compile_rules`]). mihomo rule lines
+    /// carry no actions upstream, so that loader never fills this.
+    pub rule_actions: std::collections::HashMap<usize, crate::rule::RuleAction>,
 }
 
 impl EngineConfig {
     /// Parse the raw rule lines; errors on the first malformed rule.
     pub fn parse_rules(&self) -> Result<Vec<Rule>> {
         self.rules.iter().map(|r| Rule::parse(r)).collect()
+    }
+
+    /// Parse the rule lines AND attach the per-index sing-box rule
+    /// actions — the action-aware parse result the router walks
+    /// ([`crate::rule::RuleTable::walk`]).
+    pub fn compile_rules(&self) -> Result<crate::rule::RuleTable> {
+        Ok(crate::rule::RuleTable::from_parts(
+            self.parse_rules()?,
+            self.rule_actions.clone(),
+        ))
+    }
+
+    /// Health-check options for one group. Absent entry (sing-box
+    /// dialect, which has no lazy/expected-status surface): never skip
+    /// a check, accept any status.
+    pub fn group_health(&self, name: &str) -> GroupHealth {
+        self.group_health.get(name).cloned().unwrap_or(GroupHealth {
+            lazy: false,
+            expected_status: ExpectedStatus::default(),
+        })
     }
 
     /// Ensure built-in outbounds exist (DIRECT/REJECT/PASS, mihomo names).
@@ -252,6 +281,124 @@ pub fn split_controller(controller: &str) -> (String, u16) {
     }
 }
 
+/// A mihomo group `expected-status` list (adapter/outboundgroup/
+/// parser.go `ExpectedStatus`, parsed with common/utils/ranges.go
+/// `NewUnsignedRanges[uint16]`): `200`, `200/204`, `200-400`,
+/// `200/204/401-429/501-503`. `,` is equivalent to `/`; a range's
+/// bounds are swapped rather than rejected (`NewRange` normalizes);
+/// empty entries drop out; empty or `*` means ANY status. The health
+/// check only counts a probe whose HTTP status matches.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExpectedStatus {
+    /// Inclusive `lo-hi` bounds; empty = any status (upstream: nil
+    /// IntRanges, where `Check` returns true).
+    ranges: Vec<(u16, u16)>,
+}
+
+impl ExpectedStatus {
+    /// Parse an `expected-status` payload. Errors on a non-numeric or
+    /// overlong bound (`lo-hi-x`), a value above `u16::MAX`, or more
+    /// than 28 ranges — mirroring upstream's "too many ranges to use,
+    /// maximum support 28 ranges" (Go's unsigned parse would silently
+    /// truncate out-of-range values; erroring is stricter and safer).
+    pub fn parse(payload: &str) -> Result<Self> {
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "*" {
+            return Ok(ExpectedStatus::default());
+        }
+        let joined = payload.replace(',', "/");
+        let list: Vec<&str> = joined.split('/').collect();
+        if list.len() > 28 {
+            return Err(Error::config(format!(
+                "expected-status {payload:?}: too many ranges to use, \
+                 maximum support 28 ranges"
+            )));
+        }
+        let mut ranges = Vec::with_capacity(list.len());
+        for entry in list {
+            if entry.is_empty() {
+                continue;
+            }
+            let one = |s: &str| -> Result<u16> {
+                s.trim_matches(['[', ']', ' '])
+                    .parse::<u16>()
+                    .map_err(|_| Error::config(format!("invalid range: {entry}")))
+            };
+            let (lo, hi) = match entry.split_once('-') {
+                None => {
+                    let v = one(entry)?;
+                    (v, v)
+                }
+                Some((lo, hi)) => {
+                    // `NewRange` swaps inverted bounds instead of failing.
+                    let (lo, hi) = (one(lo)?, one(hi)?);
+                    (lo.min(hi), lo.max(hi))
+                }
+            };
+            ranges.push((lo, hi));
+        }
+        Ok(ExpectedStatus { ranges })
+    }
+
+    /// Whether a probe response status counts as healthy
+    /// (utils.IntRanges.Check): an empty list accepts everything.
+    pub fn matches(&self, status: u16) -> bool {
+        self.ranges.is_empty() || self.ranges.iter().any(|&(lo, hi)| lo <= status && status <= hi)
+    }
+
+    /// True when no filter was configured (any status accepted).
+    pub fn is_any(&self) -> bool {
+        self.ranges.is_empty()
+    }
+}
+
+/// Per-group health-check options (mihomo groupbase surface; sing-box
+/// urltest carries neither upstream — option/group.go URLTestOutbound
+/// has only url/interval/tolerance/idle_timeout).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupHealth {
+    /// mihomo `lazy` (adapter/outboundgroup/parser.go:35): a lazy group
+    /// skips its periodic health check when it has not been touched
+    /// (used for routing) within the check interval. Defaults to TRUE
+    /// upstream (parser.go:51-53).
+    pub lazy: bool,
+    /// mihomo `expected-status`: only statuses in the list count as
+    /// healthy probes.
+    pub expected_status: ExpectedStatus,
+}
+
+impl Default for GroupHealth {
+    fn default() -> Self {
+        GroupHealth {
+            lazy: true,
+            expected_status: ExpectedStatus::default(),
+        }
+    }
+}
+
+impl GroupHealth {
+    /// Whether this group's periodic check should run NOW — mihomo
+    /// adapter/provider/healthcheck.go `process()`: on every interval
+    /// tick, `if !hc.lazy || since < hc.interval { check() } else {
+    /// skip }`, where `since` is time since the last touch (never
+    /// touched = the zero time = skip, matching the huge `since`).
+    pub fn due(
+        &self,
+        interval: std::time::Duration,
+        last_touch: Option<std::time::Instant>,
+        now: std::time::Instant,
+    ) -> bool {
+        if !self.lazy {
+            return true;
+        }
+        match last_touch {
+            Some(t) => now.duration_since(t) < interval,
+            None => false,
+        }
+    }
+}
+
+
 /// Validate a normalized config the way `engine test` does.
 pub fn validate(cfg: &EngineConfig) -> Result<Vec<String>> {
     let mut warnings = Vec::new();
@@ -269,7 +416,7 @@ pub fn validate(cfg: &EngineConfig) -> Result<Vec<String>> {
             warnings.push(format!("rule provider {} file missing: {}", p.name, p.path));
         }
     }
-    for r in &cfg.parse_rules()? {
+    for (i, r) in cfg.parse_rules()?.iter().enumerate() {
         match &r.matcher {
             crate::rule::RuleMatcher::RuleSet { name, .. } => {
                 if !cfg.rule_providers.iter().any(|p| &p.name == name) {
@@ -279,6 +426,12 @@ pub fn validate(cfg: &EngineConfig) -> Result<Vec<String>> {
             // Geosite names resolve at build; unknown ones warn there.
             crate::rule::RuleMatcher::Geosite { .. } => {}
             _ => {}
+        }
+        // A rule carrying an action routes through the action, not an
+        // outbound (sing-box action rules have no `outbound` field; the
+        // converted line's target is only a placeholder).
+        if cfg.rule_actions.contains_key(&i) {
+            continue;
         }
         if !names.contains(r.outbound.as_str()) {
             return Err(Error::config(format!(
@@ -365,5 +518,104 @@ mod tests {
         assert_eq!(RuleMode::parse("global").unwrap(), RuleMode::Global);
         assert!(RuleMode::parse("wild").is_err());
         assert_eq!(GroupPolicy::parse("url-test").unwrap().as_str(), "URLTest");
+    }
+
+    #[test]
+    fn expected_status_parses_upstream_forms() {
+        // common/utils/ranges.go newIntRanges: "" and "*" accept
+        // everything; `,` == `/`; empty entries drop out.
+        for any in ["", "*", "  "] {
+            let s = ExpectedStatus::parse(any).unwrap();
+            assert!(s.is_any());
+            assert!(s.matches(200) && s.matches(500) && s.matches(0));
+        }
+        let single = ExpectedStatus::parse("204").unwrap();
+        assert!(!single.is_any());
+        assert!(single.matches(204));
+        assert!(!single.matches(200) && !single.matches(205));
+
+        // Lists, both separators.
+        let list = ExpectedStatus::parse("200/302").unwrap();
+        assert!(list.matches(200) && list.matches(302) && !list.matches(301));
+        let commas = ExpectedStatus::parse("200,302").unwrap();
+        assert_eq!(commas, list);
+
+        // Ranges, mixed lists, inverted bounds (NewRange swaps).
+        let mixed = ExpectedStatus::parse("200/204/401-429/501-503").unwrap();
+        assert!(mixed.matches(200) && mixed.matches(429) && mixed.matches(503));
+        assert!(!mixed.matches(400) && !mixed.matches(430) && !mixed.matches(504));
+        let swapped = ExpectedStatus::parse("429-401").unwrap();
+        assert!(swapped.matches(401) && swapped.matches(429));
+
+        // Errors: garbage, lo-hi-extra, out-of-u16, >28 ranges.
+        assert!(ExpectedStatus::parse("20x").is_err());
+        assert!(ExpectedStatus::parse("200-204-399").is_err());
+        assert!(ExpectedStatus::parse("70000").is_err());
+        let many = std::iter::repeat_n("200", 29).collect::<Vec<_>>().join("/");
+        assert!(ExpectedStatus::parse(&many).is_err());
+        let max = std::iter::repeat_n("200", 28).collect::<Vec<_>>().join("/");
+        assert!(ExpectedStatus::parse(&max).is_ok());
+    }
+
+    #[test]
+    fn group_health_lazy_gate_matches_mihomo() {
+        // healthcheck.go process(): non-lazy always checks.
+        let eager = GroupHealth {
+            lazy: false,
+            ..Default::default()
+        };
+        let now = std::time::Instant::now();
+        assert!(eager.due(std::time::Duration::from_secs(300), None, now));
+
+        // Lazy: never touched → skip (upstream zero lastTouch).
+        let lazy = GroupHealth::default();
+        assert!(lazy.lazy);
+        assert!(!lazy.due(std::time::Duration::from_secs(300), None, now));
+
+        // Touched recently (within the interval) → check runs; touched
+        // one interval ago → skipped.
+        let fresh = now - std::time::Duration::from_secs(10);
+        assert!(lazy.due(std::time::Duration::from_secs(300), Some(fresh), now));
+        let stale = now - std::time::Duration::from_secs(300);
+        assert!(!lazy.due(std::time::Duration::from_secs(300), Some(stale), now));
+        assert!(lazy.expected_status.is_any());
+    }
+
+    #[test]
+    fn compile_rules_attaches_actions_and_validate_skips_them() {
+        let mut cfg = EngineConfig {
+            rules: vec!["DST-PORT,443,NOSUCHOUTBOUND".to_string(), "MATCH,DIRECT".to_string()],
+            rule_actions: std::collections::HashMap::from([(
+                0,
+                crate::rule::RuleAction::Sniff {
+                    sniffer: vec!["tls".into()],
+                },
+            )]),
+            ..Default::default()
+        }
+        .with_builtin_outbounds();
+
+        let table = cfg.compile_rules().unwrap();
+        assert_eq!(table.rules().len(), 2);
+        assert_eq!(
+            table.action(0),
+            Some(&crate::rule::RuleAction::Sniff {
+                sniffer: vec!["tls".to_string()]
+            })
+        );
+        assert_eq!(table.action(1), None);
+
+        // The action rule's placeholder outbound is not validated…
+        assert!(validate(&cfg).is_ok());
+        // …while a plain rule with a dangling target still fails.
+        cfg.rule_actions.clear();
+        assert!(validate(&cfg).is_err());
+
+        // group_health accessor: absent (sing-box) = never skip; the
+        // mihomo default entry is lazy.
+        assert!(!cfg.group_health("G").lazy);
+        assert!(cfg.group_health("G").expected_status.is_any());
+        cfg.group_health.insert("G".into(), GroupHealth::default());
+        assert!(cfg.group_health("G").lazy);
     }
 }

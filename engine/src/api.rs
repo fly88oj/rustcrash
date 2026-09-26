@@ -232,6 +232,9 @@ async fn dispatch(stream: &mut TcpStream, req: &Request, engine: &Arc<Engine>) -
                 write_json(stream, 200, &connections_payload(engine)).await
             }
         }
+        // mihomo hub/route getLogs (server.go on Alpha): the broadcast
+        // log stream, ?level= filtered, ws or bare JSON stream.
+        ("GET", "/logs") => logs_stream(stream, req).await,
         ("DELETE", "/connections") => {
             // mihomo connections.go closeAllConnections(): signal every
             // tracked relay through its cancel token; each connection
@@ -887,9 +890,13 @@ fn rule_providers_payload(engine: &Arc<Engine>) -> serde_json::Map<String, serde
     out
 }
 
-/// mihomo provider.go updateRuleProvider(): re-fetches the provider.
-/// The engine materializes providers at config build and has no
-/// runtime reload path — 404 for unknown names, honest 503 otherwise.
+/// mihomo provider.go updateRuleProvider(): re-fetches the provider —
+/// here [`Engine::reload_rule_provider`] re-reads the file, re-parses
+/// it and swaps the live matcher set, so the next RULE-SET evaluation
+/// follows the new content. Upstream answers 204 on success, 503
+/// (StatusServiceUnavailable) with the Update() error as the message
+/// when the reload fails — the live set keeps its previous content —
+/// and 404 for unknown names.
 async fn update_rule_provider(
     stream: &mut TcpStream,
     engine: &Arc<Engine>,
@@ -903,16 +910,15 @@ async fn update_rule_provider(
     if !known {
         return write_json(stream, 404, r#"{"message":"Provider not found"}"#).await;
     }
-    write_json(
-        stream,
-        503,
-        &serde_json::json!({
-            "message": "runtime rule-provider reload is not wired: providers are \
-                        materialized at config build — update the file and restart"
-        })
-        .to_string(),
-    )
-    .await
+    match engine.reload_rule_provider(name) {
+        Ok(()) => write_json(stream, 204, "").await,
+        Err(msg) => write_json(
+            stream,
+            503,
+            &serde_json::json!({ "message": msg }).to_string(),
+        )
+        .await,
+    }
 }
 
 async fn proxies_payload(engine: &Arc<Engine>) -> serde_json::Value {
@@ -1176,6 +1182,251 @@ async fn ws_send_text(stream: &mut TcpStream, payload: &[u8]) -> Result<()> {
         .await
         .map_err(|e| Error::network(e.to_string()))?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// /logs — the engine log broadcast (mihomo hub/route getLogs; on Alpha
+// it lives in server.go, streamed from log.Subscribe())
+// ---------------------------------------------------------------------------
+
+/// One captured log event, broadcast to every /logs stream.
+struct LogEvent {
+    level: LogLevel,
+    /// The formatted message (the `message` field of the tracing event).
+    payload: String,
+}
+
+/// mihomo's log levels, ordered least→most severe (log.LogLevelMapping:
+/// debug=0, info=1, warning=2, error=3, silent=4 — silent only exists as
+/// a query filter and mutes everything).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LogLevel {
+    Debug,
+    Info,
+    Warning,
+    Error,
+}
+
+impl LogLevel {
+    fn from_tracing(level: tracing::Level) -> Self {
+        match level {
+            tracing::Level::TRACE | tracing::Level::DEBUG => LogLevel::Debug,
+            tracing::Level::INFO => LogLevel::Info,
+            tracing::Level::WARN => LogLevel::Warning,
+            tracing::Level::ERROR => LogLevel::Error,
+        }
+    }
+
+    /// The `type` value of the /logs frame (mihomo Log.Type strings).
+    fn as_str(self) -> &'static str {
+        match self {
+            LogLevel::Debug => "debug",
+            LogLevel::Info => "info",
+            LogLevel::Warning => "warning",
+            LogLevel::Error => "error",
+        }
+    }
+}
+
+/// `?level=` filter value → mihomo severity number (events with
+/// severity >= the requested one pass; `silent` mutes everything).
+/// Unknown values are rejected by the endpoint like upstream's
+/// LogLevelMapping miss.
+fn log_level_severity(s: &str) -> Option<u8> {
+    match s {
+        "debug" => Some(0),
+        "info" => Some(1),
+        "warning" => Some(2),
+        "error" => Some(3),
+        "silent" => Some(4),
+        _ => None,
+    }
+}
+
+/// The process-wide log bus. Capacity matches upstream's subscriber
+/// buffer (1024); slow clients simply miss frames (RecvError::Lagged)
+/// rather than backpressuring the tracing pipeline.
+static LOG_BUS: std::sync::OnceLock<tokio::sync::broadcast::Sender<std::sync::Arc<LogEvent>>> =
+    std::sync::OnceLock::new();
+
+fn log_bus() -> &'static tokio::sync::broadcast::Sender<std::sync::Arc<LogEvent>> {
+    LOG_BUS.get_or_init(|| tokio::sync::broadcast::channel(1024).0)
+}
+
+/// Create the log bus and install the broadcast tap as the process's
+/// global tracing subscriber — the /logs endpoint's event source.
+/// Called at engine init (Engine::build).
+///
+/// The tap is a hand-rolled `tracing::Subscriber` (the engine depends
+/// on `tracing` only, not tracing-subscriber, so there is no `Layer`
+/// to implement; a Subscriber IS the tap here). Installation is
+/// best-effort first-wins: when the embedder already owns the tracing
+/// pipeline (the crash CLI installs its fmt subscriber before building
+/// the engine), its subscriber stays untouched — stderr behavior is
+/// unchanged — and /logs then carries no macro-emitted events until
+/// the engine owns the pipeline. With no prior subscriber (library
+/// embedding, tests) the tap takes over; the prior default dispatched
+/// events nowhere, so nothing is lost.
+pub fn init_log_broadcast() {
+    let _ = tracing::subscriber::set_global_default(LogSubscriber {
+        next_span_id: std::sync::atomic::AtomicU64::new(0),
+    });
+}
+
+/// The broadcast tap: every enabled event is formatted and pushed onto
+/// [`log_bus`]. Per-client `?level=` filtering happens at each /logs
+/// stream, so the tap itself enables everything. The span bookkeeping
+/// methods are inert (fresh ids, no-op recording) — only events are
+/// consumed.
+struct LogSubscriber {
+    next_span_id: std::sync::atomic::AtomicU64,
+}
+
+impl tracing::Subscriber for LogSubscriber {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        use std::sync::atomic::Ordering;
+        // Ids must be non-zero; start at 1.
+        tracing::span::Id::from_u64(self.next_span_id.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut visitor = MessageVisitor::default();
+        event.record(&mut visitor);
+        // A full bus (no live stream draining it) is not an error: the
+        // send fails, the event is simply not broadcast.
+        let _ = log_bus().send(std::sync::Arc::new(LogEvent {
+            level: LogLevel::from_tracing(*event.metadata().level()),
+            payload: visitor.message,
+        }));
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// Extracts an event's `message` field — the rendered format args of
+/// `tracing::info!("...")`-style calls (format_args implements Debug by
+/// writing the formatted string, the same record_debug path
+/// tracing-subscriber's formatter rides).
+#[derive(Default)]
+struct MessageVisitor {
+    message: String,
+}
+
+impl tracing::field::Visit for MessageVisitor {
+    fn record_debug(
+        &mut self,
+        field: &tracing::field::Field,
+        value: &dyn std::fmt::Debug,
+    ) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}");
+        }
+    }
+}
+
+/// `GET /logs` — mihomo hub/route getLogs(): stream every log event at
+/// or above `?level=` (default info; an unknown level is a 400 like
+/// upstream's LogLevelMapping miss) as one JSON document per event —
+/// `{"type","payload"}` (or `{"time","level","message","fields"}` with
+/// `?format=structured`) — over websocket when upgraded, else as a
+/// bare application/json byte stream until the client goes away.
+async fn logs_stream(stream: &mut TcpStream, req: &Request) -> Result<()> {
+    let level = query_param(&req.query, "level").unwrap_or_else(|| "info".into());
+    let Some(min) = log_level_severity(&level) else {
+        return write_json(stream, 400, r#"{"message":"Params invalid"}"#).await;
+    };
+    let structured = query_param(&req.query, "format").as_deref() == Some("structured");
+
+    let is_ws = req.is_websocket;
+    if is_ws {
+        ws_upgrade(stream, req).await?;
+    } else {
+        // Upstream sets status + Content-Type then streams without a
+        // Content-Length: the body ends when the connection does.
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .map_err(|e| Error::network(e.to_string()))?;
+    }
+    let mut rx = log_bus().subscribe();
+    loop {
+        // Client close: the ws loops watch readability the same way.
+        // A WouldBlock after readiness is tokio's documented spurious
+        // wakeup (readiness is only a hint) — keep waiting on it.
+        let ev = tokio::select! {
+            r = rx.recv() => r,
+            _ = stream.readable() => {
+                let mut buf = [0u8; 64];
+                match stream.try_read(&mut buf) {
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Ok(0) | Err(_) => return Ok(()),
+                    Ok(_) => continue,
+                }
+            }
+        };
+        match ev {
+            Ok(ev) => {
+                if (ev.level as u8) < min {
+                    continue;
+                }
+                let frame = if structured {
+                    serde_json::json!({
+                        "time": utc_time_of_day(),
+                        "level": match ev.level {
+                            LogLevel::Warning => "warn",
+                            other => other.as_str(),
+                        },
+                        "message": ev.payload,
+                        "fields": [],
+                    })
+                    .to_string()
+                } else {
+                    serde_json::json!({
+                        "type": ev.level.as_str(),
+                        "payload": ev.payload,
+                    })
+                    .to_string()
+                };
+                if is_ws {
+                    ws_send_text(stream, frame.as_bytes()).await?;
+                } else {
+                    let mut line = frame.into_bytes();
+                    line.push(b'\n');
+                    stream
+                        .write_all(&line)
+                        .await
+                        .map_err(|e| Error::network(e.to_string()))?;
+                }
+            }
+            // Missed frames on a slow drain: keep streaming from now.
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+        }
+    }
+}
+
+/// `HH:MM:SS` of the current UTC instant — the `time.TimeOnly` field
+/// of the structured /logs frame (UTC: the engine has no local-time
+/// dependency).
+fn utc_time_of_day() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let day = secs % 86_400;
+    format!("{:02}:{:02}:{:02}", day / 3600, (day % 3600) / 60, day % 60)
 }
 
 fn percent_decode(s: &str) -> String {
@@ -1785,13 +2036,317 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(body, "{\"providers\":{}}");
 
-        // Update: known name fails loudly (no runtime reload), unknown
-        // name is a 404 like upstream.
+        // Update: the file does not exist — the reload runs, fails, and
+        // the reason surfaces with upstream's 503; unknown name 404s.
         let (status, body) = request(addr, "PUT", "/providers/rules/ads", b"").await;
         assert_eq!(status, 503, "body: {body}");
-        assert!(body.contains("not wired"));
+        assert!(body.contains("cannot read"), "reason surfaced: {body}");
         let (status, _) = request(addr, "PUT", "/providers/rules/nope", b"").await;
         assert_eq!(status, 404);
+    }
+
+    /// Id of the first relay not in `known` (each spawned relay opens a
+    /// fresh stats entry), plus its chains from GET /connections.
+    async fn next_relay_chains(
+        addr: std::net::SocketAddr,
+        known: &mut Vec<u64>,
+    ) -> serde_json::Value {
+        let ids = wait_for_conns(addr, |ids| ids.iter().any(|i| !known.contains(i))).await;
+        let new_id = *ids.iter().find(|i| !known.contains(i)).unwrap();
+        known.push(new_id);
+        let (_, body) = request(addr, "GET", "/connections", b"").await;
+        chains_of(&body, new_id)
+    }
+
+    /// PUT /providers/rules/{name} (mihomo updateRuleProvider →
+    /// RP.Initial()): swapping the provider FILE through the API
+    /// re-routes the next relay — RULE-SET follows the new set, old
+    /// content is gone (replace, not merge), a failed reload keeps the
+    /// live set, and repeated reloads work.
+    #[tokio::test]
+    async fn rule_provider_runtime_reload_reroutes_relay() {
+        use crate::config::{ProviderBehavior, ProviderFormat, RuleProviderSpec};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cidr.list");
+        std::fs::write(&path, "127.0.0.1/32\n").unwrap();
+
+        let mut cfg = base_cfg();
+        cfg.rules = vec!["RULE-SET,cidr,PickA".into(), "MATCH,PickB".into()];
+        cfg.rule_providers = vec![RuleProviderSpec {
+            name: "cidr".into(),
+            path: path.to_str().unwrap().to_string(),
+            behavior: ProviderBehavior::IpCidr,
+            format: ProviderFormat::Text,
+        }];
+        let pick = |name: &str| crate::outbound::GroupConfig {
+            name: name.into(),
+            members: vec!["DIRECT".into()],
+            policy: crate::outbound::GroupPolicy::Select,
+            url: None,
+            interval: 0,
+            tolerance: 0,
+        };
+        cfg.groups = vec![pick("PickA"), pick("PickB")];
+        let (addr, engine) = start_api_with_engine(cfg).await;
+        let target = dribble_server().await;
+        let mut known: Vec<u64> = Vec::new();
+
+        // Before reload: the loopback target matches 127.0.0.1/32.
+        let _r1 = spawn_relay(&engine, target).await;
+        assert_eq!(
+            next_relay_chains(addr, &mut known).await,
+            serde_json::json!(["PickA"]),
+            "initial set routes via PickA"
+        );
+
+        // Swap the file (target no longer in the set) + reload → 204;
+        // the NEXT relay falls through to MATCH.
+        std::fs::write(&path, "10.9.9.9/32\n").unwrap();
+        let (status, body) = request(addr, "PUT", "/providers/rules/cidr", b"").await;
+        assert_eq!(status, 204, "body: {body}");
+        let _r2 = spawn_relay(&engine, target).await;
+        assert_eq!(
+            next_relay_chains(addr, &mut known).await,
+            serde_json::json!(["PickB"]),
+            "after reload the old cidr no longer matches"
+        );
+
+        // Swap back + reload: the set returns (repeated reloads work).
+        std::fs::write(&path, "127.0.0.1/32\n").unwrap();
+        let (status, _) = request(addr, "PUT", "/providers/rules/cidr", b"").await;
+        assert_eq!(status, 204);
+        let _r3 = spawn_relay(&engine, target).await;
+        assert_eq!(
+            next_relay_chains(addr, &mut known).await,
+            serde_json::json!(["PickA"]),
+            "reloading the original content restores the route"
+        );
+
+        // A corrupt provider file fails the reload (503 + reason) and
+        // leaves the live set untouched: routing keeps the last good set.
+        std::fs::write(&path, b"SRS-broken-garbage").unwrap();
+        let (status, body) = request(addr, "PUT", "/providers/rules/cidr", b"").await;
+        assert_eq!(status, 503, "body: {body}");
+        assert!(body.contains("srs"), "parse reason surfaced: {body}");
+        let _r4 = spawn_relay(&engine, target).await;
+        assert_eq!(
+            next_relay_chains(addr, &mut known).await,
+            serde_json::json!(["PickA"]),
+            "failed reload keeps the live set"
+        );
+    }
+
+    // ---- /logs: the broadcast log stream ----
+
+    /// Read a response head (up to \r\n\r\n) from a raw connection.
+    async fn read_head(c: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            c.read_exact(&mut byte).await.unwrap();
+            buf.push(byte[0]);
+            if buf.ends_with(b"\r\n\r\n") {
+                return String::from_utf8_lossy(&buf).to_string();
+            }
+            if buf.len() > 16 * 1024 {
+                panic!("runaway head");
+            }
+        }
+    }
+
+    /// The first complete, parseable JSON line containing `marker`.
+    fn marker_json(buf: &str, marker: &str) -> serde_json::Value {
+        buf.split('\n')
+            .filter(|l| l.contains(marker))
+            .find_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+            .unwrap_or_else(|| panic!("no parseable {marker} frame in: {buf}"))
+    }
+
+    #[tokio::test]
+    async fn logs_stream_events_level_filter_and_token_auth() {
+        let addr = start_api(base_cfg()).await;
+
+        // Non-ws stream, authorized via ?token= (query-token auth must
+        // cover the streaming endpoints too).
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(
+            b"GET /logs?level=info&token=sekrit HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let head = read_head(&mut c).await;
+        assert!(head.starts_with("HTTP/1.1 200"), "head: {head}");
+        assert!(head.to_ascii_lowercase().contains("application/json"));
+
+        // A tracing event lands in the stream as {"type","payload"}.
+        // Loop-emit: the server subscribes right after writing the head,
+        // so a retried marker closes the (sub-millisecond) race.
+        let mut seen = String::new();
+        let mut got = false;
+        for i in 0..80 {
+            tracing::info!(target: "engine", "wave14-logs-marker-{i}");
+            let mut chunk = vec![0u8; 8192];
+            if let Ok(Ok(n)) = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                c.read(&mut chunk),
+            )
+            .await
+            {
+                seen.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                if seen.contains("wave14-logs-marker") {
+                    got = true;
+                    break;
+                }
+            }
+        }
+        assert!(got, "no log frame observed; saw: {seen}");
+        let v = marker_json(&seen, "wave14-logs-marker");
+        assert_eq!(v["type"], "info");
+        assert!(v["payload"].as_str().unwrap().contains("wave14-logs-marker"));
+        drop(c);
+
+        // ?level=error gates info events out; error events pass.
+        let mut c2 = TcpStream::connect(addr).await.unwrap();
+        c2.write_all(
+            b"GET /logs?level=error HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer sekrit\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        read_head(&mut c2).await;
+
+        // Info events below the filter must never arrive (concurrent
+        // tests share the process bus, so unrelated error-level frames
+        // are tolerated — only OUR info marker must stay absent).
+        let mut noise = String::new();
+        for i in 0..6 {
+            tracing::info!(target: "engine", "wave14-gated-info-{i}");
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+        let mut chunk = vec![0u8; 8192];
+        if let Ok(Ok(n)) = tokio::time::timeout(std::time::Duration::from_millis(250), c2.read(&mut chunk)).await {
+            noise.push_str(&String::from_utf8_lossy(&chunk[..n]));
+        }
+        assert!(
+            !noise.contains("wave14-gated-info"),
+            "info events must not reach an error-level stream; saw: {noise}"
+        );
+
+        // Error events pass — and their arrival proves the stream is
+        // live, so the silence above was the filter, not a dead stream.
+        let mut seen = String::new();
+        let mut got = false;
+        for i in 0..80 {
+            tracing::error!(target: "engine", "wave14-err-marker-{i}");
+            if let Ok(Ok(n)) = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                c2.read(&mut chunk),
+            )
+            .await
+            {
+                seen.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                if seen.contains("wave14-err-marker") {
+                    got = true;
+                    break;
+                }
+            }
+        }
+        assert!(got, "no error frame observed; saw: {seen}");
+        let v = marker_json(&seen, "wave14-err-marker");
+        assert_eq!(v["type"], "error");
+
+        // After the proven-live point, an info event still never lands.
+        tracing::info!(target: "engine", "wave14-gated-info-final");
+        let mut tail = String::new();
+        if let Ok(Ok(n)) = tokio::time::timeout(std::time::Duration::from_millis(250), c2.read(&mut chunk)).await {
+            tail.push_str(&String::from_utf8_lossy(&chunk[..n]));
+        }
+        assert!(
+            !tail.contains("wave14-gated-info"),
+            "post-live info event still filtered; saw: {tail}"
+        );
+    }
+
+    /// Read the next ws text frame's payload (short timeout; None when
+    /// the stream stays quiet). Handles extended-length headers so a
+    /// long concurrent frame cannot desync the reader.
+    async fn read_ws_frame(c: &mut TcpStream) -> Option<String> {
+        let mut hdr = [0u8; 2];
+        if tokio::time::timeout(std::time::Duration::from_millis(50), c.read_exact(&mut hdr))
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        if hdr[0] != 0x81 {
+            return None;
+        }
+        let len = match hdr[1] {
+            n if n < 126 => n as usize,
+            126 => {
+                let mut ext = [0u8; 2];
+                c.read_exact(&mut ext).await.ok()?;
+                u16::from_be_bytes(ext) as usize
+            }
+            _ => {
+                let mut ext = [0u8; 8];
+                c.read_exact(&mut ext).await.ok()?;
+                usize::try_from(u64::from_be_bytes(ext)).ok()?
+            }
+        };
+        let mut body = vec![0u8; len];
+        c.read_exact(&mut body).await.ok()?;
+        Some(String::from_utf8_lossy(&body).to_string())
+    }
+
+    #[tokio::test]
+    async fn logs_bad_level_is_a_400() {
+        let addr = start_api(base_cfg()).await;
+        // Unknown level → upstream's ErrBadRequest shape.
+        let (status, body) = request(addr, "GET", "/logs?level=verbose", b"").await;
+        assert_eq!(status, 400);
+        assert!(body.contains("Params invalid"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn logs_websocket_and_structured_format() {
+        let addr = start_api(base_cfg()).await;
+        // ws upgrade (?token= auth), structured frames.
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(
+            b"GET /logs?level=debug&format=structured&token=sekrit HTTP/1.1\r\nHost: x\r\n\
+               Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+               Sec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let head = read_head(&mut c).await;
+        assert!(head.starts_with("HTTP/1.1 101"), "head: {head}");
+        assert!(head.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
+
+        // Loop-emit until a ws text frame with our marker arrives (a
+        // retried marker closes the head-write → subscribe race; frames
+        // from concurrent tests share the bus and are skipped over).
+        let mut frames = String::new();
+        let mut got = false;
+        for i in 0..80 {
+            tracing::info!(target: "engine", "wave14-ws-marker-{i}");
+            while let Some(frame) = read_ws_frame(&mut c).await {
+                frames.push_str(&frame);
+                frames.push('\n');
+                if frame.contains("wave14-ws-marker") {
+                    got = true;
+                    break;
+                }
+            }
+            if got {
+                break;
+            }
+        }
+        assert!(got, "no ws frame observed; saw: {frames}");
+        let v = marker_json(&frames, "wave14-ws-marker");
+        assert_eq!(v["level"], "info", "payload: {frames}");
+        assert!(v["message"].as_str().unwrap().contains("wave14-ws-marker"));
+        assert!(v.get("fields").is_some(), "structured frame carries fields");
     }
 
     #[tokio::test]

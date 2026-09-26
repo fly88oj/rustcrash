@@ -103,6 +103,15 @@ struct RawGroup {
     interval: Option<u64>,
     #[serde(default)]
     tolerance: Option<u16>,
+    /// `lazy`: skip the periodic health check when the group has not
+    /// been used within its interval (adapter/outboundgroup/parser.go
+    /// GroupCommonOption.Lazy — defaults TRUE upstream).
+    #[serde(default)]
+    lazy: Option<bool>,
+    /// `expected-status`: statuses a health probe must return to count
+    /// (parser.go ExpectedStatus → utils.NewUnsignedRanges[uint16]).
+    #[serde(default, rename = "expected-status")]
+    expected_status: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -189,6 +198,10 @@ pub fn load(text: &str) -> Result<EngineConfig> {
         .collect::<Result<Vec<_>>>()?;
 
     let mut groups = Vec::new();
+    // groupbase health-check filters (lazy / expected-status), one
+    // entry per group like upstream's per-group HealthCheck
+    // (adapter/provider/healthcheck.go NewHealthCheck carries both).
+    let mut group_health = std::collections::HashMap::new();
     for g in &raw.proxy_groups {
         groups.push(GroupConfig {
             name: g.name.clone(),
@@ -198,6 +211,18 @@ pub fn load(text: &str) -> Result<EngineConfig> {
             interval: g.interval.unwrap_or(300),
             tolerance: g.tolerance.unwrap_or(50),
         });
+        let expected_status = crate::config::ExpectedStatus::parse(
+            g.expected_status.as_deref().unwrap_or_default(),
+        )
+        .map_err(|e| Error::config(format!("group {}: {e}", g.name)))?;
+        group_health.insert(
+            g.name.clone(),
+            crate::config::GroupHealth {
+                // mihomo defaults lazy to true (parser.go:51-53).
+                lazy: g.lazy.unwrap_or(true),
+                expected_status,
+            },
+        );
     }
 
     let mut providers = Vec::new();
@@ -289,6 +314,10 @@ pub fn load(text: &str) -> Result<EngineConfig> {
         proxy_servers: parse_proxy_servers(raw.listeners.as_deref())?,
         tun,
         wg_endpoints: Vec::new(),
+        group_health,
+        // mihomo rule lines carry no actions upstream (rules/common/
+        // base.go ParseParams knows only `no-resolve`/`src`).
+        rule_actions: std::collections::HashMap::new(),
     })
 }
 
@@ -2393,6 +2422,62 @@ rules:
         assert_eq!(dns.fakeip_range, "198.18.0.1/15");
         let api = cfg.api.as_ref().unwrap();
         assert_eq!(api.port, 9090);
+    }
+
+    #[test]
+    fn group_health_defaults_lazy_true_and_parses_expected_status() {
+        // No lazy/expected-status keys: lazy defaults TRUE (upstream
+        // parser.go seeds GroupCommonOption{Lazy: true}), any status.
+        let cfg = load(SAMPLE).unwrap();
+        assert_eq!(cfg.group_health.len(), 2);
+        let auto = cfg.group_health("Auto");
+        assert!(auto.lazy && auto.expected_status.is_any());
+        let manual = cfg.group_health("Manual");
+        assert!(manual.lazy && manual.expected_status.is_any());
+
+        // Explicit values: lazy: false + a status/range list.
+        let cfg = load(
+            r#"
+mixed-port: 7890
+proxies:
+  - name: a
+    type: socks5
+    server: h.example
+    port: 1
+proxy-groups:
+  - name: Auto
+    type: url-test
+    lazy: false
+    expected-status: 200/204/301-308
+    proxies: [a]
+"#,
+        )
+        .unwrap();
+        let auto = cfg.group_health("Auto");
+        assert!(!auto.lazy);
+        assert!(auto.expected_status.matches(200));
+        assert!(auto.expected_status.matches(307));
+        assert!(!auto.expected_status.matches(199));
+        assert!(!auto.expected_status.matches(309));
+
+        // An invalid expected-status rejects the group (parser.go
+        // errors through NewUnsignedRanges).
+        let bad = load(
+            r#"
+mixed-port: 7890
+proxies:
+  - name: a
+    type: socks5
+    server: h.example
+    port: 1
+proxy-groups:
+  - name: Auto
+    type: url-test
+    expected-status: 20x
+    proxies: [a]
+"#,
+        );
+        assert!(bad.is_err());
     }
 
     #[test]
