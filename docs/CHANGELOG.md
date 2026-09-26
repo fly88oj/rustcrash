@@ -27,6 +27,56 @@ All notable changes to RustCrash. Format based on
   passthrough (the framing half of the splice; the raw-transport
   rebind is tracked).
 
+### Upstream bug audit: 25 real user-reported issues checked, 14 fixed
+
+Audited the top open bugs from mihomo/sing-box issue trackers against
+the engine. Fixed:
+
+- **Connection lifecycle** (#921/#1703/#2897): outbound dial timeout
+  (10s) so a hanging proxy can't park the relay + stats entry forever;
+  half-close grace (30s) so a peer that FINs but never EOFs doesn't
+  hold the connection in CLOSE_WAIT indefinitely; DNS cache sweep
+  (expired entries evicted on insert, not just masked).
+- **DNS reliability** (#859): DIRECT dials resolve through the ENGINE
+  resolver — a failing built-in DNS no longer silently falls through to
+  the system resolver. #2560: per-exchange total timeout (5s) — a
+  black-holed nameserver can't hold a query for the OS connect timeout.
+  #739: `#detour` tags on nameservers are stripped with a warning
+  instead of silently dropping the upstream. #1689: dns-hijack entries
+  now parse `any:53`/`ip:port`/protocol forms and match on address AND
+  port (was: bare-IP-only, silently matching nothing or everything).
+- **Loop prevention** (sing-box #2704/#3878): an in-flight loop guard
+  answers SERVFAIL for the engine's own re-entered queries (one bounce
+  kills the loop — covers TUN re-entry, systemd-resolved stub loops,
+  dns-hijack any:53); TUN now hijacks TCP DNS to hijacked destinations
+  too.
+- **Migration residue** (the user's scenario): `crash init/debug/
+  firewall` now scan for a live or leftover ShellCrash (install dirs,
+  /usr/bin/crash wrapper, profile alias, CrashCore pids, `inet
+  shellcrash` nft table, foreign iptables chains, stale fwmark rules)
+  and warn with deconfliction steps; a port-collision bind error names
+  the likely old instance with its stop commands; `firewall apply`
+  CLEAN foreign ShellCrash chains before installing ours (the
+  match-carrying jumps previously made our apply abort outright).
+- **Security** (#2426): `dialer-proxy`/`detour` now REFUSED at load
+  with the real-IP-leak reason (we never implemented chaining —
+  silently dialing direct was the same leak).
+- **Group correctness** (#1298/#2343): load-balance groups join health
+  rounds (dead members were rotated forever); a 0ms probe result is
+  alive, not failed.
+- **Share links** (#3220): legacy full-base64 `ss://`, unpadded/URL-
+  safe base64, and bracketed IPv6 `[v6]:port` parse in the
+  subconverter.
+- **HTTP auth** (#2539): the Proxy-Authorization header is sent
+  preemptively; a 407 now says "credentials rejected" vs "no username".
+
+Immune-with-evidence: #2346 (selection reset — our provider table is
+disjoint from the routing Registry), #813 (first health tick is
+immediate), #3197 (h2 half-close drains + END_STREAM), #926 (netstack
+hard caps every table), #2492 (no auto-redirect layer exists to drop
+packets), #1493/#983/#1875 (netstack TUN has no kernel-route conflict),
+#1681 (no shared context objects between resolver and relay).
+
 ### tests/docker-shellcrash — the real ShellCrash migration e2e
 
 A Docker suite that installs the REAL ShellCrash (dev @1.9.5beta3) in a
