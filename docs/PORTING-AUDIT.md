@@ -38,8 +38,8 @@ Status legend:
 | tuic.go | `proto/tuic.rs` v5 (TLS-exporter token auth, native/quic UDP relay, heartbeats, dissociate) | ✅ this pass |
 | wireguard.go | `proto/wireguard.rs` — hand-rolled Noise_IKpsk2 handshake (KDF/MAC1/2 step-cited from the whitepaper), transport keys, anti-replay, cookie consumption, keepalive/rekey timers, smoltcp client stack for TCP+UDP, mihomo `reserved` bytes per sing-wireguard `client_bind.go` | ✅ this pass (self-consistent: verified against an in-test noise responder; IPv6 inner stack ✅ wave-7 (dual-stack interface, per-family source selection, v4/v6 share one tunnel) |
 | tailscale.go | `proto/tailscale.rs` + `tailscale/{noise,controlhttp,derp,tailcfg,state,control,wg}.rs` — wave-11: the ipn layer (machine/node key state store, /key fetch, RegisterRequest auth-key login, the /map long-poll with delta application, NetMap cryptokey routing) + the data plane (WireGuard session over direct UDP or DERP relay, smoltcp stack; e2e TCP relay via both paths against the engine's own WG endpoint). tailcfg is JSON, not protobuf (wire fact from controlclient/direct.go) | 🟡 wave-13: disco IN (the bounded magicsock subset — ping/pong path confirmation, call-me-maybe via DERP, pong-confirmed addresses override DERP sessions) + key-expiry renewal IN (OldNodeKey re-register flow, RFC3339 expiry detection, tunnel cache re-key); remaining: the tailnet packet filter (inbound ACLs — no traffic to filter on an outbound) + browser login (headless) — both out of scope for a proxy outbound |
-| easytier.go | `proto/easytier.rs` — wave-10 config surface + component port; wave-11 MILESTONE 1: the direct-TCP peer tunnel (framing, plain-mode handshake with network digest, AES-GCM/ChaCha packet encryption byte-parity-proven against upstream's NIST vector, keepalive/backoff, IP-frame seam) — connect() now joins one peer for real | 🟡 wave-13 M3 IN: the UDP peer transport (8-byte header + SYN/SACK + PMH-framed datagrams — live-format found vs the real binary), the multi-peer `serve()` listener (inbound peers join the node; shared registry with the dial path), secure mode assessed+gated (the Noise_XX handshake is bounded but the SecureDatagramSession/PeerSessionStore payload layer is not — precise map in SECURE_MODE_NOT_PORTED) — **4/4 real-binary interop tests pass** (TCP/UDP × dial/listen). Remaining: quic/ws/wg transports, relay/foreign networks, multi-hop SPF, IPv6 overlay |
-| zerotier.go | `proto/zerotier.rs` — full config surface + every upstream validation (network id/node address/identity/MTU windows/orbit dedup/state-dir default); connect fails citing the libzt C dependency + the staged Rust-replacement milestones | 🟡 wave-10 (blocked by the no-C policy — the map is documented) |
+| easytier.go | `proto/easytier.rs` — wave-10 config surface + component port; wave-11 MILESTONE 1: the direct-TCP peer tunnel (framing, plain-mode handshake with network digest, AES-GCM/ChaCha packet encryption byte-parity-proven against upstream's NIST vector, keepalive/backoff, IP-frame seam) — connect() now joins one peer for real | 🟡 wave-14 M4 IN: the QUIC transport (the quinn-plaintext seam re-implemented in-tree — SeaHash-tagged, no TLS; wire-identical vs the real binary) + the WS/WSS transport (RFC 6455 hand-rolled, PMH-framed binary messages, in-process P-256 DER cert) — **8/8 real-binary interop tests pass** (TCP/UDP/QUIC/WS × dial/listen). Remaining: wg transport (boringtun recipe mapped), secure mode payload layer, relay/foreign networks, multi-hop SPF, IPv6 overlay |
+| zerotier.go | `proto/zerotier.rs` — wave-14: the RUST CORE MILESTONE 1 LANDED (no C): identity generation/validation (memory-hard hashcash, cross-validated vs zerotier-go's known-good identity), the armored packet codec (hand-rolled Salsa20/12+Poly1305, eSTREAM/BouncyCastle-pinned; AES-GMAC-SIV avoided by advertising protocol 11), HELLO/OK identity handshake, the controller netconf conversation (LZ4 decode + chunk reassembly + controller Ed25519 verify — ZeroTier's sig is RFC-8032 over a SHA-512 pre-digest, ring covers it). PoW identity = 0.71s release. Config bugs fixed: hex10 addresses, 0xff ad-hoc | 🟡 (connect() still NOT_PORTED: node runtime — UDP loop/WHOIS/fragmentation/planet parse — staged in the map; none of it needs C) |
 | tor | — | N/A upstream: neither mihomo (adapter/outbound/tor.go 404) nor sing-box (outbound/tor.go + protocol/tor/outbound.go 404) ships a tor outbound (probed 2026-09-24); nothing to port for 1:1 |
 | ssh.go | `proto/ssh.rs` via russh (password/PEM keys, direct-tcpip channels, known host keys) | ✅ this pass |
 | shadowtls.go (v3) | `proto/shadowtls.rs` (Hello-HMAC auth, record XOR chains, inner `proxy:` nesting in the mihomo dialect) | ✅ this pass (v1/v2 rejected with a clear error) |
@@ -64,7 +64,7 @@ Status legend:
 | Upstream | Engine | Status |
 |---|---|---|
 | selector, urltest, fallback, loadbalance | `outbound.rs` GroupPolicy | ✅ |
-| groupbase (health-check URL, expected-status, lazy) | url-test prober | 🟡 no lazy/expected-status filters |
+| groupbase (health-check URL, expected-status, lazy) | url-test prober + wave-14: `lazy` (default true; healthcheck.go's touch-gate) + `expected-status` (full IntRanges forms — lists/ranges/`*`, max 28) parsed per group | ✅ (application glue: health loop gates + probe status match — the parse/validate/expose landed with the GroupHealth API) |
 
 ### listener/ (inbounds)
 
@@ -174,7 +174,7 @@ Status legend:
 | cross-field AND / in-field OR semantics | combine_groups | ✅ (this audit pass — was previously wrong: plain OR lines) |
 | rule_set (.srs binary) | ✅ `ruleset_bin.rs` + provider wiring | |
 | user / package_name (android) / network_type (wifi/cellular) | ❌ |
-| rule *actions* (sniff/resolve/hijack-dns/route-options/reject variants) | 🟡 route+reject only; sniff is config-level |
+| rule *actions* | wave-14: the SING-BOX action surface (verified: mihomo has only no-resolve/src params — the old row overclaimed): sniff{sniffer-subset}/resolve/hijack-dns parsed with continue-from-next-rule semantics (route.go matchRule), reject→block, logical rules too; mihomo `lazy`/`expected-status` groups + the action RuleTable landed | 🟡 (route-options/reject-method variants warned+dropped with reasons; the app.rs re-entry loop glue is staged — MatchOutcome/resume_at exposed) |
 | dns rules (per-server routing, rewrite_ttl, client_subnet, disable_cache) | ❌ |
 | fakeip store persistence | fakeip.rs — JSON store with load_from/persist_to (atomic), range-mismatch reset, corrupt-store loud errors; `profile.store-fake-ip` wires the path | ✅ wave-12 |
 
@@ -199,7 +199,7 @@ Status legend:
 
 ### experimental/clashapi
 
-Proxies/connections/rules/traffic/mode/logs subset ✅; websocket traffic streaming 🟡 (polling only); v2rayapi ❌.
+Proxies/connections/rules/traffic/mode/logs/configs/providers ✅; /logs live via a hand-rolled tracing Subscriber broadcast (wave-14); providers runtime reload ✅ (RwLock-swapped rule sets); v2rayapi: N/A upstream (probed — no handler exists in Alpha; code search 0 hits).
 
 ## 3. Rust-native advantages over the Go originals (deliberate design deltas)
 

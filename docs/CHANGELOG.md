@@ -27,6 +27,13 @@ All notable changes to RustCrash. Format based on
   passthrough (the framing half of the splice; the raw-transport
   rebind is tracked).
 
+### Engine — wave 14: API finals, easytier M4 (QUIC+WS), group health + rule actions, ZeroTier Rust core milestone 1
+
+- **API finals**: PUT /providers/rules/{name} really reloads (RwLock-swapped rule sets — the swap is race-free, in-flight evaluations keep their snapshot; corrupt files 503 with the reason and keep routing); GET /logs streams live events via a hand-rolled tracing Subscriber feeding a process-wide broadcast (level filter, structured format, websocket); v2rayapi verified absent from current mihomo — recorded N/A.
+- **easytier M4**: the QUIC peer transport — easytier's QUIC is NOT TLS (the quinn-plaintext crate: an 8-byte SeaHash tag per packet, no crypto); re-implemented in-tree against quinn-proto and proven wire-identical against the real binary. The WS/WSS transport (RFC 6455 hand-rolled, one PMH-framed binary message per peer frame, in-process P-256 DER cert for wss). 8/8 real-binary interop tests now cover TCP/UDP/QUIC/WS × dial/listen. The wg transport is honestly mapped out (it drags boringtun's endpoint state machine — the recipe is in NOT_PORTED).
+- **group health + rule actions**: mihomo `lazy` (default true, the touch-gate) + `expected-status` (full range forms) per group; the sing-box rule-action surface (verified mihomo has none): sniff{sniffer-subset}/resolve/hijack-dns with continue-from-next-rule semantics, reject→block, logical rules included.
+- **ZeroTier Rust core milestone 1 — the "C dependency" verdict overturned**: identity generation (memory-hard hashcash address, cross-validated against zerotier-go's published identity), the armored packet codec (hand-rolled Salsa20/12+Poly1305 — eSTREAM/BouncyCastle-pinned; the AES-GMAC-SIV suite is avoided by advertising protocol 11), the HELLO/OK identity handshake, and the controller netconf conversation (LZ4 decode, chunk reassembly, controller signature verification — ZeroTier's signature is standard RFC-8032 Ed25519 over a SHA-512 pre-digest). Full PoW identity generation: 0.71s release. connect() still honestly NOT_PORTED (the node runtime), all staged without C.
+
 ### Engine — wave 13: stall fixes everywhere, easytier M3, tailscale disco + key renewal, API finishers
 
 - **The wireguard stall fixes applied to the siblings**: tailscale/wg.rs
