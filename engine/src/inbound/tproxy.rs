@@ -266,7 +266,10 @@ fn parse_orig_dst(control: &[u8], len: usize, is_v4: bool) -> Result<SocketAddr>
             unsafe { &*(control.as_ptr().add(off) as *const libc::cmsghdr) };
         let data_off = off + std::mem::size_of::<libc::cmsghdr>();
         // cmsg_len is u32 on musl, usize on glibc — cast for both.
+        #[cfg(target_env = "musl")]
         let cmsg_len = hdr.cmsg_len as usize;
+        #[cfg(not(target_env = "musl"))]
+        let cmsg_len = hdr.cmsg_len;
         let data_len = cmsg_len.saturating_sub(std::mem::size_of::<libc::cmsghdr>());
         if off + cmsg_len > len || data_off + data_len > control.len() {
             break;
