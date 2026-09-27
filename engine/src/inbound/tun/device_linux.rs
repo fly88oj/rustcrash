@@ -334,6 +334,11 @@ fn cap_hint(e: &io::Error) -> &'static str {
     match e.raw_os_error() {
         Some(libc::EPERM) | Some(libc::EACCES) => " (needs CAP_NET_ADMIN)",
         Some(libc::ENODEV) => " (no such interface; create it with `ip tuntap add`)",
+        Some(libc::EBUSY) => {
+            " (the device name is already held by another process — a running \
+             mihomo/sing-box/ShellCrash with the same TUN name? stop it or \
+             pick a different device name)"
+        }
         _ => "",
     }
 }

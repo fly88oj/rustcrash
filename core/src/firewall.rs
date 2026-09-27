@@ -71,7 +71,8 @@ pub struct ShellCrashResidue {
     pub wrapper_scripts: Vec<String>,
     /// Shell profile files carrying the `crash` → menu.sh alias.
     pub profile_aliases: Vec<String>,
-    /// Live foreign kernel processes ("CrashCore (pid 123)").
+    /// Live foreign kernel processes ("CrashCore (pid 123)",
+    /// "mihomo (pid 456)", "sing-box (pid 789)").
     pub live_cores: Vec<String>,
     /// The foreign `inet shellcrash` nft table is loaded.
     pub nft_table: bool,
@@ -160,23 +161,29 @@ impl ShellCrashResidue {
                     let comm = entry.path().join("comm");
                     if let Ok(comm) = std::fs::read_to_string(&comm) {
                         let comm = comm.trim();
-                        if comm == "CrashCore" {
-                            residue.live_cores.push(format!("CrashCore (pid {pid})"));
+                        // CrashCore is ShellCrash's kernel name; bare
+                        // mihomo/sing-box binaries are the same conflict
+                        // class (ports, TUN device, firewall rules).
+                        if matches!(comm, "CrashCore" | "mihomo" | "sing-box") {
+                            residue.live_cores.push(format!("{comm} (pid {pid})"));
                         }
                     }
                 }
             }
         }
 
-        // Foreign nft table (ShellCrash's nftables firewall_mod lives in
-        // exactly one table: inet shellcrash).
-        if Command::new("nft")
-            .args(["list", "table", "inet", "shellcrash"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            residue.nft_table = true;
+        // Foreign nft tables: ShellCrash's firewall_mod lives in exactly
+        // one table (inet shellcrash); sing-box's auto-route creates its
+        // own (inet sing-box). Either one hijacks traffic alongside ours.
+        for table in ["shellcrash", "sing-box"] {
+            if Command::new("nft")
+                .args(["list", "table", "inet", table])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+            {
+                residue.nft_table = true;
+            }
         }
 
         // Foreign iptables/ip6tables chains (ShellCrash fw_*.sh names).
@@ -281,14 +288,15 @@ impl ShellCrashResidue {
 /// chain (`-j shellcrash…`). RustCrash's own iptables chains share the
 /// `shellcrash` prefix by design (drop-in compat); the caller deletes
 /// ours first, so survivors are foreign.
-fn references_shellcrash_chain(rule: &str) -> bool {
-    let mut tokens = rule.split_whitespace();
-    while let Some(tok) = tokens.next() {
-        if tok == "-j" || tok == "-g" {
-            if let Some(target) = tokens.next() {
-                return target.starts_with("shellcrash");
-            }
-        }
+fn references_foreign_chain(rule: &str) -> bool {
+    let jump_target = rule
+        .split("-j ")
+        .nth(1)
+        .map(|t| t.split_whitespace().next().unwrap_or(""));
+    if let Some(target) = jump_target {
+        return target.starts_with("shellcrash")
+            || target.starts_with("mihomo")
+            || target.starts_with("sing-box");
     }
     false
 }
@@ -298,7 +306,11 @@ fn foreign_chains_in(dump: &str) -> Vec<String> {
     dump.lines()
         .filter_map(|l| l.strip_prefix("-N "))
         .map(str::trim)
-        .filter(|name| name.starts_with("shellcrash"))
+        .filter(|name| {
+            name.starts_with("shellcrash")
+                || name.starts_with("mihomo")
+                || name.starts_with("sing-box")
+        })
         .map(str::to_string)
         .collect()
 }
@@ -356,7 +368,7 @@ pub fn clean_foreign_shellcrash() -> Vec<String> {
             // Jump rules first: order matters (see doc comment).
             let jumps: Vec<&str> = dump
                 .lines()
-                .filter(|l| l.starts_with("-A ") && references_shellcrash_chain(l))
+                .filter(|l| l.starts_with("-A ") && references_foreign_chain(l))
                 .collect();
             for rule in jumps {
                 let argv = deletion_args(rule);
@@ -380,17 +392,19 @@ pub fn clean_foreign_shellcrash() -> Vec<String> {
         }
     }
 
-    // 2. Foreign nft table.
-    if Command::new("nft")
-        .args(["list", "table", "inet", "shellcrash"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
-        let _ = Command::new("nft")
-            .args(["delete", "table", "inet", "shellcrash"])
-            .output();
-        removed.push("nft: deleted table inet shellcrash".to_string());
+    // 2. Foreign nft tables (ShellCrash and sing-box auto-route).
+    for table in ["shellcrash", "sing-box"] {
+        if Command::new("nft")
+            .args(["list", "table", "inet", table])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            let _ = Command::new("nft")
+                .args(["delete", "table", "inet", table])
+                .output();
+            removed.push(format!("nft: deleted table inet {table}"));
+        }
     }
 
     // 3. Stale fwmark policy routing into the proxy tables (100/101).
@@ -2106,13 +2120,13 @@ mod tests {
             "-A OUTPUT -p tcp -j shellcrash_out",
             "-A PREROUTING -p tcp --dport 53 -j shellcrashv6_dns",
         ] {
-            assert!(references_shellcrash_chain(line), "{line}");
+            assert!(references_foreign_chain(line), "{line}");
         }
         // Foreign chains (docker etc.) must never match.
-        assert!(!references_shellcrash_chain(
+        assert!(!references_foreign_chain(
             "-A PREROUTING -d 172.17.0.0/16 -j DOCKER"
         ));
-        assert!(!references_shellcrash_chain(
+        assert!(!references_foreign_chain(
             "-A FORWARD -j ufw-before-forward"
         ));
 
