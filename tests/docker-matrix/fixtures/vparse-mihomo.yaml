@@ -1,0 +1,63 @@
+# Config-validation matrix (no live relay possible hermetically): the
+# engine must PARSE + VALIDATE one config carrying every outbound type
+# that has no in-repo server, the DoQ/DoH3/DHCP DNS upstream spellings,
+# and the group health knobs (lazy, expected-status). Run via
+# `engine test --flavor rust-mihomo`.
+mixed-port: 42890
+
+proxies:
+  # mieru (TCP + UDP transport + port-range form)
+  - {name: v-mieru, type: mieru, server: m.example, port: 8964, username: u, password: p, transport: TCP}
+  # restls outbound
+  - {name: v-restls, type: restls, server: r.example, port: 443, password: pw}
+  # shadowquic
+  - {name: v-shadowquic, type: shadowquic, server: sq.example, port: 443, username: u1, password: p1}
+  # sudoku / gost-relay / trusttunnel / masque
+  - {name: v-sudoku, type: sudoku, server: h.example, port: 443}
+  - {name: v-gost-relay, type: gost-relay, server: g.example, port: 443}
+  - {name: v-trusttunnel, type: trusttunnel, server: t.example, port: 443, password: pw}
+  - {name: v-masque, type: masque, server: m2.example, port: 443}
+  # openvpn (requires ca)
+  - name: v-openvpn
+    type: openvpn
+    server: v.example
+    port: 1194
+    proto: udp
+    cipher: AES-256-GCM
+    auth: SHA256
+    ca: |
+      -----BEGIN CERTIFICATE-----
+      fake-matrix-ca
+      -----END CERTIFICATE-----
+  # tailscale / zerotier / easytier overlays
+  - {name: v-tailscale, type: tailscale, hostname: node1, control-url: 'https://ctrl.example', state-dir: /tmp/ts, ephemeral: true}
+  - {name: v-zerotier, type: zerotier, network: a84ac5c10a1d86e9, udp: true}
+  - {name: v-easytier, type: easytier, network-name: mesh, network-secret: s3cret, peers: ['tcp://p.example:11010'], hostname: node1}
+  # ssh + shadowtls (inner proxy chain)
+  - {name: v-inner, type: socks5, server: 127.0.0.1, port: 42409}
+  - {name: v-ssh, type: ssh, server: s.example, port: 22, user: root, password: pw}
+  - {name: v-shadowtls, type: shadowtls, server: st.example, port: 443, password: stpw, version: 3, proxy: v-inner}
+  # dns outbound + jls-fronted snell (parse surface)
+  - {name: v-dns, type: dns, server: 127.0.0.1, port: 53}
+  - {name: v-jls, type: trojan, server: t.example, port: 443, password: pw, jls-opts: {username: u, password: p}}
+  # tlsmirror outbound surface (ech/tlsmirror opts on vmess)
+  - {name: v-vmess-mirror, type: vmess, server: v.example, port: 443, uuid: 66666666-6666-6666-6666-666666666666, cipher: auto,
+     tlsmirror-opts: {primary-key: bWF0cml4LXRsc21pcnJvci1wcmltYXJ5LWtleS0zMmI=}}
+
+proxy-groups:
+  - name: VParse
+    type: select
+    proxies: [v-mieru, v-restls, v-shadowquic, v-sudoku, v-gost-relay, v-trusttunnel, v-masque, v-openvpn, v-tailscale, v-zerotier, v-easytier, v-ssh, v-shadowtls, v-dns, v-jls, v-vmess-mirror]
+
+dns:
+  enable: true
+  listen: 127.0.0.1:42853
+  nameserver:
+    - 127.0.0.1:41553
+  nameserver-policy:
+    "doq.test": quic://127.0.0.1:41853
+    "doh3.test": h3://127.0.0.1:41443/dns-query
+    "dhcp.test": dhcp://lo
+
+rules:
+  - MATCH,VParse

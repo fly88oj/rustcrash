@@ -1,0 +1,115 @@
+# The RULE-engine: the full 26-type rule ladder + geodata rows. Each rule
+# routes to its own r-* outbound so /connections chains name the rule
+# that fired. Runs on the SAME ports as the matrix engine (sequential
+# lifecycle; see battery.sh).
+#
+# Rule-ladder probe map (all hermetic loopback):
+#   NETWORK,udp      SOCKS UDP-ASSOCIATE -> udp echo :41890
+#   IP-CIDR6         http://[::1]:41805/
+#   DOMAIN,reject    reject.test -> REJECT (negative row)
+#   DOMAIN           exact.test              (resolved by the oracle -> 127.0.0.1)
+#   DOMAIN-SUFFIX    a.suff.test
+#   DOMAIN-KEYWORD   xkeyw.test
+#   DOMAIN-REGEX     re-abc.test
+#   DOMAIN-WILDCARD  awild.test              (*wild.test)
+#   GEOSITE,cn       cn-full.test / cn-suffix.test  (generated geosite.dat)
+#   RULE-SET         a.ruleset.test          (provider file)
+#   IP-CIDR          127.0.0.99:41800
+#   IP-SUFFIX        127.0.127.9:41800       (suffix 127.9)
+#   GEOIP,CN         127.126.0.1:41800       (mmdb maps it to CN)
+#   IP-ASN           127.0.128.5:41800       (asn-only mmdb range)
+#   DST-PORT         127.0.0.2:41801
+#   SRC-PORT         127.0.0.3:41802 from source port 45123
+#   IN-PORT          via the classic http listener :42796 (`port:`)
+#   IN-NAME,socks    via the classic socks listener :42795 (`socks-port:`)
+#   PROCESS-PATH     curl -> 127.0.0.5:41804/slow.txt
+#   UID,0            python3 (root) -> 127.0.0.5:41804/slow.txt
+#   IN-TYPE,mixed    nobody python3 via mixed :42790 -> 127.0.0.3:41802
+#   CLASH-MODE,rule  /rules presence (mode-aware; see battery)
+#   MATCH            terminal (verified via /rules)
+mode: rule
+log-level: info
+mixed-port: 42790
+socks-port: 42795
+port: 42796
+external-controller: 127.0.0.1:42990
+ipv6: true
+
+proxies:
+  - {name: r-net-udp, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-ipcidr6, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-domain, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-suffix, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-keyword, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-regex, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-wildcard, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-geosite, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-ruleset, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-ipcidr, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-ipsuffix, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-geoip, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-asn, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-dstport, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-srcport, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-inport, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-inname, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-procpath, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-uid, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-intype, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-dscp, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-inuser, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-clashmode, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-match, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+
+rule-providers:
+  pset:
+    type: file
+    behavior: domain
+    format: text
+    path: /tmp/matrix/ruleset-provider.txt
+
+dns:
+  enable: true
+  listen: 127.0.0.1:42753
+  enhanced-mode: fake-ip
+  fake-ip-filter:
+    - "+.*"
+  default-nameserver:
+    - 127.0.0.1:41553
+  nameserver:
+    - 127.0.0.1:41553
+  nameserver-policy:
+    "geoip-cn.test": 127.0.0.1:41553
+    "tcp.test": tcp://127.0.0.1:41553
+    "dot.test": tls://127.0.0.1:41853
+    "doh.test": https://127.0.0.1:41443/dns-query
+    "sys.test": system
+    "nxd.test": rcode://name_error
+    "ref.test": rcode://refused
+
+rules:
+  - NETWORK,udp,r-net-udp
+  - IP-CIDR6,::1/128,r-ipcidr6,no-resolve
+  - DOMAIN,reject.test,REJECT
+  - DOMAIN,exact.test,r-domain
+  - DOMAIN-SUFFIX,suff.test,r-suffix
+  - DOMAIN-KEYWORD,keyw,r-keyword
+  - DOMAIN-REGEX,^re-.*\.test$,r-regex
+  - DOMAIN-WILDCARD,*wild.test,r-wildcard
+  - GEOSITE,cn,r-geosite
+  - RULE-SET,pset,r-ruleset
+  - IP-CIDR,127.0.0.99/32,r-ipcidr,no-resolve
+  - IP-SUFFIX,127.9,r-ipsuffix,no-resolve
+  - GEOIP,CN,r-geoip,no-resolve
+  - IP-ASN,65000,r-asn,no-resolve
+  - DST-PORT,41801,r-dstport
+  - SRC-PORT,45123,r-srcport
+  - IN-PORT,42796,r-inport
+  - IN-NAME,socks,r-inname
+  - PROCESS-PATH,/usr/bin/curl,r-procpath
+  - UID,0,r-uid
+  - IN-TYPE,mixed,r-intype
+  - IN-USER,probe-user,r-inuser
+  - DSCP,4,r-dscp
+  - CLASH-MODE,rule,r-clashmode
+  - MATCH,r-match

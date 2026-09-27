@@ -1,0 +1,4 @@
+vless://b831381d-6324-4d53-ad4f-8cda48b30811@127.0.0.1:39402?security=tls&sni=tls.test&flow=xtls-rprx-vision#sub2-vless
+hysteria2://matrix-hy2-pw@127.0.0.1:42404?sni=tls.test#sub2-hy2
+tuic://b831381d-6324-4d53-ad4f-8cda48b30811:matrix-tuic-pw@127.0.0.1:42405?congestion_control=bbr&sni=tls.test#sub2-tuic
+wireguard://private_key=CEPallHQzXQ2OIAxgB4M2Ng9lWH%2BXhcwmwv5Pu54R2Q%3D&peer_public_key=hSpZ638o2zcJ4RLj72HgeiXWzPlu8Xlxw0QXJeQ6Cyc%3D&endpoint=127.0.0.1%3A42160&mtu=1380#sub2-wg

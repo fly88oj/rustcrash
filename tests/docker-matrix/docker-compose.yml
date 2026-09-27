@@ -1,0 +1,34 @@
+# Feature-matrix e2e: ONE shared container runs everything — the target
+# servers (web/DNS-oracle/camo/udp-echo/subscription HTTP), the real
+# mihomo proxy server + client, the engine wireguard endpoint — and the
+# THREE platform binaries under test side by side:
+#   x86_64-glibc  /usr/local/bin/crash   (the engine image's own binary)
+#   x86_64-musl   /musl/crash            (static musl build, host-built)
+#   aarch64-musl  /qemu/qemu-aarch64 /arm64/crash  (cross-rs + QEMU user)
+# Same config, same servers, same assertions; only the runner differs.
+# Hermetic by construction (container loopback only). /etc/resolv.conf
+# is pinned to the in-container DNS oracle so the `system` DNS upstream
+# is hermetic too.
+services:
+  rustcrash:
+    image: docker-engine-rustcrash
+    networks:
+      - matrixnet
+    cap_add:
+      - NET_ADMIN
+    environment:
+      CRASHDIR: /tmp/rustcrash
+      USER: root
+    volumes:
+      - ./fixtures:/matrix-fixtures:ro
+      - ../docker-interop/fixtures:/interop-fixtures:ro
+      - ./fixtures/resolv.conf:/etc/resolv.conf:ro
+      - ${MUSL_BIN:-/tmp/rustcrash-musl/crash}:/musl/crash:ro
+      - ${ARM64_BIN:-/home/jeffrey/works/personal/github/fly88oj/rustcrash/target/aarch64-unknown-linux-musl/release/crash}:/arm64/crash:ro
+      - ${QEMU_BIN:-/tmp/qemu-aarch64}:/qemu/qemu-aarch64:ro
+    entrypoint: bash
+    command: -c "sleep infinity"
+
+networks:
+  matrixnet:
+    driver: bridge
