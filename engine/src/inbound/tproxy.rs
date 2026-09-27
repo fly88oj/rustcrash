@@ -265,8 +265,10 @@ fn parse_orig_dst(control: &[u8], len: usize, is_v4: bool) -> Result<SocketAddr>
         let hdr =
             unsafe { &*(control.as_ptr().add(off) as *const libc::cmsghdr) };
         let data_off = off + std::mem::size_of::<libc::cmsghdr>();
-        let data_len = hdr.cmsg_len.saturating_sub(std::mem::size_of::<libc::cmsghdr>());
-        if off + hdr.cmsg_len > len || data_off + data_len > control.len() {
+        // cmsg_len is u32 on musl, usize on glibc — cast for both.
+        let cmsg_len = hdr.cmsg_len as usize;
+        let data_len = cmsg_len.saturating_sub(std::mem::size_of::<libc::cmsghdr>());
+        if off + cmsg_len > len || data_off + data_len > control.len() {
             break;
         }
         let data = &control[data_off..data_off + data_len];
@@ -290,7 +292,7 @@ fn parse_orig_dst(control: &[u8], len: usize, is_v4: bool) -> Result<SocketAddr>
                 u16::from_be(sa.sin6_port),
             ));
         }
-        off += hdr.cmsg_len;
+        off += cmsg_len;
     }
     Err(Error::network("tproxy udp: no orig-dst cmsg"))
 }
