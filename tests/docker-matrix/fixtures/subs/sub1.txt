@@ -1,0 +1,2 @@
+ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@127.0.0.1:8388#sub1-ss
+trojan://pw123@127.0.0.1:443?sni=t.test#sub1-trojan

@@ -1,0 +1,24 @@
+{
+  "log": { "level": "debug" },
+  "inbounds": [
+    { "type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": 42161 }
+  ],
+  "endpoints": [
+    {
+      "type": "wireguard",
+      "tag": "wg-ep",
+      "private_key": "WAGPV3p73t+NKbMZEC050a7Qijlvs05dkkdF4Yx0vWg=",
+      "listen_port": 42160,
+      "address": ["172.19.0.1/30"],
+      "mtu": 1380,
+      "peers": [
+        {
+          "public_key": "u86QmbJ+ufe6pAW+Q82yZMXs9C6uBQyb+QnjWy7BK0M=",
+          "allowed_ips": ["172.19.0.2/32"]
+        }
+      ]
+    }
+  ],
+  "outbounds": [{ "type": "direct", "tag": "direct" }],
+  "route": { "final": "direct" }
+}

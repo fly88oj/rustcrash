@@ -1,0 +1,91 @@
+# The inbound (listener) matrix engine: one instance per platform
+# serving every listener type; the real mihomo client dials the
+# functional rows. jls / restls / tlsmirror camouflage at the TLS camo
+# site :41843 (tests/docker-interop/fixtures/camo-tls.py).
+mode: rule
+log-level: debug
+mixed-port: 43600
+socks-port: 43112
+port: 43113
+redir-port: 43702
+tproxy-port: 43703
+external-controller: 127.0.0.1:43990
+
+proxies:
+  - {name: dummy, type: socks5, server: 127.0.0.1, port: 1}
+
+listeners:
+  - {name: in-ss, type: shadowsocks, listen: 127.0.0.1, port: 43101, cipher: aes-256-gcm, password: matrix-ss-psk-123456, udp: true}
+  - {name: in-vmess, type: vmess, listen: 127.0.0.1, port: 43102, users: [{uuid: b831381d-6324-4d53-ad4f-8cda48b30811, alterId: 0}]}
+  - name: in-vless
+    type: vless
+    listen: 127.0.0.1
+    port: 43103
+    users:
+      - uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    certificate: /tmp/matrix/certs/server.crt
+    private-key: /tmp/matrix/certs/server.key
+  - name: in-trojan
+    type: trojan
+    listen: 127.0.0.1
+    port: 43104
+    udp: true
+    users:
+      - username: trojan-user
+        password: matrix-trojan-pw-123456
+    certificate: /tmp/matrix/certs/server.crt
+    private-key: /tmp/matrix/certs/server.key
+  - name: in-anytls
+    type: anytls
+    listen: 127.0.0.1
+    port: 43105
+    users:
+      - username: anytls-user
+        password: matrix-anytls-pw-123456
+    certificate: /tmp/matrix/certs/server.crt
+    private-key: /tmp/matrix/certs/server.key
+  - name: in-hy2
+    type: hysteria2
+    listen: 127.0.0.1
+    port: 43106
+    users:
+      - username: hy2-user
+        password: matrix-hy2-pw-123456
+    certificate: /tmp/matrix/certs/server.crt
+    private-key: /tmp/matrix/certs/server.key
+  - name: in-tuic
+    type: tuic
+    listen: 127.0.0.1
+    port: 43107
+    users:
+      - uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+        password: matrix-tuic-pw-123456
+    certificate: /tmp/matrix/certs/server.crt
+    private-key: /tmp/matrix/certs/server.key
+    alpn: [tuic]
+  - {name: in-snell4, type: snell, listen: 127.0.0.1, port: 43108, psk: matrix-snell-psk-123456, version: 4}
+  - {name: in-snell5, type: snell, listen: 127.0.0.1, port: 43114, psk: matrix-snell-psk-123456, version: 5}
+  - name: in-jls
+    type: jls
+    listen: 127.0.0.1
+    port: 43109
+    sni: tls.test
+    dest: 127.0.0.1:41843
+    users:
+      - username: alice
+        password: matrix-jls-pw-123456
+  - name: in-restls
+    type: restls
+    listen: 127.0.0.1
+    port: 43110
+    password: matrix-restls-pw-123456
+    dest: 127.0.0.1:41843
+  - name: in-tlsmirror
+    type: tlsmirror
+    listen: 127.0.0.1
+    port: 43111
+    primary-key: bWF0cml4LXRsc21pcnJvci1wcmltYXJ5LWtleS0zMmI=
+    dest: 127.0.0.1:41843
+
+rules:
+  - MATCH,DIRECT

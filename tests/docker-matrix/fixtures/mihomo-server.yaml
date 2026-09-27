@@ -1,0 +1,144 @@
+# The REAL mihomo binary as the shared proxy SERVER for the outbound
+# matrix (all three platform binaries dial it as clients). One listener
+# per relay-tested protocol, fixed ports, everything outbound direct.
+# Fake credentials throughout. Certs live at /tmp/matrix/certs.
+mode: direct
+log-level: debug
+external-controller: 127.0.0.1:42390
+
+listeners:
+  - name: m-ss
+    type: shadowsocks
+    listen: 127.0.0.1
+    port: 42388
+    cipher: aes-256-gcm
+    password: matrix-ss-psk-123456
+    udp: true
+
+  - name: m-ss2022
+    type: shadowsocks
+    listen: 127.0.0.1
+    port: 42389
+    cipher: 2022-blake3-aes-256-gcm
+    password: bWF0cml4LXNzMjAyMi1rZXktLS0zMi1ieXRlcy1vayE=
+    udp: true
+
+  - name: m-vmess
+    type: vmess
+    listen: 127.0.0.1
+    port: 42400
+    users:
+      - uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+        alterId: 0
+
+  - name: m-vmess-ws
+    type: vmess
+    listen: 127.0.0.1
+    port: 42401
+    users:
+      - uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+        alterId: 0
+    ws-path: /ws
+
+  - name: m-vless
+    type: vless
+    listen: 127.0.0.1
+    port: 42402
+    users:
+      - uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    certificate: /tmp/matrix/certs/server.crt
+    private-key: /tmp/matrix/certs/server.key
+
+  - name: m-vless-reality
+    type: vless
+    listen: 127.0.0.1
+    port: 42412
+    users:
+      - uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    reality-config:
+      dest: 127.0.0.1:41843
+      private-key: IMr2zKQXw_IjvcdKV1jdnpR40GAJE-zfJRezmwJzAUs
+      short-id:
+        - "0123456789abcdef"
+      server-names:
+        - tls.test
+
+  - name: m-trojan
+    type: trojan
+    listen: 127.0.0.1
+    port: 42403
+    udp: true
+    users:
+      - username: trojan-user
+        password: matrix-trojan-pw-123456
+    certificate: /tmp/matrix/certs/server.crt
+    private-key: /tmp/matrix/certs/server.key
+
+  - name: m-trojan-ws
+    type: trojan
+    listen: 127.0.0.1
+    port: 42411
+    network: ws
+    ws-opts:
+      path: /ws
+    users:
+      - username: trojan-user
+        password: matrix-trojan-pw-123456
+    certificate: /tmp/matrix/certs/server.crt
+    private-key: /tmp/matrix/certs/server.key
+
+  - name: m-hy2
+    type: hysteria2
+    listen: 127.0.0.1
+    port: 42404
+    users:
+      hy2-user: matrix-hy2-pw-123456
+    certificate: /tmp/matrix/certs/server.crt
+    private-key: /tmp/matrix/certs/server.key
+
+  - name: m-tuic
+    type: tuic
+    listen: 127.0.0.1
+    port: 42405
+    users:
+      b831381d-6324-4d53-ad4f-8cda48b30811: matrix-tuic-pw-123456
+    certificate: /tmp/matrix/certs/server.crt
+    private-key: /tmp/matrix/certs/server.key
+    alpn:
+      - tuic
+    congestion-controller: bbr
+    max-idle-time: 15000
+
+  - name: m-anytls
+    type: anytls
+    listen: 127.0.0.1
+    port: 42406
+    users:
+      anytls-user: matrix-anytls-pw-123456
+    certificate: /tmp/matrix/certs/server.crt
+    private-key: /tmp/matrix/certs/server.key
+
+  - name: m-snell4
+    type: snell
+    listen: 127.0.0.1
+    port: 42407
+    psk: matrix-snell-psk-123456
+    version: 4
+
+  - name: m-snell5
+    type: snell
+    listen: 127.0.0.1
+    port: 42408
+    psk: matrix-snell-psk-123456
+    version: 5
+
+  - name: m-socks
+    type: socks
+    listen: 127.0.0.1
+    port: 42409
+    udp: true
+
+  - name: m-http
+    type: http
+    listen: 127.0.0.1
+    port: 42410

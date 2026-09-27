@@ -1,0 +1,110 @@
+# The BIG relay engine: one instance per platform carries the outbound
+# matrix (Pick selector), the group matrix, the full 26-type rule ladder
+# (each row routed to its own r-* outbound so /connections chains name
+# the rule that fired), the DNS matrix (nameserver-policy maps one probe
+# domain per upstream), and the API battery. Ports are fixed.
+#
+# Rule-ladder probe map (all hermetic loopback):
+#   NETWORK,udp      SOCKS UDP-ASSOCIATE -> udp echo :41890
+#   IP-CIDR6         http://[::1]:41805/
+#   DOMAIN           exact.test              (resolved by the oracle -> 127.0.0.1)
+#   DOMAIN-SUFFIX    a.suff.test
+#   DOMAIN-KEYWORD   xkeyw.test
+#   DOMAIN-REGEX     re-abc.test
+#   DOMAIN-WILDCARD  awild.test              (*wild.test)
+#   RULE-SET         a.ruleset.test          (provider file)
+#   IP-CIDR          127.0.0.99:41800
+#   IP-SUFFIX        127.0.127.9:41800       (suffix 127.9)
+#   GEOIP,CN         127.126.0.1:41800       (mmdb maps it to CN)
+#   IP-ASN           127.0.128.5:41800       (asn-only mmdb range)
+#   DST-PORT         127.0.0.2:41801
+#   SRC-PORT         127.0.0.3:41802 from source port 45123
+#   IN-PORT          via listener :42791
+#   IN-NAME          via listener named-in :42795
+#   PROCESS-PATH     curl -> 127.0.0.5:41804/slow.txt
+#   UID,0            python3 (root) -> 127.0.0.5:41804/slow.txt
+#   IN-TYPE,mixed    nobody python3 via mixed :42790 -> 127.0.0.3:41802
+#   CLASH-MODE,rule  nobody python3 via http listener :42796 -> 127.0.0.4:41802
+#   MATCH            terminal (verified via /rules)
+mode: rule
+log-level: info
+mixed-port: 42790
+socks-port: 42795
+port: 42796
+external-controller: 127.0.0.1:42990
+ipv6: true
+
+proxies:
+  # --- the outbound relay matrix (all dial the real mihomo server) ---
+  - {name: o-ss, type: ss, server: 127.0.0.1, port: 42388, cipher: aes-256-gcm, password: matrix-ss-psk-123456, udp: true}
+  - {name: o-ss2022, type: ss, server: 127.0.0.1, port: 42389, cipher: 2022-blake3-aes-256-gcm, password: bWF0cml4LXNzMjAyMi1rZXktLS0zMi1ieXRlcy1vayE=, udp: true}
+  - {name: o-vmess, type: vmess, server: 127.0.0.1, port: 42400, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, alterId: 0, cipher: auto}
+  - {name: o-vmess-ws, type: vmess, server: 127.0.0.1, port: 42401, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, alterId: 0, cipher: auto, network: ws, ws-opts: {path: /ws}}
+  - {name: o-vless, type: vless, server: 127.0.0.1, port: 42402, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, servername: tls.test, skip-cert-verify: true}
+  - {name: o-vless-reality, type: vless, server: 127.0.0.1, port: 42412, uuid: b831381d-6324-4d53-ad4f-8cda48b30811,
+     reality-opts: {public-key: pF3AsmPmCvPgtT6eIhqv5Et6nes_Gy9-IBFXSC_oNTY, short-id: "0123456789abcdef"}, servername: tls.test, client-fingerprint: chrome}
+  - {name: o-trojan, type: trojan, server: 127.0.0.1, port: 42403, password: matrix-trojan-pw-123456, sni: tls.test, skip-cert-verify: true, udp: true}
+  - {name: o-trojan-ws, type: trojan, server: 127.0.0.1, port: 42411, password: matrix-trojan-pw-123456, sni: tls.test, skip-cert-verify: true, network: ws, ws-opts: {path: /ws}}
+  - {name: o-socks5, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: o-http, type: http, server: 127.0.0.1, port: 42410}
+  - {name: o-hy2, type: hysteria2, server: 127.0.0.1, port: 42404, password: matrix-hy2-pw-123456, skip-cert-verify: true}
+  - {name: o-tuic, type: tuic, server: 127.0.0.1, port: 42405, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, password: matrix-tuic-pw-123456, alpn: [tuic], skip-cert-verify: true}
+  - {name: o-wireguard, type: wireguard, private-key: CEPallHQzXQ2OIAxgB4M2Ng9lWH+Xhcwmwv5Pu54R2Q=, ip: 172.19.0.2,
+     peers: [{server: 127.0.0.1, port: 42160, public-key: hSpZ638o2zcJ4RLj72HgeiXWzPlu8Xlxw0QXJeQ6Cyc=}]}
+  - {name: o-snell4, type: snell, server: 127.0.0.1, port: 42407, psk: matrix-snell-psk-123456, version: 4}
+  - {name: o-snell5, type: snell, server: 127.0.0.1, port: 42408, psk: matrix-snell-psk-123456, version: 5}
+  - {name: o-anytls, type: anytls, server: 127.0.0.1, port: 42406, username: anytls-user, password: matrix-anytls-pw-123456, skip-cert-verify: true}
+  - {name: o-jls, type: snell, server: 127.0.0.1, port: 43109, psk: matrix-snell-psk-123456, version: 4,
+     plugin-opts: {mode: jls, username: alice, password: matrix-jls-pw-123456}}
+  - {name: o-ss-wrongpw, type: ss, server: 127.0.0.1, port: 42388, cipher: aes-256-gcm, password: WRONG-password-999}
+  - {name: o-dead, type: socks5, server: 127.0.0.1, port: 1}
+
+proxy-groups:
+  - name: Pick
+    type: select
+    proxies: [o-ss, o-ss2022, o-vmess, o-vmess-ws, o-vless, o-vless-reality, o-trojan, o-trojan-ws, o-socks5, o-http, o-hy2, o-tuic, o-wireguard, o-snell4, o-snell5, o-anytls, o-jls, DIRECT]
+  - name: AutoUT
+    type: url-test
+    proxies: [o-ss, o-dead]
+    url: http://127.0.0.1:41800/hello.txt
+    interval: 60
+    lazy: false
+    expected-status: "200"
+  - name: AutoFB
+    type: fallback
+    proxies: [o-dead, o-ss]
+    url: http://127.0.0.1:41800/hello.txt
+    interval: 60
+  - name: AutoLB
+    type: load-balance
+    proxies: [o-ss, o-ss2022]
+    strategy: consistent-hashing
+
+rule-providers:
+  pset:
+    type: file
+    behavior: domain
+    format: text
+    path: /tmp/matrix/ruleset-provider.txt
+
+dns:
+  enable: true
+  listen: 127.0.0.1:42753
+  enhanced-mode: fake-ip
+  fake-ip-filter:
+    - "+.*"
+  default-nameserver:
+    - 127.0.0.1:41553
+  nameserver:
+    - 127.0.0.1:41553
+  nameserver-policy:
+    "geoip-cn.test": 127.0.0.1:41553
+    "tcp.test": tcp://127.0.0.1:41553
+    "dot.test": tls://127.0.0.1:41853
+    "doh.test": https://127.0.0.1:41443/dns-query
+    "sys.test": system
+    "nxd.test": rcode://name_error
+    "ref.test": rcode://refused
+
+rules:
+  - MATCH,Pick

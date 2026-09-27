@@ -1,0 +1,19 @@
+{
+  "inbounds": [
+    { "type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": 42891 }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    { "type": "block", "tag": "block" }
+  ],
+  "route": {
+    "rules": [
+      { "port": 443, "action": "sniff", "sniffer": ["tls", "dns"] },
+      { "domain_suffix": ["resolve-me.test"], "action": "resolve" },
+      { "port": 53, "action": "hijack-dns" },
+      { "domain": ["reject-me.test"], "action": "reject" },
+      { "domain": ["direct-me.test"], "outbound": "direct" }
+    ],
+    "final": "direct"
+  }
+}
