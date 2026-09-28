@@ -93,12 +93,18 @@ pub fn init_logging(configured_level: &str) {
     let filter = tracing_subscriber::EnvFilter::try_new(&level)
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::Layer;
     let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_target(false);
+        .with_target(false)
+        .with_filter(filter);
+    // The broadcast layer sees EVERY event (no filter): per-client
+    // ?level= filtering happens at each /logs stream, like mihomo.
+    let broadcast: tracing_subscriber::filter::LevelFilter =
+        tracing_subscriber::filter::LevelFilter::TRACE;
+    let broadcast_layer = crate::logging::LogBroadcastLayer.with_filter(broadcast);
     let subscriber = tracing_subscriber::registry()
-        .with(filter)
         .with(fmt_layer)
-        .with(crate::logging::LogBroadcastLayer);
+        .with(broadcast_layer);
     let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
