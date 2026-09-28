@@ -362,6 +362,9 @@ if [ "$engine_up" = 1 ]; then
     w=$(python3 "$FX/ws-probe.py" "$API" /traffic 6 2>&1)
     echo "$w" | grep -q '"up"\|"down"' && ok "api: /traffic websocket" "frame: ${w:0:40}" \
                                        || bad "api: /traffic websocket" "${w:0:60}"
+    # Generate an INFO log event first (the engine is quiet otherwise):
+    # a relay through the engine produces a tcp-dispatch log line.
+    curl -s --max-time 2 -x "http://127.0.0.1:$MIX" "http://127.0.0.1:18080/test.txt" >/dev/null 2>&1 &
     w=$(python3 "$FX/ws-probe.py" "$API" "/logs?level=info" 6 2>&1)
     if [ -n "$w" ] && [ "$w" != "NO_HANDSHAKE" ] && [ "$w" != "NO_FRAME" ]; then
         ok "api: /logs websocket" "${w:0:50}"
