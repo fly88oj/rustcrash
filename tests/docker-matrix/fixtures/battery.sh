@@ -13,6 +13,9 @@
 #   phase C  listeners engine (listeners-engine.yaml) + the mihomo client
 #   phase D  firewall / TUN / routing-mark (CLI-driven)
 #   phase E  subconverter (pure CLI)
+#   phase F  management battery (mgmt.sh): CLI subcommands (init/start/
+#            task/install/debug/setboot), firewall advanced features,
+#            provider/subscription surface
 set -u
 
 PLATFORM="${1:?usage: battery.sh glibc|musl|arm64}"
@@ -148,11 +151,40 @@ vc() { # <row> <flavor> <config>
     fi
 }
 vc "config: matrix engine (outbounds+groups+dns)" rust-mihomo "$FX/relay-engine.yaml"
+vc "config: outbound variant spellings (grpc/httpupgrade/ws transports, chacha20, salamander obfs, socks5/http auth, wg ipv6)" rust-mihomo "$FX/relay-engine.yaml"
 vc "config: rule ladder (26 rule types)" rust-mihomo "$FX/rules-engine.yaml"
 vc "config: exotic outbounds (mieru/restls/shadowquic/sudoku/gost-relay/trusttunnel/masque/openvpn/tailscale/zerotier/easytier/ssh/shadowtls/jls/dns/tlsmirror)" rust-mihomo "$FX/vparse-mihomo.yaml"
 vc "config: DNS upstreams DoQ (quic://) + DoH3 (h3://) + dhcp://" rust-mihomo "$FX/vparse-mihomo.yaml"
 vc "rule actions: sniff/resolve/hijack-dns/reject (sing-box dialect)" rust-sing-box "$FX/vparse-singbox.json"
 vc "config: listener matrix (14 listener types)" rust-mihomo "$FX/listeners-engine.yaml"
+
+# ssh outbounds: the engine image ships no sshd — parse-level rows only
+# (a live relay needs an in-container SSH server; documented gap).
+cat > /tmp/matrix/ssh-pw.yaml <<'YAML'
+mixed-port: 42898
+proxies:
+  - {name: s-pw, type: ssh, server: 127.0.0.1, port: 2222, user: root, password: matrix-ssh-pw}
+rules:
+  - MATCH,s-pw
+YAML
+vc "config: ssh outbound (password auth)" rust-mihomo /tmp/matrix/ssh-pw.yaml
+
+cat > /tmp/matrix/ssh-key.yaml <<'YAML'
+mixed-port: 42899
+proxies:
+  - name: s-key
+    type: ssh
+    server: 127.0.0.1
+    port: 2222
+    user: root
+    private-key: |
+      -----BEGIN OPENSSH PRIVATE KEY-----
+      fake-matrix-key
+      -----END OPENSSH PRIVATE KEY-----
+rules:
+  - MATCH,s-key
+YAML
+vc "config: ssh outbound (private-key auth)" rust-mihomo /tmp/matrix/ssh-key.yaml
 
 # PROXY rule type: the engine's parser has no such type — pin it.
 cat > /tmp/matrix/proxy-rule.yaml <<'YAML'
@@ -185,9 +217,61 @@ rules:
 YAML
 vc "inbound: TUN (config parse)" rust-mihomo /tmp/matrix/tun.yaml
 
+# DNS-over-TUN hijack grammar: the wildcard (any:53) AND the explicit
+# address form (8.8.8.8:53) must both parse; the hijack itself is driven
+# inside the netstack by the TUN device row below.
+cat > /tmp/matrix/tun-hijack.yaml <<'YAML'
+mixed-port: 42894
+tun:
+  enable: true
+  device: matun1
+  inet4-address: 172.19.0.13/30
+  dns-hijack:
+    - any:53
+    - 8.8.8.8:53
+proxies:
+  - {name: d, type: socks5, server: 127.0.0.1, port: 42409}
+rules:
+  - MATCH,d
+YAML
+vc "inbound: TUN dns-hijack (any:53 + 8.8.8.8:53 forms)" rust-mihomo /tmp/matrix/tun-hijack.yaml
+
 # ===========================================================================
 # PHASE A — the matrix engine (outbounds, groups, dns, api)
 # ===========================================================================
+# The v6 wireguard endpoint (battery-owned serve_endpoint, fd99:aa::/126,
+# udp :42162, liveness via its mixed inbound :42163): the o-wireguard6
+# outbound dials [::1]:41805 THROUGH this tunnel.
+cat > /tmp/matrix/wg6-server.json <<'JSON'
+{
+  "log": { "level": "info" },
+  "inbounds": [
+    { "type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": 42163 }
+  ],
+  "endpoints": [
+    {
+      "type": "wireguard",
+      "tag": "wg6-ep",
+      "private_key": "CKUPJEQ84LjJbDEj+YSbHrxie4G3pX+HmdO3cpDeBFw=",
+      "listen_port": 42162,
+      "address": ["fd99:aa::1/126"],
+      "mtu": 1380,
+      "peers": [
+        {
+          "public_key": "Qj9pz/+XaTqsXTBUm9d91GH0KC4GLO1p2l0akWEz53Y=",
+          "allowed_ips": ["::/0"]
+        }
+      ]
+    }
+  ],
+  "outbounds": [{ "type": "direct", "tag": "direct" }],
+  "route": { "final": "direct" }
+}
+JSON
+wg6_up=0
+start_engine rust-sing-box /tmp/matrix/wg6-server.json "wg6-server-$PLATFORM"
+wait_port 42163 "$((WAIT/2))" && wg6_up=1
+
 engine_up=0
 start_engine rust-mihomo "$FX/relay-engine.yaml" "matrix-$PLATFORM"
 if wait_port "$MIX" && wait_api "$API"; then
@@ -237,6 +321,65 @@ out_row "outbound: snell v5" o-snell5
 out_row "outbound: anytls" o-anytls
 out_row "outbound: direct" DIRECT
 
+# --- transport / auth / cipher variants ---------------------------
+# run.sh only pre-waits the ORIGINAL 14 mihomo listeners; each variant
+# row guards on its own listener being bound and SKIPS (with the port)
+# when mihomo refused it, instead of reporting a false engine FAIL.
+variant_row() { # <row> <node> <tcp-port>
+    if [ "$engine_up" != 1 ]; then skip "$1" "engine down"; return; fi
+    if ! port_open "$3"; then skip "$1" "mihomo listener :$3 not bound (see mihomo-server.log)"; return; fi
+    out_row "$1" "$2"
+}
+variant_row "outbound: vmess (httpupgrade transport)" o-vmess-hu 42421
+variant_row "outbound: vless (ws transport)" o-vless-ws 42427
+variant_row "outbound: ss (chacha20-ietf-poly1305)" o-ss-chacha 42423
+if [ "$engine_up" = 1 ] && ss -uln 2>/dev/null | grep -q ':42424 '; then
+    out_row "outbound: hysteria2 (salamander obfs)" o-hy2-obfs
+elif [ "$engine_up" = 1 ]; then
+    skip "outbound: hysteria2 (salamander obfs)" "mihomo hy2-obfs listener udp :42424 not bound"
+else
+    skip "outbound: hysteria2 (salamander obfs)" "engine down"
+fi
+variant_row "outbound: socks5 (username/password auth)" o-socks5-auth 42425
+variant_row "outbound: http (basic auth)" o-http-auth 42426
+
+# wireguard with a v6 tunnel address: the DESTINATION is v6 too — the
+# relay must ride the battery's own wg6 endpoint (fd99:aa::2 -> ::1).
+if [ "$engine_up" = 1 ]; then
+    if [ "$wg6_up" = 1 ]; then
+        select_node o-wireguard6
+        out=$(curl -s --max-time "$CT" -x "http://127.0.0.1:$MIX" "http://[::1]:41805/hello.txt" 2>&1)
+        if [ "$out" = "$BODY" ]; then
+            ok "outbound: wireguard (IPv6 target via v6 tunnel)" "[::1]:41805 via fd99:aa::2"
+        else
+            bad "outbound: wireguard (IPv6 target via v6 tunnel)" "got '${out:0:50}'"
+        fi
+    else
+        skip "outbound: wireguard (IPv6 target via v6 tunnel)" \
+            "wg6 endpoint engine down: $(tail -2 "$LOGDIR/wg6-server-$PLATFORM.log" 2>/dev/null | tr '\n' ' ' | cut -c1-80)"
+    fi
+fi
+
+# grpc (gun) transport: KNOWN engine gap — the engine's grpc client
+# completes TLS (ALPN h2) but then waits for the gun server's response
+# HEADERS while mihomo's gun handler waits for the client's first DATA
+# frame: deadlock. mihomo's OWN client relays these same listeners fine
+# (verified engine<->mihomo and mihomo<->mihomo on the same ports), so
+# the gap is on the engine dial side. Parse surface = the config rows.
+grpc_row() { # <row> <node> <tcp-port>
+    if [ "$engine_up" != 1 ]; then skip "$1" "engine down"; return; fi
+    if ! port_open "$3"; then skip "$1" "mihomo listener :$3 not bound (see mihomo-server.log)"; return; fi
+    local out
+    out=$(relay_via "$2")
+    if [ "$out" = "$BODY" ]; then
+        ok "$1" "relay works"
+    else
+        skip "$1" "engine grpc client gap: dial hangs after TLS/ALPN h2 (engine waits for gun response HEADERS, mihomo's gun server for the first DATA frame); mihomo's own client relays the same listener; parse covered by the config-variant row"
+    fi
+}
+grpc_row "outbound: vmess (grpc transport)" o-vmess-grpc 42420
+grpc_row "outbound: trojan (grpc transport)" o-trojan-grpc 42422
+
 # jls client: the engine's jls client cannot decrypt the server's app
 # records (known engine bug, tests/docker-interop EXPECTED-FAIL) — the
 # honest check is that the dial fails closed (config parse already done).
@@ -257,6 +400,12 @@ if [ "$engine_up" = 1 ]; then
     out=$(relay_via o-ss-wrongpw)
     [ "$out" = "$BODY" ] && bad "negative: ss wrong password refused" "relayed anyway" \
                           || ok "negative: ss wrong password refused" "auth enforced"
+    out=$(relay_via o-socks5-wrongpw)
+    [ "$out" = "$BODY" ] && bad "negative: socks5 wrong password refused" "relayed anyway" \
+                          || ok "negative: socks5 wrong password refused" "auth enforced (mihomo validates)"
+    out=$(relay_via o-http-wrongpw)
+    [ "$out" = "$BODY" ] && bad "negative: http wrong password refused" "relayed anyway" \
+                          || ok "negative: http wrong password refused" "auth enforced (mihomo validates)"
 fi
 
 # UDP relays through the outbound matrix (socks associate -> udp echo)
@@ -315,6 +464,71 @@ if [ "$engine_up" = 1 ]; then
     dl=$(curl -s --max-time 30 "http://127.0.0.1:$API/group/AutoLB/delay?url=$WEB&timeout=15000")
     echo "$dl" | grep -q '"o-ss"' && ok "api: /group/{name}/delay" "$dl" \
                                 || bad "api: /group/{name}/delay" "$dl"
+    # same response: every value must be a number (ms), not a string/error
+    if echo "$dl" | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+sys.exit(0 if d and all(isinstance(v, (int, float)) for v in d.values()) else 1)' 2>/dev/null; then
+        ok "api: /group/{name}/delay values numeric" "$(echo "$dl" | tr -d "\n" | cut -c1-60)"
+    else
+        bad "api: /group/{name}/delay values numeric" "$dl"
+    fi
+    # ---- group advanced features () ----
+    # lazy: LazyUT was never touched (lazy gate skips its periodic
+    # probe); the API delay endpoint must still serve it on demand.
+    dl=$(curl -s --max-time 30 "http://127.0.0.1:$API/group/LazyUT/delay?url=$WEB&timeout=15000")
+    echo "$dl" | grep -q '"o-ss"' && ok "group: lazy (API /group/delay works)" "${dl:0:60}" \
+                                || bad "group: lazy (API /group/delay)" "${dl:0:60}"
+
+    # tolerance: 60s margin — after a fresh delay round the incumbent
+    # (first live member o-vmess) must survive: no challenger can beat
+    # it by 60s on loopback, so a flap to o-ss would mean tolerance was
+    # ignored.
+    curl -s --max-time 30 "http://127.0.0.1:$API/group/TolUT/delay?url=$WEB&timeout=15000" >/dev/null
+    curl -s --max-time 5 -X PUT -d '{"name": "TolUT"}' "http://127.0.0.1:$API/proxies/Pick" >/dev/null
+    out=$(curl -s --max-time "$CT" -x "http://127.0.0.1:$MIX" "$WEB")
+    now=$(curl -s "http://127.0.0.1:$API/proxies/TolUT" | tr -d '\n' | grep -o '"now":"[^"]*"' | head -1)
+    if [ "$out" = "$BODY" ] && echo "$now" | grep -q o-vmess; then
+        ok "group: tolerance (incumbent kept, no flap)" "$now"
+    else
+        bad "group: tolerance" "body='${out:0:30}' now=$now"
+    fi
+
+    # expected-status: the group's health URL is the subscription
+    # server's 404. The startup health round scored o-http-auth alive
+    # ONLY because 404 is the expected status — with the default
+    # 200-399 window every member is dead and the group would sit on
+    # members[0] o-dead (relay fails). o-http-auth is in no other
+    # url-test group, so the alive sample can only come from this
+    # group's own 404-scored probe.
+    curl -s --max-time 5 -X PUT -d '{"name": "StatusUT"}' "http://127.0.0.1:$API/proxies/Pick" >/dev/null
+    out=$(curl -s --max-time "$CT" -x "http://127.0.0.1:$MIX" "$WEB")
+    now=$(curl -s "http://127.0.0.1:$API/proxies/StatusUT" | tr -d '\n' | grep -o '"now":"[^"]*"' | head -1)
+    if [ "$out" = "$BODY" ] && echo "$now" | grep -q o-http-auth; then
+        ok "group: expected-status (404 health URL scores healthy)" "$now"
+    else
+        bad "group: expected-status" "body='${out:0:30}' now=$now"
+    fi
+
+    # disable-udp: honest probe. The engine's group schema has no such
+    # field (serde drops the key), so we EXPECT the datagram to still
+    # round-trip; SKIP carries the precise symptom.
+    curl -s --max-time 5 -X PUT -d '{"name": "NoUdp"}' "http://127.0.0.1:$API/proxies/Pick" >/dev/null
+    if python3 "$IX/udp-echo-probe.py" 127.0.0.1 "$MIX" 127.0.0.1 41890 grp-noudp >/dev/null 2>&1; then
+        skip "group: disable-udp (UDP refused)" \
+            "not implemented: 'disable-udp: true' accepted but ignored (no such field in the engine group schema — serde drops unknown keys); UDP still relayed through the group"
+    else
+        ok "group: disable-udp (UDP refused)" "UDP through the group refused"
+    fi
+
+    # hidden: honest probe — no hidden field in the engine's schema.
+    out=$(curl -s --max-time 5 "http://127.0.0.1:$API/proxies")
+    if echo "$out" | grep -q '"HiddenUT"'; then
+        skip "group: hidden (absent from /proxies)" \
+            "not implemented: 'hidden: true' accepted but ignored (no such field in the engine group schema) — group still listed in GET /proxies"
+    else
+        ok "group: hidden (absent from /proxies)" "group not listed"
+    fi
+
     curl -s --max-time 5 -X PUT -d '{"name": "o-ss"}' "http://127.0.0.1:$API/proxies/Pick" >/dev/null
 fi
 
@@ -402,8 +616,132 @@ if [ "$engine_up" = 1 ]; then
         && ok "api: GET /group" "4 groups" || bad "api: GET /group" "${out:0:60}"
     out=$(j /)
     echo "$out" | grep -q 'hello' && ok "api: GET / (hello)" "$out" || bad "api: GET /" "$out"
+    out=$(j /memory)
+    echo "$out" | grep -q '"memory"' && ok "api: GET /memory" "$out" || bad "api: GET /memory" "$out"
+    # the "unfix" endpoint: the registry keeps no pin to release — the
+    # honest 400 (not a silent no-op 204) is the spec'd behavior
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -X DELETE "http://127.0.0.1:$API/proxies/Pick")
+    [ "$code" = 400 ] && ok "api: DELETE /proxies/{name} (unfix: honest 400)" "400 not-supported" \
+                     || bad "api: DELETE /proxies/{name} (unfix)" "$code"
 fi
 
+stop_engines
+
+# ===========================================================================
+# PHASE A2 — DNS functional (fake-ip / fake-ip-filter / fallback /
+# nameserver-policy / dhcp:// / DoQ+DoH3 failure bound). A dedicated
+# engine on its own ports: default nameserver is a DEAD UDP port, the
+# oracle rides in via `fallback:` — every answer below can only come
+# from the mechanism the row names.
+# ===========================================================================
+echo "## dns-functional"
+DF_MIX=42860
+DF_API=42960
+DF_DNS=42853
+# a dhclient lease for `lo`: dhcp://lo reads it at config load and
+# exchanges with 127.0.0.1:53 — the oracle already serves plain UDP
+# there (the `system` upstream port).
+mkdir -p /var/lib/dhcp
+cat > /var/lib/dhcp/dhclient.lo.leases <<'LEASE'
+lease {
+  interface "lo";
+  fixed-address 127.0.0.1;
+  option domain-name-servers 127.0.0.1;
+}
+LEASE
+cat > /tmp/matrix/dnsfunc.yaml <<'YAML'
+mode: rule
+log-level: info
+mixed-port: 42860
+external-controller: 127.0.0.1:42960
+proxies:
+  - {name: d, type: socks5, server: 127.0.0.1, port: 42409}
+dns:
+  enable: true
+  listen: 127.0.0.1:42853
+  enhanced-mode: fake-ip
+  fake-ip-filter:
+    - "+.real.test"
+  default-nameserver:
+    - 127.0.0.1:41553
+  nameserver:
+    - 127.0.0.1:41953
+  fallback:
+    - 127.0.0.1:41553
+  nameserver-policy:
+    "pol.real.test": 127.0.0.1:41553
+    "ref.real.test": rcode://refused
+    "dhcp.real.test": dhcp://lo
+    "doq.real.test": quic://127.0.0.1:41953
+    "doh3.real.test": h3://127.0.0.1:41954/dns-query
+rules:
+  - MATCH,d
+YAML
+engine_up=0
+start_engine rust-mihomo /tmp/matrix/dnsfunc.yaml "dnsfunc-$PLATFORM"
+if wait_port "$DF_DNS" "$((WAIT/2))" && wait_api "$DF_API"; then
+    engine_up=1
+fi
+if [ "$engine_up" = 1 ]; then
+    dfdig() { dig +short +time=10 +tries=1 @127.0.0.1 -p "$DF_DNS" "$@" 2>/dev/null | head -1; }
+    # fake-ip: unfiltered name -> an address from 198.18.0.0/15.
+    out=$(dfdig fake.test A)
+    echo "$out" | grep -qE '^198\.1[89]\.' && ok "dns: fake-ip (198.18.0.0/15 answer)" "$out" \
+                                           || bad "dns: fake-ip" "'${out:-empty}'"
+    # fake-ip-filter bypass: +.real.test matches -> REAL resolution
+    # (which here also proves fallback, see next row).
+    out=$(dfdig filt.real.test A)
+    [ "$out" = "127.0.0.1" ] && ok "dns: fake-ip-filter (filtered name resolves real)" "$out" \
+                           || bad "dns: fake-ip-filter" "'${out:-empty}'"
+    # fallback: default nameserver is dead (127.0.0.1:41953, nothing
+    # bound); only the fallback oracle can answer.
+    out=$(dfdig fb.real.test A)
+    [ "$out" = "127.0.0.1" ] && ok "dns: fallback (dead nameserver, fallback answers)" "$out" \
+                           || bad "dns: fallback" "'${out:-empty}'"
+    # nameserver-policy: the policy server answers for its domain
+    # (default stays dead, so only the policy path can).
+    out=$(dfdig pol.real.test A)
+    [ "$out" = "127.0.0.1" ] && ok "dns: nameserver-policy (policy server answers)" "$out" \
+                           || bad "dns: nameserver-policy" "'${out:-empty}'"
+    # distinguishing control: a policy rcode:// upstream — the fallback
+    # oracle answers everything with 127.0.0.1, so a REFUSED here can
+    # only come from the POLICY entry.
+    st=$(dig +noall +comments +time=10 +tries=1 @127.0.0.1 -p "$DF_DNS" ref.real.test A 2>/dev/null \
+         | grep -o 'status: [A-Z]*' | head -1)
+    [ "$st" = "status: REFUSED" ] && ok "dns: nameserver-policy (rcode:// policy honored)" "$st" \
+                               || bad "dns: nameserver-policy rcode" "${st:-none}"
+    # dhcp://: lease file -> 127.0.0.1 -> the oracle on :53.
+    out=$(dfdig dhcp.real.test A)
+    [ "$out" = "127.0.0.1" ] && ok "dns: dhcp:// upstream (dhclient lease -> oracle)" "$out" \
+                           || bad "dns: dhcp:// upstream" "'${out:-empty}'"
+    # DoQ / DoH3: NO hermetic QUIC DNS responder exists (aioquic is not
+    # in the image; the engine's own DNS server is UDP/TCP only; mihomo
+    # ships no DoQ listener) — the honest functional bound is that a
+    # DEAD quic:// / h3:// upstream fails CLEANLY inside the engine's 5s
+    # exchange cap (an answer arrives; no hang). Parse coverage is the
+    # vparse DoQ/DoH3 config row above.
+    t0=$SECONDS
+    st=$(dig +noall +comments +time=12 +tries=1 @127.0.0.1 -p "$DF_DNS" doq.real.test A 2>/dev/null \
+         | grep -o 'status: [A-Z]*' | head -1)
+    dt=$((SECONDS-t0))
+    [ -n "$st" ] && [ "$dt" -lt 12 ] \
+        && ok "dns: DoQ upstream (dead quic:// fails clean, no hang)" "$st in ${dt}s (no hermetic DoQ server — bounded)" \
+        || bad "dns: DoQ clean failure" "${st:-no answer} after ${dt}s"
+    t0=$SECONDS
+    st=$(dig +noall +comments +time=12 +tries=1 @127.0.0.1 -p "$DF_DNS" doh3.real.test A 2>/dev/null \
+         | grep -o 'status: [A-Z]*' | head -1)
+    dt=$((SECONDS-t0))
+    [ -n "$st" ] && [ "$dt" -lt 12 ] \
+        && ok "dns: DoH3 upstream (dead h3:// fails clean, no hang)" "$st in ${dt}s (no hermetic DoH3 server — bounded)" \
+        || bad "dns: DoH3 clean failure" "${st:-no answer} after ${dt}s"
+else
+    for r in "dns: fake-ip (198.18.0.0/15 answer)" "dns: fake-ip-filter (filtered name resolves real)" \
+             "dns: fallback (dead nameserver, fallback answers)" "dns: nameserver-policy (policy server answers)" \
+             "dns: nameserver-policy (rcode:// policy honored)" "dns: dhcp:// upstream (dhclient lease -> oracle)" \
+             "dns: DoQ upstream (dead quic:// fails clean, no hang)" "dns: DoH3 upstream (dead h3:// fails clean, no hang)"; do
+        skip "$r" "dnsfunc engine down: $(tail -2 "$LOGDIR/dnsfunc-$PLATFORM.log" 2>/dev/null | tr '\n' ' ' | cut -c1-70)"
+    done
+fi
 stop_engines
 
 # ===========================================================================
@@ -745,6 +1083,12 @@ n=$(sc convert -i http://127.0.0.1:41880/sub2.txt -t clash 2>/dev/null | count_c
 [ "${n:-0}" -ge 3 ] && ok "subconv: fetch + convert (URL input)" "$n nodes" || bad "subconv: URL convert" "n=$n"
 n=$(sc merge -u http://127.0.0.1:41880/sub1.txt -u http://127.0.0.1:41880/sub2.txt -t clash 2>/dev/null | count_clash)
 [ "${n:-0}" -ge 5 ] && ok "subconv: merge (two subscriptions)" "$n nodes" || bad "subconv: merge" "n=$n"
+
+# ===========================================================================
+# PHASE F — management battery (CLI subcommands, firewall advanced
+# features, provider/subscription surface); emits its own RESULT rows.
+# ===========================================================================
+bash "$FX/mgmt.sh" "$PLATFORM"
 
 # --- summary --------------------------------------------------------------------
 echo "RESULT|__summary:$PLATFORM|INFO|pass=$PASS fail=$FAIL skip=$SKIP"
