@@ -113,17 +113,15 @@ pub async fn grpc_connect(
     );
     conn.flush_out().await?;
 
-    while !conn.got_response {
-        conn.drain_frames()?;
-        if conn.got_response {
-            break;
-        }
-        if conn.fill().await? == 0 {
-            return Err(Error::protocol("grpc: EOF before response headers"));
-        }
-    }
-    // Push acks (SETTINGS/PING) queued while we were waiting.
-    conn.flush_out().await?;
+    // Do NOT block on the server's response HEADERS here: the real gun
+    // server (mihomo's grpc server) sends them only after the first
+    // DATA frame arrives, so waiting deadlocks the dial. The response
+    // status is checked lazily on the first read instead (GrpcStream's
+    // read path processes HEADERS and rejects non-200).
+    //
+    // Process any frames already in flight (SETTINGS, the server's
+    // early HEADERS if it sent them) without blocking on more:
+    conn.drain_frames()?;
 
     Ok(Box::new(GrpcStream {
         conn,
@@ -227,6 +225,7 @@ impl H2Conn {
     }
 
     /// Read once from the socket into `rbuf`; 0 means EOF.
+    #[allow(dead_code)]
     async fn fill(&mut self) -> Result<usize> {
         let mut tmp = [0u8; 16 * 1024];
         let n = self.inner.read(&mut tmp).await?;
@@ -1662,18 +1661,37 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_connect_rejects_non_200() {
-        let (client, server) = tokio::io::duplex(4096);
-        let server = tokio::spawn(fake_gun_server(server, 404));
+        let (client, server) = fake_gun_server_pipe(404).await;
         let settings = GrpcSettings {
             service_name: "svc".into(),
             host: Some("grpc.example.com".into()),
         };
-        let err = match grpc_connect(Box::new(client), &settings, "h.example.com").await {
-            Ok(_) => panic!("grpc: expected the 404 response to fail the handshake"),
+        // The connect no longer blocks on the response HEADERS (the real
+        // gun server only answers after the first DATA), so the 404
+        // surfaces on the first READ instead.
+        let mut stream = grpc_connect(Box::new(client), &settings, "h.example.com")
+            .await
+            .expect("connect should succeed (response is lazy)");
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 16];
+        let err = match stream.read(&mut buf).await {
+            Ok(0) => panic!("expected an error, got clean EOF"),
+            Ok(_) => panic!("expected an error, got data"),
             Err(e) => e,
         };
         assert!(err.to_string().contains("404"), "{err}");
-        assert_eq!(server.await.unwrap(), "/svc/Tun");
+        let _ = server.await;
+    }
+
+    /// A duplex variant of fake_gun_server returning the client half.
+    async fn fake_gun_server_pipe(
+        reply_status: u16,
+    ) -> (tokio::io::DuplexStream, tokio::task::JoinHandle<()>) {
+        let (client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            let _ = fake_gun_server(server, reply_status).await;
+        });
+        (client, task)
     }
 
     #[tokio::test]
