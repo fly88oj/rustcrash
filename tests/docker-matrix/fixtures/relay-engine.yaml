@@ -59,10 +59,53 @@ proxies:
   - {name: o-ss-wrongpw, type: ss, server: 127.0.0.1, port: 42388, cipher: aes-256-gcm, password: WRONG-password-999}
   - {name: o-dead, type: socks5, server: 127.0.0.1, port: 1}
 
+  # --- outbound transport/auth variants (wave-18) ---
+  # vmess over gRPC (gun) — TLS is mandatory for grpc (engine rule).
+  # RELAY GAP (engine): the engine's grpc client never completes the
+  # gRPC handshake against mihomo's gun listener (TLS+ALPN h2 succeeds,
+  # then the engine waits for response HEADERS while the gun server
+  # waits for the first DATA frame — deadlock; mihomo's OWN client
+  # relays this same listener fine). Parse surface only in the matrix.
+  - {name: o-vmess-grpc, type: vmess, server: 127.0.0.1, port: 42420, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, alterId: 0, cipher: auto,
+     network: grpc, grpc-opts: {grpc-service-name: matsvc}, tls: true, servername: tls.test, skip-cert-verify: true}
+  # vmess over httpupgrade (shares ws-opts for path/headers).
+  - {name: o-vmess-hu, type: vmess, server: 127.0.0.1, port: 42421, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, alterId: 0, cipher: auto,
+     network: httpupgrade, ws-opts: {path: /hu}, tls: true, servername: tls.test, skip-cert-verify: true}
+  # vless over websocket+TLS.
+  - {name: o-vless-ws, type: vless, server: 127.0.0.1, port: 42427, uuid: b831381d-6324-4d53-ad4f-8cda48b30811,
+     tls: true, servername: tls.test, skip-cert-verify: true, network: ws, ws-opts: {path: /ws}}
+  # trojan over gRPC (gun) — same engine grpc gap as o-vmess-grpc.
+  - {name: o-trojan-grpc, type: trojan, server: 127.0.0.1, port: 42422, password: matrix-trojan-pw-123456,
+     sni: tls.test, skip-cert-verify: true, network: grpc, grpc-opts: {grpc-service-name: tjsvc}}
+  # shadowsocks, chacha20-ietf-poly1305 AEAD cipher.
+  - {name: o-ss-chacha, type: ss, server: 127.0.0.1, port: 42423, cipher: chacha20-ietf-poly1305, password: matrix-ss-psk-123456, udp: true}
+  # hysteria2 with salamander obfs.
+  - {name: o-hy2-obfs, type: hysteria2, server: 127.0.0.1, port: 42424, password: matrix-hy2-pw-123456,
+     skip-cert-verify: true, obfs: salamander, obfs-password: matrix-obfs-pw-123}
+  # socks5 with username/password auth.
+  - {name: o-socks5-auth, type: socks5, server: 127.0.0.1, port: 42425, username: socksuser, password: sockspw123, udp: true}
+  # http with basic auth.
+  - {name: o-http-auth, type: http, server: 127.0.0.1, port: 42426, username: httpuser, password: httppw123}
+  # wrong-credential negatives (mihomo refuses both — verified).
+  - {name: o-socks5-wrongpw, type: socks5, server: 127.0.0.1, port: 42425, username: socksuser, password: WRONG-pw-999}
+  - {name: o-http-wrongpw, type: http, server: 127.0.0.1, port: 42426, username: httpuser, password: WRONG-pw-999}
+  # wireguard with an IPv6 tunnel address — the battery relays a v6
+  # DESTINATION ([::1]:41805) through it against the wg6 endpoint it
+  # starts itself (serve_endpoint, fd99:aa::/126).
+  - {name: o-wireguard6, type: wireguard, private-key: +AarM977BRuq//eIUNC4d9AxRfZnmwghqQMv9ELTRHw=, ipv6: "fd99:aa::2",
+     peers: [{server: 127.0.0.1, port: 42162, public-key: lwHQv9Be2TOT7fE/xSPtkqF7/ApO+eCZwNsWzCGA+T4=}]}
+
 proxy-groups:
+  # Pick carries every leaf, the auto groups AND the negatives so each
+  # battery row genuinely switches the selector (set_selected rejects
+  # non-members — a row that PUTs a non-member would silently relay
+  # through the PREVIOUS selection and lie).
   - name: Pick
     type: select
-    proxies: [o-ss, o-ss2022, o-vmess, o-vmess-ws, o-vless, o-vless-reality, o-trojan, o-trojan-ws, o-socks5, o-http, o-hy2, o-tuic, o-wireguard, o-snell4, o-snell5, o-anytls, o-jls, DIRECT]
+    proxies: [o-ss, o-ss2022, o-vmess, o-vmess-ws, o-vless, o-vless-reality, o-trojan, o-trojan-ws, o-socks5, o-http, o-hy2, o-tuic, o-wireguard, o-snell4, o-snell5, o-anytls, o-jls,
+              o-vmess-grpc, o-vmess-hu, o-vless-ws, o-trojan-grpc, o-ss-chacha, o-hy2-obfs, o-socks5-auth, o-http-auth, o-wireguard6,
+              AutoUT, AutoFB, AutoLB, TolUT, StatusUT, LazyUT, NoUdp, HiddenUT,
+              o-ss-wrongpw, o-socks5-wrongpw, o-http-wrongpw, o-dead, DIRECT]
   - name: AutoUT
     type: url-test
     proxies: [o-ss, o-dead]
@@ -79,6 +122,53 @@ proxy-groups:
     type: load-balance
     proxies: [o-ss, o-ss2022]
     strategy: consistent-hashing
+  # ---- group-advanced rows (wave-18) ----
+  # tolerance: with a 60 s margin the incumbent (first live member,
+  # o-vmess) can never be displaced — the group must NOT flap to o-ss
+  # even when o-ss probes a hair faster.
+  - name: TolUT
+    type: url-test
+    proxies: [o-vmess, o-ss]
+    url: http://127.0.0.1:41800/hello.txt
+    interval: 60
+    tolerance: 60000
+    lazy: false
+    expected-status: "200"
+  # expected-status: the health URL is the subscription server's 404
+  # (missing path); only a probe that scores 404 as healthy keeps
+  # o-http-auth alive — with the default 200-399 window both members
+  # are dead and the group falls back to o-dead (relay fails). o-dead
+  # first + a member in NO other url-test group (cross-group latency
+  # recording) makes the distinction observable.
+  - name: StatusUT
+    type: url-test
+    proxies: [o-dead, o-http-auth]
+    url: http://127.0.0.1:41880/matrix-missing-404
+    interval: 60
+    lazy: false
+    expected-status: "404"
+  # lazy: untouched at startup — the API delay endpoint must still work
+  # on it (the wave-15 unit tests cover the probe-skip gate itself).
+  - name: LazyUT
+    type: url-test
+    proxies: [o-ss, o-dead]
+    url: http://127.0.0.1:41800/hello.txt
+    interval: 60
+    lazy: true
+    expected-status: "200"
+  # disable-udp: NOT implemented in the engine (RawGroup has no such
+  # field; serde ignores the key) — the row probes UDP and reports the
+  # honest SKIP when the datagram still relays.
+  - name: NoUdp
+    type: select
+    proxies: [o-ss]
+    disable-udp: true
+  # hidden: NOT implemented in the engine — the row checks /proxies and
+  # reports the honest SKIP while the group stays listed.
+  - name: HiddenUT
+    type: select
+    proxies: [o-ss]
+    hidden: true
 
 rule-providers:
   pset:

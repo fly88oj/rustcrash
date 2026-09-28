@@ -2,6 +2,14 @@
 # matrix (all three platform binaries dial it as clients). One listener
 # per relay-tested protocol, fixed ports, everything outbound direct.
 # Fake credentials throughout. Certs live at /tmp/matrix/certs.
+#
+# NOTE (mihomo listener grammar, v1.19.x): the vmess/vless/trojan
+# LISTENERS have no `network:` key — the transport is selected by which
+# field is set: `ws-path` serves websocket, `grpc-service-name` serves
+# the gun (gRPC) handler (v1.19.13 listener/config/vmess.go: VmessServer
+# {WsPath, GrpcServiceName}). vless-ws-over-TLS and trojan-grpc work the
+# same way. The engine's httpupgrade CLIENT is wire-compatible with the
+# ws listener (verified engine<->mihomo end to end).
 mode: direct
 log-level: debug
 external-controller: 127.0.0.1:42390
@@ -142,3 +150,94 @@ listeners:
     type: http
     listen: 127.0.0.1
     port: 42410
+
+  # ---- outbound-variant listeners (wave-18) -------------------------
+
+  # vmess over gRPC (gun): TLS + grpc-service-name selects the handler.
+  - name: m-vmess-grpc
+    type: vmess
+    listen: 127.0.0.1
+    port: 42420
+    users:
+      - uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+        alterId: 0
+    grpc-service-name: matsvc
+    certificate: /tmp/matrix/certs/server.crt
+    private-key: /tmp/matrix/certs/server.key
+
+  # engine-side httpupgrade transport target (mihomo's ws listener
+  # accepts the raw-upgrade handshake; path via ws-path).
+  - name: m-vmess-hu
+    type: vmess
+    listen: 127.0.0.1
+    port: 42421
+    users:
+      - uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+        alterId: 0
+    ws-path: /hu
+    certificate: /tmp/matrix/certs/server.crt
+    private-key: /tmp/matrix/certs/server.key
+
+  # trojan over gRPC (gun).
+  - name: m-trojan-grpc
+    type: trojan
+    listen: 127.0.0.1
+    port: 42422
+    grpc-service-name: tjsvc
+    users:
+      - username: trojan-user
+        password: matrix-trojan-pw-123456
+    certificate: /tmp/matrix/certs/server.crt
+    private-key: /tmp/matrix/certs/server.key
+
+  # vless over websocket+TLS.
+  - name: m-vless-ws
+    type: vless
+    listen: 127.0.0.1
+    port: 42427
+    users:
+      - uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    ws-path: /ws
+    certificate: /tmp/matrix/certs/server.crt
+    private-key: /tmp/matrix/certs/server.key
+
+  # shadowsocks with the chacha20-ietf-poly1305 AEAD cipher.
+  - name: m-ss-chacha
+    type: shadowsocks
+    listen: 127.0.0.1
+    port: 42423
+    cipher: chacha20-ietf-poly1305
+    password: matrix-ss-psk-123456
+    udp: true
+
+  # hysteria2 + salamander obfs.
+  - name: m-hy2-obfs
+    type: hysteria2
+    listen: 127.0.0.1
+    port: 42424
+    users:
+      hy2-user: matrix-hy2-pw-123456
+    obfs: salamander
+    obfs-password: matrix-obfs-pw-123
+    certificate: /tmp/matrix/certs/server.crt
+    private-key: /tmp/matrix/certs/server.key
+
+  # socks5 with username/password auth (wrong-credential probes are
+  # refused by mihomo — verified engine<->mihomo both directions).
+  - name: m-socks-auth
+    type: socks
+    listen: 127.0.0.1
+    port: 42425
+    users:
+      - username: socksuser
+        password: sockspw123
+    udp: true
+
+  # http with basic auth.
+  - name: m-http-auth
+    type: http
+    listen: 127.0.0.1
+    port: 42426
+    users:
+      - username: httpuser
+        password: httppw123
