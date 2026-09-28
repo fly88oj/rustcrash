@@ -362,10 +362,17 @@ if [ "$engine_up" = 1 ]; then
     w=$(python3 "$FX/ws-probe.py" "$API" /traffic 6 2>&1)
     echo "$w" | grep -q '"up"\|"down"' && ok "api: /traffic websocket" "frame: ${w:0:40}" \
                                        || bad "api: /traffic websocket" "${w:0:60}"
-    # Generate an INFO log event first (the engine is quiet otherwise):
-    # a relay through the engine produces a tcp-dispatch log line.
-    curl -s --max-time 2 -x "http://127.0.0.1:$MIX" "http://127.0.0.1:18080/test.txt" >/dev/null 2>&1 &
-    w=$(python3 "$FX/ws-probe.py" "$API" "/logs?level=debug" 6 2>&1)
+    # The /logs ws only receives events sent AFTER subscription: open
+    # the ws first (background), then generate a relay to produce a
+    # DEBUG dispatch event, then collect the probe's output.
+    w_file=/tmp/rustcrash-matrix-results/logs-ws-$$.txt
+    mkdir -p "$(dirname "$w_file")"
+    python3 "$FX/ws-probe.py" "$API" "/logs?level=debug" 6 > "$w_file" 2>&1 &
+    ws_pid=$!
+    sleep 1
+    curl -s --max-time 3 -x "http://127.0.0.1:$MIX" "http://127.0.0.1:18080/test.txt" >/dev/null 2>&1
+    wait $ws_pid 2>/dev/null
+    w=$(cat "$w_file" 2>/dev/null || echo "NO_FRAME")
     if [ -n "$w" ] && [ "$w" != "NO_HANDSHAKE" ] && [ "$w" != "NO_FRAME" ]; then
         ok "api: /logs websocket" "${w:0:50}"
     else
