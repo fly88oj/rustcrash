@@ -850,8 +850,15 @@ fn decode_field_section(buf: &[u8]) -> Result<Vec<(String, String)>> {
                 .ok_or_else(|| Error::protocol(format!("qpack: bad static index {idx}")))?;
             fields.push((name.to_string(), value.to_string()));
         } else if b & 0xc0 == 0x40 {
-            // 01NT: literal with name reference.
-            let is_static = b & 0x08 != 0;
+            // 01NT: literal with name reference. T is bit 4 (0x10), not
+            // bit 3 — bit 3 belongs to the 4-bit index prefix (RFC 9204
+            // §4.5.4). quic-go's qpack encoder (what the mihomo hy2
+            // client rides) always emits this form for static-name
+            // matches as `0x50 | index`, e.g. `:path` (idx 1) → 0x51;
+            // reading T at 0x08 misclassified those as dynamic
+            // references and killed the auth exchange — the mirror of
+            // the wave-12 client-side bug (proto/hysteria2.rs).
+            let is_static = b & 0x10 != 0;
             let (idx, n) = read_prefixed_int(buf, off, 4)
                 .ok_or_else(|| Error::protocol("qpack: truncated name index"))?;
             off = n;
@@ -1230,9 +1237,13 @@ mod tests {
         );
 
         // Literal with static name reference (:status -> "233"), the
-        // shape quic-go emits for the hysteria2 auth response.
+        // shape quic-go emits for the hysteria2 auth response. T (0x10)
+        // must be set independently of the 4-bit index prefix: idx 24
+        // spills into a continuation byte, so the first byte is
+        // 0x40|0x10|0x0f = 0x5f, not 0x4f (which would read T=0 and
+        // be a DYNAMIC reference — exactly what the old bit got wrong).
         let mut block = vec![0x00, 0x00];
-        quic::put_prefixed_int(&mut block, 0x40, 4, 24); // T=1 static, name idx 24
+        quic::put_prefixed_int(&mut block, 0x50, 4, 24); // 01NT, T=1 static, name idx 24
         quic::put_prefixed_int(&mut block, 0x00, 7, 3);
         block.extend_from_slice(b"233");
         assert_eq!(
@@ -1244,6 +1255,69 @@ mod tests {
         assert!(decode_field_section(&[0x00, 0x00, 0x80]).is_err()); // T=0
         assert!(decode_field_section(&[0x00, 0x00, 0x1f]).is_err()); // post-base
         assert!(decode_field_section(&[0x01]).is_err()); // required inserts
+    }
+
+    /// The exact byte shapes quic-go's qpack encoder writes (encoder.go:
+    /// writeIndexedField ^0xc0, writeLiteralFieldWithNameReference ^0x50,
+    /// writeLiteralFieldWithoutNameReference ^0x28) — the field section
+    /// mihomo's hysteria2 client sends on its auth POST through
+    /// http3.Transport. `:path` (static name idx 3, T bit 0x10) used to
+    /// decode as a dynamic reference and kill the exchange at "qpack:
+    /// dynamic name reference" — the server-side mirror of wave-12.
+    #[test]
+    fn qpack_decoder_accepts_quic_go_encoder_shapes() {
+        // quic-go http3 request headers, one field section:
+        //   :method POST      -> indexed static idx 20        (0xd4)
+        //   :scheme https     -> indexed static idx 23        (0xd7)
+        //   :authority hysteria -> static name idx 0 + value (0x50)
+        //   :path /auth       -> static name idx 1 + value    (0x51)
+        //   hysteria-auth pw  -> literal name (H=1, len<8) + literal value
+        let mut block = vec![0x00, 0x00];
+        block.push(0xc0 | 20); // :method POST
+        block.push(0xc0 | 23); // :scheme https
+        block.push(0x50); // :authority, static name reference (idx 0)
+        block.push(8); // value "hysteria" (7-bit len, H=0)
+        block.extend_from_slice(b"hysteria");
+        block.push(0x50 | 1); // :path, static name reference
+        block.push(5); // value "/auth"
+        block.extend_from_slice(b"/auth");
+        // Literal name with a 3-bit length that overflows into a
+        // continuation byte: "hysteria-auth" is 13 chars -> prefix 7 +
+        // 6. (quic-go would also Huffman-code the name — the H path is
+        // covered by huffman_decode_rfc7541_vector — this exercises the
+        // plain form.)
+        block.push(0x20 | 7);
+        block.push(13 - 7);
+        block.extend_from_slice(b"hysteria-auth");
+        block.push(2);
+        block.extend_from_slice(b"pw");
+        assert_eq!(
+            decode_field_section(&block).unwrap(),
+            vec![
+                (":method".to_string(), "POST".to_string()),
+                (":scheme".to_string(), "https".to_string()),
+                (":authority".to_string(), "hysteria".to_string()),
+                (":path".to_string(), "/auth".to_string()),
+                ("hysteria-auth".to_string(), "pw".to_string()),
+            ]
+        );
+
+        // The old bug, pinned: a T-bit read at 0x08 turns 0x51
+        // (`:path` name reference) into a dynamic reference.
+        let mut bad = vec![0x00, 0x00, 0x51];
+        bad.push(5);
+        bad.extend_from_slice(b"/auth");
+        assert_eq!(
+            decode_field_section(&bad).unwrap(),
+            vec![(":path".to_string(), "/auth".to_string())]
+        );
+
+        // A genuinely dynamic name reference (T=0: 0x40|idx) is still
+        // rejected — a conforming client never sends one here.
+        let mut dyn_ref = vec![0x00, 0x00, 0x43];
+        dyn_ref.push(5);
+        dyn_ref.extend_from_slice(b"/auth");
+        assert!(decode_field_section(&dyn_ref).is_err());
     }
 
     #[test]

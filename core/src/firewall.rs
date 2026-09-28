@@ -2120,13 +2120,13 @@ mod tests {
             "-A OUTPUT -p tcp -j shellcrash_out",
             "-A PREROUTING -p tcp --dport 53 -j shellcrashv6_dns",
         ] {
-            assert!(references_shellcrash_chain(line), "{line}");
+            assert!(references_foreign_chain(line), "{line}");
         }
         // Foreign chains (docker etc.) must never match.
-        assert!(!references_shellcrash_chain(
+        assert!(!references_foreign_chain(
             "-A PREROUTING -d 172.17.0.0/16 -j DOCKER"
         ));
-        assert!(!references_shellcrash_chain(
+        assert!(!references_foreign_chain(
             "-A FORWARD -j ufw-before-forward"
         ));
 

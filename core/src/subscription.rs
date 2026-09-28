@@ -510,6 +510,9 @@ impl SubscriptionManager {
         let client = reqwest::Client::builder()
             .user_agent("Mozilla/5.0 (compatible; RustCrash/1.0)")
             .timeout(std::time::Duration::from_secs(30))
+            // Redirect chains (CDN hops, short-links) are followed, but
+            // bounded — an airport redirect loop must terminate.
+            .redirect(reqwest::redirect::Policy::limited(3))
             .build()
             .map_err(|e| Error::Subscription(e.to_string()))?;
 
@@ -523,12 +526,18 @@ impl SubscriptionManager {
             return Err(Error::Subscription(format!("HTTP {}", resp.status())));
         }
 
-        let body = resp
-            .text()
+        let raw = resp
+            .bytes()
             .await
             .map_err(|e| Error::Subscription(format!("Failed to read response: {e}")))?;
 
-        let content = Self::decode_content(&body);
+        let content = Self::decode_content(&Self::decode_body_bytes(&raw));
+        if content.trim().is_empty() {
+            return Err(Error::Subscription(format!(
+                "Empty subscription body from {}",
+                validation.host.as_deref().unwrap_or("server")
+            )));
+        }
         let format = Self::detect_format(&content);
 
         tracing::debug!(
@@ -543,6 +552,23 @@ impl SubscriptionManager {
             format,
             backend: None,
         })
+    }
+
+    /// Raw response body → text. Some providers force
+    /// `Content-Encoding: gzip` regardless of `Accept-Encoding`; the
+    /// client passes those bytes through untouched, so gunzip on the
+    /// gzip magic before the (lossy) UTF-8 conversion — otherwise the
+    /// whole subscription turns into replacement characters.
+    fn decode_body_bytes(raw: &[u8]) -> String {
+        if raw.starts_with(&[0x1f, 0x8b]) {
+            if let Some(plain) = Self::decompress_gzip(raw)
+                .ok()
+                .and_then(|v| String::from_utf8(v).ok())
+            {
+                return plain;
+            }
+        }
+        String::from_utf8_lossy(raw).into_owned()
     }
 
     fn decode_content(body: &str) -> String {
@@ -1451,5 +1477,267 @@ proxies:
         let result = SubscriptionManager::validate_url("https://example.com#section");
         assert!(result.is_valid);
         assert_eq!(result.host, Some("example.com".to_string()));
+    }
+
+    // ==================================================================
+    // HTTP fetch hardening — hermetic, raw wire-level HTTP/1.1 servers
+    // on loopback (no external network, no new dev-dependencies).
+    // ==================================================================
+
+    mod http {
+        use super::super::*;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        /// Serve `responses` (raw HTTP/1.1 wire bytes, one per accepted
+        /// connection, in order) on a fresh loopback port; returns the
+        /// base URL. The listener closes when the list is exhausted.
+        fn raw_server(responses: Vec<Vec<u8>>) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                for resp in responses {
+                    let Ok((mut sock, _)) = listener.accept() else {
+                        break;
+                    };
+                    // Drain the request head so our reply can't race the
+                    // client's write (keep-alive + pipelining safety).
+                    let _ = sock.set_read_timeout(Some(Duration::from_secs(5)));
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match sock.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let _ = sock.write_all(&resp);
+                    let _ = sock.flush();
+                    let _ = sock.shutdown(std::net::Shutdown::Write);
+                }
+            });
+            format!("http://{addr}")
+        }
+
+        fn plain_response(status_line: &str, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
+            let mut r = format!("{status_line}\r\nServer: wave17\r\nConnection: close\r\n").into_bytes();
+            for (k, v) in headers {
+                r.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
+            }
+            r.extend_from_slice(b"\r\n");
+            r.extend_from_slice(body);
+            r
+        }
+
+        /// `Transfer-Encoding: chunked` framing over arbitrary chunk
+        /// boundaries — including boundaries that split a UTF-8
+        /// sequence, which is legal on the wire.
+        fn chunked_response(chunks: &[&[u8]]) -> Vec<u8> {
+            let mut r =
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                    .to_vec();
+            for c in chunks {
+                r.extend_from_slice(format!("{:x}\r\n", c.len()).as_bytes());
+                r.extend_from_slice(c);
+                r.extend_from_slice(b"\r\n");
+            }
+            r.extend_from_slice(b"0\r\n\r\n");
+            r
+        }
+
+        fn redirect(status: u16, location: &str) -> Vec<u8> {
+            plain_response(
+                &format!("HTTP/1.1 {status} Moved"),
+                &[("Location", location)],
+                b"",
+            )
+        }
+
+        const VMESS_URI: &str = "vmess://eyJ2IjoiMiIsInBzIjoiQ2h1bmtlZCIsImFkZCI6ImNodW5rLmV4YW1wbGUuY29tIiwicG9ydCI6IjQ0MyIsImlkIjoiMTIzNDU2NzgtMTIzNC0xMjM0LTEyMzQtMTIzNDU2Nzg5YWJjZCIsImFpZCI6IjAiLCJuZXQiOiJ0Y3AiLCJ0bHMiOiJub25lIn0=";
+
+        /// Chunked transfer encoding with a boundary inside the base64
+        /// payload and inside the UTF-8 node name — reassembly must be
+        /// byte-exact or the node is garbage.
+        #[tokio::test]
+        async fn fetch_decodes_chunked_transfer_encoding() {
+            let body = format!("{VMESS_URI}\ntrojan://pw@chunk.example.com:443#%E9%A6%99%E6%B8%AF\n");
+            let bytes = body.as_bytes();
+            // 1/3, 1/3, 1/3 — cuts mid-payload and mid-multibyte-name.
+            let a = &bytes[..bytes.len() / 3];
+            let b = &bytes[bytes.len() / 3..2 * bytes.len() / 3];
+            let c = &bytes[2 * bytes.len() / 3..];
+            let base = raw_server(vec![chunked_response(&[a, b, c])]);
+
+            let info = SubscriptionManager::fetch(&format!("{base}/sub")).await.unwrap();
+            assert_eq!(info.format, SubscriptionFormat::UriList);
+            // decode_content trims surrounding whitespace — everything
+            // else must be byte-exact.
+            assert_eq!(
+                info.content,
+                body.trim_end(),
+                "chunk reassembly must be byte-exact"
+            );
+            assert!(info.content.contains("chunk.example.com"));
+        }
+
+        /// A 100KB subscription across many chunks — no truncation.
+        #[tokio::test]
+        async fn fetch_large_chunked_subscription_no_truncation() {
+            let mut body = String::with_capacity(200_000);
+            let mut last_line = String::new();
+            while body.len() < 100_000 {
+                let line = format!(
+                    "trojan://pw@big.example.com:{}/#big-{}\n",
+                    body.len() % 60000 + 1024,
+                    body.len()
+                );
+                last_line = line.trim_end().to_string();
+                body.push_str(&line);
+            }
+            let expected = body.trim_end().to_string();
+            let chunks: Vec<&[u8]> = body.as_bytes().chunks(7).collect();
+            assert!(chunks.len() > 1000, "many chunks: {}", chunks.len());
+            let base = raw_server(vec![chunked_response(&chunks)]);
+
+            let info = SubscriptionManager::fetch(&format!("{base}/big")).await.unwrap();
+            assert_eq!(info.content.len(), expected.len(), "payload truncated");
+            // The FINAL chunk's node must have survived (tail truncation
+            // check, since decode_content trims the trailing newline).
+            assert!(
+                info.content.contains(&last_line),
+                "tail lost; last line was {last_line}"
+            );
+        }
+
+        /// 3xx chains are followed, at most 3 hops; the final body wins.
+        #[tokio::test]
+        async fn fetch_follows_redirects_up_to_three_hops() {
+            let base = raw_server(vec![
+                redirect(301, "/hop1"),
+                redirect(302, "/hop2"),
+                redirect(307, "/final"),
+                plain_response("HTTP/1.1 200 OK", &[], VMESS_URI.as_bytes()),
+            ]);
+
+            let info = SubscriptionManager::fetch(&format!("{base}/start")).await.unwrap();
+            assert_eq!(info.format, SubscriptionFormat::UriList);
+            assert!(info.content.starts_with("vmess://"));
+            // The node inside the final body must actually parse.
+            let uris = SubscriptionManager::extract_uris(&info.content, info.format);
+            assert_eq!(uris.len(), 1);
+        }
+
+        /// Redirect chains longer than 3 hops are cut off with an error
+        /// (loops must terminate).
+        #[tokio::test]
+        async fn fetch_rejects_redirect_chains_beyond_three_hops() {
+            let base = raw_server(vec![
+                redirect(302, "/loop1"),
+                redirect(302, "/loop2"),
+                redirect(302, "/loop3"),
+                redirect(302, "/loop4"),
+                plain_response("HTTP/1.1 200 OK", &[], b"never reached"),
+            ]);
+
+            let err = SubscriptionManager::fetch(&format!("{base}/start"))
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().to_lowercase().contains("redirect"),
+                "expected redirect error, got: {err}"
+            );
+        }
+
+        /// Non-2xx statuses surface as errors carrying the status code.
+        #[tokio::test]
+        async fn fetch_non_200_status_is_an_error() {
+            for status in ["503 Service Unavailable", "404 Not Found", "500 Internal Server Error"] {
+                let base = raw_server(vec![plain_response(
+                    &format!("HTTP/1.1 {status}"),
+                    &[],
+                    b"server exploded",
+                )]);
+                let err = SubscriptionManager::fetch(&format!("{base}/sub"))
+                    .await
+                    .unwrap_err();
+                let msg = err.to_string();
+                assert!(msg.contains("HTTP"), "missing status in: {msg}");
+            }
+        }
+
+        /// 200 with an empty body is a dead airport link, not a valid
+        /// empty subscription — must be an error, not an empty config.
+        #[tokio::test]
+        async fn fetch_empty_body_is_an_error() {
+            for body in ["", "   ", "\r\n"] {
+                let base = raw_server(vec![plain_response(
+                    "HTTP/1.1 200 OK",
+                    &[],
+                    body.as_bytes(),
+                )]);
+                let err = SubscriptionManager::fetch(&format!("{base}/sub"))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    err.to_string().contains("Empty subscription body"),
+                    "got: {err}"
+                );
+            }
+        }
+
+        /// Providers that force `Content-Encoding: gzip` anyway: the
+        /// body must be inflated before parsing (uses flate2, which is
+        /// already a dependency — reqwest's gzip feature is not enabled).
+        #[tokio::test]
+        async fn fetch_gunzips_content_encoding_gzip() {
+            use flate2::write::GzEncoder;
+            use flate2::Compression;
+
+            let payload = format!("{VMESS_URI}\n");
+            let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(payload.as_bytes()).unwrap();
+            let gz = enc.finish().unwrap();
+
+            let base = raw_server(vec![plain_response(
+                "HTTP/1.1 200 OK",
+                &[("Content-Encoding", "gzip")],
+                &gz,
+            )]);
+
+            let info = SubscriptionManager::fetch(&format!("{base}/gz")).await.unwrap();
+            assert_eq!(info.content, payload.trim_end(), "gzip body was not inflated");
+            assert_eq!(info.format, SubscriptionFormat::UriList);
+        }
+
+        /// Large plain Content-Length body (100KB) — no truncation.
+        #[tokio::test]
+        async fn fetch_large_content_length_body_no_truncation() {
+            let mut body = String::with_capacity(200_000);
+            let mut i = 0usize;
+            while body.len() < 100_000 {
+                body.push_str(&format!(
+                    "trojan://pw{i}@cl.example.com:{}#cl-{i}\n",
+                    i % 60000 + 1024
+                ));
+                i += 1;
+            }
+            let expected = body.clone();
+            let base = raw_server(vec![plain_response(
+                "HTTP/1.1 200 OK",
+                &[("Content-Type", "text/plain")],
+                expected.as_bytes(),
+            )]);
+
+            let info = SubscriptionManager::fetch(&format!("{base}/cl")).await.unwrap();
+            assert_eq!(
+                info.content.len(),
+                expected.trim_end().len(),
+                "payload truncated"
+            );
+        }
     }
 }

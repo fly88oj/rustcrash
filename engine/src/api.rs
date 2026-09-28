@@ -1611,17 +1611,7 @@ enum LogLevel {
 }
 
 impl LogLevel {
-    fn from_tracing(level: tracing::Level) -> Self {
-        match level {
-            tracing::Level::TRACE | tracing::Level::DEBUG => LogLevel::Debug,
-            tracing::Level::INFO => LogLevel::Info,
-            tracing::Level::WARN => LogLevel::Warning,
-            tracing::Level::ERROR => LogLevel::Error,
-        }
-    }
-
-    /// The `type` value of the /logs frame (mihomo Log.Type strings).
-    fn as_str(self) -> &'static str {
+    fn as_str(&self) -> &'static str {
         match self {
             LogLevel::Debug => "debug",
             LogLevel::Info => "info",
@@ -1630,6 +1620,7 @@ impl LogLevel {
         }
     }
 }
+
 
 /// `?level=` filter value → mihomo severity number (events with
 /// severity >= the requested one pass; `silent` mutes everything).
@@ -1649,11 +1640,13 @@ fn log_level_severity(s: &str) -> Option<u8> {
 /// The process-wide log bus. Capacity matches upstream's subscriber
 /// buffer (1024); slow clients simply miss frames (RecvError::Lagged)
 /// rather than backpressuring the tracing pipeline.
-static LOG_BUS: std::sync::OnceLock<tokio::sync::broadcast::Sender<std::sync::Arc<LogEvent>>> =
-    std::sync::OnceLock::new();
-
 fn log_bus() -> &'static tokio::sync::broadcast::Sender<std::sync::Arc<LogEvent>> {
-    LOG_BUS.get_or_init(|| tokio::sync::broadcast::channel(1024).0)
+    static BUS: std::sync::OnceLock<tokio::sync::broadcast::Sender<std::sync::Arc<LogEvent>>> =
+        std::sync::OnceLock::new();
+    BUS.get_or_init(|| {
+        let (tx, _) = tokio::sync::broadcast::channel(1024);
+        tx
+    })
 }
 
 /// Create the log bus and install the broadcast tap as the process's
@@ -1671,71 +1664,78 @@ fn log_bus() -> &'static tokio::sync::broadcast::Sender<std::sync::Arc<LogEvent>
 /// embedding, tests) the tap takes over; the prior default dispatched
 /// events nowhere, so nothing is lost.
 pub fn init_log_broadcast() {
-    let _ = tracing::subscriber::set_global_default(LogSubscriber {
-        next_span_id: std::sync::atomic::AtomicU64::new(0),
-    });
-}
-
-/// The broadcast tap: every enabled event is formatted and pushed onto
-/// [`log_bus`]. Per-client `?level=` filtering happens at each /logs
-/// stream, so the tap itself enables everything. The span bookkeeping
-/// methods are inert (fresh ids, no-op recording) — only events are
-/// consumed.
-struct LogSubscriber {
-    next_span_id: std::sync::atomic::AtomicU64,
-}
-
-impl tracing::Subscriber for LogSubscriber {
-    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
-        true
-    }
-
-    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        use std::sync::atomic::Ordering;
-        // Ids must be non-zero; start at 1.
-        tracing::span::Id::from_u64(self.next_span_id.fetch_add(1, Ordering::Relaxed) + 1)
-    }
-
-    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-
-    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-    fn event(&self, event: &tracing::Event<'_>) {
-        let mut visitor = MessageVisitor::default();
-        event.record(&mut visitor);
-        // A full bus (no live stream draining it) is not an error: the
-        // send fails, the event is simply not broadcast.
-        let _ = log_bus().send(std::sync::Arc::new(LogEvent {
-            level: LogLevel::from_tracing(*event.metadata().level()),
-            payload: visitor.message,
-        }));
-    }
-
-    fn enter(&self, _span: &tracing::span::Id) {}
-
-    fn exit(&self, _span: &tracing::span::Id) {}
-}
-
-/// Extracts an event's `message` field — the rendered format args of
-/// `tracing::info!("...")`-style calls (format_args implements Debug by
-/// writing the formatted string, the same record_debug path
-/// tracing-subscriber's formatter rides).
-#[derive(Default)]
-struct MessageVisitor {
-    message: String,
-}
-
-impl tracing::field::Visit for MessageVisitor {
-    fn record_debug(
-        &mut self,
-        field: &tracing::field::Field,
-        value: &dyn std::fmt::Debug,
-    ) {
-        if field.name() == "message" {
-            self.message = format!("{value:?}");
+    // For embedders without the CLI path: install the engine's own
+    // tracing tap so /logs captures events. If a subscriber is already
+    // set (the CLI's layered fmt+broadcast), this is a no-op — that
+    // path pushes via push_log_event.
+    struct EngineTap;
+    impl tracing::Subscriber for EngineTap {
+        fn enabled(&self, _meta: &tracing::Metadata<'_>) -> bool {
+            true
         }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _sub: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct MsgVisitor {
+                message: String,
+            }
+            impl tracing::field::Visit for MsgVisitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.message = format!("{value:?}");
+                    }
+                }
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    if field.name() == "message" {
+                        self.message = value.to_string();
+                    }
+                }
+            }
+            let mut visitor = MsgVisitor {
+                message: String::new(),
+            };
+            event.record(&mut visitor);
+            if visitor.message.is_empty() {
+                return;
+            }
+            let level = match *event.metadata().level() {
+                tracing::Level::ERROR => "error",
+                tracing::Level::WARN => "warning",
+                tracing::Level::INFO => "info",
+                _ => "debug",
+            };
+            push_log_event(level, &visitor.message);
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
     }
+    let _ = tracing::subscriber::set_global_default(EngineTap);
 }
+
+/// Push a log event onto the /logs bus from outside the tracing
+/// pipeline (the CLI's BroadcastLayer calls this via the engine feature).
+pub fn push_log_event(level: &str, payload: &str) {
+    let level = match level {
+        "error" => LogLevel::Error,
+        "warning" | "warn" => LogLevel::Warning,
+        "info" => LogLevel::Info,
+        "debug" | "trace" => LogLevel::Debug,
+        _ => LogLevel::Info,
+    };
+    let _ = log_bus().send(std::sync::Arc::new(LogEvent {
+        level,
+        payload: payload.to_string(),
+    }));
+}
+
+
 
 /// `GET /logs` — mihomo hub/route getLogs(): stream every log event at
 /// or above `?level=` (default info; an unknown level is a 400 like

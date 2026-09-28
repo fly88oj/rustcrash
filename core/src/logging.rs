@@ -92,10 +92,71 @@ pub fn init_logging(configured_level: &str) {
         .unwrap_or_else(|| configured_level.to_string());
     let filter = tracing_subscriber::EnvFilter::try_new(&level)
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .try_init();
+    use tracing_subscriber::layer::SubscriberExt;
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_target(false);
+    let subscriber = tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt_layer)
+        .with(crate::logging::LogBroadcastLayer);
+    let _ = tracing::subscriber::set_global_default(subscriber);
+}
+
+// ---------------------------------------------------------------------------
+// /logs broadcast bus (owned by core so both the CLI and engine paths can
+// push onto it; the engine's /logs endpoint subscribes).
+// ---------------------------------------------------------------------------
+
+
+/// A tracing Layer mirroring every enabled event onto the /logs bus.
+pub struct LogBroadcastLayer;
+
+impl<S> tracing_subscriber::Layer<S> for LogBroadcastLayer
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(
+        &self,
+        #[cfg_attr(not(feature = "engine-mihomo"), allow(unused_variables))] event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        #[cfg(feature = "engine-mihomo")]
+        {
+            use tracing::field::Visit;
+            struct MsgVisitor {
+                message: String,
+            }
+            impl Visit for MsgVisitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.message = format!("{value:?}");
+                    }
+                }
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    if field.name() == "message" {
+                        self.message = value.to_string();
+                    }
+                }
+            }
+            let mut visitor = MsgVisitor {
+                message: String::new(),
+            };
+            event.record(&mut visitor);
+            if !visitor.message.is_empty() {
+                let level = match *event.metadata().level() {
+                    tracing::Level::ERROR => "error",
+                    tracing::Level::WARN => "warning",
+                    tracing::Level::INFO => "info",
+                    _ => "debug",
+                };
+                rustcrash_engine::api::push_log_event(level, &visitor.message);
+            }
+        }
+    }
 }
 
 /// Install a panic hook that writes a crash report into the log dir
