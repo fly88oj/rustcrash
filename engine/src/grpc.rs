@@ -1658,6 +1658,47 @@ mod tests {
         assert_eq!(server.await.unwrap(), "/TunService/Tun");
     }
 
+// Quick probe: TLS-connect to mihomo's grpc listener, then grpc_connect.
+#[tokio::test]
+async fn probe_mihomo_grpc() {
+    let tcp = tokio::net::TcpStream::connect("127.0.0.1:42420").await.unwrap();
+    let tls = crate::transport::tls_connect(
+        Box::new(tcp),
+        "grpc.test",
+        &crate::transport::TlsSettings {
+            enabled: true,
+            server_name: Some("grpc.test".into()),
+            skip_cert_verify: true,
+            alpn: vec!["h2".into()],
+        },
+    ).await.unwrap();
+    eprintln!("TLS OK");
+    let settings = crate::grpc::GrpcSettings {
+        service_name: "matsvc".into(),
+        host: Some("grpc.test".into()),
+    };
+    let mut stream = crate::grpc::grpc_connect(tls, &settings, "grpc.test").await.unwrap();
+    eprintln!("grpc_connect OK");
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // Send the vmess auth header (first DATA)
+    stream.write_all(&[0x00u8; 16]).await.unwrap();
+    eprintln!("wrote 16 bytes");
+    stream.flush().await.unwrap();
+    // Check if the DATA frame was actually sent
+    eprintln!("sendq after write+flush: {} bytes", {
+        // We can't access sendq directly from the test, but the flush returning
+        // means poll_drive completed. Let me check by reading mihomo's log.
+        0
+    });
+    let mut buf = [0u8; 64];
+    match tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut buf)).await {
+        Ok(Ok(n)) => eprintln!("read {n} bytes: {:02x?}", &buf[..n.min(8)]),
+        Ok(Err(e)) => eprintln!("read error: {e}"),
+        Err(_) => eprintln!("read TIMEOUT after 3s"),
+    }
+}
+
+
     #[tokio::test]
     async fn grpc_connect_rejects_non_200() {
         let (client, server) = fake_gun_server_pipe(404).await;
