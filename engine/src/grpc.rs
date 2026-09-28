@@ -225,6 +225,7 @@ impl H2Conn {
     }
 
     /// Read once from the socket into `rbuf`; 0 means EOF.
+    #[allow(dead_code)]
     async fn fill(&mut self) -> Result<usize> {
         let mut tmp = [0u8; 16 * 1024];
         let n = self.inner.read(&mut tmp).await?;
