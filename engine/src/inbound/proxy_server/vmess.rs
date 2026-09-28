@@ -10,6 +10,14 @@
 //! (`aes-128-gcm`, `chacha20-poly1305`); security `none` and the legacy
 //! MD5 header (alter-id) are rejected.
 //!
+//! Request options: chunked streaming is required, and the two
+//! chunk-framing options mihomo's client ALWAYS sets for AEAD securities
+//! are served — `ChunkMasking` (0x04, the 2-byte chunk length XORed
+//! with a SHAKE128 keystream seeded from the direction IV) and
+//! `GlobalPadding` (0x08, a SHAKE128-derived padding appended inside
+//! the chunk length) — see [`ChunkFraming`]. `AuthenticatedLength`
+//! (0x10) is refused; no mihomo default sets it.
+//!
 //! With the UDP command (cmd 2) the connection stays AEAD-framed but the
 //! body chunks become datagrams: each chunk is
 //! `port-first addr || payload`, exactly the shape the engine client
@@ -46,6 +54,7 @@ const VERSION: u8 = 1;
 /// Request options: we serve the standard chunked stream only.
 const OPT_CHUNK_STREAM: u8 = 0x01;
 const OPT_CHUNK_MASKING: u8 = 0x04;
+const OPT_GLOBAL_PADDING: u8 = 0x08;
 const OPT_AUTH_LEN: u8 = 0x10;
 /// Commands.
 const CMD_TCP: u8 = 0x01;
@@ -182,9 +191,9 @@ impl VmessServer {
                 "vmess: unchunked streams are not supported",
             ));
         }
-        if opt & (OPT_CHUNK_MASKING | OPT_AUTH_LEN) != 0 {
+        if opt & OPT_AUTH_LEN != 0 {
             return Err(Error::protocol(
-                "vmess: chunk masking / authenticated length are not supported",
+                "vmess: authenticated length chunks are not supported",
             ));
         }
         match security {
@@ -219,24 +228,29 @@ impl VmessServer {
         }
 
         // Response direction keys: SHA-256 of the request key/IV (v2fly
-        // convention), then the AEAD header KDF chain over those.
+        // convention), then the AEAD header KDF chain over those. The
+        // response body rides the SAME request options (sing-vmess
+        // service.go answers with CreateWriter(..., c.option)), so its
+        // chunk framing is masked/padded with streams seeded from the
+        // response IV — exactly what mihomo's client expects to read.
         let mut resp_key = [0u8; 16];
         resp_key.copy_from_slice(&Sha256::digest(req_key)[..16]);
         let mut resp_iv = [0u8; 16];
         resp_iv.copy_from_slice(&Sha256::digest(req_iv)[..16]);
-        let enc = VmessBody::new(security, resp_key, resp_iv)?;
-        let dec = VmessBody::new(security, req_key, req_iv)?;
+        let enc = VmessBody::new(security, resp_key, resp_iv, opt)?;
+        let dec = VmessBody::new(security, req_key, req_iv, opt)?;
 
         // Response header: sealed length, then the sealed
-        // [response-V, no option, no command, no command payload]. The
-        // client checks the first byte against its random response-V.
+        // [response-V, echoed option, no command, no command payload]
+        // (sing-vmess writes its option byte back; the client checks
+        // the first byte against its random response-V).
         let mut wire = Vec::with_capacity(64);
         let len_aead = Aead::new(
             AeadKind::Aes128Gcm,
             &kdf16(&resp_key, &[KDF_RESP_LEN_KEY]),
         )?;
         let len_nonce = kdf12(&resp_iv, &[KDF_RESP_LEN_IV]);
-        let resp_hdr = [response_v, 0u8, 0u8, 0u8];
+        let resp_hdr = [response_v, opt, 0u8, 0u8];
         len_aead.seal(
             &len_nonce,
             &[],
@@ -338,35 +352,38 @@ fn spawn_vmess_udp(
     });
 }
 
-/// Read one AEAD body chunk as one datagram; `Ok(None)` at EOF. The
-/// zero-length chunk (end-of-stream marker) is skipped.
+/// Read one AEAD body chunk as one datagram; `Ok(None)` at EOF or at
+/// the zero-length end-of-stream marker. The chunk length is
+/// masked/padded per the negotiated options exactly like the TCP body.
 async fn read_body_datagram<R>(reader: &mut R, dec: &mut VmessBody) -> Result<Option<Vec<u8>>>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     use tokio::io::AsyncReadExt;
-    loop {
-        let mut len = [0u8; 2];
-        match reader.read_exact(&mut len).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e.into()),
-        }
-        let n = u16::from_be_bytes(len) as usize;
-        if n == 0 {
-            continue;
-        }
-        if n < TAG {
-            return Err(Error::protocol("vmess udp: body chunk shorter than a tag"));
-        }
-        let mut ct = vec![0u8; n];
-        reader.read_exact(&mut ct).await?;
-        let plain = dec
-            .aead
-            .open(&dec.nonce.advance(), &[], &ct)
-            .map_err(|e| Error::protocol(format!("vmess udp body: {e}")))?;
-        return Ok(Some(plain));
+    let mut len = [0u8; 2];
+    match reader.read_exact(&mut len).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e.into()),
     }
+    let (mask, pad) = dec.framing_word();
+    let total = (u16::from_be_bytes(len) ^ mask) as usize;
+    let data = total
+        .checked_sub(pad)
+        .ok_or_else(|| Error::protocol("vmess udp: chunk length below its padding"))?;
+    if data == 0 {
+        return Ok(None); // end-of-stream marker
+    }
+    if data < TAG {
+        return Err(Error::protocol("vmess udp: body chunk shorter than a tag"));
+    }
+    let mut ct = vec![0u8; total];
+    reader.read_exact(&mut ct).await?;
+    let plain = dec
+        .aead
+        .open(&dec.nonce.advance(), &[], &ct[..data])
+        .map_err(|e| Error::protocol(format!("vmess udp body: {e}")))?;
+    Ok(Some(plain))
 }
 
 /// Serve a VMess listener; returns the bound address.
@@ -448,15 +465,232 @@ impl VmessNonce {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SHAKE128 (FIPS 202): the extendable-output function sing-vmess seeds
+// with the direction IV to derive per-chunk length masks and padding
+// lengths (`chunk_length_stream.go`). Hand-rolled because the engine
+// carries no SHA-3 dependency and this is its only consumer; pinned to
+// the NIST KATs (empty-message SHAKE128/256 and SHA3-256 vectors) in
+// the tests below.
+// ---------------------------------------------------------------------------
+
+/// Keccak-f[1600] round constants.
+const KECCAK_RC: [u64; 24] = [
+    0x0000_0000_0000_0001,
+    0x0000_0000_0000_8082,
+    0x8000_0000_0000_808a,
+    0x8000_0000_8000_8000,
+    0x0000_0000_0000_808b,
+    0x0000_0000_8000_0001,
+    0x8000_0000_8000_8081,
+    0x8000_0000_0000_8009,
+    0x0000_0000_0000_008a,
+    0x0000_0000_0000_0088,
+    0x0000_0000_8000_8009,
+    0x0000_0000_8000_000a,
+    0x0000_0000_8000_808b,
+    0x8000_0000_0000_008b,
+    0x8000_0000_0000_8089,
+    0x8000_0000_0000_8003,
+    0x8000_0000_0000_8002,
+    0x8000_0000_0000_0080,
+    0x0000_0000_0000_800a,
+    0x8000_0000_8000_000a,
+    0x8000_0000_8000_8081,
+    0x8000_0000_0000_8080,
+    0x0000_0000_8000_0001,
+    0x8000_0000_8000_8008,
+];
+
+/// Rho rotation offsets paired with [`KECCAK_PILN`].
+const KECCAK_ROTC: [u32; 24] = [
+    1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14, 27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44,
+];
+
+/// Pi lane permutation paired with [`KECCAK_ROTC`].
+const KECCAK_PILN: [usize; 24] = [
+    10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4, 15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1,
+];
+
+/// The Keccak-f[1600] permutation (the classic in-place formulation:
+/// theta, rho+pi, chi, iota).
+fn keccak_f(st: &mut [u64; 25]) {
+    for &rc in KECCAK_RC.iter() {
+        let mut bc = [0u64; 5];
+        // Theta.
+        for (i, slot) in bc.iter_mut().enumerate() {
+            *slot = st[i] ^ st[i + 5] ^ st[i + 10] ^ st[i + 15] ^ st[i + 20];
+        }
+        for i in 0..5 {
+            let t = bc[(i + 4) % 5] ^ bc[(i + 1) % 5].rotate_left(1);
+            for j in (0..25).step_by(5) {
+                st[j + i] ^= t;
+            }
+        }
+        // Rho and Pi.
+        let mut t = st[1];
+        for i in 0..24 {
+            let j = KECCAK_PILN[i];
+            let tmp = st[j];
+            st[j] = t.rotate_left(KECCAK_ROTC[i]);
+            t = tmp;
+        }
+        // Chi.
+        for j in (0..25).step_by(5) {
+            bc.copy_from_slice(&st[j..j + 5]);
+            for i in 0..5 {
+                st[j + i] ^= !bc[(i + 1) % 5] & bc[(i + 2) % 5];
+            }
+        }
+        // Iota.
+        st[0] ^= rc;
+    }
+}
+
+/// Squeeze `out.len()` bytes from Keccak-f[1600] over `seed` with the
+/// given rate and domain-separation byte (0x1f = SHAKE, 0x06 = SHA3).
+/// Only used with one-shot seeds shorter than the rate.
+#[cfg(test)]
+fn keccak_xof(domain: u8, rate: usize, seed: &[u8], out: &mut [u8]) {
+    debug_assert!(seed.len() < rate && matches!(rate, 136 | 168));
+    let mut st = [0u64; 25];
+    // Absorb (single final block: seed || pad10*1 with the domain byte).
+    let mut block = vec![0u8; rate];
+    block[..seed.len()].copy_from_slice(seed);
+    block[seed.len()] ^= domain;
+    block[rate - 1] ^= 0x80;
+    for (lane, state_lane) in st.iter_mut().enumerate().take(rate / 8) {
+        let start = lane * 8;
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&block[start..start + 8]);
+        *state_lane ^= u64::from_le_bytes(word);
+    }
+    // Squeeze.
+    let mut written = 0;
+    while written < out.len() {
+        keccak_f(&mut st);
+        let take = (out.len() - written).min(rate);
+        let end = written + take;
+        let mut lane = 0;
+        while written + lane * 8 + 8 <= end {
+            out[written + lane * 8..written + lane * 8 + 8]
+                .copy_from_slice(&st[lane].to_le_bytes());
+            lane += 1;
+        }
+        // A tail shorter than one lane (callers use whole-byte words).
+        if written + lane * 8 < end {
+            let word = st[lane].to_le_bytes();
+            out[written + lane * 8..end].copy_from_slice(&word[..end - written - lane * 8]);
+        }
+        written = end;
+    }
+}
+
+/// SHAKE128 XOF state: absorb once at construction, then pull
+/// big-endian u16 words off the squeeze stream chunk by chunk.
+struct Shake128 {
+    st: [u64; 25],
+    out: [u8; 168],
+    /// Bytes of `out` already consumed (== 168 → permute first).
+    pos: usize,
+}
+
+impl Shake128 {
+    /// SHAKE128(seed); seed must be shorter than the 168-byte rate.
+    fn new(seed: &[u8]) -> Self {
+        let mut s = Shake128 {
+            st: [0u64; 25],
+            out: [0u8; 168],
+            pos: 168,
+        };
+        let mut block = [0u8; 168];
+        block[..seed.len().min(168)].copy_from_slice(&seed[..seed.len().min(168)]);
+        block[seed.len()] ^= 0x1f;
+        block[167] ^= 0x80;
+        for lane in 0..21 {
+            let start = lane * 8;
+            let mut word = [0u8; 8];
+            word.copy_from_slice(&block[start..start + 8]);
+            s.st[lane] ^= u64::from_le_bytes(word);
+        }
+        s
+    }
+
+    /// The next big-endian u16 off the squeeze stream (`binary.Read`
+    /// into a uint16 in sing-vmess).
+    fn next_u16(&mut self) -> u16 {
+        if self.pos + 2 > 168 {
+            keccak_f(&mut self.st);
+            for lane in 0..21 {
+                let word = self.st[lane].to_le_bytes();
+                self.out[lane * 8..lane * 8 + 8].copy_from_slice(&word);
+            }
+            self.pos = 0;
+        }
+        let n = u16::from_be_bytes([self.out[self.pos], self.out[self.pos + 1]]);
+        self.pos += 2;
+        n
+    }
+}
+
+/// sing-vmess's per-chunk length framing (chunk_length_stream.go):
+/// the 2-byte chunk length is XOR-masked and/or the chunk carries
+/// SHAKE-derived padding counted inside the length. The stream is
+/// seeded with the direction's 16-byte IV; with BOTH options sing uses
+/// ONE stream (the padding instance doubles as the mask instance),
+/// reading the padding word first and the mask word second — mirrored
+/// here so every option combination stays byte-compatible.
+enum ChunkFraming {
+    /// No framing options: plain `be16(len || ct || tag)` chunks.
+    Plain,
+    /// RequestOptionChunkMasking (0x04): `be16(len ^ mask)`.
+    Mask(Shake128),
+    /// RequestOptionGlobalPadding (0x08): `be16(len)` with `len %`-64
+    /// random padding trailing the ciphertext inside the length.
+    Pad(Shake128),
+    /// Both: one shared stream — padding word, then mask word.
+    MaskPad(Shake128),
+}
+
+impl ChunkFraming {
+    /// From the request option byte; the direction IV seeds the stream.
+    fn from_opt(opt: u8, iv: [u8; 16]) -> Self {
+        match (
+            opt & OPT_CHUNK_MASKING != 0,
+            opt & OPT_GLOBAL_PADDING != 0,
+        ) {
+            (true, true) => ChunkFraming::MaskPad(Shake128::new(&iv)),
+            (true, false) => ChunkFraming::Mask(Shake128::new(&iv)),
+            (false, true) => ChunkFraming::Pad(Shake128::new(&iv)),
+            (false, false) => ChunkFraming::Plain,
+        }
+    }
+
+    /// `(mask, padding_len)` for the next chunk, in wire order.
+    fn next(&mut self) -> (u16, usize) {
+        match self {
+            ChunkFraming::Plain => (0, 0),
+            ChunkFraming::Mask(s) => (s.next_u16(), 0),
+            ChunkFraming::Pad(s) => (0, (s.next_u16() % 64) as usize),
+            ChunkFraming::MaskPad(s) => {
+                let pad = (s.next_u16() % 64) as usize;
+                (s.next_u16(), pad)
+            }
+        }
+    }
+}
+
 /// Body cipher for one direction: 2-byte ciphertext length then one AEAD
-/// block (the length counts the tag; mirrors `proto::vmess::BodyCodec`).
+/// block (the length counts the tag; mirrors `proto::vmess::BodyCodec`),
+/// optionally length-masked and padded per [`ChunkFraming`].
 struct VmessBody {
     aead: Aead,
     nonce: VmessNonce,
+    framing: ChunkFraming,
 }
 
 impl VmessBody {
-    fn new(security: u8, key: [u8; 16], iv: [u8; 16]) -> Result<Self> {
+    fn new(security: u8, key: [u8; 16], iv: [u8; 16], opt: u8) -> Result<Self> {
         let kind = match security {
             SEC_AES128_GCM => AeadKind::Aes128Gcm,
             SEC_CHACHA20_POLY1305 => AeadKind::Chacha20Poly1305,
@@ -480,23 +714,42 @@ impl VmessBody {
         Ok(VmessBody {
             aead: Aead::new(kind, &key)?,
             nonce: VmessNonce::new(iv),
+            framing: ChunkFraming::from_opt(opt, iv),
         })
     }
 
     fn seal_chunk(&mut self, plain: &[u8], out: &mut Vec<u8>) -> Result<()> {
+        let (mask, pad) = self.framing.next();
         let frame_len = plain
             .len()
-            .checked_add(TAG)
+            .checked_add(TAG + pad)
             .filter(|n| *n <= u16::MAX as usize)
             .ok_or_else(|| Error::protocol("vmess chunk exceeds 65535 bytes"))?;
-        out.extend_from_slice(&(frame_len as u16).to_be_bytes());
-        self.aead.seal(&self.nonce.advance(), &[], plain, out)
+        out.extend_from_slice(&((frame_len as u16) ^ mask).to_be_bytes());
+        self.aead.seal(&self.nonce.advance(), &[], plain, out)?;
+        // Padding trails the ciphertext INSIDE the masked length
+        // (sing-vmess StreamChunkWriter.WriteBuffer).
+        if pad > 0 {
+            let start = out.len();
+            out.resize(start + pad, 0);
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut out[start..]);
+        }
+        Ok(())
+    }
+
+    /// Decode a wire length just read: `(mask, padding_len)` for it.
+    fn framing_word(&mut self) -> (u16, usize) {
+        self.framing.next()
     }
 }
 
 enum ReadState {
+    /// Waiting for the 2-byte chunk length (masked per [`ChunkFraming`]).
     Len,
-    Payload(u16),
+    /// Reading `n` wire bytes of which the trailing `pad` are padding.
+    Payload { n: usize, pad: usize },
+    /// The peer's zero-length end-of-stream chunk.
+    End,
 }
 
 /// The server side of a VMess AEAD session.
@@ -515,28 +768,36 @@ impl VmessServerStream {
     fn advance_state(&mut self) -> Result<()> {
         match self.state {
             ReadState::Len => {
-                let len = u16::from_be_bytes([self.rbuf[0], self.rbuf[1]]);
+                let wire = u16::from_be_bytes([self.rbuf[0], self.rbuf[1]]);
                 self.rbuf.advance(2);
-                self.state = ReadState::Payload(len);
-            }
-            ReadState::Payload(len) => {
-                let n = len as usize;
-                if n == 0 {
-                    self.state = ReadState::Len;
+                let (mask, pad) = self.dec.framing_word();
+                let total = (wire ^ mask) as usize;
+                let data = total
+                    .checked_sub(pad)
+                    .ok_or_else(|| Error::protocol("vmess: chunk length below its padding"))?;
+                if data == 0 {
+                    // sing-vmess's StreamChunkReader reads this as EOF.
+                    self.state = ReadState::End;
                     return Ok(());
                 }
-                if n < TAG {
+                self.state = ReadState::Payload { n: total, pad };
+            }
+            ReadState::Payload { n, pad } => {
+                let data = n - pad;
+                if data < TAG {
                     return Err(Error::protocol("vmess body chunk shorter than a tag"));
                 }
                 let pt = self
                     .dec
                     .aead
-                    .open(&self.dec.nonce.advance(), &[], &self.rbuf[..n])
+                    .open(&self.dec.nonce.advance(), &[], &self.rbuf[..data])
                     .map_err(|e| Error::protocol(format!("vmess body: {e}")))?;
+                // Advance past ciphertext AND the trailing padding.
                 self.rbuf.advance(n);
                 self.plain.extend_from_slice(&pt);
                 self.state = ReadState::Len;
             }
+            ReadState::End => {}
         }
         Ok(())
     }
@@ -555,7 +816,10 @@ impl VmessServerStream {
             }
             let need = match &self.state {
                 ReadState::Len => 2,
-                ReadState::Payload(len) => *len as usize,
+                ReadState::Payload { n, .. } => *n,
+                // The end-of-stream chunk: deliver EOF once the decoded
+                // bytes are drained (plain is empty here).
+                ReadState::End => return Poll::Ready(Ok(())),
             };
             if self.rbuf.len() >= need {
                 if let Err(e) = self.advance_state() {
@@ -800,6 +1064,399 @@ mod tests {
         assert!(VmessServer::new(fresh_uuid().as_str(), "none").is_err());
         assert!(VmessServer::new(fresh_uuid().as_str(), "aes-256-cfb").is_err());
         assert!(VmessServer::new(fresh_uuid().as_str(), "auto").is_ok());
+    }
+
+    // --- SHAKE128 / Keccak-f[1600] correctness ---------------------------
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The NIST KATs the hand-rolled sponge must reproduce: the
+    /// empty-message SHAKE128/SHAKE256 prefixes and SHA3-256 for "" and
+    /// "abc" (same permutation, different domain bytes and rates — a
+    /// wrong round constant, rotation or lane order breaks all four).
+    #[test]
+    fn keccak_matches_nist_vectors() {
+        let mut out = [0u8; 32];
+        keccak_xof(0x1f, 168, b"", &mut out);
+        assert_eq!(
+            hex(&out),
+            "7f9c2ba4e88f827d616045507605853ed73b8093f6efbc88eb1a6eacfa66ef26",
+            "SHAKE128(\"\")"
+        );
+        keccak_xof(0x1f, 136, b"", &mut out);
+        assert_eq!(
+            hex(&out[..32]),
+            "46b9dd2b0ba88d13233b3feb743eeb243fcd52ea62b81b82b50c27646ed5762f",
+            "SHAKE256(\"\")"
+        );
+        keccak_xof(0x06, 136, b"", &mut out);
+        assert_eq!(
+            hex(&out),
+            "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a",
+            "SHA3-256(\"\")"
+        );
+        keccak_xof(0x06, 136, b"abc", &mut out);
+        assert_eq!(
+            hex(&out),
+            "3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532",
+            "SHA3-256(\"abc\")"
+        );
+    }
+
+    /// The incremental u16 squeeze must equal the one-shot XOF output,
+    /// including across the 168-byte block boundary.
+    #[test]
+    fn shake128_streaming_matches_one_shot() {
+        let mut oneshot = vec![0u8; 400];
+        keccak_xof(0x1f, 168, b"vmess-chunk-masking-seed", &mut oneshot);
+        let mut s = Shake128::new(b"vmess-chunk-masking-seed");
+        for (i, word) in (0..200u16).map(|i| i * 7).enumerate() {
+            let _ = word;
+            let got = s.next_u16().to_be_bytes();
+            assert_eq!(got, &oneshot[i * 2..i * 2 + 2], "word {i}");
+        }
+    }
+
+    // --- mihomo-shaped (sing-vmess) client sessions -----------------------
+
+    /// The per-chunk framing word order, mirrored from sing-vmess
+    /// chunk_length_stream.go: the padding length word is read BEFORE
+    /// the mask word, from one shared SHAKE stream when both options
+    /// are set (and no stream at all when neither is).
+    fn sing_framing_word(
+        shake: &mut Option<Shake128>,
+        mask: bool,
+        pad: bool,
+    ) -> (u16, usize) {
+        let Some(s) = shake.as_mut() else {
+            return (0, 0);
+        };
+        let padding = if pad {
+            (s.next_u16() % 64) as usize
+        } else {
+            0
+        };
+        let mask = if mask { s.next_u16() } else { 0 };
+        (mask, padding)
+    }
+
+    /// One count-based AEAD body nonce: `be16(count) || iv[2..12]`.
+    fn sing_chunk_nonce(count: u16, iv: &[u8; 16]) -> [u8; 12] {
+        let mut n = [0u8; 12];
+        n[..2].copy_from_slice(&count.to_be_bytes());
+        n[2..].copy_from_slice(&iv[2..12]);
+        n
+    }
+
+    /// A minimal client speaking EXACTLY the wire shapes metacubex
+    /// sing-vmess produces (client.go writeHandshake for the AEAD
+    /// header; chunk_length_stream.go for the framed body) — the shapes
+    /// the real mihomo client sends. Masking/padding follow the `opt`
+    /// handed in, so every option combination the server accepts is
+    /// exercisable.
+    struct SingClient {
+        stream: TcpStream,
+        enc: Aead,
+        enc_count: u16,
+        req_iv: [u8; 16],
+        resp_key: [u8; 16],
+        dec: Aead,
+        dec_count: u16,
+        resp_iv: [u8; 16],
+        resp_v: u8,
+        opt: u8,
+        up_shake: Option<Shake128>,
+        down_shake: Option<Shake128>,
+    }
+
+    impl SingClient {
+        async fn connect(
+            uuid: &str,
+            addr: SocketAddr,
+            opt: u8,
+            cmd: u8,
+            target: &NetAddr,
+        ) -> Result<Self> {
+            use aes::cipher::BlockEncrypt;
+            let mut stream = TcpStream::connect(addr).await?;
+            let key = cmd_key(uuid::Uuid::parse_str(uuid).unwrap());
+            let mut rnd = [0u8; 33];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut rnd);
+            let mut req_key = [0u8; 16];
+            req_key.copy_from_slice(&rnd[..16]);
+            let mut req_iv = [0u8; 16];
+            req_iv.copy_from_slice(&rnd[16..32]);
+            let resp_v = rnd[32];
+            let mut resp_key = [0u8; 16];
+            resp_key.copy_from_slice(&Sha256::digest(req_key)[..16]);
+            let mut resp_iv = [0u8; 16];
+            resp_iv.copy_from_slice(&Sha256::digest(req_iv)[..16]);
+
+            // Instruction header: V iv key respV opt P resv cmd addr
+            // pad fnv — P carries (header-pad<<4 | security).
+            let header_pad = 3usize;
+            let mut hdr = Vec::with_capacity(64);
+            hdr.push(VERSION);
+            hdr.extend_from_slice(&req_iv);
+            hdr.extend_from_slice(&req_key);
+            hdr.push(resp_v);
+            hdr.push(opt);
+            hdr.push(((header_pad as u8) << 4) | SEC_AES128_GCM);
+            hdr.push(0);
+            hdr.push(cmd);
+            encode_port_first_addr(&mut hdr, &target.host, target.port);
+            hdr.extend(std::iter::repeat_n(0u8, header_pad));
+            let checksum = fnv1a32(&hdr).to_be_bytes();
+            hdr.extend_from_slice(&checksum);
+
+            // Auth id: AES-ECB(ts || rand4 || crc32).
+            let mut body = [0u8; 16];
+            body[..8].copy_from_slice(&(now_secs() as i64).to_be_bytes());
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut body[8..12]);
+            let crc = crc32fast::hash(&body[..12]);
+            body[12..].copy_from_slice(&crc.to_be_bytes());
+            let cipher = aes::Aes128::new_from_slice(&kdf16(&key, &[KDF_AUTH_ID_ENC_KEY]))
+                .map_err(|e| Error::crypto(e.to_string()))?;
+            let mut block = aes::cipher::generic_array::GenericArray::from(body);
+            cipher.encrypt_block(&mut block);
+            let auth_id: [u8; 16] = block.into();
+
+            let mut nonce8 = [0u8; 8];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce8);
+
+            let len_plain = (hdr.len() as u16).to_be_bytes();
+            let len_aead = Aead::new(
+                AeadKind::Aes128Gcm,
+                &kdf16(&key, &[KDF_HEADER_LEN_KEY, &auth_id, &nonce8]),
+            )?;
+            let mut len_ct = Vec::with_capacity(18);
+            len_aead.seal(
+                &kdf12(&key, &[KDF_HEADER_LEN_NONCE, &auth_id, &nonce8]),
+                &auth_id,
+                &len_plain,
+                &mut len_ct,
+            )?;
+            let hdr_aead = Aead::new(
+                AeadKind::Aes128Gcm,
+                &kdf16(&key, &[KDF_HEADER_PAYLOAD_KEY, &auth_id, &nonce8]),
+            )?;
+            let mut hdr_ct = Vec::with_capacity(hdr.len() + TAG);
+            hdr_aead.seal(
+                &kdf12(&key, &[KDF_HEADER_PAYLOAD_NONCE, &auth_id, &nonce8]),
+                &auth_id,
+                &hdr,
+                &mut hdr_ct,
+            )?;
+
+            let mut wire = Vec::with_capacity(42 + hdr_ct.len());
+            wire.extend_from_slice(&auth_id);
+            wire.extend_from_slice(&len_ct);
+            wire.extend_from_slice(&nonce8);
+            wire.extend_from_slice(&hdr_ct);
+            stream.write_all(&wire).await?;
+            stream.flush().await?;
+
+            Ok(SingClient {
+                stream,
+                enc: Aead::new(AeadKind::Aes128Gcm, &req_key)?,
+                enc_count: 0,
+                req_iv,
+                resp_key,
+                dec: Aead::new(AeadKind::Aes128Gcm, &resp_key)?,
+                dec_count: 0,
+                resp_iv,
+                resp_v,
+                opt,
+                up_shake: if opt & (OPT_CHUNK_MASKING | OPT_GLOBAL_PADDING) != 0 {
+                    Some(Shake128::new(&req_iv))
+                } else {
+                    None
+                },
+                down_shake: if opt & (OPT_CHUNK_MASKING | OPT_GLOBAL_PADDING) != 0 {
+                    Some(Shake128::new(&resp_iv))
+                } else {
+                    None
+                },
+            })
+        }
+
+        async fn send_chunk(&mut self, plain: &[u8]) -> Result<()> {
+            let (mask, pad) = sing_framing_word(
+                &mut self.up_shake,
+                self.opt & OPT_CHUNK_MASKING != 0,
+                self.opt & OPT_GLOBAL_PADDING != 0,
+            );
+            let total = plain.len() + TAG + pad;
+            let mut out = Vec::with_capacity(total + 2);
+            out.extend_from_slice(&((total as u16) ^ mask).to_be_bytes());
+            self.enc.seal(
+                &sing_chunk_nonce(self.enc_count, &self.req_iv),
+                &[],
+                plain,
+                &mut out,
+            )?;
+            self.enc_count = self.enc_count.wrapping_add(1);
+            if pad > 0 {
+                let start = out.len();
+                out.resize(start + pad, 0);
+                rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut out[start..]);
+            }
+            self.stream.write_all(&out).await?;
+            self.stream.flush().await?;
+            Ok(())
+        }
+
+        /// Read and verify the server's sealed response header: the
+        /// 18-byte sealed length, then the sealed
+        /// `[response-V, echoed option, 0, 0]` payload.
+        async fn read_response_header(&mut self) -> Result<()> {
+            use tokio::io::AsyncReadExt;
+            let len_aead = Aead::new(
+                AeadKind::Aes128Gcm,
+                &kdf16(&self.resp_key, &[KDF_RESP_LEN_KEY]),
+            )?;
+            let mut buf = [0u8; 18];
+            self.stream.read_exact(&mut buf).await?;
+            let pt = len_aead.open(&kdf12(&self.resp_iv, &[KDF_RESP_LEN_IV]), &[], &buf)?;
+            let hlen = u16::from_be_bytes([pt[0], pt[1]]) as usize;
+            let payload_aead = Aead::new(
+                AeadKind::Aes128Gcm,
+                &kdf16(&self.resp_key, &[KDF_RESP_PAYLOAD_KEY]),
+            )?;
+            let mut hdr_ct = vec![0u8; hlen + TAG];
+            self.stream.read_exact(&mut hdr_ct).await?;
+            let hdr = payload_aead.open(
+                &kdf12(&self.resp_iv, &[KDF_RESP_PAYLOAD_IV]),
+                &[],
+                &hdr_ct,
+            )?;
+            assert_eq!(hdr[0], self.resp_v, "response header byte mismatch");
+            assert_eq!(hdr[1], self.opt, "server must echo the request options");
+            Ok(())
+        }
+
+        /// Read one framed (masked/padded) response body chunk.
+        async fn read_chunk(&mut self) -> Result<Vec<u8>> {
+            use tokio::io::AsyncReadExt;
+            let mut len = [0u8; 2];
+            self.stream.read_exact(&mut len).await?;
+            let (mask, pad) = sing_framing_word(
+                &mut self.down_shake,
+                self.opt & OPT_CHUNK_MASKING != 0,
+                self.opt & OPT_GLOBAL_PADDING != 0,
+            );
+            let total = (u16::from_be_bytes(len) ^ mask) as usize;
+            let data = total
+                .checked_sub(pad)
+                .ok_or_else(|| Error::protocol("chunk length below its padding"))?;
+            let mut wire = vec![0u8; total];
+            self.stream.read_exact(&mut wire).await?;
+            let plain = self.dec.open(
+                &sing_chunk_nonce(self.dec_count, &self.resp_iv),
+                &[],
+                &wire[..data],
+            )?;
+            self.dec_count = self.dec_count.wrapping_add(1);
+            Ok(plain)
+        }
+    }
+
+    /// mihomo's default for AEAD securities: option 0x05 — chunk
+    /// stream + chunk masking (sing-vmess dialRaw). The old server
+    /// rejected this outright, which is why the real mihomo client
+    /// completed the dial but never saw payload.
+    #[tokio::test]
+    async fn mihomo_style_masked_tcp_roundtrip() {
+        let uuid = fresh_uuid();
+        let (capture, addr) = spawn_server(&uuid, "auto").await;
+        let target = NetAddr::domain("echo.test", 443).unwrap();
+        let mut c = SingClient::connect(
+            &uuid,
+            addr,
+            OPT_CHUNK_STREAM | OPT_CHUNK_MASKING,
+            CMD_TCP,
+            &target,
+        )
+        .await
+        .unwrap();
+        c.send_chunk(b"ping").await.unwrap();
+        c.read_response_header().await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), c.read_chunk())
+            .await
+            .expect("timeout")
+            .unwrap();
+        assert_eq!(got, b"ping");
+        assert_eq!(capture.targets(), vec![target]);
+    }
+
+    /// Masking + global padding (option 0x0d, mihomo's
+    /// `global-padding: true`): one SHAKE stream yields the padding
+    /// word then the mask word per chunk, in both directions, and the
+    /// random padding trails the ciphertext inside the masked length.
+    #[tokio::test]
+    async fn mihomo_style_masked_padded_tcp_roundtrip() {
+        let uuid = fresh_uuid();
+        let (capture, addr) = spawn_server(&uuid, "auto").await;
+        let target = NetAddr::domain("echo.test", 443).unwrap();
+        let mut c = SingClient::connect(
+            &uuid,
+            addr,
+            OPT_CHUNK_STREAM | OPT_CHUNK_MASKING | OPT_GLOBAL_PADDING,
+            CMD_TCP,
+            &target,
+        )
+        .await
+        .unwrap();
+        c.send_chunk(b"first").await.unwrap();
+        c.send_chunk(b"-second").await.unwrap();
+        c.read_response_header().await.unwrap();
+        let a = tokio::time::timeout(Duration::from_secs(5), c.read_chunk())
+            .await
+            .expect("timeout")
+            .unwrap();
+        let b = tokio::time::timeout(Duration::from_secs(5), c.read_chunk())
+            .await
+            .expect("timeout")
+            .unwrap();
+        assert_eq!(a, b"first");
+        assert_eq!(b, b"-second");
+        assert_eq!(capture.targets(), vec![target]);
+    }
+
+    /// The UDP command with masking: datagram chunks are framed with
+    /// the same masked lengths in both directions.
+    #[tokio::test]
+    async fn mihomo_style_masked_udp_roundtrip() {
+        let uuid = fresh_uuid();
+        let (capture, addr) = spawn_server(&uuid, "auto").await;
+        let target = NetAddr::domain("echo.test", 443).unwrap();
+        let placeholder =
+            NetAddr::ip(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+        let mut c = SingClient::connect(
+            &uuid,
+            addr,
+            OPT_CHUNK_STREAM | OPT_CHUNK_MASKING,
+            CMD_UDP,
+            &placeholder,
+        )
+        .await
+        .unwrap();
+        let mut frame = Vec::new();
+        encode_port_first_addr(&mut frame, &target.host, target.port);
+        frame.extend_from_slice(b"udp-ping");
+        c.send_chunk(&frame).await.unwrap();
+        c.read_response_header().await.unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(5), c.read_chunk())
+            .await
+            .expect("timeout")
+            .unwrap();
+        let (from, used) = decode_port_first_addr(&reply).unwrap();
+        assert_eq!(from, target);
+        assert_eq!(&reply[used..], b"udp-ping");
+        assert_eq!(capture.udp_targets(), vec![target]);
+        assert_eq!(capture.relayed(), 0);
     }
 
     /// UDP command (cmd 2) roundtrip through the engine's own client:

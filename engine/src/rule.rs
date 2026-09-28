@@ -215,8 +215,11 @@ pub enum RuleMatcher {
     /// IN-NAME,<tag> — the inbound listener tag.
     InName(String),
     /// IN-TYPE,<kind[/kind...]> — the inbound listener kind
-    /// (`mixed`/`socks`/`http`/`redir`/`tproxy`/`tun`), compared
-    /// case-insensitively; `/`-separated lists like upstream mihomo.
+    /// (`mixed`/`socks`/`http`/`redir`/`tproxy`/`tun` plus the
+    /// proxy-protocol kinds), compared case-insensitively;
+    /// `/`-separated lists like upstream mihomo. The payload-free
+    /// `PROXY,<outbound>` rule compiles to this matcher over
+    /// [`PROXY_RULE_INBOUND_KINDS`].
     InType(String),
     /// UID,<uid or start-end> — owner uid of the client process.
     Uid(U32Range),
@@ -447,13 +450,19 @@ impl Rule {
                 parts[2].to_string(),
             ),
             ("MATCH", 2) => (RuleMatcher::MatchAll, parts[1].to_string()),
+            // PROXY,<outbound> — payload-free like MATCH; compiled to an
+            // IN-TYPE match over every proxy-protocol listener kind.
+            ("PROXY", 2) => (
+                RuleMatcher::InType(PROXY_RULE_INBOUND_KINDS.to_string()),
+                parts[1].to_string(),
+            ),
             _ => {
                 return Err(Error::config(format!(
                     "unsupported rule {line:?} (supported: DOMAIN, DOMAIN-SUFFIX, \
                      DOMAIN-KEYWORD, DOMAIN-REGEX, IP-CIDR, IP-CIDR6, SRC-IP-CIDR, \
                      DST-PORT, SRC-PORT, GEOIP, GEOSITE, RULE-SET, CLASH-MODE, MATCH, \
-                     AND/OR/NOT, NETWORK, IN-PORT, IN-NAME, IN-TYPE, UID, IN-USER, \
-                     DSCP, IP-ASN, IP-SUFFIX, PROCESS-NAME/PATH)"
+                     PROXY, AND/OR/NOT, NETWORK, IN-PORT, IN-NAME, IN-TYPE, UID, \
+                     IN-USER, DSCP, IP-ASN, IP-SUFFIX, PROCESS-NAME/PATH)"
                 )))
             }
         };
@@ -643,6 +652,14 @@ fn matcher_needs_ip(m: &RuleMatcher) -> bool {
 pub(crate) fn domain_matches_suffix(domain: &str, suffix: &str) -> bool {
     domain == suffix || domain.ends_with(&format!(".{suffix}"))
 }
+
+/// The inbound kinds a `PROXY,<outbound>` rule compiles to (an
+/// [`RuleMatcher::InType`] list): every proxy-protocol listener kind
+/// the engine serves — connections that arrived through a proxy chain,
+/// as opposed to the direct local inbounds (mixed/socks/http/redir/
+/// tproxy/tun).
+pub(crate) const PROXY_RULE_INBOUND_KINDS: &str =
+    "vmess/vless/trojan/shadowsocks/hysteria2/tuic/snell/anytls/jls/restls/tlsmirror";
 
 /// Validate an IN-TYPE / IN-USER `/`-separated list payload (upstream
 /// mihomo parses both as lists): entries are trimmed, IN-TYPE entries
@@ -1518,6 +1535,45 @@ mod tests {
         assert!(!nr.needs_ip());
         assert!(Rule::parse("IP-SUFFIX,8..8,P").is_err());
         assert!(Rule::parse("IP-SUFFIX,.8,P").is_err());
+    }
+
+    #[test]
+    fn proxy_rule_matches_proxy_chain_inbounds_only() {
+        // PROXY,<outbound> parses payload-free like MATCH and compiles
+        // to an IN-TYPE match over the proxy-protocol listener kinds.
+        let r = Rule::parse("PROXY,d").unwrap();
+        assert!(matches!(&r.matcher, RuleMatcher::InType(k) if k == PROXY_RULE_INBOUND_KINDS));
+        assert_eq!(r.outbound, "d");
+
+        let sets = RuleSets::default();
+        let geo = GeoLookups::default();
+        let host = Host::Domain("example.com".into());
+
+        // Every proxy-protocol inbound kind matches: the connection
+        // arrived through a proxy chain.
+        for kind in PROXY_RULE_INBOUND_KINDS.split('/') {
+            let mut c = ctx(&host, 443);
+            c.inbound_kind = kind;
+            assert!(
+                r.evaluate(&c, &sets, &geo),
+                "PROXY must match inbound kind {kind}"
+            );
+        }
+
+        // Direct local inbounds do not.
+        for kind in ["mixed", "socks", "http", "redir", "tproxy", "tun"] {
+            let mut c = ctx(&host, 443);
+            c.inbound_kind = kind;
+            assert!(
+                !r.evaluate(&c, &sets, &geo),
+                "PROXY must not match direct inbound kind {kind}"
+            );
+        }
+
+        // A rule table carrying PROXY needs neither IP resolution nor
+        // the client process.
+        let t = RuleTable::from_parts(vec![r.clone()], Default::default());
+        assert!(!t.needs_ip() && !t.needs_process());
     }
 
     // --- sing-box rule actions (RuleTable walk) -------------------------
