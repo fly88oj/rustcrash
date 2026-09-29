@@ -409,39 +409,31 @@ if [ "$engine_up" = 1 ]; then
     fi
 fi
 
-# grpc (gun) transport: the connect-side deadlock is FIXED (the dial no
-# longer blocks on the gun server's response HEADERS — the real gun
-# server sends them only after the client's first DATA frame; the
-# :status check moved to the first read) and the client SETTINGS/HPACK
-# shapes are Go-server compatible (non-empty SETTINGS, indexed
-# pseudo-headers). The rows relay end to end against mihomo's gun
-# listeners (vmess :42420 matsvc, trojan :42422 tjsvc).
-#
-# The gun exchange is timing-sensitive: a tunnel can park waiting for
-# the server's lazy response HEADERS and only a FRESH dial recovers
-# (observed engine<->mihomo: one of several tunnels stalls while a new
-# connection relays fine), so each row makes up to three REAL relay
-# attempts before declaring the skip. Should every attempt fail, the
-# SKIP carries the live symptom (the observed body + the engine log's
-# last grpc/gun line) instead of pinning stale failure text.
+# grpc (gun) transport: the dial no longer blocks on the gun server's
+# response HEADERS (they are lazy — sent only after the client's first
+# DATA frame; the :status check moved to the first read) and the client
+# SETTINGS/HPACK shapes are Go-server compatible. The wave-22 fix closed
+# the LAST stall: when the server's whole response burst was already
+# socket-buffered before the first read, poll_drive de-framed it into
+# `plain` and poll_read parked on the socket with the payload ready —
+# END_STREAM had been seen, so nothing would ever wake the tunnel again
+# (~1/6 of tunnels hung; only a fresh dial recovered). poll_read now
+# re-checks its deliverable/terminal state before parking, so a single
+# relay attempt is honest — no retry masking.
 grpc_row() { # <row> <node> <tcp-port>
     if [ "$engine_up" != 1 ]; then skip "$1" "engine down"; return; fi
     if ! port_open "$3"; then skip "$1" "mihomo listener :$3 not bound (see mihomo-server.log)"; return; fi
-    local out symptom attempt
-    out=""
-    for attempt in 1 2 3; do
-        out=$(relay_via "$2")
-        if [ "$out" = "$BODY" ]; then
-            ok "$1" "relay works (attempt $attempt; lazy response HEADERS)"
-            return
-        fi
-        [ "$attempt" -lt 3 ] && sleep 1
-    done
+    local out symptom
+    out=$(relay_via "$2")
+    if [ "$out" = "$BODY" ]; then
+        ok "$1" "relay works (single attempt; lazy response HEADERS, no-park fix)"
+        return
+    fi
     # strip the ANSI/timestamp prefix so the symptom survives the
     # detail truncation (the raw line is mostly escape codes)
     symptom=$(grep -aiE 'grpc|gun' "$LOGDIR/matrix-$PLATFORM.log" 2>/dev/null | tail -1 \
               | sed 's/\x1b\[[0-9;]*m//g' | grep -oE 'grpc: .*|gun: .*' | cut -c1-90)
-    skip "$1" "grpc relay failed after $attempt attempts with the fixed client (response HEADERS are lazy): ${symptom:-no grpc/gun line in the engine log} (body '$(echo "$out" | cut -c1-30)')"
+    skip "$1" "grpc relay failed on a single honest attempt (park-with-payload fixed; check the symptom): ${symptom:-no grpc/gun line in the engine log} (body '$(echo "$out" | cut -c1-30)')"
 }
 grpc_row "outbound: vmess (grpc transport)" o-vmess-grpc 42420
 grpc_row "outbound: trojan (grpc transport)" o-trojan-grpc 42422
