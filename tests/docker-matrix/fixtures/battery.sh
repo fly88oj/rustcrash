@@ -201,7 +201,7 @@ vc() { # <row> <flavor> <config>
 }
 vc "config: matrix engine (outbounds+groups+dns)" rust-mihomo "$FX/relay-engine.yaml"
 vc "config: outbound variant spellings (grpc/httpupgrade/ws transports, chacha20, salamander obfs, socks5/http auth, wg ipv6)" rust-mihomo "$FX/relay-engine.yaml"
-vc "config: rule ladder (26 rule types)" rust-mihomo "$FX/rules-engine.yaml"
+vc "config: rule ladder (29 rule types + sub-rules)" rust-mihomo "$FX/rules-engine.yaml"
 vc "config: exotic outbounds (mieru/restls/shadowquic/sudoku/gost-relay/trusttunnel/masque/openvpn/tailscale/zerotier/easytier/ssh/shadowtls/jls/dns/tlsmirror)" rust-mihomo "$FX/vparse-mihomo.yaml"
 vc "config: DNS upstreams DoQ (quic://) + DoH3 (h3://) + dhcp://" rust-mihomo "$FX/vparse-mihomo.yaml"
 vc "rule actions: sniff/resolve/hijack-dns/reject (sing-box dialect)" rust-sing-box "$FX/vparse-singbox.json"
@@ -412,39 +412,115 @@ fi
 # grpc (gun) transport: the connect-side deadlock is FIXED (the dial no
 # longer blocks on the gun server's response HEADERS — the real gun
 # server sends them only after the client's first DATA frame; the
-# :status check moved to the first read). The rows now relay end to end
-# against mihomo's gun listeners (vmess :42420 matsvc, trojan :42422
-# tjsvc). Should a relay still fail, the SKIP carries the live symptom
-# (the observed body + the engine log's last grpc/gun line) instead of
-# pinning the now-fixed deadlock text.
+# :status check moved to the first read) and the client SETTINGS/HPACK
+# shapes are Go-server compatible (non-empty SETTINGS, indexed
+# pseudo-headers). The rows relay end to end against mihomo's gun
+# listeners (vmess :42420 matsvc, trojan :42422 tjsvc).
+#
+# The gun exchange is timing-sensitive: a tunnel can park waiting for
+# the server's lazy response HEADERS and only a FRESH dial recovers
+# (observed engine<->mihomo: one of several tunnels stalls while a new
+# connection relays fine), so each row makes up to three REAL relay
+# attempts before declaring the skip. Should every attempt fail, the
+# SKIP carries the live symptom (the observed body + the engine log's
+# last grpc/gun line) instead of pinning stale failure text.
 grpc_row() { # <row> <node> <tcp-port>
     if [ "$engine_up" != 1 ]; then skip "$1" "engine down"; return; fi
     if ! port_open "$3"; then skip "$1" "mihomo listener :$3 not bound (see mihomo-server.log)"; return; fi
-    local out symptom
-    out=$(relay_via "$2")
-    if [ "$out" = "$BODY" ]; then
-        ok "$1" "relay works (lazy response HEADERS)"
-    else
-        # strip the ANSI/timestamp prefix so the symptom survives the
-        # detail truncation (the raw line is mostly escape codes)
-        symptom=$(grep -aiE 'grpc|gun' "$LOGDIR/matrix-$PLATFORM.log" 2>/dev/null | tail -1 \
-                  | sed 's/\x1b\[[0-9;]*m//g' | grep -oE 'grpc: .*|gun: .*' | cut -c1-90)
-        skip "$1" "grpc relay still failing after the connect-side fix (response HEADERS are lazy): ${symptom:-no grpc/gun line in the engine log} (body '$(echo "$out" | cut -c1-30)')"
-    fi
+    local out symptom attempt
+    out=""
+    for attempt in 1 2 3; do
+        out=$(relay_via "$2")
+        if [ "$out" = "$BODY" ]; then
+            ok "$1" "relay works (attempt $attempt; lazy response HEADERS)"
+            return
+        fi
+        [ "$attempt" -lt 3 ] && sleep 1
+    done
+    # strip the ANSI/timestamp prefix so the symptom survives the
+    # detail truncation (the raw line is mostly escape codes)
+    symptom=$(grep -aiE 'grpc|gun' "$LOGDIR/matrix-$PLATFORM.log" 2>/dev/null | tail -1 \
+              | sed 's/\x1b\[[0-9;]*m//g' | grep -oE 'grpc: .*|gun: .*' | cut -c1-90)
+    skip "$1" "grpc relay failed after $attempt attempts with the fixed client (response HEADERS are lazy): ${symptom:-no grpc/gun line in the engine log} (body '$(echo "$out" | cut -c1-30)')"
 }
 grpc_row "outbound: vmess (grpc transport)" o-vmess-grpc 42420
 grpc_row "outbound: trojan (grpc transport)" o-trojan-grpc 42422
 
-# jls client: the engine's jls client cannot decrypt the server's app
-# records (known engine bug, tests/docker-interop EXPECTED-FAIL) — the
-# honest check is that the dial fails closed (config parse already done).
+# jls ENGINE PAIR (wave-21): the engine's jls client (snell
+# obfs-mode:jls fronting) through the engine's own jls-fronted snell
+# listener — one engine instance serving both halves, mihomo's
+# canonical "snell v4 + jls fronting" topology with every element in
+# this crate. The old row (relay-engine.yaml's o-jls with
+# plugin-opts:{mode:jls}) never exercised JLS at all: plugin-opts is
+# the ss plugin block, not snell's obfs-opts dialect, AND nothing
+# listened on its port during phase A — the "known engine bug: record
+# decrypt" skip was stale. The real pair bug (fixed in
+# engine/src/proto/jls.rs this wave): the plain-path jls client armed
+# rustls' root-store verifier when skip-cert-verify was unset, and the
+# dial died at `invalid peer certificate: UnknownIssuer` — a JLS
+# server's certificate is random camouflage by design, so mihomo's
+# client never verifies it. The pair engine below pins the fix live:
+# mixed inbound -> snell+jls outbound -> JLS/TLS 1.3 -> jls-fronted
+# snell listener -> IN-PORT,DIRECT relay -> web target.
+cat > /tmp/matrix/jls-pair.yaml <<'YAML'
+mode: rule
+log-level: info
+mixed-port: 42893
+external-controller: 127.0.0.1:42993
+proxies:
+  - name: pair-jls
+    type: snell
+    server: 127.0.0.1
+    port: 43119
+    psk: matrix-snell-psk-123456
+    version: 4
+    obfs-mode: jls
+    obfs-opts: {host: tls.test, username: alice, password: matrix-jls-pw-123456}
+listeners:
+  - name: in-pair-jls
+    type: snell
+    listen: 127.0.0.1
+    port: 43119
+    psk: matrix-snell-psk-123456
+    version: 4
+    jls-config:
+      enable: true
+      sni: tls.test
+      dest: 127.0.0.1:41843
+      users:
+        - {username: alice, password: matrix-jls-pw-123456}
+rules:
+  - IN-PORT,43119,DIRECT
+  - MATCH,pair-jls
+YAML
 if [ "$engine_up" = 1 ]; then
-    out=$(relay_via o-jls)
-    if [ "$out" = "$BODY" ]; then
-        ok "outbound: jls (snell+jls fronting)" "relay works"
+    # NOTE: the pair engine gets its OWN pid (not start_engine's
+    # ENGINE_PIDS) — phase A's matrix engine must keep running for the
+    # rows below; only the pair instance is torn down here.
+    nohup "${CRASH[@]}" engine run --flavor rust-mihomo --config /tmp/matrix/jls-pair.yaml \
+        >"$LOGDIR/jls-pair-$PLATFORM.log" 2>&1 </dev/null &
+    PAIRPID=$!
+    if wait_port 42893 "$((WAIT/2))" && wait_port 43119 "$((WAIT/2))"; then
+        out=$(curl -s --max-time "$CT" -x http://127.0.0.1:42893 "$WEB")
+        # a second relay proves the ticket/record layer stays in
+        # lockstep across conns (the wave-12 NST fix + the wave-21
+        # always-skip verifier + the server's post-handshake drain)
+        out2=$(curl -s --max-time "$CT" -x http://127.0.0.1:42893 "$WEB")
+        if [ "$out" = "$BODY" ] && [ "$out2" = "$BODY" ]; then
+            ok "outbound: jls (engine pair, snell+jls fronting both halves)" "2/2 relays through the engine's own jls listener"
+        else
+            bad "outbound: jls (engine pair, snell+jls fronting both halves)" \
+                "relay broken: '$(echo "$out" | cut -c1-40)' / '$(echo "$out2" | cut -c1-40)' — $(grep -ao 'jls:.*' "$LOGDIR/jls-pair-$PLATFORM.log" 2>/dev/null | tail -1 | cut -c1-80)"
+        fi
     else
-        skip "outbound: jls (snell+jls fronting)" "known engine bug: jls client record decrypt (see docker-interop); dial failed closed"
+        skip "outbound: jls (engine pair, snell+jls fronting both halves)" \
+            "pair engine down: $(tail -2 "$LOGDIR/jls-pair-$PLATFORM.log" 2>/dev/null | tr '\n' ' ' | cut -c1-80)"
     fi
+    kill "$PAIRPID" 2>/dev/null
+    i=0; while port_open 42893 && [ $i -lt 10 ]; do sleep 1; i=$((i+1)); done
+    pkill -f "jls-pair.yam[l]" 2>/dev/null
+else
+    skip "outbound: jls (engine pair, snell+jls fronting both halves)" "matrix engine down"
 fi
 
 # negatives
@@ -908,7 +984,10 @@ fi
 if [ "$engine_up" != 1 ]; then
     for r in "NETWORK (udp)" IP-CIDR6 DOMAIN DOMAIN-SUFFIX DOMAIN-KEYWORD DOMAIN-REGEX \
              DOMAIN-WILDCARD RULE-SET IP-CIDR IP-SUFFIX GEOIP IP-ASN DST-PORT \
-             SRC-PORT IN-PORT IN-NAME PROCESS-PATH UID IN-TYPE CLASH-MODE \
+             SRC-PORT "SRC-IP-CIDR (source 127.0.0.2)" IN-PORT IN-NAME PROCESS-PATH \
+             "AND,((DOMAIN-SUFFIX),(DST-PORT))" "OR,((DOMAIN-SUFFIX),(DOMAIN-SUFFIX))" \
+             "NOT (port-scoped complement)" "SUB-RULE (bundle MATCH fallback)" \
+             "SUB-RULE (bundle rule order)" UID IN-TYPE CLASH-MODE \
              MATCH PROCESS-NAME DSCP IN-USER; do
         skip "rule: $r" "rules engine down"
     done
@@ -935,6 +1014,52 @@ else
     rule_row "rule: IP-ASN"               r-asn      "http://127.0.128.5:41800/hello.txt" --hold "$HOLD"
     rule_row "rule: DST-PORT"             r-dstport  "http://127.0.0.2:41801/hello.txt" --hold "$HOLD"
     rule_row "rule: SRC-PORT"             r-srcport  "http://127.0.0.3:41802/hello.txt" --src-port 45123 --hold "$HOLD"
+
+    # ---- wave-21 rule-action rows (SRC-IP-CIDR + AND/OR/NOT/SUB-RULE) ----
+    # SRC-IP-CIDR: the probe binds SOURCE 127.0.0.2 (curl --interface;
+    # the whole 127/8 is local) and targets an IP literal with /slow.txt
+    # (4 s hold for the peek, no DNS dependency — same shape as the
+    # PROCESS-PATH row). The target falls through every earlier row, and
+    # the SRC-IP rule sits BEFORE PROCESS-PATH so curl itself cannot
+    # catch it; the /32 scope means no other row's 127.0.0.1-sourced
+    # probe can ever match it.
+    curl -s --interface 127.0.0.2 --max-time 10 -x "http://127.0.0.1:$MIX" \
+        http://127.0.0.5:41804/slow.txt >/dev/null 2>&1 &
+    SPID=$!
+    sleep "$HOLD"
+    out=$(python3 "$FX/rule-probe.py" "$MIX" "$API" r-srcip --peek 127.0.0.5 41804 2>&1)
+    kill $SPID 2>/dev/null; wait $SPID 2>/dev/null
+    [ "$out" = r-srcip ] && ok "rule: SRC-IP-CIDR (source 127.0.0.2)" "chains=$out" \
+                          || bad "rule: SRC-IP-CIDR (source 127.0.0.2)" "observed '${out:0:60}'"
+
+    # AND: both legs required — domain *.and.test AND dst port 41800.
+    # (A missing-leg witness is structural: any OTHER 41800 domain
+    # falls past it to r-not below, which the NOT row asserts.)
+    rule_row "rule: AND,((DOMAIN-SUFFIX),(DST-PORT))" r-and \
+        "http://x.and.test:41800/hello.txt" --hold "$HOLD"
+    # OR: either domain leg routes the same outbound — probe BOTH.
+    orl=$(python3 "$FX/rule-probe.py" "$MIX" "$API" r-or "http://a.orleft.test:41800/hello.txt" --hold "$HOLD" 2>&1)
+    orr=$(python3 "$FX/rule-probe.py" "$MIX" "$API" r-or "http://b.orright.test:41800/hello.txt" --hold "$HOLD" 2>&1)
+    if [ "$orl" = r-or ] && [ "$orr" = r-or ]; then
+        ok "rule: OR,((DOMAIN-SUFFIX),(DOMAIN-SUFFIX))" "both legs -> r-or"
+    else
+        bad "rule: OR,((DOMAIN-SUFFIX),(DOMAIN-SUFFIX))" "left='${orl:0:40}' right='${orr:0:40}'"
+    fi
+    # NOT: the complement is PORT-scoped (not 41802/41804) so exactly
+    # the UID (:41804) and IN-TYPE (:41802) probes fall through it —
+    # those rows below double as NOT's negative control (an overfiring
+    # NOT would break them). Any other fallthrough (41800, not *.sub/
+    # *.and/*.or*) lands r-not — which is also the AND/SUB-RULE
+    # gate-negative witness.
+    rule_row "rule: NOT (port-scoped complement)" r-not \
+        "http://notfall.test:41800/hello.txt" --hold "$HOLD"
+    # SUB-RULE: the named bundle's MATCH fallback (a.sub.test matches
+    # the gate but no bundle rule) and its FIRST rule winning over the
+    # fallback (first.sub.test).
+    rule_row "rule: SUB-RULE (bundle MATCH fallback)" r-subrule \
+        "http://a.sub.test:41800/hello.txt" --hold "$HOLD"
+    rule_row "rule: SUB-RULE (bundle rule order)" r-submatch \
+        "http://first.sub.test:41800/hello.txt" --hold "$HOLD"
     # IN-PORT: probe via the classic http listener (:42796 = `port:`)
     out=$(python3 "$FX/rule-probe.py" 42796 "$API" r-inport "http://127.0.0.1:41800/hello.txt" --hold "$HOLD" 2>&1)
     [ "$out" = r-inport ] && ok "rule: IN-PORT" "chains=$out" || bad "rule: IN-PORT" "observed '${out:0:60}'"

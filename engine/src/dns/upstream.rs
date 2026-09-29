@@ -812,4 +812,306 @@ eth1\t0002A8C0\t00000000\t\t0001\t\t0\t0\t0\t00FFFFFF\n";
         let err = Upstream::extract_http_body(b"HTTP/1.1 500 Oops\r\n\r\nx").unwrap_err();
         assert!(err.to_string().contains("500"));
     }
+
+    // ------------------------------------------------------------------
+    // Hermetic QUIC DNS responders (RFC 9250 DoQ + RFC 8484 over HTTP/3):
+    // a quinn server on loopback with an rcgen CA-signed leaf certificate,
+    // exercised through the REAL dial path (`exchange_doq` /
+    // `exchange_h3` dial with `skip_verify: false`, so the engine's
+    // rustls-native-certs root loading must actually trust the test CA —
+    // `SSL_CERT_FILE` redirects it, which rustls-native-certs honors on
+    // both 0.7 and 0.8). Nothing leaves loopback.
+    // ------------------------------------------------------------------
+
+    use std::sync::OnceLock;
+
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    /// CA + leaf pair for one in-test QUIC server; the leaf carries `san`
+    /// as its only subjectAltName (the SNI the client verifies).
+    struct TestPki {
+        ca_pem: String,
+        leaf: CertificateDer<'static>,
+        leaf_key: PrivateKeyDer<'static>,
+    }
+
+    fn test_pki(san: &str) -> TestPki {
+        let ca_key = rcgen::KeyPair::generate().expect("ca key");
+        let mut ca_params =
+            rcgen::CertificateParams::new(Vec::new()).expect("ca params");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).expect("ca cert");
+        let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
+        let leaf_params =
+            rcgen::CertificateParams::new(vec![san.to_string()]).expect("leaf params");
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &ca, &ca_key)
+            .expect("leaf cert");
+        TestPki {
+            ca_pem: ca.pem().to_string(),
+            leaf: CertificateDer::from(leaf.der().to_vec()),
+            leaf_key: PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into()),
+        }
+    }
+
+    /// A quinn server config with the test leaf and one ALPN protocol.
+    fn quinn_server_config(pki: &TestPki, alpn: &[u8]) -> quinn::ServerConfig {
+        let mut tls = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![pki.leaf.clone()], pki.leaf_key.clone_key())
+        .expect("server cert");
+        tls.alpn_protocols = vec![alpn.to_vec()];
+        let quic_tls =
+            quinn::crypto::rustls::QuicServerConfig::try_from(std::sync::Arc::new(tls))
+                .unwrap();
+        quinn::ServerConfig::with_crypto(std::sync::Arc::new(quic_tls))
+    }
+
+    /// Answer one wire query with a NOERROR A record (the responder's
+    /// entire DNS intelligence: echo the id/question, one answer).
+    fn answer_dns(query: &[u8]) -> Vec<u8> {
+        let msg = crate::dns::wire::parse(query).expect("responder: parse query");
+        let ip: IpAddr = "192.0.2.7".parse().unwrap();
+        crate::dns::wire::build_response(
+            &msg,
+            crate::dns::wire::RCODE_NOERROR,
+            &[(ip, 30)],
+        )
+    }
+
+    /// Trust the test CA for the duration of `f`: point the engine's
+    /// native root loading at a temp-file CA bundle. `SSL_CERT_FILE` is
+    /// process-global, so the two QUIC responder tests serialize on this
+    /// mutex; the previous value (if any) is restored before returning.
+    async fn with_test_ca<F: std::future::Future>(ca_pem: String, f: F) -> F::Output {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        let _guard = LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca_path = dir.path().join("engine-doq-test-ca.pem");
+        std::fs::write(&ca_path, ca_pem).expect("write ca pem");
+        let prev = std::env::var_os("SSL_CERT_FILE");
+        std::env::set_var("SSL_CERT_FILE", &ca_path);
+        let out = f.await;
+        match prev {
+            Some(v) => std::env::set_var("SSL_CERT_FILE", v),
+            None => std::env::remove_var("SSL_CERT_FILE"),
+        }
+        out
+    }
+
+    /// RFC 9250 responder: accept connections, then one query per bi
+    /// stream — read the 2-byte length framing, answer on the same
+    /// stream with identical framing.
+    async fn spawn_doq_responder(pki: &TestPki) -> SocketAddr {
+        let endpoint = quinn::Endpoint::server(
+            quinn_server_config(pki, b"doq"),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .expect("doq server endpoint");
+        let addr = endpoint.local_addr().expect("doq server addr");
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                let Ok(conn) = incoming.await else { continue };
+                tokio::spawn(async move {
+                    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                        let mut len = [0u8; 2];
+                        if recv.read_exact(&mut len).await.is_err() {
+                            break;
+                        }
+                        let mut query = vec![0u8; u16::from_be_bytes(len) as usize];
+                        if recv.read_exact(&mut query).await.is_err() {
+                            break;
+                        }
+                        let resp = answer_dns(&query);
+                        let mut framed = Vec::with_capacity(resp.len() + 2);
+                        framed.extend_from_slice(&(resp.len() as u16).to_be_bytes());
+                        framed.extend_from_slice(&resp);
+                        let _ = send.write_all(&framed).await;
+                        let _ = send.finish();
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// Parse `frame_type || length` at the front of `data` (the same
+    /// shape [`crate::quic::read_frame_header`] implements privately).
+    fn h3_frame_header(data: &[u8]) -> Option<(u64, u64, usize)> {
+        let (ftype, a) = crate::quic::read_varint(data)?;
+        let (flen, b) = crate::quic::read_varint(data.get(a..)?)?;
+        Some((ftype, flen, a + b))
+    }
+
+    /// The server half of the HTTP/3 connection-level streams (control +
+    /// QPACK encoder/decoder), mirroring the client's
+    /// [`crate::quic::h3_open_control`]; kept alive by the caller.
+    async fn h3_server_control(conn: &quinn::Connection) -> Option<Vec<quinn::SendStream>> {
+        let mut control = conn.open_uni().await.ok()?;
+        let mut encoder = conn.open_uni().await.ok()?;
+        let mut decoder = conn.open_uni().await.ok()?;
+        let mut head = Vec::with_capacity(8);
+        crate::quic::write_varint(&mut head, crate::quic::H3_STREAM_CONTROL);
+        crate::quic::put_h3_frame(&mut head, crate::quic::H3_SETTINGS, &[]);
+        control.write_all(&head).await.ok()?;
+        let mut t = Vec::with_capacity(4);
+        crate::quic::write_varint(&mut t, crate::quic::H3_STREAM_QPACK_ENCODER);
+        encoder.write_all(&t).await.ok()?;
+        t.clear();
+        crate::quic::write_varint(&mut t, crate::quic::H3_STREAM_QPACK_DECODER);
+        decoder.write_all(&t).await.ok()?;
+        Some(vec![control, encoder, decoder])
+    }
+
+    /// Minimal DoH3 responder: one POST per bi stream — collect the DATA
+    /// frames (the wire query; HEADERS et al. are skipped), answer with
+    /// HEADERS(:status 200) + DATA(response).
+    async fn spawn_doh3_responder(pki: &TestPki) -> SocketAddr {
+        let endpoint = quinn::Endpoint::server(
+            quinn_server_config(pki, b"h3"),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .expect("doh3 server endpoint");
+        let addr = endpoint.local_addr().expect("doh3 server addr");
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                let Ok(conn) = incoming.await else { continue };
+                tokio::spawn(async move {
+                    let _control = h3_server_control(&conn).await;
+                    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                        let mut buf = Vec::with_capacity(1024);
+                        let mut body = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        loop {
+                            while let Some((ftype, flen, hdr)) = h3_frame_header(&buf) {
+                                let total = hdr + flen as usize;
+                                if buf.len() < total {
+                                    break;
+                                }
+                                if ftype == crate::quic::H3_DATA {
+                                    body.extend_from_slice(&buf[hdr..total]);
+                                }
+                                buf.drain(..total);
+                            }
+                            match recv.read(&mut chunk).await {
+                                Ok(Some(n)) => buf.extend_from_slice(&chunk[..n]),
+                                Ok(None) | Err(_) => break,
+                            }
+                        }
+                        if body.is_empty() {
+                            continue;
+                        }
+                        let resp = answer_dns(&body);
+                        let mut out = Vec::with_capacity(resp.len() + 64);
+                        let mut fields = Vec::with_capacity(48);
+                        // QPACK field section prefix: insert count 0, base 0.
+                        fields.extend_from_slice(&[0x00, 0x00]);
+                        crate::quic::put_qpack_literal(&mut fields, b":status", b"200");
+                        crate::quic::put_qpack_literal(
+                            &mut fields,
+                            b"content-type",
+                            b"application/dns-message",
+                        );
+                        crate::quic::put_h3_frame(
+                            &mut out,
+                            crate::quic::H3_HEADERS,
+                            &fields,
+                        );
+                        crate::quic::put_h3_frame(&mut out, crate::quic::H3_DATA, &resp);
+                        let _ = send.write_all(&out).await;
+                        let _ = send.finish();
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// DoQ success path: the real `exchange_doq` dial (ALPN "doq",
+    /// verified TLS against the in-test CA) returns the responder's
+    /// answer — matching id, echoed question, the served A record — and
+    /// a second exchange proves the one-connection-per-query model
+    /// keeps working.
+    #[tokio::test]
+    async fn doq_exchange_round_trips_with_in_test_responder() {
+        let pki = test_pki("doq.test");
+        let addr = spawn_doq_responder(&pki).await;
+        let upstream = Upstream::Doq {
+            addr,
+            name: "doq.test".to_string(),
+        };
+        let query = crate::dns::wire::build_query(
+            0x1F4D,
+            "quic.example",
+            crate::dns::wire::TYPE_A,
+        );
+        let resp = with_test_ca(pki.ca_pem.clone(), upstream.exchange(&query))
+            .await
+            .expect("doq exchange");
+        let msg = crate::dns::wire::parse(&resp).expect("parse doq response");
+        assert!(msg.is_response(), "QR set");
+        assert_eq!(msg.id, 0x1F4D, "query id echoed");
+        assert_eq!(msg.rcode, crate::dns::wire::RCODE_NOERROR);
+        assert_eq!(
+            msg.questions.first().map(|q| q.name.as_str()),
+            Some("quic.example"),
+            "question echoed"
+        );
+        assert_eq!(msg.answers.len(), 1);
+        assert_eq!(msg.answers[0].rtype, crate::dns::wire::TYPE_A);
+        assert_eq!(msg.answers[0].rdata, vec![192, 0, 2, 7]);
+
+        // A second exchange dials a fresh QUIC connection and stream.
+        let query2 = crate::dns::wire::build_query(
+            0x2E60,
+            "again.example",
+            crate::dns::wire::TYPE_A,
+        );
+        let resp2 = with_test_ca(pki.ca_pem.clone(), upstream.exchange(&query2))
+            .await
+            .expect("second doq exchange");
+        let msg2 = crate::dns::wire::parse(&resp2).expect("parse second response");
+        assert_eq!(msg2.id, 0x2E60);
+        assert_eq!(
+            msg2.questions.first().map(|q| q.name.as_str()),
+            Some("again.example")
+        );
+    }
+
+    /// DoH3 success path: the real `exchange_h3` dial (ALPN "h3", HTTP/3
+    /// request streams + QPACK control streams, verified TLS) posts the
+    /// wire query and gets the answer body back.
+    #[tokio::test]
+    async fn doh3_exchange_round_trips_with_in_test_responder() {
+        let pki = test_pki("doh3.test");
+        let addr = spawn_doh3_responder(&pki).await;
+        let upstream = Upstream::H3 {
+            addr,
+            name: "doh3.test".to_string(),
+            path: "/dns-query".to_string(),
+        };
+        let query = crate::dns::wire::build_query(
+            0x3C51,
+            "h3.example",
+            crate::dns::wire::TYPE_A,
+        );
+        let resp = with_test_ca(pki.ca_pem.clone(), upstream.exchange(&query))
+            .await
+            .expect("doh3 exchange");
+        let msg = crate::dns::wire::parse(&resp).expect("parse doh3 response");
+        assert!(msg.is_response(), "QR set");
+        assert_eq!(msg.id, 0x3C51, "query id echoed");
+        assert_eq!(msg.rcode, crate::dns::wire::RCODE_NOERROR);
+        assert_eq!(
+            msg.questions.first().map(|q| q.name.as_str()),
+            Some("h3.example"),
+            "question echoed (the POST body was the wire query)"
+        );
+        assert_eq!(msg.answers.len(), 1);
+        assert_eq!(msg.answers[0].rdata, vec![192, 0, 2, 7]);
+    }
 }
