@@ -338,7 +338,20 @@ pub const MAX_PACKET_LENGTH: usize = 7 * DEFAULT_PHYSICAL_MTU;
 pub const IDENTITY_GEN_MEMORY: usize = 2 * 1024 * 1024;
 /// `ZT_IDENTITY_GEN_HASHCASH_FIRST_BYTE_LESS_THAN`
 /// (node/Identity.cpp:15): digest[0] < 17 ⇒ ~1/16.6 work factor.
+/// Hashcash difficulty: the first digest byte must be below this
+/// (node/Identity.cpp `ZT_IDENTITY_HASHCASH_FIRST_BYTE_LESS_THAN` is 17,
+/// ≈16.6 expected 2 MiB memory-hard hashes per identity — seconds in
+/// release, minutes in debug). Tests drop the difficulty to first-try:
+/// the PoW itself is pinned by the zerotier-go known-good vectors, and
+/// the overlay e2e suites generate up to five identities per test —
+/// on CI's debug builds the real difficulty alone blows every dial
+/// timeout (observed: 40s first-dial timeout exceeded). Generate and
+/// locally_validate share the constant, so test identities stay
+/// self-consistent, and real (threshold-17) identities still validate.
+#[cfg(not(test))]
 const IDENTITY_HASHCASH_THRESHOLD: u8 = 17;
+#[cfg(test)]
+const IDENTITY_HASHCASH_THRESHOLD: u8 = u8::MAX;
 /// `ZT_NETWORKCONFIG_VERSION` (node/NetworkConfig.hpp:90).
 pub const NETWORKCONFIG_VERSION: u64 = 7;
 
