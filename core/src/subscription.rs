@@ -21,6 +21,71 @@ pub struct SubscriptionInfo {
     pub content: String,
     pub format: SubscriptionFormat,
     pub backend: Option<String>,
+    /// Quota facts parsed from the `subscription-userinfo` response
+    /// header (`upload=..; download=..; total=..; expire=..`), when the
+    /// server sent one (None otherwise).
+    pub userinfo: Option<SubscriptionUserInfo>,
+}
+
+/// The quota facts of a `subscription-userinfo` header — the shape
+/// mihomo exposes on GET /providers/proxies/{name}
+/// (adapter/provider/subscription_info.go `SubscriptionInfo`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SubscriptionUserInfo {
+    /// Bytes uploaded through the subscription (this period).
+    pub upload: i64,
+    /// Bytes downloaded through the subscription (this period).
+    pub download: i64,
+    /// Total quota in bytes (0 when the server does not meter).
+    pub total: i64,
+    /// Subscription expiry as a unix timestamp (0 = unknown).
+    pub expire: i64,
+}
+
+/// Parse a `subscription-userinfo` header value with mihomo's exact
+/// tolerance (adapter/provider/subscription_info.go
+/// `NewSubscriptionInfo`): case-insensitive, whitespace stripped,
+/// `;`-separated `key=value` fields, values parsed as an integer and
+/// then as a float (truncated), unknown keys and unparsable values
+/// skipped, missing keys left at zero. Examples:
+///
+/// * `upload=453211024; download=7423116545; total=107374182400; expire=1735689600`
+/// * `Upload=1; Download=2.5` (float → truncated)
+/// * `garbage` / `upload=abc` (skipped, not an error)
+pub fn parse_subscription_userinfo(header: &str) -> SubscriptionUserInfo {
+    let cleaned: String = header
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let mut out = SubscriptionUserInfo::default();
+    for field in cleaned.split(';') {
+        let Some((name, value)) = field.split_once('=') else {
+            continue;
+        };
+        let parse_value = |v: &str| -> Option<i64> {
+            if let Ok(i) = v.parse::<i64>() {
+                return Some(i);
+            }
+            v.parse::<f64>().ok().map(|f| f as i64)
+        };
+        let Some(value) = parse_value(value) else {
+            tracing::warn!(
+                "subscription-userinfo: failed to parse value {:?} of field {:?}",
+                value,
+                name
+            );
+            continue;
+        };
+        match name {
+            "upload" => out.upload = value,
+            "download" => out.download = value,
+            "total" => out.total = value,
+            "expire" => out.expire = value,
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Detected subscription format
@@ -526,6 +591,14 @@ impl SubscriptionManager {
             return Err(Error::Subscription(format!("HTTP {}", resp.status())));
         }
 
+        // The quota header rides the response head: read it before the
+        // body is consumed (mihomo provider.go:212-214 SetInRead).
+        let userinfo = resp
+            .headers()
+            .get("subscription-userinfo")
+            .and_then(|v| v.to_str().ok())
+            .map(parse_subscription_userinfo);
+
         let raw = resp
             .bytes()
             .await
@@ -551,6 +624,7 @@ impl SubscriptionManager {
             content,
             format,
             backend: None,
+            userinfo,
         })
     }
 
@@ -1479,6 +1553,44 @@ proxies:
         assert_eq!(result.host, Some("example.com".to_string()));
     }
 
+    /// `subscription-userinfo` parsing with mihomo's exact tolerance
+    /// (adapter/provider/subscription_info.go NewSubscriptionInfo):
+    /// exact fields, case/whitespace insensitivity, float truncation,
+    /// unparsable values and `no=` fields skipped.
+    #[test]
+    fn test_parse_subscription_userinfo() {
+        let info = parse_subscription_userinfo(
+            "upload=453211024; download=7423116545; total=107374182400; expire=1735689600",
+        );
+        assert_eq!(
+            info,
+            SubscriptionUserInfo {
+                upload: 453211024,
+                download: 7423116545,
+                total: 107374182400,
+                expire: 1735689600,
+            }
+        );
+        // Case-insensitive keys, whitespace between fields tolerated.
+        assert_eq!(
+            parse_subscription_userinfo(" Upload=1 ; DOWNLOAD=2 ; Total=3 "),
+            SubscriptionUserInfo {
+                upload: 1,
+                download: 2,
+                total: 3,
+                expire: 0,
+            }
+        );
+        // Floats truncate (upstream's parseValue ParseFloat fallback).
+        assert_eq!(parse_subscription_userinfo("total=1073741824.9").total, 1073741824);
+        // Garbage never fails the fetch: bad values and fields without
+        // `=` drop out, unknown keys are ignored.
+        let partial = parse_subscription_userinfo("upload=abc; total=5; noequals; odd=1");
+        assert_eq!(partial.upload, 0);
+        assert_eq!(partial.total, 5);
+        assert_eq!(parse_subscription_userinfo(""), SubscriptionUserInfo::default());
+    }
+
     // ==================================================================
     // HTTP fetch hardening — hermetic, raw wire-level HTTP/1.1 servers
     // on loopback (no external network, no new dev-dependencies).
@@ -1738,6 +1850,58 @@ proxies:
                 expected.trim_end().len(),
                 "payload truncated"
             );
+        }
+
+        /// The `subscription-userinfo` response header surfaces on the
+        /// fetch result (mihomo provider.go:212-214): quota facts parsed
+        /// with the upstream tolerance, None when the server sends none.
+        #[tokio::test]
+        async fn fetch_surfaces_subscription_userinfo_header() {
+            let header = "upload=453211024; download=7423116545; total=107374182400; expire=1735689600";
+            let base = raw_server(vec![plain_response(
+                "HTTP/1.1 200 OK",
+                &[("subscription-userinfo", header)],
+                VMESS_URI.as_bytes(),
+            )]);
+            let info = SubscriptionManager::fetch(&format!("{base}/sub")).await.unwrap();
+            assert_eq!(
+                info.userinfo.as_ref().unwrap(),
+                &SubscriptionUserInfo {
+                    upload: 453211024,
+                    download: 7423116545,
+                    total: 107374182400,
+                    expire: 1735689600,
+                }
+            );
+
+            // No header → None (the common unmetered case).
+            let base = raw_server(vec![plain_response(
+                "HTTP/1.1 200 OK",
+                &[],
+                VMESS_URI.as_bytes(),
+            )]);
+            let info = SubscriptionManager::fetch(&format!("{base}/sub")).await.unwrap();
+            assert!(info.userinfo.is_none(), "userinfo: {:?}", info.userinfo);
+        }
+
+        /// The header survives a redirect chain: only the FINAL response's
+        /// facts count (the intermediate hop's header is not the
+        /// subscription's).
+        #[tokio::test]
+        async fn fetch_userinfo_follows_redirect_to_final_header() {
+            let base = raw_server(vec![
+                redirect(302, "/final"),
+                plain_response(
+                    "HTTP/1.1 200 OK",
+                    &[("subscription-userinfo", "upload=7; total=9")],
+                    VMESS_URI.as_bytes(),
+                ),
+            ]);
+            let info = SubscriptionManager::fetch(&format!("{base}/start")).await.unwrap();
+            let info = info.userinfo.unwrap();
+            assert_eq!(info.upload, 7);
+            assert_eq!(info.total, 9);
+            assert_eq!(info.download, 0);
         }
     }
 }

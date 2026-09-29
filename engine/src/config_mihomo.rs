@@ -59,6 +59,12 @@ struct RawConfig {
     proxy_groups: Vec<RawGroup>,
     #[serde(default, rename = "rule-providers")]
     rule_providers: Option<BTreeMap<String, RawProvider>>,
+    /// mihomo `proxy-providers:` (config/config.go parseProxyProviders →
+    /// adapter/provider/parser.go ParseProxyProvider): named
+    /// subscription vehicles whose nodes join the outbound registry at
+    /// load (see [`load_proxy_providers`]).
+    #[serde(default, rename = "proxy-providers")]
+    proxy_providers: Option<BTreeMap<String, RawProxyProvider>>,
     #[serde(default)]
     rules: Vec<String>,
     #[serde(default, rename = "sub-rules")]
@@ -119,6 +125,19 @@ struct RawGroup {
     /// (parser.go ExpectedStatus → utils.NewUnsignedRanges[uint16]).
     #[serde(default, rename = "expected-status")]
     expected_status: Option<String>,
+    /// `disable-udp` (GroupCommonOption tag "disable-udp"): refuse UDP
+    /// relayed through the group regardless of member capability
+    /// (selector.go SupportUDP).
+    #[serde(default, rename = "disable-udp", alias = "disable_udp")]
+    disable_udp: bool,
+    /// `hidden` (GroupCommonOption tag "hidden"): keep the group out of
+    /// the API /proxies listing (dashboards skip it).
+    #[serde(default)]
+    hidden: bool,
+    /// `use: [provider]` (GroupCommonOption tag "use"): pull the named
+    /// proxy-providers' nodes into the group's members.
+    #[serde(default, rename = "use")]
+    use_providers: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,6 +148,39 @@ struct RawProvider {
     format: Option<String>,
     #[serde(default)]
     path: Option<String>,
+}
+
+/// One `proxy-providers:` entry — the bounded `proxyProviderSchema`
+/// (adapter/provider/parser.go:34-49): `type: http|file`, `url`,
+/// `path`, `interval` and the `health-check:` sub-block.
+#[derive(Debug, Deserialize)]
+struct RawProxyProvider {
+    #[serde(default, rename = "type")]
+    provider_type: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    interval: Option<u64>,
+    #[serde(default, rename = "health-check")]
+    health_check: Option<RawProviderHealthCheck>,
+}
+
+/// `healthCheckSchema` (parser.go): `Lazy` is preset TRUE before
+/// decoding; an enabled check with no interval defaults to 300.
+#[derive(Debug, Clone, Deserialize, Default)]
+struct RawProviderHealthCheck {
+    #[serde(default)]
+    enable: bool,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    interval: Option<u64>,
+    #[serde(default)]
+    lazy: Option<bool>,
+    #[serde(default, rename = "expected-status")]
+    expected_status: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -197,27 +249,57 @@ pub fn load(text: &str) -> Result<EngineConfig> {
         ));
     }
 
-    let outbounds = raw
+    let mut outbounds = raw
         .proxies
         .iter()
         .enumerate()
         .map(|(i, entry)| parse_proxy(entry, i, &raw.proxies))
         .collect::<Result<Vec<_>>>()?;
 
+    // `proxy-providers:` — fetch/file-load every provider now (config
+    // load is synchronous and pre-runtime) and merge the nodes into the
+    // outbound list under `{provider}:{node}` names.
+    let provider_nodes = load_proxy_providers(raw.proxy_providers.as_ref(), &mut outbounds)?;
+
     let mut groups = Vec::new();
     // groupbase health-check filters (lazy / expected-status), one
     // entry per group like upstream's per-group HealthCheck
     // (adapter/provider/healthcheck.go NewHealthCheck carries both).
     let mut group_health = std::collections::HashMap::new();
+    // GroupCommonOption display/udp flags (`disable-udp`, `hidden`),
+    // keyed by group name; handed to the API layer below.
+    let mut group_flags: std::collections::HashMap<String, crate::config::GroupCommonFlags> =
+        std::collections::HashMap::new();
     for g in &raw.proxy_groups {
+        // `use: [provider]` (parser.go GroupCommonOption.Use): the
+        // provider's nodes join the members after the inline ones.
+        let mut members = g.proxies.clone();
+        for p in &g.use_providers {
+            let Some(nodes) = provider_nodes.get(p) else {
+                return Err(Error::config(format!(
+                    "group {}: the proxy provider {p:?} not found",
+                    g.name
+                )));
+            };
+            members.extend(nodes.iter().cloned());
+        }
         groups.push(GroupConfig {
             name: g.name.clone(),
-            members: g.proxies.clone(),
+            members,
             policy: GroupPolicy::parse(&g.group_type)?,
             url: g.url.clone(),
             interval: g.interval.unwrap_or(300),
             tolerance: g.tolerance.unwrap_or(50),
         });
+        if g.disable_udp || g.hidden {
+            group_flags.insert(
+                g.name.clone(),
+                crate::config::GroupCommonFlags {
+                    disable_udp: g.disable_udp,
+                    hidden: g.hidden,
+                },
+            );
+        }
         let expected_status = crate::config::ExpectedStatus::parse(
             g.expected_status.as_deref().unwrap_or_default(),
         )
@@ -230,6 +312,13 @@ pub fn load(text: &str) -> Result<EngineConfig> {
                 expected_status,
             },
         );
+    }
+    // One config load = one flag table. Registered only when non-empty:
+    // this loader also runs for provider subscription WRAPPERS (api.rs
+    // parse_subscription_proxies builds a synthetic proxy-only config)
+    // and those must not wipe the live engine's group flags.
+    if !group_flags.is_empty() {
+        crate::api::register_group_flags(group_flags);
     }
 
     let mut providers = Vec::new();
@@ -733,7 +822,126 @@ fn parse_proxy_servers(
     Ok(out)
 }
 
-/// Expand mihomo `SUB-RULE,<condition>,<bundle-name>` lines: when the
+/// mihomo `proxy-providers:` — config/config.go parseProxyProviders →
+/// adapter/provider/parser.go ParseProxyProvider, then each provider's
+/// `Initial()` at config assembly: read the vehicle (file read, or a
+/// plain BLOCKING `http://` GET — config load runs before any async
+/// context exists), parse the subscription through the SAME parser the
+/// API provider surface uses, rename every node to `{provider}:{node}`
+/// (the engine's flat outbound-registry namespace) and append it to
+/// `outbounds`. The provider state (spec, nodes, the
+/// `subscription-userinfo` facts) is installed into the API's
+/// process-global provider table, so GET /providers/proxies[/{name}]
+/// and the health-check interval loop see it.
+///
+/// Returns provider name → node names (the group `use:` expansion
+/// input).
+///
+/// Bounded core: `type: http` re-fetches on every load (upstream
+/// caches the body to `path` and re-reads it while fresh); the
+/// inline/age vehicles and the `filter`/`override`/`header`/
+/// `size-limit`/`dialer-proxy` schema fields are out (the same subset
+/// the runtime provider surface ports).
+fn load_proxy_providers(
+    raw: Option<&BTreeMap<String, RawProxyProvider>>,
+    outbounds: &mut Vec<OutboundConfig>,
+) -> Result<std::collections::HashMap<String, Vec<String>>> {
+    let mut nodes_by_provider = std::collections::HashMap::new();
+    let Some(map) = raw else {
+        return Ok(nodes_by_provider);
+    };
+    for (name, p) in map {
+        let vehicle = match p.provider_type.as_deref() {
+            Some("file") => crate::api::ProviderVehicle::File {
+                path: p.path.clone().ok_or_else(|| {
+                    Error::config(format!(
+                        "proxy provider {name}: type file requires a path"
+                    ))
+                })?,
+            },
+            Some("http") => crate::api::ProviderVehicle::Http {
+                // mihomo defaults `path` to a URL-hashed cache file; we
+                // always re-fetch, so no path is needed.
+                url: p.url.clone().ok_or_else(|| {
+                    Error::config(format!("proxy provider {name}: type http requires a url"))
+                })?,
+            },
+            other => {
+                return Err(Error::config(format!(
+                    "proxy provider {name}: unsupport vehicle type {other:?} \
+                     (supported: http, file)"
+                )))
+            }
+        };
+        // healthCheckSchema (parser.go): Lazy presets true; an enabled
+        // check with no interval defaults to 300.
+        let hc = p.health_check.clone().unwrap_or_default();
+        let expected_status = hc.expected_status.clone().unwrap_or_default();
+        if !expected_status.is_empty() {
+            crate::config::ExpectedStatus::parse(&expected_status).map_err(|e| {
+                Error::config(format!("proxy provider {name}: health-check: {e}"))
+            })?;
+        }
+        let health_check = crate::api::ProviderHealthCheck {
+            enable: hc.enable,
+            url: hc.url.clone().unwrap_or_default(),
+            interval: match (hc.enable, hc.interval) {
+                (true, None) => 300,
+                (_, Some(i)) => i,
+                (false, None) => 0,
+            },
+            lazy: hc.lazy.unwrap_or(true),
+            expected_status,
+        };
+        // Read + parse (provider.go Initial → vehicle read →
+        // proxiesParse).
+        let (body, subscription_info) = match &vehicle {
+            crate::api::ProviderVehicle::File { path } => (
+                std::fs::read_to_string(path).map_err(|e| {
+                    Error::config(format!("proxy provider {name}: read {path}: {e}"))
+                })?,
+                None,
+            ),
+            crate::api::ProviderVehicle::Http { url } => {
+                let reply = crate::api::http_get_sync(url).map_err(|e| {
+                    Error::config(format!("proxy provider {name}: {e}"))
+                })?;
+                let info = reply
+                    .header("subscription-userinfo")
+                    .map(crate::api::parse_subscription_userinfo);
+                (reply.body, info)
+            }
+        };
+        let proxies = crate::api::parse_subscription_proxies(&body)
+            .map_err(|e| Error::config(format!("proxy provider {name}: {e}")))?;
+        let mut renamed = Vec::with_capacity(proxies.len());
+        for mut node in proxies {
+            node.name = format!("{name}:{}", node.name);
+            renamed.push(node);
+        }
+        let names: Vec<String> = renamed.iter().map(|n| n.name.clone()).collect();
+        let updated_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| crate::api::rfc3339_utc(d.as_secs()))
+            .ok();
+        crate::api::install_loaded_provider(
+            crate::api::ProxyProviderSpec {
+                name: name.clone(),
+                vehicle,
+                interval: p.interval.unwrap_or(0),
+                health_check,
+            },
+            renamed.clone(),
+            subscription_info,
+            updated_at,
+        );
+        outbounds.extend(renamed);
+        nodes_by_provider.insert(name.clone(), names);
+    }
+    Ok(nodes_by_provider)
+}
+
+
 /// condition holds, the named bundle's rules run with THEIR outbounds;
 /// if none of them matches, evaluation continues past the reference.
 /// Equivalent sequential form: each bundle rule gated by the condition
@@ -3701,5 +3909,254 @@ rules:
   - MATCH,n
 "#;
         assert!(load(cfg).is_err());
+    }
+
+    // ----  `proxy-providers:` and the GroupCommonOption flags ----
+
+    /// A raw loopback HTTP/1.1 server for the SYNC config-load fetch
+    /// (one canned response per connection; hermetic: loopback only).
+    fn raw_http_server(responses: Vec<Vec<u8>>) -> std::net::SocketAddr {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for resp in responses {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    break;
+                };
+                let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let mut buf = [0u8; 8192];
+                loop {
+                    match sock.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let _ = sock.write_all(&resp);
+                let _ = sock.flush();
+                let _ = sock.shutdown(std::net::Shutdown::Write);
+            }
+        });
+        addr
+    }
+
+    /// `type: file` provider: nodes load from the subscription file,
+    /// join the outbound list under `{provider}:{node}` names, `use:`
+    /// pulls them into the group, and the whole config still validates.
+    #[test]
+    fn proxy_providers_file_vehicle_merges_prefixed_nodes() {
+        let _guard = crate::api::provider_table_test_lock().blocking_lock();
+        crate::api::reset_proxy_providers();
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("provider1.yaml");
+        std::fs::write(
+            &sub,
+            "proxies:\n  - name: node1\n    type: socks5\n    server: 10.0.0.1\n    port: 1080\n  - name: node2\n    type: trojan\n    server: 10.0.0.2\n    port: 443\n    password: pw\n",
+        )
+        .unwrap();
+        let cfg = format!(
+            r#"
+mixed-port: 7890
+proxy-providers:
+  provider1:
+    type: file
+    path: {}
+    interval: 3600
+    health-check:
+      enable: true
+      url: http://www.gstatic.com/generate_204
+      interval: 300
+proxy-groups:
+  - name: Auto
+    type: url-test
+    use:
+      - provider1
+    proxies:
+      - DIRECT
+rules:
+  - MATCH,Auto
+"#,
+            sub.to_string_lossy()
+        );
+        let parsed = load(&cfg).unwrap();
+        let names: Vec<&str> = parsed.outbounds.iter().map(|o| o.name.as_str()).collect();
+        assert!(names.contains(&"provider1:node1"), "outbounds: {names:?}");
+        assert!(names.contains(&"provider1:node2"), "outbounds: {names:?}");
+        // `use:` appends the provider's nodes after the inline members.
+        let auto = parsed.groups.iter().find(|g| g.name == "Auto").unwrap();
+        assert_eq!(
+            auto.members,
+            vec![
+                "DIRECT".to_string(),
+                "provider1:node1".to_string(),
+                "provider1:node2".to_string()
+            ]
+        );
+        // The merged config is coherent (rules resolve, groups reference
+        // real outbounds).
+        assert!(crate::config::validate(
+            &parsed.clone().with_builtin_outbounds()
+        )
+        .is_ok());
+        // The provider is installed for the API surface with the
+        // health-check block parsed (interval defaults to 300).
+        let doc = crate::api::installed_provider_document("provider1").unwrap();
+        assert_eq!(doc["name"], "provider1");
+        assert_eq!(doc["vehicleType"], "File");
+        assert_eq!(doc["testUrl"], "http://www.gstatic.com/generate_204");
+        assert_eq!(
+            doc["proxies"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>(),
+            vec!["provider1:node1".to_string(), "provider1:node2".to_string()]
+        );
+        crate::api::reset_proxy_providers();
+    }
+
+    /// `type: http` provider: the config load fetches the subscription
+    /// synchronously and parses the `subscription-userinfo` header.
+    #[test]
+    fn proxy_providers_http_vehicle_fetches_and_parses_userinfo() {
+        let _guard = crate::api::provider_table_test_lock().blocking_lock();
+        crate::api::reset_proxy_providers();
+        let body = "proxies:\n  - name: node1\n    type: socks5\n    server: 10.0.0.1\n    port: 1080\n";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nsubscription-userinfo: upload=453211024; download=7423116545; total=107374182400; expire=1735689600\r\nConnection: close\r\n\r\n{body}"
+        )
+        .into_bytes();
+        let sub_addr = raw_http_server(vec![resp]);
+        let cfg = format!(
+            r#"
+mixed-port: 7890
+proxy-providers:
+  provider1:
+    type: http
+    url: http://127.0.0.1:{}/sub
+    interval: 3600
+    path: ./provider1.yaml
+rules:
+  - MATCH,provider1:node1
+"#,
+            sub_addr.port()
+        );
+        let parsed = load(&cfg).unwrap();
+        assert_eq!(
+            parsed
+                .outbounds
+                .iter()
+                .map(|o| o.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["provider1:node1"],
+            "the fetched node joined the registry under a prefixed name"
+        );
+        assert!(crate::config::validate(
+            &parsed.clone().with_builtin_outbounds()
+        )
+        .is_ok());
+        let doc = crate::api::installed_provider_document("provider1").unwrap();
+        assert_eq!(doc["vehicleType"], "HTTP");
+        assert_eq!(doc["subscriptionInfo"]["Total"], 107374182400i64);
+        assert_eq!(doc["subscriptionInfo"]["Expire"], 1735689600);
+        crate::api::reset_proxy_providers();
+    }
+
+    /// Precise errors: an unsupported vehicle, http without url, file
+    /// without path, a broken health-check expected-status.
+    #[test]
+    fn proxy_provider_schema_errors_are_precise() {
+        let _guard = crate::api::provider_table_test_lock().blocking_lock();
+        crate::api::reset_proxy_providers();
+        let base = "mixed-port: 7890\nrules:\n  - MATCH,DIRECT\n";
+        let cases = [
+            (
+                "proxy-providers:\n  p:\n    type: inline\n    payload: []\n",
+                "unsupport vehicle type",
+            ),
+            (
+                "proxy-providers:\n  p:\n    type: http\n    interval: 60\n",
+                "type http requires a url",
+            ),
+            (
+                "proxy-providers:\n  p:\n    type: file\n",
+                "type file requires a path",
+            ),
+            (
+                "proxy-providers:\n  p:\n    type: file\n    path: /nope.yaml\n    health-check:\n      enable: true\n      expected-status: 20x\n",
+                "health-check",
+            ),
+            (
+                "proxy-providers:\n  p:\n    type: file\n    path: /nonexistent-provider.yaml\n",
+                "read /nonexistent-provider.yaml",
+            ),
+        ];
+        for (section, want) in cases {
+            let err = load(&format!("{base}{section}")).err().unwrap().to_string();
+            assert!(err.contains(want), "want {want:?} in: {err}");
+        }
+        // A group `use:` of an unknown provider is refused too.
+        let err = load(
+            "mixed-port: 7890\nproxy-groups:\n  - name: G\n    type: select\n    use: [nope]\nrules:\n  - MATCH,G\n",
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(err.contains("not found") && err.contains("nope"), "{err}");
+        crate::api::reset_proxy_providers();
+    }
+
+    /// GroupCommonOption `disable-udp` / `hidden` parse and land in the
+    /// API flag table (the hidden listing and udp:false surface read
+    /// them; see api.rs's tests).
+    #[test]
+    fn group_disable_udp_and_hidden_flags_register() {
+        let _guard = crate::api::provider_table_test_lock().blocking_lock();
+        crate::api::register_group_flags(std::collections::HashMap::new());
+        let cfg = r#"
+mixed-port: 7890
+proxies:
+  - {name: n, type: socks5, server: 127.0.0.1, port: 1}
+proxy-groups:
+  - name: Sneaky
+    type: select
+    hidden: true
+    disable-udp: true
+    proxies: [n]
+  - name: NoUdpOnly
+    type: select
+    disable-udp: true
+    proxies: [n]
+  - name: Plain
+    type: select
+    proxies: [n]
+rules:
+  - MATCH,Plain
+"#;
+        let parsed = load(cfg).unwrap();
+        assert_eq!(parsed.groups.len(), 3);
+        let flags = crate::api::group_flags_of;
+        assert_eq!(
+            flags("Sneaky"),
+            crate::config::GroupCommonFlags {
+                hidden: true,
+                disable_udp: true
+            }
+        );
+        assert_eq!(
+            flags("NoUdpOnly"),
+            crate::config::GroupCommonFlags {
+                hidden: false,
+                disable_udp: true
+            }
+        );
+        // Unflagged groups default both false.
+        assert_eq!(flags("Plain"), crate::config::GroupCommonFlags::default());
+        crate::api::register_group_flags(std::collections::HashMap::new());
     }
 }

@@ -29,6 +29,10 @@ pub async fn serve(cfg: ApiConfig, engine: Arc<Engine>) -> Result<()> {
         .map_err(|e| Error::network(e.to_string()))?;
     tracing::info!(target: "engine", "clash api listening on {bound}");
     let secret = cfg.secret.clone().filter(|s| !s.is_empty());
+    // Provider health checks ride the API server's lifetime (the
+    // interval task needs the registry; serve() is where the engine
+    // handle lives).
+    spawn_provider_health_checks(engine.clone());
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -309,9 +313,9 @@ async fn dispatch(stream: &mut TcpStream, req: &Request, engine: &Arc<Engine>) -
                 .await,
             }
         }
-        // mihomo provider.go getProviders(): the whole provider map.
-        // Empty until providers are installed (the dialect loader drops
-        // `proxy-providers:` today — see the proxy-provider section).
+        // mihomo provider.go getProviders(): the whole provider map —
+        // config-loaded providers (config_mihomo) and runtime-installed
+        // ones (install_proxy_provider) share the table.
         ("GET", "/providers/proxies") => {
             let payload = proxy_providers_payload().await.to_string();
             write_json(stream, 200, &payload).await
@@ -747,7 +751,8 @@ async fn group_payload(engine: &Arc<Engine>, name: &str) -> serde_json::Value {
         "type": group.map(|g| g.cfg.policy.as_str()).unwrap_or("Selector"),
         "now": selected,
         "all": members,
-        "udp": true,
+        // SupportUDP(): disable-udp forces false.
+        "udp": group_supports_udp(name),
         "proxies": proxies,
     })
 }
@@ -766,14 +771,16 @@ async fn proxy_payload(engine: &Arc<Engine>, name: &str) -> serde_json::Value {
             "type": group.cfg.policy.as_str(),
             "now": selected,
             "all": group.cfg.members,
-            "udp": true,
+            // SupportUDP(): disable-udp forces false.
+            "udp": group_supports_udp(name),
         });
     }
     let latencies = registry.latency_snapshot().await;
+    let udp = registry.resolve(name).await.map(|o| o.udp).unwrap_or(true);
     serde_json::json!({
         "name": name,
         "type": leaf_type(registry, name).await,
-        "udp": true,
+        "udp": udp,
         "history": latency_history(&latencies, name),
     })
 }
@@ -936,9 +943,17 @@ async fn update_rule_provider(
 //
 // What is in (this subset):
 // * the `proxyProviderSchema` core fields: `type: file|http`, `path`,
-//   `url` (adapter/provider/parser.go:34-49);
+//   `url`, `interval`, `health-check: {enable, url, interval, lazy,
+//   expected-status}` (adapter/provider/parser.go:34-49);
 // * the fetch: file read, or a hand-rolled HTTP/1.1 GET for `http://`
-//   URLs (content-length + chunked bodies);
+//   URLs (content-length + chunked bodies) — [`http_get_sync`] is the
+//   blocking std-TcpStream core (shared with the config loader, which
+//   runs before any async context exists), the async path wraps it on
+//   the blocking pool;
+// * the `subscription-userinfo` response header → the provider's
+//   `subscriptionInfo` document field (provider.go:212-214
+//   SetInRead → NewSubscriptionInfo), parsed with mihomo's exact
+//   algorithm (subscription_info.go);
 // * the parse: mihomo's subscription dialect — a YAML (or JSON — JSON is
 //   a YAML subset, so `{"proxies": [...]}` rides the same path) document
 //   whose top-level `proxies:` list holds proxy mappings, fed through
@@ -946,23 +961,36 @@ async fn update_rule_provider(
 //   outbound kind the engine speaks is parsed by the SAME code path as
 //   config load (`proxiesParse`, provider.go:379-386: the missing-field
 //   error is mihomo's exact string);
+// * `proxy-providers:` CONFIG parsing — the mihomo dialect loader
+//   (config_mihomo.rs) parses the section, fetches/file-loads every
+//   provider, merges the nodes into the outbound list under
+//   `{provider}:{node}` names and installs the provider state here
+//   ([`install_loaded_provider`], the sync twin of
+//   [`install_proxy_provider`] for pre-runtime config load);
+// * the health-check interval: `health-check: {enable, lazy, url,
+//   interval}` runs a periodic URL probe of every provider member
+//   ([`spawn_provider_health_checks`], started with the API server),
+//   recording latencies the same way the delay endpoint does —
+//   `lazy: true` (mihomo's preset default) skips probing untouched
+//   members, and with no touch hook for provider nodes that means the
+//   eager loop only runs when `lazy: false`;
 // * the API surface: GET list/detail, PUT re-fetch (204 / 503 with the
 //   fetch error, mihomo updateProvider), per-provider proxy detail
 //   (findProviderProxyByName's 404s included).
 //
 // What is out (precise, sprawl or outside this file's blast radius):
-// * `proxy-providers:` CONFIG parsing — the mihomo dialect loader
-//   (config_mihomo.rs, not this file) drops the section today, so no
-//   provider is installed at config load; providers enter through
-//   [`install_proxy_provider`] (embedders/tests) until that lands;
-// * registry SELECTION — provider proxies are listed but not routable
-//   (the Registry is built once at startup; provider members joining
-//   groups needs outbound.rs + app.rs);
+// * registry SELECTION for RUNTIME-installed providers — providers
+//   installed through [`install_proxy_provider`] are listed but not
+//   routable (the Registry is built once at startup); providers that
+//   rode config load ARE in the registry (the loader merges their
+//   nodes into `outbounds`), and `use:` expands groups to them;
 // * the inline/age vehicles, `filter`/`exclude-filter`/`exclude-type`
 //   regexes, `override`, `header`, `size-limit`, `dialer-proxy`
 //   (parser.go's full schema), the periodic `interval` auto-update task,
-//   per-provider health checks (GET .../healthcheck answers 503 with the
-//   reason) and the subscription-userinfo display;
+//   the http vehicle's path CACHE (upstream writes the body to `path`
+//   and re-reads it while fresh; we always re-fetch), per-provider
+//   health checks on demand (GET .../healthcheck answers 503 with the
+//   reason);
 // * `https://` subscription URLs (the fetch is the engine's plain
 //   HTTP/1.1; a precise error names it).
 
@@ -975,6 +1003,106 @@ pub struct ProxyProviderSpec {
     /// The optional auto-update interval (seconds). Kept for fidelity;
     /// the periodic task is not ported, PUT is the manual equivalent.
     pub interval: u64,
+    /// The `health-check:` sub-block (parser.go healthCheckSchema:
+    /// `Lazy` is preset TRUE before decoding; `enable` with a zero
+    /// interval defaults to 300).
+    pub health_check: ProviderHealthCheck,
+}
+
+/// The provider `health-check:` block — adapter/provider/parser.go
+/// `healthCheckSchema`: `enable`, `url`, `interval`, `lazy`,
+/// `expected-status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderHealthCheck {
+    pub enable: bool,
+    /// The URL tested against every provider member (the group default
+    /// test URL feeds from this upstream). Empty when unconfigured.
+    pub url: String,
+    /// Probe interval in seconds (mihomo defaults 300 when `enable` is
+    /// set and no interval is given).
+    pub interval: u64,
+    /// `lazy: true` (upstream's preset default) skips probes of members
+    /// that were not used within the interval.
+    pub lazy: bool,
+    /// The raw `expected-status` payload (rendered into the provider
+    /// document's `expectedStatus` like upstream's IntRanges.String()).
+    pub expected_status: String,
+}
+
+impl Default for ProviderHealthCheck {
+    fn default() -> Self {
+        ProviderHealthCheck {
+            enable: false,
+            url: String::new(),
+            interval: 0,
+            lazy: true,
+            expected_status: String::new(),
+        }
+    }
+}
+
+/// The quota facts carried by the `subscription-userinfo` response
+/// header (provider.go:212-214). Field names and JSON keys mirror
+/// upstream's Go struct (no json tags → capitalized keys in the
+/// provider document).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SubscriptionUserInfo {
+    pub upload: i64,
+    pub download: i64,
+    pub total: i64,
+    pub expire: i64,
+}
+
+impl SubscriptionUserInfo {
+    /// The document form (mihomo `providerForApi.SubscriptionInfo`:
+    /// Go marshals the untagged struct with capitalized field names).
+    fn document(&self) -> serde_json::Value {
+        serde_json::json!({
+            "Upload": self.upload,
+            "Download": self.download,
+            "Total": self.total,
+            "Expire": self.expire,
+        })
+    }
+}
+
+/// `subscription-userinfo: upload=453211024; download=7423116545;
+/// total=107374182400; expire=1735689600` → the quota facts, with
+/// mihomo's exact tolerance (adapter/provider/subscription_info.go
+/// `NewSubscriptionInfo`): case-insensitive, spaces stripped, fields
+/// `;`-separated, values parsed as int then float (truncated), unknown
+/// keys and unparsable values skipped, missing keys zero.
+pub fn parse_subscription_userinfo(header: &str) -> SubscriptionUserInfo {
+    let cleaned: String = header
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let mut out = SubscriptionUserInfo::default();
+    for field in cleaned.split(';') {
+        let Some((name, value)) = field.split_once('=') else {
+            continue;
+        };
+        let parse_value = |v: &str| -> Option<i64> {
+            if let Ok(i) = v.parse::<i64>() {
+                return Some(i);
+            }
+            v.parse::<f64>().ok().map(|f| f as i64)
+        };
+        let Some(value) = parse_value(value) else {
+            tracing::warn!(target: "engine",
+                "provider subscription-userinfo: failed to parse value {value:?}");
+            continue;
+        };
+        match name {
+            "upload" => out.upload = value,
+            "download" => out.download = value,
+            "total" => out.total = value,
+            "expire" => out.expire = value,
+            _ => {}
+        }
+    }
+    out
 }
 
 /// The provider vehicle (mihomo `resource.FileVehicle` /
@@ -1000,24 +1128,33 @@ struct ProxyProviderState {
     proxies: Vec<OutboundConfig>,
     /// RFC3339 UTC of the last successful fetch (`UpdatedAt`).
     updated_at: Option<String>,
+    /// The `subscription-userinfo` facts of the last HTTP fetch
+    /// (provider.go:212-214; `None` for file vehicles or absent
+    /// headers).
+    subscription_info: Option<SubscriptionUserInfo>,
 }
 
 impl ProxyProviderState {
     /// `proxySetProvider.MarshalJSON` → `providerForApi`
     /// (adapter/provider/provider.go:30-43, 130-138): name, the literal
-    /// type "Proxy", the vehicle type, the proxy documents, the empty
-    /// health-check fields (health checks are not ported) and the
-    /// omitempty timestamp.
+    /// type "Proxy", the vehicle type, the proxy documents, the
+    /// health-check URL/status (upstream marshals `pp.healthCheck.url`
+    /// and `expectedStatus.String()`), the omitempty timestamp and the
+    /// omitempty subscription info.
     fn document(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut doc = serde_json::json!({
             "name": self.spec.name,
             "type": "Proxy",
             "vehicleType": self.spec.vehicle.vehicle_type(),
             "proxies": self.proxies.iter().map(provider_proxy_document).collect::<Vec<_>>(),
-            "testUrl": "",
-            "expectedStatus": "",
+            "testUrl": self.spec.health_check.url,
+            "expectedStatus": self.spec.health_check.expected_status,
             "updatedAt": self.updated_at.clone().unwrap_or_default(),
-        })
+        });
+        if let Some(info) = &self.subscription_info {
+            doc["subscriptionInfo"] = info.document();
+        }
+        doc
     }
 }
 
@@ -1036,52 +1173,98 @@ fn provider_proxy_document(cfg: &OutboundConfig) -> serde_json::Value {
 }
 
 /// The process-global provider table (the counterpart of mihomo's
-/// `tunnel.Providers()` map, minus the config-load wiring).
-fn proxy_providers() -> &'static tokio::sync::RwLock<HashMap<String, ProxyProviderState>> {
-    static PROVIDERS: OnceLock<tokio::sync::RwLock<HashMap<String, ProxyProviderState>>> =
+/// `tunnel.Providers()` map, minus the config-load wiring). A plain
+/// std RwLock — never held across an await — so the SYNCHRONOUS config
+/// loader (config_mihomo::load, which runs before any async context
+/// exists) can install providers through [`install_loaded_provider`].
+fn proxy_providers() -> &'static std::sync::RwLock<HashMap<String, ProxyProviderState>> {
+    static PROVIDERS: OnceLock<std::sync::RwLock<HashMap<String, ProxyProviderState>>> =
         OnceLock::new();
     PROVIDERS.get_or_init(Default::default)
 }
 
 /// Install (or replace) one proxy provider and run its INITIAL fetch —
 /// `ParseProxyProvider` + `ProxySetProvider.Initial()`
-/// (parser.go:64-110, provider.go:155-170). This is the entry point for
-/// embedders until the mihomo dialect carries `proxy-providers:` through
-/// config load (see the subset note above).
+/// (parser.go:64-110, provider.go:155-170). Async entry point for
+/// embedders; the config loader uses the sync [`install_loaded_provider`].
 pub async fn install_proxy_provider(spec: ProxyProviderSpec) -> Result<()> {
-    let (proxies, updated_at) = fetch_provider(&spec).await?;
+    let (proxies, subscription_info, updated_at) = fetch_provider(&spec).await?;
+    install_loaded_provider(spec, proxies, subscription_info, updated_at);
+    Ok(())
+}
+
+/// The sync twin of [`install_proxy_provider`] for the config loader:
+/// install a provider whose body was already fetched/parsed (the
+/// blocking fetch happens in config_mihomo::load, before any runtime
+/// exists).
+pub(crate) fn install_loaded_provider(
+    spec: ProxyProviderSpec,
+    proxies: Vec<OutboundConfig>,
+    subscription_info: Option<SubscriptionUserInfo>,
+    updated_at: Option<String>,
+) {
     proxy_providers()
         .write()
-        .await
+        .unwrap()
         .insert(spec.name.clone(), ProxyProviderState {
             spec,
             proxies,
             updated_at,
+            subscription_info,
         });
-    Ok(())
 }
 
 /// Remove every installed provider (hermetic tests reset with this).
 pub async fn clear_proxy_providers() {
-    proxy_providers().write().await.clear();
+    reset_proxy_providers();
+}
+
+/// Sync table reset (the config-loader tests run without a runtime).
+pub(crate) fn reset_proxy_providers() {
+    proxy_providers().write().unwrap().clear();
+}
+
+/// One installed provider's document, synchronously — the
+/// config-loader tests (plain #[test], no runtime) assert through this
+/// instead of the HTTP surface. The config-loader suites are
+/// mihomo-dialect tests; the helper must not exist in a no-dialect
+/// test build (workspace clippy -D warnings runs one).
+#[cfg(all(test, feature = "mihomo"))]
+pub(crate) fn installed_provider_document(name: &str) -> Option<serde_json::Value> {
+    proxy_providers()
+        .read()
+        .unwrap()
+        .get(name)
+        .map(|state| state.document())
+}
+
+/// Serialize every touch of the process-global provider/group-flag
+/// tables across test threads (cargo runs #[test] and #[tokio::test]
+/// in parallel; sync tests use `blocking_lock`).
+#[cfg(test)]
+pub(crate) fn provider_table_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static PROVIDER_TESTS: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    PROVIDER_TESTS.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 /// `Fetcher.Update()` for one provider: fetch, parse, swap — the parse
 /// happens fully before the swap, so a bad body keeps the live set.
 async fn refetch_provider(name: &str) -> std::result::Result<(), String> {
     let spec = {
-        let providers = proxy_providers().read().await;
+        let providers = proxy_providers().read().unwrap();
         providers
             .get(name)
             .map(|p| p.spec.clone())
             .ok_or_else(|| format!("provider {name:?} not found"))?
     };
     match fetch_provider(&spec).await {
-        Ok((proxies, updated_at)) => {
-            let mut providers = proxy_providers().write().await;
+        Ok((proxies, subscription_info, updated_at)) => {
+            let mut providers = proxy_providers().write().unwrap();
             if let Some(state) = providers.get_mut(name) {
                 state.proxies = proxies;
                 state.updated_at = updated_at;
+                state.subscription_info = subscription_info;
             }
             Ok(())
         }
@@ -1090,30 +1273,40 @@ async fn refetch_provider(name: &str) -> std::result::Result<(), String> {
 }
 
 /// The initial/update fetch: vehicle read + subscription parse
-/// (`proxiesParse`, provider.go:379-386). Returns the parsed outbounds
-/// and the fetch timestamp.
+/// (`proxiesParse`, provider.go:379-386). Returns the parsed outbounds,
+/// the `subscription-userinfo` facts (HTTP vehicles only) and the fetch
+/// timestamp.
 async fn fetch_provider(
     spec: &ProxyProviderSpec,
-) -> Result<(Vec<OutboundConfig>, Option<String>)> {
-    let body = match &spec.vehicle {
-        ProviderVehicle::File { path } => tokio::fs::read_to_string(path)
-            .await
-            .map_err(|e| Error::config(format!("provider {}: read {path}: {e}", spec.name)))?,
-        ProviderVehicle::Http { url } => http_get(url)
-            .await
-            .map_err(|e| Error::config(format!("provider {}: fetch {url}: {e}", spec.name)))?,
+) -> Result<(Vec<OutboundConfig>, Option<SubscriptionUserInfo>, Option<String>)> {
+    let (reply, subscription_info) = match &spec.vehicle {
+        ProviderVehicle::File { path } => (
+            tokio::fs::read_to_string(path)
+                .await
+                .map_err(|e| Error::config(format!("provider {}: read {path}: {e}", spec.name)))?,
+            None,
+        ),
+        ProviderVehicle::Http { url } => {
+            let reply = http_get(url)
+                .await
+                .map_err(|e| Error::config(format!("provider {}: fetch {url}: {e}", spec.name)))?;
+            let info = reply
+                .header("subscription-userinfo")
+                .map(parse_subscription_userinfo);
+            (reply.body, info)
+        }
     };
-    let proxies = parse_subscription_proxies(&body)
+    let proxies = parse_subscription_proxies(&reply)
         .map_err(|e| Error::config(format!("provider {}: {e}", spec.name)))?;
     let updated_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| rfc3339_utc(d.as_secs()))
         .ok();
-    Ok((proxies, updated_at))
+    Ok((proxies, subscription_info, updated_at))
 }
 
 /// seconds → an RFC3339 UTC timestamp (Go's `time.Time` JSON shape).
-fn rfc3339_utc(unix_secs: u64) -> String {
+pub(crate) fn rfc3339_utc(unix_secs: u64) -> String {
     const DAYS_IN_MONTH: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     let mut days = unix_secs / 86_400;
     let secs_of_day = unix_secs % 86_400;
@@ -1151,7 +1344,7 @@ fn rfc3339_utc(unix_secs: u64) -> String {
 /// supports is a valid subscription entry. The missing-field error is
 /// mihomo's exact string.
 #[cfg(feature = "mihomo")]
-fn parse_subscription_proxies(body: &str) -> Result<Vec<OutboundConfig>> {
+pub(crate) fn parse_subscription_proxies(body: &str) -> Result<Vec<OutboundConfig>> {
     let doc: serde_yaml::Value = serde_yaml::from_str(body)
         .map_err(|e| Error::config(format!("parse subscription: {e}")))?;
     let proxies = doc
@@ -1179,10 +1372,32 @@ fn parse_subscription_proxies(_body: &str) -> Result<Vec<OutboundConfig>> {
     ))
 }
 
-/// A plain `http://` GET (the engine's hand-rolled HTTP/1.1 client —
-/// content-length and chunked bodies; `https://` answers with a precise
-/// error).
-async fn http_get(url: &str) -> Result<String> {
+/// One `http://` GET reply: the response headers (lower-cased names)
+/// and the de-chunked body. The status line is validated inside the
+/// fetch (non-200 is an error, like the previous async-only client).
+pub(crate) struct HttpReply {
+    headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+impl HttpReply {
+    /// First header value by (case-insensitive) name.
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// A plain `http://` GET over a BLOCKING std TcpStream — the engine's
+/// hand-rolled HTTP/1.1 client (content-length and chunked bodies);
+/// `https://` answers with a precise error. This is the shared fetch
+/// core: the async provider path wraps it on the blocking pool, and the
+/// synchronous config loader (config_mihomo::load, pre-runtime) calls
+/// it directly.
+pub(crate) fn http_get_sync(url: &str) -> Result<HttpReply> {
+    use std::io::{Read, Write};
     let rest = url
         .strip_prefix("http://")
         .ok_or_else(|| Error::config("only http:// provider URLs are supported (https fetch is not ported)"))?;
@@ -1198,30 +1413,38 @@ async fn http_get(url: &str) -> Result<String> {
         }
         None => (rest.to_string(), 80, "/".to_string()),
     };
-    let mut stream = tokio::net::TcpStream::connect((host.as_str(), port))
-        .await
+    let mut stream = std::net::TcpStream::connect((host.as_str(), port))
         .map_err(|e| Error::network(format!("connect: {e}")))?;
     let request = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: rustcrash-provider\r\nAccept: */*\r\nConnection: close\r\n\r\n"
     );
-    stream.write_all(request.as_bytes()).await?;
+    stream.write_all(request.as_bytes())?;
     let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).await?;
+    stream.read_to_end(&mut raw)?;
     let text = String::from_utf8_lossy(&raw).into_owned();
     let (head, body) = text
         .split_once("\r\n\r\n")
         .ok_or_else(|| Error::protocol("provider response has no header terminator"))?;
-    let status_line = head.lines().next().unwrap_or_default();
+    let status_line = head.lines().next().unwrap_or_default().to_string();
     if !status_line.contains(" 200 ") {
         return Err(Error::network(format!(
             "provider fetch status {status_line:?}"
         )));
     }
-    let chunked = head
+    let headers: Vec<(String, String)> = head
         .lines()
-        .any(|l| l.to_ascii_lowercase().starts_with("transfer-encoding: chunked"));
+        .skip(1)
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    let chunked = headers
+        .iter()
+        .any(|(k, v)| k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked"));
     if !chunked {
-        return Ok(body.to_string());
+        return Ok(HttpReply {
+            headers,
+            body: body.to_string(),
+        });
     }
     // De-chunk.
     let mut out = String::new();
@@ -1238,17 +1461,30 @@ async fn http_get(url: &str) -> Result<String> {
         out.push_str(&tail[..size]);
         rest = tail[size..].strip_prefix("\r\n").unwrap_or(&tail[size..]);
     }
-    Ok(out)
+    Ok(HttpReply {
+        headers,
+        body: out,
+    })
+}
+
+/// A plain `http://` GET (the blocking [`http_get_sync`] core on the
+/// blocking pool, so the async provider paths never stall a worker).
+async fn http_get(url: &str) -> Result<HttpReply> {
+    let url = url.to_string();
+    tokio::task::spawn_blocking(move || http_get_sync(&url))
+        .await
+        .map_err(|e| Error::network(format!("provider fetch task: {e}")))?
 }
 
 /// GET /providers/proxies (mihomo provider.go getProviders(): the whole
 /// `tunnel.Providers()` map under `providers`).
 async fn proxy_providers_payload() -> serde_json::Value {
-    let providers = proxy_providers().read().await;
+    let providers = proxy_providers().read().unwrap();
     let mut map = serde_json::Map::new();
     for state in providers.values() {
         map.insert(state.spec.name.clone(), state.document());
     }
+    drop(providers);
     serde_json::json!({ "providers": map })
 }
 
@@ -1298,28 +1534,151 @@ async fn proxy_provider_subroute(
     if method != "GET" {
         return write_json(stream, 404, r#"{"message":"Not Found"}"#).await;
     }
-    let providers = proxy_providers().read().await;
-    let Some(state) = providers.get(name) else {
-        return write_json(stream, 404, r#"{"message":"Provider not found"}"#).await;
+    // Resolve the document under the lock, then drop it before any
+    // await (a std read guard is not Send).
+    enum Resolved {
+        ProviderMissing,
+        ProxyMissing,
+        Doc(String),
+    }
+    let resolved = {
+        let providers = proxy_providers().read().unwrap();
+        match providers.get(name) {
+            None => Resolved::ProviderMissing,
+            Some(state) => match proxy {
+                // getProvider: the provider document itself.
+                None => Resolved::Doc(state.document().to_string()),
+                // getProxy (proxyProviderProxyRouter): the member's
+                // document — mihomo's findProviderProxyByName 404s
+                // unknown names.
+                Some(proxy) => match state.proxies.iter().find(|p| p.name == proxy) {
+                    Some(cfg) => Resolved::Doc(provider_proxy_document(cfg).to_string()),
+                    None => Resolved::ProxyMissing,
+                },
+            },
+        }
     };
-    match proxy {
-        // getProvider: the provider document itself.
-        None => {
-            let doc = state.document().to_string();
-            drop(providers);
-            write_json(stream, 200, &doc).await
+    match resolved {
+        Resolved::ProviderMissing => {
+            write_json(stream, 404, r#"{"message":"Provider not found"}"#).await
         }
-        // getProxy (proxyProviderProxyRouter): the member's document —
-        // mihomo's findProviderProxyByName 404s unknown names.
-        Some(proxy) => {
-            let Some(cfg) = state.proxies.iter().find(|p| p.name == proxy) else {
-                drop(providers);
-                return write_json(stream, 404, r#"{"message":"Proxy not found"}"#).await;
+        Resolved::ProxyMissing => write_json(stream, 404, r#"{"message":"Proxy not found"}"#).await,
+        Resolved::Doc(doc) => write_json(stream, 200, &doc).await,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Group flags (mihomo GroupCommonOption `hidden` / `disable-udp`): the
+// runtime GroupConfig lives in outbound.rs; the flags ride this
+// process-global table keyed by group name (installed by the mihomo
+// dialect loader, the same split as the provider table).
+// ---------------------------------------------------------------------------
+
+fn group_flags() -> &'static std::sync::RwLock<HashMap<String, crate::config::GroupCommonFlags>> {
+    static FLAGS: OnceLock<std::sync::RwLock<HashMap<String, crate::config::GroupCommonFlags>>> =
+        OnceLock::new();
+    FLAGS.get_or_init(Default::default)
+}
+
+/// Install the whole group-flag table (one config load = one table).
+/// Only the mihomo dialect loader (and tests) installs flags; without
+/// the dialect the fn must not exist (workspace clippy -D warnings
+/// builds a no-dialect lib).
+#[cfg(any(test, feature = "mihomo"))]
+pub(crate) fn register_group_flags(flags: HashMap<String, crate::config::GroupCommonFlags>) {
+    *group_flags().write().unwrap() = flags;
+}
+
+/// The flags of one group (absent = both false, mihomo's defaults).
+/// pub(crate): the config-loader tests assert registrations through it.
+pub(crate) fn group_flags_of(name: &str) -> crate::config::GroupCommonFlags {
+    group_flags()
+        .read()
+        .unwrap()
+        .get(name)
+        .copied()
+        .unwrap_or_default()
+}
+
+/// mihomo's `SupportUDP()` for a group (selector.go:41-46): disable-udp
+/// forces false; otherwise the group is as UDP-capable as its members
+/// (reported true — per-member capability is the leaf document's field).
+///
+/// Upstream REFUSES the UDP relay through a disable-udp group at dial
+/// time; the engine's equivalent gate (`!outbound.udp` after the group
+/// has been flattened to a member in app.rs `relay_udp_inner`) sees
+/// only the leaf, so the relay-time refusal needs the app.rs owner —
+/// this surface carries the API-visible half (the `"udp": false`
+/// document field dashboards act on).
+fn group_supports_udp(name: &str) -> bool {
+    !group_flags_of(name).disable_udp
+}
+
+// ---------------------------------------------------------------------------
+// Provider health checks (mihomo baseProvider.Initial →
+// healthCheck.registerHealthCheckTask, adapter/provider/healthcheck.go):
+// every `health-check.interval` seconds, URL-probe each provider
+// member and record the latency the same way the delay endpoint does —
+// the input url-test groups select on. `lazy: true` (mihomo's preset
+// default) skips untouched members; without a touch hook for provider
+// nodes that means the eager round only runs when `lazy: false`.
+// ---------------------------------------------------------------------------
+
+fn spawn_provider_health_checks(engine: Arc<Engine>) {
+    tokio::spawn(async move {
+        // name -> next due Instant.
+        let mut due: HashMap<String, tokio::time::Instant> = HashMap::new();
+        loop {
+            let jobs: Vec<ProxyProviderSpec> = {
+                let providers = proxy_providers().read().unwrap();
+                providers
+                    .values()
+                    .filter(|p| p.spec.health_check.enable && !p.spec.health_check.lazy)
+                    .map(|p| p.spec.clone())
+                    .collect()
             };
-            let doc = provider_proxy_document(cfg).to_string();
-            drop(providers);
-            write_json(stream, 200, &doc).await
+            let now = tokio::time::Instant::now();
+            for spec in jobs {
+                let interval = std::time::Duration::from_secs(
+                    spec.health_check.interval.max(1),
+                );
+                let next = due.entry(spec.name.clone()).or_insert(now);
+                if now < *next {
+                    continue;
+                }
+                *next = now + interval;
+                provider_health_round(&engine, &spec).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
+    });
+}
+
+/// One provider health round: probe every member through the health
+/// URL and record the latency (None on failure — a failed probe evicts
+/// the member from url-test selection exactly like the group checks).
+async fn provider_health_round(engine: &Arc<Engine>, spec: &ProxyProviderSpec) {
+    let expected = crate::config::ExpectedStatus::parse(&spec.health_check.expected_status)
+        .unwrap_or_default();
+    let members: Vec<OutboundConfig> = {
+        let providers = proxy_providers().read().unwrap();
+        providers
+            .get(&spec.name)
+            .map(|p| p.proxies.clone())
+            .unwrap_or_default()
+    };
+    for cfg in members {
+        let Ok(outbound) = Outbound::from_config(&cfg) else {
+            continue;
+        };
+        let started = std::time::Instant::now();
+        let sample = match crate::outbound::probe_expect(&spec.health_check.url, &outbound, &expected)
+            .await
+        {
+            Ok(()) => Some(started.elapsed().as_millis().min(u32::MAX as u128) as u32),
+            Err(_) => None,
+        };
+        engine.registry().record_latency(&cfg.name, sample).await;
     }
 }
 
@@ -1329,17 +1688,27 @@ async fn proxies_payload(engine: &Arc<Engine>) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     let latencies = registry.latency_snapshot().await;
     for name in registry.leaf_names() {
+        let udp = registry
+            .resolve(&name)
+            .await
+            .map(|o| o.udp)
+            .unwrap_or(true);
         map.insert(
             name.clone(),
             serde_json::json!({
                 "name": name,
                 "type": leaf_type(registry, &name).await,
-                "udp": true,
+                "udp": udp,
                 "history": latency_history(&latencies, &name),
             }),
         );
     }
     for name in registry.group_names() {
+        // mihomo GroupCommonOption `hidden`: the group stays routable
+        // (GET /proxies/{name} still answers) but is not listed.
+        if group_flags_of(&name).hidden {
+            continue;
+        }
         let selected = registry
             .resolve(&name)
             .await
@@ -1353,7 +1722,8 @@ async fn proxies_payload(engine: &Arc<Engine>) -> serde_json::Value {
                 "type": group.map(|g| g.cfg.policy.as_str()).unwrap_or("Selector"),
                 "now": selected,
                 "all": group.map(|g| g.cfg.members.clone()).unwrap_or_default(),
-                "udp": true,
+                // SupportUDP(): disable-udp forces false.
+                "udp": group_supports_udp(&name),
             }),
         );
     }
@@ -2415,11 +2785,9 @@ mod tests {
 
     /// The proxy-provider table is process-global; the provider-surface
     /// tests serialize on this guard (cargo runs #[tokio::test]s on
-    /// parallel threads).
+    /// parallel threads) — see [`crate::api::provider_table_test_lock`].
     fn provider_test_lock() -> &'static tokio::sync::Mutex<()> {
-        static PROVIDER_TESTS: std::sync::OnceLock<tokio::sync::Mutex<()>> =
-            std::sync::OnceLock::new();
-        PROVIDER_TESTS.get_or_init(|| tokio::sync::Mutex::new(()))
+        provider_table_test_lock()
     }
 
     #[tokio::test]
@@ -2445,8 +2813,9 @@ mod tests {
         assert_eq!(ads["ruleCount"], 1, "one RULE-SET rule references it");
 
         // Proxy providers: none installed — the honest empty map (the
-        // dialect loader drops `proxy-providers:` today; see the
-        // proxy_provider_* tests for the installed surface).
+        // api tests build configs without `proxy-providers:`; see the
+        // proxy_provider_* tests for the installed surface and
+        // config_mihomo's tests for the config-load path).
         clear_proxy_providers().await;
         let (status, body) = request(addr, "GET", "/providers/proxies", b"").await;
         assert_eq!(status, 200);
@@ -2481,6 +2850,7 @@ mod tests {
             name: "sub1".into(),
             vehicle: ProviderVehicle::File { path: sub.to_string_lossy().into_owned() },
             interval: 0,
+            health_check: ProviderHealthCheck::default(),
         })
         .await
         .unwrap();
@@ -2596,6 +2966,7 @@ mod tests {
             name: "http-sub".into(),
             vehicle: ProviderVehicle::Http { url: format!("http://127.0.0.1:{}/plain", sub_addr.port()) },
             interval: 300,
+            health_check: ProviderHealthCheck::default(),
         })
         .await
         .unwrap();
@@ -2603,6 +2974,7 @@ mod tests {
             name: "chunked-sub".into(),
             vehicle: ProviderVehicle::Http { url: format!("http://127.0.0.1:{}/chunked", sub_addr.port()) },
             interval: 0,
+            health_check: ProviderHealthCheck::default(),
         })
         .await
         .unwrap();
@@ -2623,6 +2995,7 @@ mod tests {
             name: "tls-sub".into(),
             vehicle: ProviderVehicle::Http { url: "https://example.com/sub".into() },
             interval: 0,
+            health_check: ProviderHealthCheck::default(),
         })
         .await
         .unwrap_err();
@@ -2647,6 +3020,7 @@ mod tests {
             name: "json-sub".into(),
             vehicle: ProviderVehicle::File { path: sub.to_string_lossy().into_owned() },
             interval: 0,
+            health_check: ProviderHealthCheck::default(),
         })
         .await
         .unwrap();
@@ -3030,5 +3404,291 @@ mod tests {
         let text = String::from_utf8_lossy(&buf[..n]).to_string();
         assert!(text.starts_with("HTTP/1.1 200") || text.contains("200 OK"));
         assert!(text.contains(crate::VERSION));
+    }
+
+    // ----  subscription-userinfo, hidden/disable-udp, the
+    // provider health-check interval ----
+
+    /// mihomo adapter/provider/subscription_info.go NewSubscriptionInfo
+    /// semantics: exact fields, case/space tolerance, float truncation,
+    /// garbage skipped.
+    #[test]
+    fn subscription_userinfo_parses_mihomo_forms() {
+        let info = parse_subscription_userinfo(
+            "upload=453211024; download=7423116545; total=107374182400; expire=1735689600",
+        );
+        assert_eq!(
+            info,
+            SubscriptionUserInfo {
+                upload: 453211024,
+                download: 7423116545,
+                total: 107374182400,
+                expire: 1735689600,
+            }
+        );
+        // Case-insensitive, whitespace tolerant, missing fields zero.
+        assert_eq!(
+            parse_subscription_userinfo(" Upload=1 ;DOWNLOAD=2 "),
+            SubscriptionUserInfo {
+                upload: 1,
+                download: 2,
+                ..Default::default()
+            }
+        );
+        // Values may be floats (upstream parseValue falls back to
+        // ParseFloat and truncates).
+        assert_eq!(parse_subscription_userinfo("total=1073741824.9").total, 1073741824);
+        // Unparsable values and `no=` fields are skipped, not fatal.
+        let partial = parse_subscription_userinfo("upload=abc; total=5; noequals; odd=1");
+        assert_eq!(partial.upload, 0);
+        assert_eq!(partial.total, 5);
+        assert_eq!(
+            parse_subscription_userinfo(""),
+            SubscriptionUserInfo::default()
+        );
+        // The document keys are Go's capitalized field names
+        // (providerForApi marshals the untagged struct).
+        let doc = info.document();
+        assert_eq!(doc["Upload"], 453211024);
+        assert_eq!(doc["Total"], 107374182400i64);
+        assert_eq!(doc["Expire"], 1735689600);
+    }
+
+    /// GroupCommonOption `hidden` keeps a group out of the /proxies
+    /// listing (it stays routable); `disable-udp` renders the group's
+    /// SupportUDP as false; leaf documents carry the real capability.
+    #[tokio::test]
+    async fn hidden_group_filtered_and_disable_udp_flagged_in_proxies() {
+        let _guard = provider_test_lock().lock().await;
+        let mut cfg = base_cfg();
+        let group = |name: &str| crate::outbound::GroupConfig {
+            name: name.into(),
+            members: vec!["DIRECT".into()],
+            policy: crate::outbound::GroupPolicy::Select,
+            url: None,
+            interval: 0,
+            tolerance: 0,
+        };
+        cfg.groups = vec![group("Stealth"), group("NoUdp"), group("Plain")];
+        register_group_flags(HashMap::from([
+            (
+                "Stealth".into(),
+                crate::config::GroupCommonFlags {
+                    hidden: true,
+                    disable_udp: false,
+                },
+            ),
+            (
+                "NoUdp".into(),
+                crate::config::GroupCommonFlags {
+                    hidden: false,
+                    disable_udp: true,
+                },
+            ),
+        ]));
+        let addr = start_api(cfg).await;
+
+        let (status, body) = request(addr, "GET", "/proxies", b"").await;
+        assert_eq!(status, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            v["proxies"].get("Stealth").is_none(),
+            "hidden group listed: {body}"
+        );
+        assert_eq!(v["proxies"]["NoUdp"]["udp"], false, "body: {body}");
+        assert_eq!(v["proxies"]["Plain"]["udp"], true, "body: {body}");
+        // Leaf capability is the outbound's own flag, not a hardcoded
+        // true (REJECT is builtin with udp false).
+        assert_eq!(v["proxies"]["REJECT"]["udp"], false, "body: {body}");
+        assert_eq!(v["proxies"]["DIRECT"]["udp"], true, "body: {body}");
+
+        // The hidden group stays addressable by name (routability is
+        // untouched — only the listing filters).
+        let (status, body) = request(addr, "GET", "/proxies/Stealth", b"").await;
+        assert_eq!(status, 200, "body: {body}");
+        assert!(body.contains("\"Stealth\""));
+
+        register_group_flags(HashMap::new());
+    }
+
+    /// The provider health-check interval: a config-loaded provider
+    /// (`lazy: false`, interval 1s) gets its members URL-probed through
+    /// the registry and the latency recorded — the input url-test
+    /// groups select on. The probe rides a local fake HTTP proxy (hermetic:
+    /// loopback only).
+    #[tokio::test]
+    #[cfg(feature = "mihomo")]
+    async fn provider_health_check_interval_records_latency() {
+        let _guard = provider_test_lock().lock().await;
+        reset_proxy_providers();
+        let proxy = http_connect_probe_proxy().await;
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("prov.yaml");
+        std::fs::write(
+            &sub,
+            format!(
+                "proxies:\n  - name: node-a\n    type: http\n    server: 127.0.0.1\n    port: {}\n",
+                proxy.port()
+            ),
+        )
+        .unwrap();
+        let cfg_text = format!(
+            r#"
+mixed-port: 17890
+proxy-providers:
+  prov:
+    type: file
+    path: {}
+    health-check:
+      enable: true
+      lazy: false
+      interval: 1
+      url: http://probe.test/generate_204
+      expected-status: 204
+proxy-groups:
+  - name: Auto
+    type: select
+    use:
+      - prov
+rules:
+  - MATCH,Auto
+"#,
+            sub.to_string_lossy()
+        );
+        let cfg = crate::config_mihomo::load(&cfg_text)
+            .unwrap()
+            .with_builtin_outbounds();
+        // `use:` pulled the provider's prefixed node into the group.
+        let auto = cfg.groups.iter().find(|g| g.name == "Auto").unwrap();
+        assert_eq!(auto.members, vec!["prov:node-a".to_string()]);
+
+        let (addr, engine) = start_api_with_engine(cfg).await;
+
+        // The interval task probes through the member (CONNECT 200,
+        // tunneled GET 204, expected-status 204) and records the
+        // latency for the group to select on.
+        let mut recorded = None;
+        for _ in 0..100 {
+            let snap = engine.registry().latency_snapshot().await;
+            if let Some(sample) = snap.get("prov:node-a") {
+                recorded = Some(*sample);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            matches!(recorded, Some(Some(_))),
+            "no successful latency recorded for prov:node-a within 10s \
+             (last: {recorded:?})"
+        );
+
+        // The provider document carries the health-check surface
+        // (providerForApi marshals healthCheck.url/expectedStatus).
+        let (status, body) = request(addr, "GET", "/providers/proxies/prov", b"").await;
+        assert_eq!(status, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["testUrl"], "http://probe.test/generate_204");
+        assert_eq!(v["expectedStatus"], "204");
+        assert_eq!(v["proxies"][0]["name"], "prov:node-a");
+        reset_proxy_providers();
+    }
+
+    /// A local fake HTTP proxy for the health-check probe: accepts
+    /// CONNECT (answers 200) and answers the tunneled GET with 204 —
+    /// exactly what probe_expect needs to count the member healthy.
+    /// Only the mihomo-gated provider tests spin it up.
+    #[cfg(feature = "mihomo")]
+    async fn http_connect_probe_proxy() -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    continue;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    // Phase 1: the CONNECT head.
+                    let Ok(n) = sock.read(&mut buf).await else { return };
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if !head.starts_with("CONNECT ") {
+                        let _ = sock.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+                        return;
+                    }
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                        .await;
+                    // Phase 2: the tunneled GET (probe_expect's request).
+                    let Ok(n) = sock.read(&mut buf).await else { return };
+                    let got = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if got.starts_with("GET /generate_204") {
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                            .await;
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// The `subscription-userinfo` response header lands on the provider
+    /// document (`subscriptionInfo`, Go's capitalized keys) and survives
+    /// a PUT re-fetch.
+    #[tokio::test]
+    #[cfg(feature = "mihomo")]
+    async fn provider_subscription_userinfo_documented() {
+        let _guard = provider_test_lock().lock().await;
+        clear_proxy_providers().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sub_addr = listener.local_addr().unwrap();
+        let body = "proxies:\n  - name: sg-a\n    type: socks5\n    server: 10.0.0.3\n    port: 1080\n";
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nsubscription-userinfo: upload=453211024; download=7423116545; total=107374182400; expire=1735689600\r\nConnection: close\r\n\r\n{body}"
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        install_proxy_provider(ProxyProviderSpec {
+            name: "quota-sub".into(),
+            vehicle: ProviderVehicle::Http {
+                url: format!("http://127.0.0.1:{}/plain", sub_addr.port()),
+            },
+            interval: 0,
+            health_check: ProviderHealthCheck {
+                enable: true,
+                url: "http://www.gstatic.com/generate_204".into(),
+                interval: 300,
+                lazy: true,
+                expected_status: "200/204".into(),
+            },
+        })
+        .await
+        .unwrap();
+
+        let mut cfg = base_cfg();
+        cfg.rules = vec!["MATCH,DIRECT".into()];
+        let addr = start_api(cfg).await;
+        let (status, body) = request(addr, "GET", "/providers/proxies/quota-sub", b"").await;
+        assert_eq!(status, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["subscriptionInfo"]["Upload"], 453211024);
+        assert_eq!(v["subscriptionInfo"]["Download"], 7423116545i64);
+        assert_eq!(v["subscriptionInfo"]["Total"], 107374182400i64);
+        assert_eq!(v["subscriptionInfo"]["Expire"], 1735689600);
+        assert_eq!(v["testUrl"], "http://www.gstatic.com/generate_204");
+        assert_eq!(v["expectedStatus"], "200/204");
+
+        // PUT re-fetch keeps the quota facts fresh off the header.
+        let (status, _) = request(addr, "PUT", "/providers/proxies/quota-sub", b"").await;
+        assert_eq!(status, 204);
+        let (_, body) = request(addr, "GET", "/providers/proxies/quota-sub", b"").await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["subscriptionInfo"]["Total"], 107374182400i64);
+        clear_proxy_providers().await;
     }
 }
