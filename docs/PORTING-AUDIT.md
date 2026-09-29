@@ -295,7 +295,7 @@ wave-10..13 caches). Each item got exactly one class:
 
 | Item | Class | Evidence | Disposition |
 |---|---|---|---|
-| secure mode (`[secure_mode]`) | (a)-class but UNBOUNDED — loud-fail is the disposition | Noise_XX PeerConnNoiseMsg1/2/3 (peer_conn.rs:799-1170) is welded to the session AEAD that replaces the network-secret encryption for EVERY later packet: `PeerSessionStore` + `SecureDatagramSession` (peer_session.rs 422 lines + secure_datagram.rs 1020 lines: epoch keys, replay windows, rotation + root-key sync) + HMAC identity classification (peer_conn.rs:700-791). A handshake-only port completes msg1-3 and then fails every Data packet | `SECURE_MODE_NOT_PORTED` fails loudly at config validation + connect with the precise scope and the plain-mesh alternative; the standing exception until someone ports the whole session layer |
+| secure mode (`[secure_mode]`) | ✅ LANDED (M6, v2.6.4 sources) — wave-16's assessment below is superseded | the whole session layer the wave-16 read-only assessment called unbounded was ported: `Noise_XX_25519_ChaChaPoly_SHA256` PeerConnNoiseMsg1/2/3 handshake (prologue `easytier-peerconn-noise`, conn-id echoes, role_hint rule, HMAC network-secret proofs), `SecureDatagramSession` (epoch-keyed traffic keys, 256-bit replay windows, two live epochs, 1M-packet/10-min rotation, root-key sync with 5s grace), `PeerSessionStore` (Join/Sync/Create generation election, pinned remote statics), the `verify_remote_auth` subset | both directions live-tested against the real binary (`real_easytier_binary_secure_mode_serving` / `_dials_our_listener`, part of the 12/12 interop set); `SECURE_MODE_PORTED_NOTE` names the not-ported residue (trusted-key store + OSPF key propagation, foreign-network identity roles) |
 | relay path + foreign networks (`RouteForeignNetworkInfos`) | (a)-class, large — reachable in principle (2-hop meshes) | route_trait.rs:45/138 + peer_ospf_route.rs:49-53 (2.6.4 tree): foreign-network state rides the same SyncRouteInfo gossip + the relay RPC over intermediate peers | assessed, not ported this wave; the in-tree `NOT_PORTED` names it precisely (the live record is agent B's file) |
 | multi-hop OSPF convergence (SPF beyond direct neighbors) | (a)-class, large | upstream graph_algo SPF over the announced adjacencies; the port's route table is direct-neighbor only | same — named in the in-tree `NOT_PORTED` |
 | IPv6 overlay addressing | (b) NO-DRIVER (formalized) | the adapter surface driving this module is IPv4-only end to end: mihomo's `EasyTierOption` carries no ipv6 field (cached mihomo_component_easytier_toml.go — only `ProxyNetworks` etc. at line 29) and ListRoute/ParseNodeIPv4 resolve v4 only; the wg/udp/tcp transports themselves are already dual-stack | code that no configuration can reach; documented in the in-tree `NOT_PORTED` with the field-level evidence |
@@ -309,8 +309,9 @@ wave-10..13 caches). Each item got exactly one class:
 every upstream option object the two dialects define is either carried
 into behavior or rejected at load with an error naming the missing
 piece and the alternative — never silently ignored (the standing rule
-since wave 1; the remaining loud-failing surfaces are easytier's
-`[secure_mode]` and tailscale's browser-login, both precise about scope).
+since wave 1; the remaining loud-failing surface is tailscale's
+browser-login, precise about scope — easytier's `[secure_mode]` loud
+fail was retired when M6 landed).
 
 **Every wire protocol a ShellCrash user can reach is implemented and
 hermetically proven.** The engine speaks, as client or server as
@@ -321,15 +322,18 @@ wg-data-plane + the typed packet filter), zerotier (identity, armor,
 HELLO, netconf, planet/moon worlds, WHOIS/relay, fragmentation,
 **direct-path learning with NAT-t**, **state persistence**),
 easytier (TCP/UDP/QUIC/WS/WG transports, listener + dial, plain-mode
-encryption — 10/10 real-binary interops), openvpn (2.x client),
+encryption **+ secure mode (Noise_XX handshake, session AEAD, session
+store)** — 12/12 real-binary interops incl. both secure-mode
+directions), openvpn (2.x client),
 hysteria2, tuic v5, anytls, snell v1-v5, mieru, restls, jls,
 shadowquic, shadowtls, sudoku, gost-relay, tlsmirror, trusttunnel,
 masque, ssh, ech + the TLS/Reality/QUIC underpinnings. Live-network
 caveats, honestly held: zerotier/easytier/tailscale meshes are
 proven against in-test upstream-faithful mimics (full wire
 conversations, keys generated in-test), not dialed against the public
-internet roots from CI; easytier additionally holds 10 real-binary
-interop proofs and reality/vless hold live-Xray proofs.
+internet roots from CI; easytier additionally holds 12 real-binary
+interop proofs (10 transport + 2 secure-mode) and reality/vless hold
+live-Xray proofs.
 
 **The enumerated out-of-scope classes, one line each:** interactive
 browser/SSO flows (headless daemon — tailscale login, zerotier SSO);
@@ -337,8 +341,10 @@ host-side policy enforcement with no engine-adjacent traffic to
 filter (zerotier rules/tap-L2/cluster/bonds/trusted-paths, tailscale
 filter *enforcement*); code no configuration can reach
 (easytier IPv6 overlay); features upstream itself removed
-(zerotier TCP fallback); and the one unbounded loud-failing exception
-(easytier secure mode — a session-layer ecosystem, not a verb).
+(zerotier TCP fallback); and the still-open easytier gaps named in
+`NOT_PORTED` (relay path + foreign networks, multi-hop OSPF SPF,
+hole-punch connectors — reachable mesh roles, sized and documented,
+not loud-fail exceptions).
 
 With that, the porting ledger is closed: every line item in every
 `NOT_PORTED` map now ends in one of {implemented + tested,
