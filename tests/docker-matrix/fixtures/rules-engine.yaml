@@ -20,9 +20,26 @@
 #   IP-ASN           127.0.128.5:41800       (asn-only mmdb range)
 #   DST-PORT         127.0.0.2:41801
 #   SRC-PORT         127.0.0.3:41802 from source port 45123
+#   SRC-IP-CIDR      source-bound 127.0.0.2 -> 127.0.0.5:41804/slow.txt
+#                    (curl --interface; the /32 is scoped so the
+#                    127.0.0.1-sourced probes of every other row cannot
+#                    match it, and the rule sits before PROCESS-PATH so
+#                    curl itself cannot catch it)
 #   IN-PORT          via the classic http listener :42796 (`port:`)
 #   IN-NAME,socks    via the classic socks listener :42795 (`socks-port:`)
 #   PROCESS-PATH     curl -> 127.0.0.5:41804/slow.txt
+#   AND              x.and.test:41800 (domain AND port legs; the NOT row's
+#                    fallthrough probe doubles as the missing-leg witness)
+#   OR               a.orleft.test / b.orright.test (either domain leg)
+#   NOT              notfall.test:41800 — the complement is PORT-scoped
+#                    (NOT port 41802/41804) so the UID (:41804) and
+#                    IN-TYPE (:41802) probes fall THROUGH it; those rows
+#                    double as NOT's negative control
+#   SUB-RULE         a.sub.test:41800 -> subbundle MATCH (r-subrule);
+#                    first.sub.test:41800 -> subbundle first rule wins
+#                    over the MATCH fallback (r-submatch); the gate's
+#                    domain leg is witnessed by every 41800 probe that
+#                    is NOT *.sub.test (they land r-not, not r-subrule)
 #   UID,0            python3 (root) -> 127.0.0.5:41804/slow.txt
 #   IN-TYPE,mixed    nobody python3 via mixed :42790 -> 127.0.0.3:41802
 #   CLASH-MODE,rule  /rules presence (mode-aware; see battery)
@@ -51,6 +68,12 @@ proxies:
   - {name: r-asn, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
   - {name: r-dstport, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
   - {name: r-srcport, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-srcip, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-and, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-or, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-not, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-subrule, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: r-submatch, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
   - {name: r-inport, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
   - {name: r-inname, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
   - {name: r-procpath, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
@@ -67,6 +90,17 @@ rule-providers:
     behavior: domain
     format: text
     path: /tmp/matrix/ruleset-provider.txt
+
+# SUB-RULE named bundle (mihomo `sub-rules:`): referenced from the
+# ladder below. The loader expands the reference into gated AND rules
+# (config_mihomo.rs expand_sub_rules): first the exact-domain rule,
+# then the bundle's MATCH fallback — both carry the reference's
+# condition. The bundle's own domains must sit under the gate's
+# sub.test suffix or the gate excludes them.
+sub-rules:
+  subbundle:
+    - DOMAIN,first.sub.test,r-submatch
+    - MATCH,r-subrule
 
 dns:
   enable: true
@@ -104,9 +138,21 @@ rules:
   - IP-ASN,65000,r-asn,no-resolve
   - DST-PORT,41801,r-dstport
   - SRC-PORT,45123,r-srcport
+  # action rows. SRC-IP-CIDR sits with the other src rules —
+  # the 127.0.0.2/32 scope is what keeps it invisible to every
+  # 127.0.0.1-sourced probe. The composites sit AFTER PROCESS-PATH and
+  # BEFORE UID,0 so their probes (root python3 via mixed) reach them;
+  # the NOT complement is port-scoped (41802 = the IN-TYPE probe's
+  # port, 41804 = the UID probe's) so exactly those two fall through —
+  # see the header map.
+  - SRC-IP-CIDR,127.0.0.2/32,r-srcip
   - IN-PORT,42796,r-inport
   - IN-NAME,socks,r-inname
   - PROCESS-PATH,/usr/bin/curl,r-procpath
+  - SUB-RULE,(AND,((DOMAIN-SUFFIX,sub.test),(DST-PORT,41800))),subbundle
+  - AND,((DOMAIN-SUFFIX,and.test),(DST-PORT,41800)),r-and
+  - OR,((DOMAIN-SUFFIX,orleft.test),(DOMAIN-SUFFIX,orright.test)),r-or
+  - NOT,((OR,((DST-PORT,41802),(DST-PORT,41804)))),r-not
   - UID,0,r-uid
   - IN-TYPE,mixed,r-intype
   - IN-USER,probe-user,r-inuser
