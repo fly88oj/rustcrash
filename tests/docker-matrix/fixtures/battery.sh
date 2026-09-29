@@ -272,6 +272,37 @@ wg6_up=0
 start_engine rust-sing-box /tmp/matrix/wg6-server.json "wg6-server-$PLATFORM"
 wait_port 42163 "$((WAIT/2))" && wg6_up=1
 
+# The subscription-userinfo oracle: run.sh's plain http.server on
+# :41880 cannot attach response headers, so the battery runs its own
+# instance on :41881 serving the SAME bodies plus
+#   subscription-userinfo: upload=111111; download=222222; total=333333; expire=0
+# (idempotent across the three per-platform batteries — the nohup'd
+# instance survives between them, so only the first battery starts it).
+if ! port_open 41881; then
+cat > /tmp/matrix/subinfo-server.py <<'PYEOF'
+import http.server, socketserver
+
+SUBINFO = "upload=111111; download=222222; total=333333; expire=0"
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, directory="/matrix-fixtures/subs", **kw)
+
+    def end_headers(self):
+        self.send_header("subscription-userinfo", SUBINFO)
+        super().end_headers()
+
+    def log_message(self, *a):
+        pass
+
+socketserver.ThreadingTCPServer.allow_reuse_address = True
+with socketserver.ThreadingTCPServer(("127.0.0.1", 41881), Handler) as srv:
+    srv.serve_forever()
+PYEOF
+nohup python3 /tmp/matrix/subinfo-server.py >"$LOGDIR/subinfo-server.log" 2>&1 </dev/null &
+sleep 1
+fi
+
 engine_up=0
 start_engine rust-mihomo "$FX/relay-engine.yaml" "matrix-$PLATFORM"
 if wait_port "$MIX" && wait_api "$API"; then
@@ -360,21 +391,27 @@ if [ "$engine_up" = 1 ]; then
     fi
 fi
 
-# grpc (gun) transport: KNOWN engine gap — the engine's grpc client
-# completes TLS (ALPN h2) but then waits for the gun server's response
-# HEADERS while mihomo's gun handler waits for the client's first DATA
-# frame: deadlock. mihomo's OWN client relays these same listeners fine
-# (verified engine<->mihomo and mihomo<->mihomo on the same ports), so
-# the gap is on the engine dial side. Parse surface = the config rows.
+# grpc (gun) transport: the connect-side deadlock is FIXED (the dial no
+# longer blocks on the gun server's response HEADERS — the real gun
+# server sends them only after the client's first DATA frame; the
+# :status check moved to the first read). The rows now relay end to end
+# against mihomo's gun listeners (vmess :42420 matsvc, trojan :42422
+# tjsvc). Should a relay still fail, the SKIP carries the live symptom
+# (the observed body + the engine log's last grpc/gun line) instead of
+# pinning the now-fixed deadlock text.
 grpc_row() { # <row> <node> <tcp-port>
     if [ "$engine_up" != 1 ]; then skip "$1" "engine down"; return; fi
     if ! port_open "$3"; then skip "$1" "mihomo listener :$3 not bound (see mihomo-server.log)"; return; fi
-    local out
+    local out symptom
     out=$(relay_via "$2")
     if [ "$out" = "$BODY" ]; then
-        ok "$1" "relay works"
+        ok "$1" "relay works (lazy response HEADERS)"
     else
-        skip "$1" "engine grpc client gap: dial hangs after TLS/ALPN h2 (engine waits for gun response HEADERS, mihomo's gun server for the first DATA frame); mihomo's own client relays the same listener; parse covered by the config-variant row"
+        # strip the ANSI/timestamp prefix so the symptom survives the
+        # detail truncation (the raw line is mostly escape codes)
+        symptom=$(grep -aiE 'grpc|gun' "$LOGDIR/matrix-$PLATFORM.log" 2>/dev/null | tail -1 \
+                  | sed 's/\x1b\[[0-9;]*m//g' | grep -oE 'grpc: .*|gun: .*' | cut -c1-90)
+        skip "$1" "grpc relay still failing after the connect-side fix (response HEADERS are lazy): ${symptom:-no grpc/gun line in the engine log} (body '$(echo "$out" | cut -c1-30)')"
     fi
 }
 grpc_row "outbound: vmess (grpc transport)" o-vmess-grpc 42420
@@ -420,6 +457,64 @@ udp_row() { # <row> <node>
 }
 udp_row "outbound: ss UDP relay (udp echo)" o-ss
 udp_row "outbound: trojan UDP relay (udp echo)" o-trojan
+
+# --- proxy-providers (wave-19) -----------------------------------------------
+# matsub/minfo are declared in relay-engine.yaml: matsub fetches from
+# run.sh's plain subscription server (:41880), minfo from the battery's
+# header-serving instance (:41881). Both rows degrade to a precise SKIP
+# at whichever stage is missing (config-load wiring > fetch/parse >
+# registry join > group `use:` routing) and only PASS on a real relay
+# through a fetched node — a DIRECT-only SubPick can never fake it
+# because the row checks the group's `now` first.
+echo "## providers"
+if [ "$engine_up" = 1 ]; then
+    prov=$(curl -s --max-time 5 "http://127.0.0.1:$API/providers/proxies")
+    if ! echo "$prov" | grep -q '"matsub"'; then
+        skip "provider: url vehicle fetch" \
+            "not wired: the mihomo dialect drops the proxy-providers section at config load (GET /providers/proxies lists no matsub; engine/src/api.rs provider notes) — members cannot load"
+    elif ! echo "$prov" | grep -q '"sub-socks"'; then
+        skip "provider: url vehicle fetch" \
+            "provider matsub listed without members — fetch/parse of http://127.0.0.1:41880/provider-clash.yaml pending"
+    elif ! curl -s --max-time 5 "http://127.0.0.1:$API/proxies" | grep -q '"sub-socks"'; then
+        skip "provider: url vehicle fetch" \
+            "provider members listed but not joined into GET /proxies (outbound registry wiring pending)"
+    else
+        select_node SubPick
+        subnow=$(curl -s --max-time 5 "http://127.0.0.1:$API/proxies/SubPick" | tr -d '\n' | grep -o '"now":"[^"]*"' | head -1)
+        out=$(curl -s --max-time "$CT" -x "http://127.0.0.1:$MIX" "$WEB")
+        if echo "$subnow" | grep -q '"sub-'; then
+            if [ "$out" = "$BODY" ]; then
+                ok "provider: url vehicle fetch" "members fetched from :41880 and relayed through SubPick ($subnow)"
+            else
+                bad "provider: url vehicle fetch" "provider member selected ($subnow) but relay got '$(echo "$out" | cut -c1-40)'"
+            fi
+        elif echo "$subnow" | grep -q DIRECT; then
+            skip "provider: url vehicle fetch" \
+                "group use: not wired — SubPick still selects DIRECT (provider members listed in /proxies but not group-joined)"
+        else
+            bad "provider: url vehicle fetch" "SubPick selection unreadable ($subnow), relay got '$(echo "$out" | cut -c1-40)'"
+        fi
+    fi
+
+    # subscription-userinfo: the :41881 body is identical but its
+    # response carries the subscription-userinfo header; the provider
+    # detail (and list) must surface the upload/download/total numbers.
+    if ! port_open 41881; then
+        skip "provider: subscription-userinfo" "subinfo server :41881 down (see $LOGDIR/subinfo-server.log)"
+    elif ! echo "$prov" | grep -q '"minfo"'; then
+        skip "provider: subscription-userinfo" \
+            "not wired: the mihomo dialect drops the proxy-providers section at config load (provider minfo never installs; header parsing listed out-of-scope in engine/src/api.rs provider notes)"
+    else
+        pdetail=$(curl -s --max-time 5 "http://127.0.0.1:$API/providers/proxies/minfo")
+        if echo "$prov$pdetail" | grep -q 111111 && echo "$prov$pdetail" | grep -q 222222 \
+           && echo "$prov$pdetail" | grep -q 333333; then
+            ok "provider: subscription-userinfo" "upload=111111 download=222222 total=333333 surfaced via GET /providers/proxies/minfo"
+        else
+            skip "provider: subscription-userinfo" \
+                "provider minfo listed but the subscription-userinfo header is not surfaced (no upload/download/total numbers in /providers/proxies/minfo)"
+        fi
+    fi
+fi
 
 echo "## groups"
 if [ "$engine_up" = 1 ]; then
@@ -509,25 +604,51 @@ sys.exit(0 if d and all(isinstance(v, (int, float)) for v in d.values()) else 1)
         bad "group: expected-status" "body='${out:0:30}' now=$now"
     fi
 
-    # disable-udp: honest probe. The engine's group schema has no such
-    # field (serde drops the key), so we EXPECT the datagram to still
-    # round-trip; SKIP carries the precise symptom.
+    # disable-udp: when the field lands, a UDP datagram through the
+    # group must be REFUSED while TCP through the same group still
+    # relays (the guard keeps a broken group from faking a PASS).
+    # Until then the key is dropped (serde) and the datagram still
+    # round-trips — the honest SKIP with the precise symptom.
     curl -s --max-time 5 -X PUT -d '{"name": "NoUdp"}' "http://127.0.0.1:$API/proxies/Pick" >/dev/null
+    noudp_tcp=$(curl -s --max-time "$CT" -x "http://127.0.0.1:$MIX" "$WEB")
     if python3 "$IX/udp-echo-probe.py" 127.0.0.1 "$MIX" 127.0.0.1 41890 grp-noudp >/dev/null 2>&1; then
         skip "group: disable-udp (UDP refused)" \
             "not implemented: 'disable-udp: true' accepted but ignored (no such field in the engine group schema — serde drops unknown keys); UDP still relayed through the group"
+    elif [ "$noudp_tcp" = "$BODY" ]; then
+        ok "group: disable-udp (UDP refused)" "UDP through the group refused, TCP still relays"
     else
-        ok "group: disable-udp (UDP refused)" "UDP through the group refused"
+        bad "group: disable-udp (UDP refused)" "UDP refused but TCP broken too ('$(echo "$noudp_tcp" | cut -c1-30)') — group misrouted, not disable-udp"
     fi
 
-    # hidden: honest probe — no hidden field in the engine's schema.
+    # hidden: when the field lands, GET /proxies must omit the GROUP's
+    # own entry. Member lists legitimately still NAME it (Pick's "all"
+    # array carries "HiddenUT"), so the check is key-aware: parse the
+    # JSON and look for HiddenUT as a KEY of the proxies map (raw
+    # '"HiddenUT":' grep as the fallback — array members are never
+    # followed by a colon).
     out=$(curl -s --max-time 5 "http://127.0.0.1:$API/proxies")
-    if echo "$out" | grep -q '"HiddenUT"'; then
-        skip "group: hidden (absent from /proxies)" \
-            "not implemented: 'hidden: true' accepted but ignored (no such field in the engine group schema) — group still listed in GET /proxies"
-    else
-        ok "group: hidden (absent from /proxies)" "group not listed"
-    fi
+    hidden_rc=$(echo "$out" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(2)
+px = d.get("proxies", d) if isinstance(d, dict) else None
+sys.exit(0 if isinstance(px, dict) and "HiddenUT" in px else 1)' 2>/dev/null; echo "rc=$?")
+    case "$hidden_rc" in
+        rc=1)
+            ok "group: hidden (absent from /proxies)" "group omitted from the top-level proxies map";;
+        rc=2)
+            if echo "$out" | grep -q '"HiddenUT"[[:space:]]*:'; then
+                skip "group: hidden (absent from /proxies)" \
+                    "not implemented: 'hidden: true' accepted but ignored — group still a key in GET /proxies (raw-grep fallback)"
+            else
+                ok "group: hidden (absent from /proxies)" "group not listed (raw-grep fallback)"
+            fi;;
+        *)
+            skip "group: hidden (absent from /proxies)" \
+                "not implemented: 'hidden: true' accepted but ignored (no such field in the engine group schema — serde drops unknown keys); group still listed in GET /proxies";;
+    esac
 
     curl -s --max-time 5 -X PUT -d '{"name": "o-ss"}' "http://127.0.0.1:$API/proxies/Pick" >/dev/null
 fi

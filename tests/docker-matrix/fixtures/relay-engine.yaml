@@ -61,11 +61,9 @@ proxies:
 
   # --- outbound transport/auth variants (wave-18) ---
   # vmess over gRPC (gun) — TLS is mandatory for grpc (engine rule).
-  # RELAY GAP (engine): the engine's grpc client never completes the
-  # gRPC handshake against mihomo's gun listener (TLS+ALPN h2 succeeds,
-  # then the engine waits for response HEADERS while the gun server
-  # waits for the first DATA frame — deadlock; mihomo's OWN client
-  # relays this same listener fine). Parse surface only in the matrix.
+  # The engine's grpc client no longer blocks the dial on the gun
+  # server's response HEADERS (they arrive only after the first DATA
+  # frame); the rows relay end to end against mihomo's gun listeners.
   - {name: o-vmess-grpc, type: vmess, server: 127.0.0.1, port: 42420, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, alterId: 0, cipher: auto,
      network: grpc, grpc-opts: {grpc-service-name: matsvc}, tls: true, servername: tls.test, skip-cert-verify: true}
   # vmess over httpupgrade (shares ws-opts for path/headers).
@@ -74,7 +72,7 @@ proxies:
   # vless over websocket+TLS.
   - {name: o-vless-ws, type: vless, server: 127.0.0.1, port: 42427, uuid: b831381d-6324-4d53-ad4f-8cda48b30811,
      tls: true, servername: tls.test, skip-cert-verify: true, network: ws, ws-opts: {path: /ws}}
-  # trojan over gRPC (gun) — same engine grpc gap as o-vmess-grpc.
+  # trojan over gRPC (gun) — same lazy-response-HEADERS grpc client.
   - {name: o-trojan-grpc, type: trojan, server: 127.0.0.1, port: 42422, password: matrix-trojan-pw-123456,
      sni: tls.test, skip-cert-verify: true, network: grpc, grpc-opts: {grpc-service-name: tjsvc}}
   # shadowsocks, chacha20-ietf-poly1305 AEAD cipher.
@@ -104,7 +102,7 @@ proxy-groups:
     type: select
     proxies: [o-ss, o-ss2022, o-vmess, o-vmess-ws, o-vless, o-vless-reality, o-trojan, o-trojan-ws, o-socks5, o-http, o-hy2, o-tuic, o-wireguard, o-snell4, o-snell5, o-anytls, o-jls,
               o-vmess-grpc, o-vmess-hu, o-vless-ws, o-trojan-grpc, o-ss-chacha, o-hy2-obfs, o-socks5-auth, o-http-auth, o-wireguard6,
-              AutoUT, AutoFB, AutoLB, TolUT, StatusUT, LazyUT, NoUdp, HiddenUT,
+              AutoUT, AutoFB, AutoLB, TolUT, StatusUT, LazyUT, NoUdp, HiddenUT, SubPick,
               o-ss-wrongpw, o-socks5-wrongpw, o-http-wrongpw, o-dead, DIRECT]
   - name: AutoUT
     type: url-test
@@ -156,19 +154,50 @@ proxy-groups:
     interval: 60
     lazy: true
     expected-status: "200"
-  # disable-udp: NOT implemented in the engine (RawGroup has no such
-  # field; serde ignores the key) — the row probes UDP and reports the
-  # honest SKIP when the datagram still relays.
+  # disable-udp: honest probe — until the field lands the group schema
+  # has no such key (serde drops it) and the datagram still round-trips;
+  # the row then reports the precise SKIP.
   - name: NoUdp
     type: select
     proxies: [o-ss]
     disable-udp: true
-  # hidden: NOT implemented in the engine — the row checks /proxies and
-  # reports the honest SKIP while the group stays listed.
+  # hidden: honest probe — until the field lands GET /proxies keeps
+  # listing the group; the row then reports the precise SKIP.
   - name: HiddenUT
     type: select
     proxies: [o-ss]
     hidden: true
+  # provider member routing (wave-19): `use:` pulls matsub's fetched
+  # nodes into the group. Until that wiring lands the key is dropped
+  # (serde) and the group stays DIRECT-only — the provider row checks
+  # the group's `now` BEFORE trusting a relay, so a DIRECT fallback can
+  # never fake a PASS.
+  - name: SubPick
+    type: select
+    proxies: [DIRECT]
+    use: [matsub]
+
+# The wave-19 provider rows. Until the config-load wiring lands the
+# mihomo dialect loader drops this section entirely (engine/src/api.rs
+# provider notes) — the rows then SKIP with that precise symptom and
+# auto-upgrade to PASS once the fetch + registry/group wiring lands.
+#   matsub -> run.sh's plain subscription http.server (:41880)
+#   minfo  -> the battery's header-serving instance (:41881, adds the
+#             subscription-userinfo header for the userinfo row)
+# `path` is absolute and under /tmp/matrix (writable): a relative path
+# would resolve against the read-only /matrix-fixtures mount once the
+# loader starts persisting fetched bodies.
+proxy-providers:
+  matsub:
+    type: http
+    url: http://127.0.0.1:41880/provider-clash.yaml
+    path: /tmp/matrix/matsub-provider.yaml
+    interval: 300
+  minfo:
+    type: http
+    url: http://127.0.0.1:41881/provider-clash.yaml
+    path: /tmp/matrix/minfo-provider.yaml
+    interval: 300
 
 rule-providers:
   pset:

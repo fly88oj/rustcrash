@@ -7,6 +7,14 @@
 //! the receive side) and the length-prefixed gRPC message envelope, and
 //! exposes the tunnel as a plain [`AsyncRead`] + [`AsyncWrite`] byte
 //! stream, mirroring the WebSocket transport in `transport.rs`.
+//!
+//! Every gRPC message wraps its payload in a protobuf `Hunk { bytes data =
+//! 1; }`: the wire form of each message is
+//! `flag(0x00) | len_be32 | 0x0A | uvarint(payload_len) | payload`.
+//! The gun implementations on both ends (xray's v2raygrpc, mihomo's
+//! net/http gun, sing-box) read exactly this shape — a bare payload
+//! without the `0x0A` field tag makes the server misparse the length
+//! prefix and silently stall the stream.
 
 use std::io;
 use std::pin::Pin;
@@ -582,9 +590,14 @@ impl AsyncWrite for GrpcStream {
             let space = MAX_SEND_BACKLOG.saturating_sub(this.sendq.len());
             if accepted < buf.len() && space > 0 {
                 let take = (buf.len() - accepted).min(WRITE_CHUNK).min(space);
-                this.sendq.reserve(take + 5);
+                // One gRPC message per chunk, gun envelope:
+                // `flag(0) | be32(1 + uvarint_len + n) | 0x0A | uvarint(n) | data`.
+                this.sendq.reserve(take + 11);
                 this.sendq.put_u8(0); // uncompressed-flag
-                this.sendq.put_u32(take as u32); // big-endian length
+                this.sendq
+                    .put_u32((take + 1 + uvarint_len(take)) as u32); // big-endian length
+                this.sendq.put_u8(HUNK_TAG); // protobuf field 1, wire type 2
+                put_uvarint(&mut this.sendq, take);
                 this.sendq.put_slice(&buf[accepted..accepted + take]);
                 accepted += take;
                 continue;
@@ -694,12 +707,39 @@ impl AsyncRead for GrpcStream {
     }
 }
 
-/// Reassembles length-prefixed gRPC messages back into a byte stream
-/// (`flag(1) | len-be32(4) | data`), tolerating messages split across DATA
-/// frame boundaries and several messages per frame.
+/// Reassembles length-prefixed gRPC messages back into a byte stream,
+/// stripping the protobuf `Hunk` wrapper each message carries:
+/// `flag(1) | len-be32(4) | 0x0A | uvarint(n) | n bytes`. Tolerates messages
+/// split across DATA frame boundaries and several messages per frame.
 #[derive(Default)]
 struct GrpcDeframer {
     carry: BytesMut,
+}
+
+/// Protobuf field 1 (the gun `Hunk.data` bytes field), wire type 2.
+const HUNK_TAG: u8 = 0x0A;
+
+/// Number of bytes [`put_uvarint`] writes for `v`.
+fn uvarint_len(mut v: usize) -> usize {
+    let mut n = 1;
+    while v >= 128 {
+        v >>= 7;
+        n += 1;
+    }
+    n
+}
+
+/// LEB128 unsigned varint, as gun servers expect inside each message.
+fn put_uvarint<B: BufMut>(out: &mut B, mut v: usize) {
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.put_u8(b);
+            return;
+        }
+        out.put_u8(b | 0x80);
+    }
 }
 
 impl GrpcDeframer {
@@ -723,10 +763,57 @@ impl GrpcDeframer {
             if self.carry.len() < 5 + len {
                 return Ok(());
             }
-            out.extend_from_slice(&self.carry[5..5 + len]);
+            let msg = &self.carry[5..5 + len];
+            let payload = strip_hunk(msg)?;
+            out.extend_from_slice(payload);
             self.carry.advance(5 + len);
         }
     }
+}
+
+/// Parse the `0x0A | uvarint(n) | n bytes` hunk inside one complete gRPC
+/// message body and return the raw tunnel payload. An empty body carries no
+/// payload (the half-close marker the server sends is exactly that).
+fn strip_hunk(msg: &[u8]) -> Result<&[u8]> {
+    if msg.is_empty() {
+        return Ok(&[]);
+    }
+    if msg[0] != HUNK_TAG {
+        return Err(Error::protocol(format!(
+            "grpc: gun message missing hunk tag (got {:#04x})",
+            msg[0]
+        )));
+    }
+    let mut len = 0usize;
+    let mut shift = 0u32;
+    let mut i = 1usize;
+    loop {
+        let Some(&b) = msg.get(i) else {
+            return Err(Error::protocol("grpc: truncated gun hunk length"));
+        };
+        i += 1;
+        if shift >= usize::BITS {
+            return Err(Error::protocol("grpc: gun hunk length overflow"));
+        }
+        len |= ((b & 0x7f) as usize) << shift;
+        shift += 7;
+        if b & 0x80 == 0 {
+            break;
+        }
+    }
+    if len > MAX_MESSAGE {
+        return Err(Error::protocol(format!(
+            "grpc: gun payload of {len} bytes exceeds limit"
+        )));
+    }
+    if i + len > msg.len() {
+        return Err(Error::protocol("grpc: gun payload exceeds message"));
+    }
+    if i + len != msg.len() {
+        // Trailing bytes would desync the reader on the next message.
+        return Err(Error::protocol("grpc: gun payload shorter than message"));
+    }
+    Ok(&msg[i..i + len])
 }
 
 /// HPACK (RFC 7541): a sender that only emits literal-without-indexing
@@ -1417,7 +1504,9 @@ mod tests {
         let mut wire = Vec::new();
         for m in &msgs {
             wire.push(0u8);
-            wire.extend_from_slice(&(m.len() as u32).to_be_bytes());
+            wire.extend_from_slice(&((1 + uvarint_len(m.len()) + m.len()) as u32).to_be_bytes());
+            wire.push(HUNK_TAG);
+            put_uvarint(&mut wire, m.len());
             wire.extend_from_slice(m);
         }
         let want: Vec<u8> = msgs.concat();
@@ -1440,6 +1529,26 @@ mod tests {
         let mut d = GrpcDeframer::default();
         let oversize = [0u8, 0xff, 0xff, 0xff, 0xff, b'x'];
         assert!(d.push(&oversize, &mut out).is_err());
+        // Wrong protobuf tag inside the message body.
+        let mut d = GrpcDeframer::default();
+        let bad_tag = [0u8, 0, 0, 0, 2, 0x0b, 0x00];
+        assert!(d.push(&bad_tag, &mut out).is_err());
+        // Truncated uvarint payload length.
+        let mut d = GrpcDeframer::default();
+        let bad_len = [0u8, 0, 0, 0, 1, 0x8a];
+        assert!(d.push(&bad_len, &mut out).is_err());
+        // Hunk declares fewer bytes than the message body carries.
+        let mut d = GrpcDeframer::default();
+        let short = [0u8, 0, 0, 0, 4, 0x0a, 0x01, b'a', b'b'];
+        assert!(d.push(&short, &mut out).is_err());
+        // Hunk declares more bytes than the message body carries.
+        let mut d = GrpcDeframer::default();
+        let long = [0u8, 0, 0, 0, 2, 0x0a, 0x03];
+        assert!(d.push(&long, &mut out).is_err());
+        // Empty message (half-close marker) yields nothing, no error.
+        let mut d = GrpcDeframer::default();
+        d.push(&[0u8, 0, 0, 0, 0], &mut out).unwrap();
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -1570,9 +1679,13 @@ mod tests {
                 ),
             }
             if !echo.is_empty() {
-                let mut msg = Vec::with_capacity(echo.len() + 5);
+                let mut msg = Vec::with_capacity(echo.len() + 11);
                 msg.push(0u8);
-                msg.extend_from_slice(&(echo.len() as u32).to_be_bytes());
+                msg.extend_from_slice(
+                    &((1 + uvarint_len(echo.len()) + echo.len()) as u32).to_be_bytes(),
+                );
+                msg.push(HUNK_TAG);
+                put_uvarint(&mut msg, echo.len());
                 msg.extend_from_slice(&echo);
                 echo.clear();
                 for chunk in msg.chunks(MAX_FRAME) {
@@ -1659,45 +1772,69 @@ mod tests {
         assert_eq!(server.await.unwrap(), "/TunService/Tun");
     }
 
-// Quick probe: TLS-connect to mihomo's grpc listener, then grpc_connect.
-#[tokio::test]
-async fn probe_mihomo_grpc() {
-    let tcp = tokio::net::TcpStream::connect("127.0.0.1:42420").await.unwrap();
-    let tls = crate::transport::tls_connect(
-        Box::new(tcp),
-        "grpc.test",
-        &crate::transport::TlsSettings {
-            enabled: true,
-            server_name: Some("grpc.test".into()),
-            skip_cert_verify: true,
-            alpn: vec!["h2".into()],
-        },
-    ).await.unwrap();
-    eprintln!("TLS OK");
-    let settings = crate::grpc::GrpcSettings {
-        service_name: "matsvc".into(),
-        host: Some("grpc.test".into()),
-    };
-    let mut stream = crate::grpc::grpc_connect(tls, &settings, "grpc.test").await.unwrap();
-    eprintln!("grpc_connect OK");
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    // Send the vmess auth header (first DATA)
-    stream.write_all(&[0x00u8; 16]).await.unwrap();
-    eprintln!("wrote 16 bytes");
-    stream.flush().await.unwrap();
-    // Check if the DATA frame was actually sent
-    eprintln!("sendq after write+flush: {} bytes", {
-        // We can't access sendq directly from the test, but the flush returning
-        // means poll_drive completed. Let me check by reading mihomo's log.
-        0
-    });
-    let mut buf = [0u8; 64];
-    match tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut buf)).await {
-        Ok(Ok(n)) => eprintln!("read {n} bytes: {:02x?}", &buf[..n.min(8)]),
-        Ok(Err(e)) => eprintln!("read error: {e}"),
-        Err(_) => eprintln!("read TIMEOUT after 3s"),
+    /// The outbound DATA frames must carry the gun envelope byte-for-byte:
+    /// `flag(0) | be32(1 + uvarint_len + n) | 0x0A | uvarint(n) | payload`.
+    /// A bare payload stalls real gun servers (they misparse the hunk
+    /// length and wait forever), so this locks the exact wire shape.
+    #[tokio::test]
+    async fn grpc_tunnel_gun_hunk_envelope_on_the_wire() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let settings = GrpcSettings {
+            service_name: "svc".into(),
+            host: Some("grpc.example.com".into()),
+        };
+        let mut stream = grpc_connect(Box::new(client), &settings, "h.example.com")
+            .await
+            .unwrap();
+        stream.write_all(b"hello gun").await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut preface = [0u8; 24];
+        server.read_exact(&mut preface).await.unwrap();
+        assert_eq!(&preface, PREFACE);
+
+        let mut headers_seen = false;
+        let payload = loop {
+            let (kind, _flags, sid, payload) = read_frame(&mut server).await.unwrap();
+            match kind {
+                FT_HEADERS if sid == STREAM_ID => headers_seen = true,
+                FT_DATA if sid == STREAM_ID => break payload,
+                _ => {}
+            }
+        };
+        assert!(headers_seen, "HEADERS must precede DATA");
+        let mut expect = vec![0u8, 0, 0, 0, 11, HUNK_TAG, 9];
+        expect.extend_from_slice(b"hello gun");
+        assert_eq!(payload, expect);
+
+        // Answer with a hunk-wrapped message; the tunnel must deliver the
+        // payload unwrapped.
+        let ok = hpack::encode(&[(":status", "200"), ("content-type", "application/grpc")]);
+        server
+            .write_all(&frame_bytes(FT_HEADERS, FLAG_END_HEADERS, 1, &ok))
+            .await
+            .unwrap();
+        let mut msg = vec![0u8, 0, 0, 0, 11, HUNK_TAG, 9];
+        msg.extend_from_slice(b"hello gun");
+        server
+            .write_all(&frame_bytes(FT_DATA, 0, 1, &msg))
+            .await
+            .unwrap();
+        let trailers = hpack::encode(&[("grpc-status", "0")]);
+        server
+            .write_all(&frame_bytes(
+                FT_HEADERS,
+                FLAG_END_HEADERS | FLAG_END_STREAM,
+                1,
+                &trailers,
+            ))
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 9];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello gun");
     }
-}
 
 
     #[tokio::test]

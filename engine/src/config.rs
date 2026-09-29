@@ -387,6 +387,32 @@ impl ExpectedStatus {
     }
 }
 
+/// The mihomo `GroupCommonOption` display/udp flags (adapter/
+/// outboundgroup/parser.go): `disable-udp` (group tag "disable-udp")
+/// and `hidden` (group tag "hidden").
+///
+/// The shared TYPE lives here next to the other dialect-independent
+/// group config; instances ride the API layer's process-global table
+/// keyed by group name (`api::register_group_flags`), the same split
+/// as the proxy-provider table — `EngineConfig` gained no field, so
+/// the exhaustive struct literals in app.rs/config_singbox.rs stay
+/// untouched.
+///
+/// Semantics (upstream):
+/// * `disable-udp` — the group's `SupportUDP()` is false (selector.go:
+///   `if s.disableUDP { return false }`), i.e. UDP relayed through the
+///   group is refused no matter which member is selected. Surfaced as
+///   `"udp": false` on the group's API document (the relay-time
+///   refusal itself lives in app.rs's `relay_udp_inner`, outside this
+///   table's reach — see the api.rs notes).
+/// * `hidden` — the group is not listed in the API `/proxies` map
+///   (dashboards skip it; GET /proxies/{name} still answers).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GroupCommonFlags {
+    pub disable_udp: bool,
+    pub hidden: bool,
+}
+
 /// Per-group health-check options (mihomo groupbase surface; sing-box
 /// urltest carries neither upstream — option/group.go URLTestOutbound
 /// has only url/interval/tolerance/idle_timeout).

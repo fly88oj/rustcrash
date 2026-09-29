@@ -1,0 +1,13 @@
+# The proxy-provider payload (wave-19 provider rows): a clash-dialect
+# document whose nodes dial the REAL mihomo listeners run.sh started,
+# so a provider member is genuinely relay-capable — the url-vehicle row
+# relays THROUGH a fetched node, not just lists it.
+#   sub-socks -> m-socks   :42409 (udp-capable)
+#   sub-http  -> m-http    :42410
+# Served by BOTH subscription servers: the plain http.server on :41880
+# and the battery's header-serving instance on :41881 (which adds
+# `subscription-userinfo: upload=111111; download=222222; total=333333;
+# expire=0` for the subscription-userinfo row).
+proxies:
+  - {name: sub-socks, type: socks5, server: 127.0.0.1, port: 42409, udp: true}
+  - {name: sub-http, type: http, server: 127.0.0.1, port: 42410}
