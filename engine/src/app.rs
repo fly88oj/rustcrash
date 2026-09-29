@@ -1641,6 +1641,9 @@ mod tests {
 
     /// Hand-built minimal TLS ClientHello carrying `sni` (same shape as
     /// the sniffer's own fixture: record → handshake → SNI extension).
+    /// Only the sing-box rule-action tests feed it through the sniff
+    /// slot; keep the gate aligned so no-dialect builds stay clean.
+    #[cfg(feature = "singbox")]
     fn client_hello(sni: &str) -> Vec<u8> {
         let name = sni.as_bytes();
         let mut ext = Vec::new();

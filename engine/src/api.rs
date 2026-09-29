@@ -1226,8 +1226,10 @@ pub(crate) fn reset_proxy_providers() {
 
 /// One installed provider's document, synchronously — the
 /// config-loader tests (plain #[test], no runtime) assert through this
-/// instead of the HTTP surface.
-#[cfg(test)]
+/// instead of the HTTP surface. The config-loader suites are
+/// mihomo-dialect tests; the helper must not exist in a no-dialect
+/// test build (workspace clippy -D warnings runs one).
+#[cfg(all(test, feature = "mihomo"))]
 pub(crate) fn installed_provider_document(name: &str) -> Option<serde_json::Value> {
     proxy_providers()
         .read()
@@ -1579,6 +1581,10 @@ fn group_flags() -> &'static std::sync::RwLock<HashMap<String, crate::config::Gr
 }
 
 /// Install the whole group-flag table (one config load = one table).
+/// Only the mihomo dialect loader (and tests) installs flags; without
+/// the dialect the fn must not exist (workspace clippy -D warnings
+/// builds a no-dialect lib).
+#[cfg(any(test, feature = "mihomo"))]
 pub(crate) fn register_group_flags(flags: HashMap<String, crate::config::GroupCommonFlags>) {
     *group_flags().write().unwrap() = flags;
 }
@@ -3595,6 +3601,8 @@ rules:
     /// A local fake HTTP proxy for the health-check probe: accepts
     /// CONNECT (answers 200) and answers the tunneled GET with 204 —
     /// exactly what probe_expect needs to count the member healthy.
+    /// Only the mihomo-gated provider tests spin it up.
+    #[cfg(feature = "mihomo")]
     async fn http_connect_probe_proxy() -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
