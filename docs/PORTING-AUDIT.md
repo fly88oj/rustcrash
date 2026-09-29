@@ -81,7 +81,7 @@ Status legend:
 
 | Upstream | Engine | Status |
 |---|---|---|
-| resolver/client (cache, fallback, policy) | `dns/resolver.rs` + `dns/policy.rs` | ✅ cache + ordered upstreams + `nameserver-policy` per-domain routing (this pass); fallback geoip-verification ❌ |
+| resolver/client (cache, fallback, policy) | `dns/resolver.rs` + `dns/policy.rs` | ✅ cache + ordered upstreams + `nameserver-policy` per-domain routing (this pass); fallback geoip-verification — `fallback-filter` key now loud-fails (engine's fallback semantics differ; refusing rather than silently ignoring) |
 | udp/tcp upstream (hostnames resolve at load) | `dns/upstream.rs` | ✅ |
 | dot.go | `dns/upstream.rs` `tls://` | ✅ |
 | doh.go | `dns/upstream.rs` `https://` (RFC 8488, h1.1, Content-Length + chunked) | ✅ |
@@ -99,7 +99,7 @@ Status legend:
 |---|---|---|
 | domain / suffix / keyword / regex | Domain*, DomainRegex | ✅ |
 | domain_wildcard | DomainWildcard → anchored regex (`*` any run, `?` one char) | ✅ |
-| ipcidr (+src), geoip, geosite, rule-set | IpCidr/GeoIp/Geosite/RuleSet | ✅ (IP-CIDR now pre-resolves domain targets like mihomo unless no-resolve; rule-set yaml/text; **mrs binary** ❌) |
+| ipcidr (+src), geoip, geosite, rule-set | IpCidr/GeoIp/Geosite/RuleSet | ✅ (IP-CIDR now pre-resolves domain targets like mihomo unless no-resolve; rule-set yaml/text; **mrs binary** ✅ (reader + writer via wave-9 `ruleset_bin.rs`)) |
 | port.go (SRC/DST ranges) | PortSrc/PortDst | ✅ |
 | process.go | Process (name/path; PATH matches exactly) via `process.rs` /proc walk (TCP+UDP tables) | ✅ |
 | in_name.go | InName | ✅ |
@@ -148,9 +148,9 @@ Status legend:
 | vmess / vless / trojan / socks / http / mixed outbound | ✅ |
 | direct / block (=REJECT) / dns outbounds | ✅ (dns answered in-process) |
 | group (selector/urltest) | ✅ |
-| hysteria / hysteria2 / tuic | ❌ QUIC (planned) |
+| hysteria2 / tuic | ✅ (QUIC via quinn, e2e verified; hysteria v1 ❌ — upstream deprecated) |
 | anytls / snell / mieru / restls / ssh / shadowtls / wireguard | `proto/{anytls,snell,mieru,restls,ssh,shadowtls,wireguard}.rs` | ✅ (scopes noted per file). naive / tor / bridge / cloudflare / series: NOT in current upstream (mihomo adapter/outbound 404s; sing-box dev outbound 404s incl. naive — removed upstream; probed 2026-09-24) — nothing to port for 1:1 | N/A |
-| all `inbound.go` server halves | ❌ server-side scope |
+| all `inbound.go` server halves | ✅ (ss/trojan/vmess/vless/hy2/tuic/anytls/snell/jls/restls/tlsmirror listeners e2e-verified) |
 
 ### transport/
 
@@ -158,7 +158,7 @@ Status legend:
 |---|---|---|
 | v2raywebsocket | ✅ | |
 | v2rayhttpupgrade | ✅ (this audit pass) | |
-| v2raygrpc / v2raygrpclite / v2rayquic (gun) | ❌ | |
+| v2raygrpc (gun) | ✅ (grpc.rs with indexed HPACK + Go-matching SETTINGS; grpc relay verified locally vs mihomo) | |
 | simple-obfs | ✅ (this pass) | |
 | wireguard | ✅ (this pass) | |
 
@@ -175,7 +175,7 @@ Status legend:
 | rule_set (.srs binary) | ✅ `ruleset_bin.rs` + provider wiring | |
 | user / package_name (android) / network_type (wifi/cellular) | ❌ |
 | rule *actions* | wave-14: the SING-BOX action surface (verified: mihomo has only no-resolve/src params — the old row overclaimed): sniff{sniffer-subset}/resolve/hijack-dns parsed with continue-from-next-rule semantics (route.go matchRule), reject→block, logical rules too; mihomo `lazy`/`expected-status` groups + the action RuleTable landed | ✅ wave-15 glue landed: route_with runs the MatchOutcome re-entry loop (Sniff→sniff_client with the narrowed policy + PrependStream replay + dial-target override; Resolve→dns.resolve; HijackDns→the `dns` outbound); lazy groups skip health when idle (route-touch gating) and probes score by expected-status. Known: the sing-box LOADER maps a declared "dns" tag to Reject — routing is correct for Dns-kind outbounds (loader fix staged) |
-| dns rules (per-server routing, rewrite_ttl, client_subnet, disable_cache) | ❌ |
+| dns rules | ✅ (dns/rules.rs: servers, disable_cache, rewrite_ttl, client_subnet) |
 | fakeip store persistence | fakeip.rs — JSON store with load_from/persist_to (atomic), range-mismatch reset, corrupt-store loud errors; `profile.store-fake-ip` wires the path | ✅ wave-12 |
 
 ### dns/
@@ -185,17 +185,17 @@ Status legend:
 | udp/tcp (with `tcp://` scheme), DoT `tls://`, DoH `https://` | `dns/upstream.rs` | ✅ |
 | hosts (string or array) | ✅ | |
 | fakeip transport | ✅ | |
-| dhcp / local / quad100/resolved | ❌ | |
-| DoH3/DoQ | ❌ QUIC | |
-| edns0 client_subnet | ❌ | |
+| dhcp / local(system) | ✅ (dhcp via lease-file + system via resolv.conf) | quad100/resolved ❌ | |
+| DoH3/DoQ | 🟡 (parse + clean-failure bound tested; no success-path test — no hermetic QUIC DNS responder) | |
+| edns0 client_subnet | ✅ (dns/rules.rs client_subnet) | |
 
 ### common/sniff/
 
 | Upstream | Engine | Status |
 |---|---|---|
 | tls.go / http.go | `sniffer.rs` | ✅ |
-| quic.go (+internal/qtls) | ❌ planned | |
-| dtls.go / bittorrent.go / dns.go sniffers | ❌ (protocol-classification rules not supported) |
+| quic.go | ✅ (sniffer) | dtls ❌ (not supported) | |
+| dtls.go / bittorrent.go sniffers | ❌ (not supported) | dns.go sniffer | ✅ |
 
 ### experimental/clashapi
 

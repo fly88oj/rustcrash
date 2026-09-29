@@ -19,7 +19,7 @@ fn crash_binary() -> String {
         .parent()
         .unwrap(); // workspace root
     workspace_root
-        .join("target/debug/rustcrash-crash")
+        .join("target/debug/crash")
         .to_string_lossy()
         .to_string()
 }
