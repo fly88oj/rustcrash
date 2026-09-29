@@ -1609,6 +1609,15 @@ fn handle_sub(action: SubAction) -> Result<()> {
             let info = rt.block_on(async { SubscriptionManager::fetch(&url).await })?;
             println!("Format detected: {:?}", info.format);
             println!("Content length: {} bytes", info.content.len());
+            // The `subscription-userinfo` response header (quota facts),
+            // when the server sent one — the same facts mihomo surfaces
+            // on GET /providers/proxies/{name}.
+            if let Some(userinfo) = &info.userinfo {
+                println!(
+                    "Subscription userinfo: upload={} download={} total={} expire={}",
+                    userinfo.upload, userinfo.download, userinfo.total, userinfo.expire
+                );
+            }
             println!();
             println!("--- Raw Content ---");
             println!("{}", info.content);
