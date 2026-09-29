@@ -103,7 +103,25 @@ pub async fn grpc_connect(
 
     let mut conn = H2Conn::new(transport);
     conn.out.put_slice(PREFACE);
-    put_frame(&mut conn.out, FT_SETTINGS, 0, 0, &[]);
+    // SETTINGS matching Go's gRPC client (transport/http2_client.go):
+    // ENABLE_PUSH=0, INITIAL_WINDOW_SIZE=4MiB, MAX_FRAME_SIZE=16384,
+    // MAX_HEADER_LIST_SIZE=10MiB. The Go HTTP/2 server treats an empty
+    // client SETTINGS differently from a meaningful one (it holds the
+    // preface stack until the first non-empty SETTINGS frame completes
+    // the connection handshake in some code paths), and mihomo's gun
+    // server rides exactly that server.
+    let settings: Vec<u8> = [
+        (2u16, 0u32),       // ENABLE_PUSH = 0
+        (4u16, 4_194_304),  // INITIAL_WINDOW_SIZE = 4 MiB
+        (5u16, 16_384),     // MAX_FRAME_SIZE = 16384
+        (6u16, 10_485_760), // MAX_HEADER_LIST_SIZE = 10 MiB
+    ]
+    .into_iter()
+    .flat_map(|(id, val)| {
+        id.to_be_bytes().into_iter().chain(val.to_be_bytes())
+    })
+    .collect();
+    put_frame(&mut conn.out, FT_SETTINGS, 0, 0, &settings);
     let conn_bump = (CONN_WINDOW - DEFAULT_WINDOW) as u32;
     put_frame(
         &mut conn.out,
@@ -201,8 +219,10 @@ impl H2Conn {
             inner,
             rbuf: BytesMut::with_capacity(16 * 1024),
             out: BytesMut::new(),
+            // Our SETTINGS advertises INITIAL_WINDOW_SIZE=4MiB, so the
+            // peer's flow-control window for our streams starts there.
             conn_send_window: DEFAULT_WINDOW,
-            stream_send_window: DEFAULT_WINDOW,
+            stream_send_window: 4_194_304,
             peer_initial_window: DEFAULT_WINDOW,
             conn_recv_window: CONN_WINDOW,
             stream_recv_window: DEFAULT_WINDOW,
@@ -897,9 +917,37 @@ mod hpack {
     pub(super) fn encode(headers: &[(&str, &str)]) -> Vec<u8> {
         let mut out = Vec::with_capacity(64);
         for (name, value) in headers {
-            out.push(0x00);
-            encode_str(name.as_bytes(), &mut out);
-            encode_str(value.as_bytes(), &mut out);
+            // Use indexed name references for HPACK static-table entries
+            // (Go's gRPC client does this — the metacubex/http fork
+            // rejects all-literal pseudo-headers in some code paths).
+            // Static table: 1=:authority 3=:method POST 4=:path /
+            // 7=:scheme https (RFC 7541 App. A).
+            match (*name, *value) {
+                (":method", "POST") => {
+                    // Fully indexed: :method POST = static index 3
+                    out.push(0x80 | 3);
+                }
+                (":scheme", "https") => {
+                    // Fully indexed: :scheme https = static index 7
+                    out.push(0x80 | 7);
+                }
+                (":authority", _) => {
+                    // Literal with incremental indexing, name=idx1
+                    out.push(0x40 | 1);
+                    encode_str(value.as_bytes(), &mut out);
+                }
+                (":path", _) => {
+                    // Literal with incremental indexing, name=idx4
+                    out.push(0x40 | 4);
+                    encode_str(value.as_bytes(), &mut out);
+                }
+                _ => {
+                    // Literal without indexing, new name
+                    out.push(0x00);
+                    encode_str(name.as_bytes(), &mut out);
+                    encode_str(value.as_bytes(), &mut out);
+                }
+            }
         }
         out
     }
