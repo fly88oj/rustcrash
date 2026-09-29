@@ -11201,6 +11201,26 @@ impl EasyTierUdp {
 
 #[cfg(test)]
 mod tests {
+    /// Sequentially-unique listener port for tests, drawn from
+    /// 21000-29000 — deliberately BELOW the Linux ephemeral port range
+    /// (ip_local_port_range, typically 32768-60999): the old random
+    /// draw inside 31000-50999 could collide with the kernel handing
+    /// the same number to a concurrent test's outgoing-connection
+    /// source port, which blocks the listener bind (an active socket
+    /// ignores SO_REUSEADDR), and two random draws can also collide
+    /// with each other (observed on CI: two-node relay serve() died
+    /// with Address already in use). The atomic counter makes
+    /// in-process collisions impossible; the random base keeps
+    /// parallel test binaries apart.
+    fn unique_test_port() -> u16 {
+        static BASE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        static NEXT: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(0);
+        let base = *BASE.get_or_init(|| 21000 + rand::random::<u32>() % 8000);
+        u16::try_from(base + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+            .unwrap()
+    }
+
     use super::*;
 
     /// SECURITY: fake credentials from the environment only.
@@ -13248,7 +13268,7 @@ mod tests {
         };
         let network = format!("itnet-{}", rand::random::<u32>());
         let secret = format!("itsec-{}", rand::random::<u64>());
-        let port = 31000 + rand::random::<u16>() % 20000;
+        let port = unique_test_port();
         let verbose = std::env::var("EASYTIER_VERBOSE").is_ok();
         let mut command = std::process::Command::new(&bin);
         command.args([
@@ -13644,7 +13664,7 @@ mod tests {
         // the INBOUND session.
         let secret = format!("et-{}", rand::random::<u64>());
         let network = "srv-net";
-        let port = 31000 + rand::random::<u16>() % 20000;
+        let port = unique_test_port();
         let cfg = EasyTierConfig {
             listeners: vec![format!("tcp://127.0.0.1:{port}")],
             network_secret: secret.clone(),
@@ -13694,7 +13714,7 @@ mod tests {
         // the datagram circuit into the same node.
         let secret = format!("et-{}", rand::random::<u64>());
         let network = "srv-udp-net";
-        let port = 31000 + rand::random::<u16>() % 20000;
+        let port = unique_test_port();
         let cfg = EasyTierConfig {
             listeners: vec![format!("udp://127.0.0.1:{port}")],
             network_secret: secret.clone(),
@@ -14293,7 +14313,7 @@ mod tests {
         // end.
         let secret = format!("sec-{}", rand::random::<u64>());
         let network = "sec-relay";
-        let port = 31000 + rand::random::<u16>() % 20000;
+        let port = unique_test_port();
         let cfg = EasyTierConfig {
             listeners: vec![format!("tcp://127.0.0.1:{port}")],
             network_secret: secret.clone(),
@@ -14379,7 +14399,7 @@ mod tests {
         // first packet).
         let secret = format!("secmix-{}", rand::random::<u64>());
         let network = "sec-mixed";
-        let port = 31000 + rand::random::<u16>() % 20000;
+        let port = unique_test_port();
         let cfg = EasyTierConfig {
             listeners: vec![format!("tcp://127.0.0.1:{port}")],
             network_secret: secret.clone(),
@@ -14493,7 +14513,7 @@ mod tests {
         };
         let network = format!("itnet-{}", rand::random::<u32>());
         let secret = format!("itsec-{}", rand::random::<u64>());
-        let port = 31000 + rand::random::<u16>() % 20000;
+        let port = unique_test_port();
         let _child = spawn_real_binary(
             &bin,
             &network,
@@ -14539,7 +14559,7 @@ mod tests {
         };
         let network = format!("itnet-{}", rand::random::<u32>());
         let secret = format!("itsec-{}", rand::random::<u64>());
-        let port = 31000 + rand::random::<u16>() % 20000;
+        let port = unique_test_port();
         let _child = spawn_real_binary(
             &bin,
             &network,
@@ -14582,11 +14602,11 @@ mod tests {
         };
         let network = format!("itnet-{}", rand::random::<u32>());
         let secret = format!("itsec-{}", rand::random::<u64>());
-        let port = 31000 + rand::random::<u16>() % 20000;
+        let port = unique_test_port();
         // A random socks5 port: the interops may run concurrently and the
         // conventional 1080 (plus any fixed port) can be taken by another
         // test's binary or an unrelated local service.
-        let socks5_port: u16 = 21000 + rand::random::<u16>() % 20000;
+        let socks5_port: u16 = unique_test_port();
         let _child = spawn_real_binary(
             &bin,
             &network,
@@ -14634,7 +14654,7 @@ mod tests {
         };
         let network = format!("itnet-{}", rand::random::<u32>());
         let secret = format!("itsec-{}", rand::random::<u64>());
-        let port = 31000 + rand::random::<u16>() % 20000;
+        let port = unique_test_port();
         let _child = spawn_real_binary(
             &bin,
             &network,
@@ -14686,7 +14706,7 @@ mod tests {
         };
         let network = format!("itnet-{}", rand::random::<u32>());
         let secret = format!("itsec-{}", rand::random::<u64>());
-        let port = 31000 + rand::random::<u16>() % 20000;
+        let port = unique_test_port();
         let _child = spawn_real_binary(
             &bin,
             &network,
@@ -15195,7 +15215,7 @@ mod tests {
         };
         let network = format!("itnet-{}", rand::random::<u32>());
         let secret = format!("itsec-{}", rand::random::<u64>());
-        let port = 31000 + rand::random::<u16>() % 20000;
+        let port = unique_test_port();
         let _child = spawn_real_binary(
             &bin,
             &network,
@@ -15235,7 +15255,7 @@ mod tests {
         };
         let network = format!("itnet-{}", rand::random::<u32>());
         let secret = format!("itsec-{}", rand::random::<u64>());
-        let port = 31000 + rand::random::<u16>() % 20000;
+        let port = unique_test_port();
         let _child = spawn_real_binary(
             &bin,
             &network,
@@ -15280,7 +15300,7 @@ mod tests {
         };
         let network = format!("itnet-{}", rand::random::<u32>());
         let secret = format!("itsec-{}", rand::random::<u64>());
-        let port = 31000 + rand::random::<u16>() % 20000;
+        let port = unique_test_port();
         let _child = spawn_real_binary(
             &bin,
             &network,
@@ -15329,7 +15349,7 @@ mod tests {
         };
         let network = format!("itnet-{}", rand::random::<u32>());
         let secret = format!("itsec-{}", rand::random::<u64>());
-        let port = 31000 + rand::random::<u16>() % 20000;
+        let port = unique_test_port();
         let _child = spawn_real_binary(
             &bin,
             &network,
@@ -15559,7 +15579,7 @@ mod tests {
         };
         let network = format!("itnet-{}", rand::random::<u32>());
         let secret = format!("itsec-{}", rand::random::<u64>());
-        let port = 31000 + rand::random::<u16>() % 20000;
+        let port = unique_test_port();
         let _child = spawn_real_binary(
             &bin,
             &network,
@@ -15605,7 +15625,7 @@ mod tests {
         };
         let network = format!("itnet-{}", rand::random::<u32>());
         let secret = format!("itsec-{}", rand::random::<u64>());
-        let port = 31000 + rand::random::<u16>() % 20000;
+        let port = unique_test_port();
         let _child = spawn_real_binary(
             &bin,
             &network,
