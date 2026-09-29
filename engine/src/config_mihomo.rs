@@ -101,6 +101,8 @@ struct RawDns {
     /// Vec<(domain, urls)> after deserialize.
     #[serde(default, rename = "nameserver-policy")]
     nameserver_policy: Option<std::collections::HashMap<String, Yaml>>,
+    #[serde(default, rename = "fallback-filter")]
+    fallback_filter: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -350,6 +352,18 @@ pub fn load(text: &str) -> Result<EngineConfig> {
     let dns = raw
         .dns
         .map(move |d| -> Result<DnsConfig> {
+            // `fallback-filter` changes WHICH answers the fallback list
+            // produces (geoip-verified vs unconditional) — refuse loudly
+            // instead of silently changing semantics by ignoring it.
+            if d.fallback_filter.is_some() {
+                return Err(Error::config(
+                    "dns fallback-filter is not supported: the engine's fallback path \
+                     consults the fallback list unconditionally, and silently ignoring \
+                     the filter would change which answers win. Remove the \
+                     fallback-filter block, or use nameserver-policy for per-domain \
+                     routing instead",
+                ));
+            }
             Ok(DnsConfig {
                 enable: d.enable,
                 listen: d.listen.clone(),
