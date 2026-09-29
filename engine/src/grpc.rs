@@ -721,7 +721,25 @@ impl AsyncRead for GrpcStream {
                     this.conn.rbuf.extend_from_slice(rb.filled());
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    // The best-effort poll_drive above may have consumed
+                    // the entire server response (HEADERS + DATA +
+                    // trailers) into `plain` — or reached a terminal
+                    // state — since the checks at the top of this loop.
+                    // Parking with that state ready is the tunnel stall:
+                    // the gun server has already sent END_STREAM and will
+                    // never wake the socket again. Re-check before
+                    // parking; the loop re-examines every exit condition,
+                    // so this only re-enters when something changed.
+                    if !this.conn.plain.is_empty()
+                        || this.conn.remote_end
+                        || this.conn.conn_eof
+                        || this.conn.stream_error.is_some()
+                    {
+                        continue;
+                    }
+                    return Poll::Pending;
+                }
             }
         }
     }
@@ -1957,5 +1975,129 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("grpc-status 7"), "{err}");
         responder.await.unwrap();
+    }
+
+    /// Regression shape of the matrix stall: the server's ENTIRE response
+    /// burst (response HEADERS + echo DATA + trailers with END_STREAM) is
+    /// buffered in the client socket after the client finished writing but
+    /// BEFORE its first read. poll_drive then de-frames the whole burst in
+    /// one pass; the read used to park on the socket with the payload
+    /// already sitting in `plain` and END_STREAM seen — the gun server
+    /// would never send another byte, so the tunnel stalled forever (the
+    /// matrix saw ~1/6 of tunnels hang; only a fresh dial recovered). The
+    /// read must return the payload without waiting for a socket event.
+    #[tokio::test]
+    async fn grpc_read_returns_response_buffered_before_first_read() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (answered_tx, answered_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut answered_tx = Some(answered_tx);
+        let srv = tokio::spawn(async move {
+            let mut io = server;
+            let mut preface = [0u8; 24];
+            io.read_exact(&mut preface).await.unwrap();
+            assert_eq!(&preface, PREFACE);
+            io.write_all(&frame_bytes(FT_SETTINGS, 0, 0, &[]))
+                .await
+                .unwrap();
+            let mut answered = false;
+            let mut request = BytesMut::new();
+            let mut deframer = GrpcDeframer::default();
+            loop {
+                let (kind, flags, stream, payload) = read_frame(&mut io).await.unwrap();
+                match kind {
+                    FT_SETTINGS if flags & FLAG_ACK == 0 => {
+                        io.write_all(&frame_bytes(FT_SETTINGS, FLAG_ACK, 0, &[]))
+                            .await
+                            .unwrap();
+                    }
+                    FT_WINDOW_UPDATE => {}
+                    FT_HEADERS if stream == 1 => {}
+                    FT_DATA if stream == 1 => {
+                        if !payload.is_empty() {
+                            let inc = (payload.len() as u32).to_be_bytes();
+                            io.write_all(&frame_bytes(FT_WINDOW_UPDATE, 0, 0, &inc))
+                                .await
+                                .unwrap();
+                            io.write_all(&frame_bytes(FT_WINDOW_UPDATE, 0, 1, &inc))
+                                .await
+                                .unwrap();
+                            deframer.push(&payload, &mut request).unwrap();
+                        }
+                        if flags & FLAG_END_STREAM != 0 || answered {
+                            continue;
+                        }
+                        answered = true;
+                        let ok = hpack::encode(&[
+                            (":status", "200"),
+                            ("content-type", "application/grpc"),
+                        ]);
+                        io.write_all(&frame_bytes(FT_HEADERS, FLAG_END_HEADERS, 1, &ok))
+                            .await
+                            .unwrap();
+                        let mut msg = Vec::new();
+                        msg.push(0u8);
+                        msg.extend_from_slice(
+                            &((1 + uvarint_len(request.len()) + request.len()) as u32).to_be_bytes(),
+                        );
+                        msg.push(HUNK_TAG);
+                        put_uvarint(&mut msg, request.len());
+                        msg.extend_from_slice(&request);
+                        for chunk in msg.chunks(MAX_FRAME) {
+                            io.write_all(&frame_bytes(FT_DATA, 0, 1, chunk))
+                                .await
+                                .unwrap();
+                        }
+                        let trailers = hpack::encode(&[("grpc-status", "0")]);
+                        io.write_all(&frame_bytes(
+                            FT_HEADERS,
+                            FLAG_END_HEADERS | FLAG_END_STREAM,
+                            1,
+                            &trailers,
+                        ))
+                        .await
+                        .unwrap();
+                        if let Some(tx) = answered_tx.take() {
+                            tx.send(()).unwrap();
+                        }
+                    }
+                    FT_RST_STREAM | FT_GOAWAY => break,
+                    _ => {}
+                }
+            }
+        });
+        let settings = GrpcSettings {
+            service_name: "svc".into(),
+            host: Some("grpc.example.com".into()),
+        };
+        let mut stream = grpc_connect(Box::new(client), &settings, "h.example.com")
+            .await
+            .unwrap();
+        stream.write_all(b"ping").await.unwrap();
+        stream.flush().await.unwrap();
+        // Gate: the whole response burst is already buffered client-side
+        // (the server confirms via the channel) BEFORE the first read.
+        answered_rx.await.unwrap();
+        // tokio's `timeout` re-polls its inner future when the deadline
+        // fires, and a read parked with the payload already de-framed in
+        // `plain` recovers on ANY re-poll — a timeout-Err assertion can
+        // never observe the stall (the deadline wake itself delivers the
+        // bytes). Assert on delivery latency instead: the burst was
+        // buffered before the first read, so delivery must be immediate;
+        // pre-fix the read only "completed" when the deadline re-polled
+        // it, i.e. after the full timeout window.
+        let t0 = std::time::Instant::now();
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut buf))
+            .await
+            .expect("read must complete within the (generous) timeout")
+            .unwrap();
+        assert_eq!(&buf, b"ping");
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "read stalled {:?}: the response was buffered before the first \
+             read and only a deadline re-poll delivered it",
+            t0.elapsed()
+        );
+        srv.abort();
     }
 }
