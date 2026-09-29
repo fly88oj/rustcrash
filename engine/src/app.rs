@@ -903,6 +903,21 @@ impl Engine {
         let Ok(outbound) = self.registry.resolve(&outbound_name).await else {
             return;
         };
+        // GroupCommonOption `disable-udp` (mihomo selector.go
+        // SupportUDP): a UDP session routed through a group whose flag
+        // is set is REFUSED at dial time. `resolve` flattens the group
+        // to its member and the member's own `udp` flag below cannot
+        // see the group's, so the route-selected name is checked
+        // against the group-flag table (installed by the mihomo
+        // dialect loader via api::register_group_flags) first.
+        if self.registry.group(&outbound_name).is_some()
+            && crate::api::group_flags_of(&outbound_name).disable_udp
+        {
+            let err = Error::protocol(format!("group {outbound_name} has UDP disabled"));
+            tracing::warn!(target: "engine",
+                "udp {} via {}: {err} (session refused)", effective, outbound_name);
+            return;
+        }
         if !outbound.udp || outbound.is_reject() {
             return;
         }
@@ -2000,6 +2015,86 @@ mod tests {
         let answered = tokio::time::timeout(Duration::from_secs(5), dl_rx.recv()).await;
         let (_, data) = answered.unwrap().unwrap();
         assert_eq!(wire::parse(&data).unwrap().id, 9);
+    }
+
+    /// GroupCommonOption `disable-udp` (mihomo selector.go SupportUDP):
+    /// a UDP session routed through a flagged group is REFUSED before
+    /// the dial — no datagram leaves, even though the flattened member
+    /// is itself UDP-capable — while the same group without the flag
+    /// relays (the `dns` leaf answers through the engine resolver).
+    #[tokio::test]
+    async fn disable_udp_group_refuses_the_udp_relay() {
+        fn cfg_with_flagged_group() -> EngineConfig {
+            let mut cfg = minimal_config();
+            cfg.outbounds.push(crate::outbound::OutboundConfig {
+                name: "dns".into(),
+                udp: true,
+                kind: crate::outbound::OutboundKind::Dns,
+            });
+            cfg.groups = vec![crate::outbound::GroupConfig {
+                name: "G".into(),
+                members: vec!["dns".into()],
+                policy: crate::outbound::GroupPolicy::Select,
+                url: None,
+                interval: 0,
+                tolerance: 0,
+            }];
+            cfg.rules = vec!["MATCH,G".into()];
+            cfg
+        }
+        let q = wire::build_query(11, "probe.test", wire::TYPE_A);
+        let source: SocketAddr = "127.0.0.1:50003".parse().unwrap();
+        let dns_target = NetAddr::ip("8.8.8.8".parse().unwrap(), 53);
+
+        // Flagged: register the group-flag table entry (the mihomo
+        // dialect loader's runtime twin), then the session must die
+        // silently — the refusal precedes the dial, so the always-
+        // answering `dns` leaf never sees the datagram.
+        crate::api::register_group_flags(std::collections::HashMap::from([(
+            "G".to_string(),
+            crate::config::GroupCommonFlags {
+                disable_udp: true,
+                hidden: false,
+            },
+        )]));
+        let engine = Engine::build(cfg_with_flagged_group()).unwrap();
+        let (up_tx, up_rx) = mpsc::channel(4);
+        let (dl_tx, mut dl_rx) = mpsc::channel(4);
+        let refused_engine = engine.clone();
+        tokio::spawn(async move {
+            refused_engine
+                .relay_udp_inner(source, "in".into(), up_rx, dl_tx)
+                .await;
+        });
+        up_tx.send((dns_target.clone(), q.clone())).await.unwrap();
+        // Refused = the relay unwinds WITHOUT an answer: the downlink
+        // channel closes (recv None) and no datagram ever crosses it.
+        match tokio::time::timeout(Duration::from_secs(2), dl_rx.recv()).await {
+            Err(_) => panic!("refused session never unwound within 2s"),
+            Ok(Some((_, data))) => {
+                panic!("disable-udp group must refuse the UDP session (answer id={})",
+                    wire::parse(&data).map(|m| m.id).unwrap_or_default());
+            }
+            Ok(None) => {}
+        }
+
+        // Control: same shape, flag cleared — the datagram relays and
+        // the dns leaf answers.
+        crate::api::register_group_flags(std::collections::HashMap::new());
+        let engine = Engine::build(cfg_with_flagged_group()).unwrap();
+        let (up_tx, up_rx) = mpsc::channel(4);
+        let (dl_tx, mut dl_rx) = mpsc::channel(4);
+        let relay_engine = engine.clone();
+        tokio::spawn(async move {
+            relay_engine
+                .relay_udp_inner(source, "in".into(), up_rx, dl_tx)
+                .await;
+        });
+        up_tx.send((dns_target, q)).await.unwrap();
+        let answered = tokio::time::timeout(Duration::from_secs(5), dl_rx.recv()).await;
+        let (_, data) = answered.expect("unflagged group relays the datagram").unwrap();
+        assert_eq!(wire::parse(&data).unwrap().id, 11);
+        crate::api::register_group_flags(std::collections::HashMap::new());
     }
 
     /// Lazy groups (mihomo `lazy`, default true): untouched → the health

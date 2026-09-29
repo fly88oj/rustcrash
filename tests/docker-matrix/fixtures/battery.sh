@@ -130,6 +130,55 @@ V=$(cr engine version 2>&1 | head -1)
 echo "$V" | grep -qi "rustcrash\|engine" && ok "platform boot" "$PLATFORM: $V" \
     || bad "platform boot" "$PLATFORM: $V"
 
+# --- 0b. battery-owned servers ----------------------------------------------
+# Started BEFORE any config test / engine start that touches them:
+# mihomo parity is a STARTUP provider fetch (executor.go loadProvider →
+# Initial()), so an engine loading relay-engine.yaml dials these the
+# moment `crash engine test/run` builds the config — a late server is
+# a Connection-refused config error, not an engine bug.
+#
+# (a) The subscription-userinfo oracle: run.sh's plain http.server on
+# :41880 cannot attach response headers, so the battery runs its own
+# instance on :41881 serving the SAME bodies plus
+#   subscription-userinfo: upload=111111; download=222222; total=333333; expire=0
+# (idempotent across the three per-platform batteries — the nohup'd
+# instance survives between them, so only the first battery starts it).
+if ! port_open 41881; then
+cat > /tmp/matrix/subinfo-server.py <<'PYEOF'
+import http.server, socketserver
+
+SUBINFO = "upload=111111; download=222222; total=333333; expire=0"
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, directory="/matrix-fixtures/subs", **kw)
+
+    def end_headers(self):
+        self.send_header("subscription-userinfo", SUBINFO)
+        super().end_headers()
+
+    def log_message(self, *a):
+        pass
+
+socketserver.ThreadingTCPServer.allow_reuse_address = True
+with socketserver.ThreadingTCPServer(("127.0.0.1", 41881), Handler) as srv:
+    srv.serve_forever()
+PYEOF
+nohup python3 /tmp/matrix/subinfo-server.py >"$LOGDIR/subinfo-server.log" 2>&1 </dev/null &
+sleep 1
+fi
+
+# (b) The SECOND udp echo (:41891) — the disable-udp probe lane. The
+# DST-PORT,41891 rule in relay-engine.yaml routes this port's datagrams
+# through the flagged NoUdp group; the echo exists so a MISSING refusal
+# would genuinely round-trip and fail the row (a dead port would make
+# "refused" and "relayed-but-lost" indistinguishable). :41890 stays
+# with the o-ss/trojan udp rows. Idempotent across batteries.
+if ! ss -uln 2>/dev/null | grep -q ':41891 '; then
+    nohup python3 "$IX/udp-echo.py" 41891 >"$LOGDIR/udp-echo-41891.log" 2>&1 </dev/null &
+    sleep 1
+fi
+
 # --- 1. kernel CLI compat (the mihomo drop-in grammar) ----------------------
 mkdir -p /tmp/matrix/kc
 KT=$(cr -t -d /tmp/matrix/kc -f "$FX/relay-engine.yaml" 2>&1; echo "rc=$?")
@@ -271,37 +320,6 @@ JSON
 wg6_up=0
 start_engine rust-sing-box /tmp/matrix/wg6-server.json "wg6-server-$PLATFORM"
 wait_port 42163 "$((WAIT/2))" && wg6_up=1
-
-# The subscription-userinfo oracle: run.sh's plain http.server on
-# :41880 cannot attach response headers, so the battery runs its own
-# instance on :41881 serving the SAME bodies plus
-#   subscription-userinfo: upload=111111; download=222222; total=333333; expire=0
-# (idempotent across the three per-platform batteries — the nohup'd
-# instance survives between them, so only the first battery starts it).
-if ! port_open 41881; then
-cat > /tmp/matrix/subinfo-server.py <<'PYEOF'
-import http.server, socketserver
-
-SUBINFO = "upload=111111; download=222222; total=333333; expire=0"
-
-class Handler(http.server.SimpleHTTPRequestHandler):
-    def __init__(self, *a, **kw):
-        super().__init__(*a, directory="/matrix-fixtures/subs", **kw)
-
-    def end_headers(self):
-        self.send_header("subscription-userinfo", SUBINFO)
-        super().end_headers()
-
-    def log_message(self, *a):
-        pass
-
-socketserver.ThreadingTCPServer.allow_reuse_address = True
-with socketserver.ThreadingTCPServer(("127.0.0.1", 41881), Handler) as srv:
-    srv.serve_forever()
-PYEOF
-nohup python3 /tmp/matrix/subinfo-server.py >"$LOGDIR/subinfo-server.log" 2>&1 </dev/null &
-sleep 1
-fi
 
 engine_up=0
 start_engine rust-mihomo "$FX/relay-engine.yaml" "matrix-$PLATFORM"
@@ -461,28 +479,34 @@ udp_row "outbound: trojan UDP relay (udp echo)" o-trojan
 # --- proxy-providers (wave-19) -----------------------------------------------
 # matsub/minfo are declared in relay-engine.yaml: matsub fetches from
 # run.sh's plain subscription server (:41880), minfo from the battery's
-# header-serving instance (:41881). Both rows degrade to a precise SKIP
-# at whichever stage is missing (config-load wiring > fetch/parse >
-# registry join > group `use:` routing) and only PASS on a real relay
-# through a fetched node — a DIRECT-only SubPick can never fake it
-# because the row checks the group's `now` first.
+# header-serving instance (:41881, started before any engine load).
+# Fetched members join the registry under `matsub:sub-socks`-style
+# prefixed names and SubPick's `use:` carries them after DIRECT — so
+# the row PUTs the provider member on SubPick before relaying and the
+# body can only arrive through the FETCHED node.
 echo "## providers"
 if [ "$engine_up" = 1 ]; then
     prov=$(curl -s --max-time 5 "http://127.0.0.1:$API/providers/proxies")
     if ! echo "$prov" | grep -q '"matsub"'; then
         skip "provider: url vehicle fetch" \
-            "not wired: the mihomo dialect drops the proxy-providers section at config load (GET /providers/proxies lists no matsub; engine/src/api.rs provider notes) — members cannot load"
-    elif ! echo "$prov" | grep -q '"sub-socks"'; then
+            "provider matsub not installed (config-load fetch failed — see $LOGDIR/matrix-$PLATFORM.log)"
+    elif ! echo "$prov" | grep -q 'matsub:sub-socks'; then
         skip "provider: url vehicle fetch" \
-            "provider matsub listed without members — fetch/parse of http://127.0.0.1:41880/provider-clash.yaml pending"
-    elif ! curl -s --max-time 5 "http://127.0.0.1:$API/proxies" | grep -q '"sub-socks"'; then
+            "provider matsub listed without members — fetch/parse of http://127.0.0.1:41880/provider-clash.yaml failed"
+    elif ! curl -s --max-time 5 "http://127.0.0.1:$API/proxies" | grep -q 'matsub:sub-socks'; then
         skip "provider: url vehicle fetch" \
             "provider members listed but not joined into GET /proxies (outbound registry wiring pending)"
     else
+        # Route through the FETCHED node: SubPick's `use:` appended the
+        # provider members after the inline DIRECT, so PUT the member
+        # explicitly — the default DIRECT selection must never carry
+        # the row.
+        curl -s --max-time 5 -X PUT -d '{"name": "matsub:sub-socks"}' \
+            "http://127.0.0.1:$API/proxies/SubPick" >/dev/null 2>&1
         select_node SubPick
         subnow=$(curl -s --max-time 5 "http://127.0.0.1:$API/proxies/SubPick" | tr -d '\n' | grep -o '"now":"[^"]*"' | head -1)
         out=$(curl -s --max-time "$CT" -x "http://127.0.0.1:$MIX" "$WEB")
-        if echo "$subnow" | grep -q '"sub-'; then
+        if echo "$subnow" | grep -q 'matsub:sub-'; then
             if [ "$out" = "$BODY" ]; then
                 ok "provider: url vehicle fetch" "members fetched from :41880 and relayed through SubPick ($subnow)"
             else
@@ -490,7 +514,7 @@ if [ "$engine_up" = 1 ]; then
             fi
         elif echo "$subnow" | grep -q DIRECT; then
             skip "provider: url vehicle fetch" \
-                "group use: not wired — SubPick still selects DIRECT (provider members listed in /proxies but not group-joined)"
+                "group use: not wired — SubPick still selects DIRECT (PUT of matsub:sub-socks rejected; provider members not group-joined)"
         else
             bad "provider: url vehicle fetch" "SubPick selection unreadable ($subnow), relay got '$(echo "$out" | cut -c1-40)'"
         fi
@@ -503,7 +527,7 @@ if [ "$engine_up" = 1 ]; then
         skip "provider: subscription-userinfo" "subinfo server :41881 down (see $LOGDIR/subinfo-server.log)"
     elif ! echo "$prov" | grep -q '"minfo"'; then
         skip "provider: subscription-userinfo" \
-            "not wired: the mihomo dialect drops the proxy-providers section at config load (provider minfo never installs; header parsing listed out-of-scope in engine/src/api.rs provider notes)"
+            "provider minfo not installed (config-load fetch of http://127.0.0.1:41881 failed — see $LOGDIR/subinfo-server.log / matrix-$PLATFORM.log)"
     else
         pdetail=$(curl -s --max-time 5 "http://127.0.0.1:$API/providers/proxies/minfo")
         if echo "$prov$pdetail" | grep -q 111111 && echo "$prov$pdetail" | grep -q 222222 \
@@ -604,18 +628,21 @@ sys.exit(0 if d and all(isinstance(v, (int, float)) for v in d.values()) else 1)
         bad "group: expected-status" "body='${out:0:30}' now=$now"
     fi
 
-    # disable-udp: when the field lands, a UDP datagram through the
-    # group must be REFUSED while TCP through the same group still
-    # relays (the guard keeps a broken group from faking a PASS).
-    # Until then the key is dropped (serde) and the datagram still
-    # round-trips — the honest SKIP with the precise symptom.
+    # disable-udp: the DST-PORT,41891 rule routes this row's UDP probe
+    # DIRECTLY through the flagged NoUdp group (enforced at relay time
+    # in app.rs relay_udp_inner): the session must be REFUSED — the
+    # probe gets no echo — while TCP through the same group (Pick ->
+    # NoUdp -> o-ss) still relays. The :41891 echo server (battery-
+    # owned, started up front) guarantees a MISSING refusal would
+    # round-trip and fail the row instead of skipping silently.
     curl -s --max-time 5 -X PUT -d '{"name": "NoUdp"}' "http://127.0.0.1:$API/proxies/Pick" >/dev/null
     noudp_tcp=$(curl -s --max-time "$CT" -x "http://127.0.0.1:$MIX" "$WEB")
-    if python3 "$IX/udp-echo-probe.py" 127.0.0.1 "$MIX" 127.0.0.1 41890 grp-noudp >/dev/null 2>&1; then
-        skip "group: disable-udp (UDP refused)" \
-            "not implemented: 'disable-udp: true' accepted but ignored (no such field in the engine group schema — serde drops unknown keys); UDP still relayed through the group"
+    if ! ss -uln 2>/dev/null | grep -q ':41891 '; then
+        skip "group: disable-udp (UDP refused)" "second udp echo :41891 not bound (see $LOGDIR/udp-echo-41891.log) — refusal vs relay indistinguishable"
+    elif python3 "$IX/udp-echo-probe.py" 127.0.0.1 "$MIX" 127.0.0.1 41891 grp-noudp >/dev/null 2>&1; then
+        bad "group: disable-udp (UDP refused)" "UDP round-tripped through the disable-udp group — relay-time enforcement missing/regressed (app.rs relay_udp_inner)"
     elif [ "$noudp_tcp" = "$BODY" ]; then
-        ok "group: disable-udp (UDP refused)" "UDP through the group refused, TCP still relays"
+        ok "group: disable-udp (UDP refused)" "UDP through the flagged group refused, TCP still relays"
     else
         bad "group: disable-udp (UDP refused)" "UDP refused but TCP broken too ('$(echo "$noudp_tcp" | cut -c1-30)') — group misrouted, not disable-udp"
     fi

@@ -154,9 +154,13 @@ proxy-groups:
     interval: 60
     lazy: true
     expected-status: "200"
-  # disable-udp: honest probe — until the field lands the group schema
-  # has no such key (serde drops it) and the datagram still round-trips;
-  # the row then reports the precise SKIP.
+  # disable-udp (parsed since wave-19; enforced at relay time): the
+  # DST-PORT,41891 rule below routes the battery's UDP probe DIRECTLY
+  # through this flagged group — the relay must refuse the session —
+  # while TCP through the same group (Pick -> NoUdp -> o-ss) still
+  # relays. :41891 is the battery's SECOND udp echo (41890 stays with
+  # the o-ss/trojan udp rows), so a missing refusal would genuinely
+  # round-trip and fail the row.
   - name: NoUdp
     type: select
     proxies: [o-ss]
@@ -168,25 +172,25 @@ proxy-groups:
     proxies: [o-ss]
     hidden: true
   # provider member routing (wave-19): `use:` pulls matsub's fetched
-  # nodes into the group. Until that wiring lands the key is dropped
-  # (serde) and the group stays DIRECT-only — the provider row checks
-  # the group's `now` BEFORE trusting a relay, so a DIRECT fallback can
-  # never fake a PASS.
+  # nodes into the group after the inline members (DIRECT first — the
+  # battery row PUTs matsub:sub-socks on SubPick before relaying, so a
+  # DIRECT fallback can never fake a PASS).
   - name: SubPick
     type: select
     proxies: [DIRECT]
     use: [matsub]
 
-# The wave-19 provider rows. Until the config-load wiring lands the
-# mihomo dialect loader drops this section entirely (engine/src/api.rs
-# provider notes) — the rows then SKIP with that precise symptom and
-# auto-upgrade to PASS once the fetch + registry/group wiring lands.
-#   matsub -> run.sh's plain subscription http.server (:41880)
-#   minfo  -> the battery's header-serving instance (:41881, adds the
-#             subscription-userinfo header for the userinfo row)
-# `path` is absolute and under /tmp/matrix (writable): a relative path
-# would resolve against the read-only /matrix-fixtures mount once the
-# loader starts persisting fetched bodies.
+# The wave-19 provider rows (config-load fetch + registry/group `use:`
+# wiring landed): matsub fetches from run.sh's plain subscription server
+# (:41880), minfo from the battery's header-serving instance (:41881,
+# adds the subscription-userinfo header for the userinfo row). The
+# battery starts :41881 BEFORE any engine/test run touching this config
+# — mihomo parity: providers fetch at startup (executor.go loadProvider
+# → Initial()), so the server must be up first. Fetched members join
+# the registry under `matsub:sub-socks`-style prefixed names.
+#   `path` is absolute and under /tmp/matrix (writable): a relative path
+#   would resolve against the read-only /matrix-fixtures mount once the
+#   loader starts persisting fetched bodies.
 proxy-providers:
   matsub:
     type: http
@@ -226,4 +230,9 @@ dns:
     "ref.test": rcode://refused
 
 rules:
+  # The disable-udp probe lane: UDP to the battery's second echo
+  # (:41891) routes DIRECTLY through the flagged NoUdp group, so the
+  # relay-time refusal fires on the rule-selected outbound. Nothing
+  # else targets :41891.
+  - DST-PORT,41891,NoUdp
   - MATCH,Pick

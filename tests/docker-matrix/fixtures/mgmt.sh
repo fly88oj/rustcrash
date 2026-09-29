@@ -346,14 +346,20 @@ skip "firewall: ipset" "no netfilter ipset in any firewall path (nft-native sets
 # ---------------------------------------------------------------------------
 echo "## provider"
 PPCFG=/tmp/matrix/mgmt-pp-$PLATFORM.yaml
+# The provider vehicle parses the CLASH dialect (a `proxies:` document,
+# engine/src/api.rs parse_subscription_proxies) — provider-clash.yaml
+# on the shared subs server, NOT the sub1.txt URI list (a URI-list
+# vehicle is out of the ported subset and would fail config load with
+# "file must have a `proxies` field"). Fetched members join under
+# `sub1:sub-socks`-style prefixed names.
 cat > "$PPCFG" <<YAML
 mixed-port: 43872
 external-controller: 127.0.0.1:43972
 proxy-providers:
   sub1:
     type: http
-    url: $SUBS
-    path: ./sub1-$PLATFORM.yaml
+    url: http://127.0.0.1:41880/provider-clash.yaml
+    path: /tmp/matrix/sub1-$PLATFORM.yaml
     interval: 300
 rules:
   - MATCH,DIRECT
@@ -369,10 +375,10 @@ nohup "${CRASH[@]}" engine run --flavor rust-mihomo --config "$PPCFG" \
 PPID_MGMT=$!
 if wait_port 43972 "$((WAIT / 2))"; then
     PJSON=$(curl -s --max-time 4 http://127.0.0.1:43972/providers/proxies)
-    if echo "$PJSON" | grep -q '"sub1"' && echo "$PJSON" | grep -q '"sub1-ss"'; then
-        ok "provider: url vehicle fetch (subscription from the local server)" "provider sub1 + members loaded"
+    if echo "$PJSON" | grep -q '"sub1"' && echo "$PJSON" | grep -q 'sub1:sub-socks'; then
+        ok "provider: url vehicle fetch (subscription from the local server)" "provider sub1 + members loaded (sub1:sub-socks)"
     else
-        skip "provider: url vehicle fetch (subscription from the local server)" "proxy-providers config-load wiring not ported (engine/src/api.rs: the dialect drops the section; providers enter only via the install_proxy_provider embedder API)"
+        skip "provider: url vehicle fetch (subscription from the local server)" "provider sub1 listed without members — fetch/parse of http://127.0.0.1:41880/provider-clash.yaml failed (see $LOGDIR/mgmt-pp-$PLATFORM.log)"
     fi
     HC=$(curl -s -w "|%{http_code}" --max-time 4 http://127.0.0.1:43972/providers/proxies/sub1/healthcheck)
     HCCODE=${HC##*|}
@@ -400,10 +406,25 @@ kill "$PPID_MGMT" 2>/dev/null
 pkill -f "mgmt-pp-$PLATFORM.yaml" 2>/dev/null
 wait_ports_free 43872 43972
 
-# subscription-userinfo: parsed nowhere today — core's SubscriptionInfo
-# keeps content/format/backend, the engine provider surface lists the
-# display out of scope (engine/src/api.rs provider notes).
-skip "subs: subscription-userinfo (upload/download/total/expire)" "header parsing unimplemented: core SubscriptionInfo keeps content/format/backend only (core/src/subscription.rs); engine provider display lists it out-of-scope (engine/src/api.rs)"
+# subscription-userinfo: core's SubscriptionManager::fetch parses the
+# header into SubscriptionUserInfo (upload/download/total/expire, the
+# wave-19 fields) and `crash sub fetch` surfaces the facts; the engine
+# provider surface is the phase-A `provider: subscription-userinfo`
+# row. Checked against the battery's header-serving instance (:41881).
+if port_open 41881; then
+    SUINFO=$(cr sub fetch http://127.0.0.1:41881/provider-clash.yaml 2>&1)
+    if echo "$SUINFO" | grep -q "upload=111111" && echo "$SUINFO" | grep -q "download=222222" \
+       && echo "$SUINFO" | grep -q "total=333333" && echo "$SUINFO" | grep -q "expire=0"; then
+        ok "subs: subscription-userinfo (upload/download/total/expire)" \
+           "core fetch parses + surfaces upload=111111 download=222222 total=333333 expire=0"
+    else
+        bad "subs: subscription-userinfo (upload/download/total/expire)" \
+            "userinfo not surfaced by 'crash sub fetch': $(echo "$SUINFO" | grep -i userinfo | head -1 | cut -c1-80)"
+    fi
+else
+    skip "subs: subscription-userinfo (upload/download/total/expire)" \
+        "subinfo server :41881 down (see $LOGDIR/subinfo-server.log)"
+fi
 
 # rule-provider refresh cadence — REAL fetch from the local subs server:
 # the first `task rules` downloads + stores, the second is fresh-skipped
