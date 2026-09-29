@@ -235,6 +235,63 @@ mod tests {
         Ok(stream)
     }
 
+    // The engine-pair pin: the engine's own JLS client through
+    // the engine's own JLS listener over REAL loopback TCP (both halves
+    // of this crate), sequential and concurrent. The record layer —
+    // the server's post-handshake session ticket racing the first
+    // application records in either direction — is exercised by the
+    // relay echo on every iteration (the client's
+    // PrependStream/record-drive and the server's in-loop +
+    // post-handshake drains must stay in lockstep or the client fails
+    // with rustls' DecryptError, "cannot decrypt peer's message").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn engine_pair_roundtrips_under_sequential_and_concurrent_load() {
+        let (dest_addr, _seen) = spawn_dest_echo().await;
+        let capture = Capture::new();
+        let cfg = listener_cfg(&[("user1", "pass1")], &dest_addr.to_string());
+        let addr = serve(&cfg, capture.clone()).await.expect("serve");
+        let target = NetAddr::domain("target.example", 443).unwrap();
+
+        let one = |i: u32| {
+            let target = target.clone();
+            async move {
+                let mut stream = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    client_conn(addr, "user1", "pass1", None, &target),
+                )
+                .await
+                .expect("handshake timeout")
+                .expect("handshake failed");
+                let payload = format!("pair-payload-{i}-{}", "x".repeat(400));
+                stream.write_all(payload.as_bytes()).await.expect("write");
+                let mut buf = vec![0u8; payload.len()];
+                tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut buf))
+                    .await
+                    .expect("echo timeout")
+                    .expect("echo read");
+                assert_eq!(buf, payload.as_bytes());
+                let _ = stream.shutdown().await;
+            }
+        };
+
+        // Sequential conns: fresh stamping windows one after another.
+        for i in 0..10 {
+            one(i).await;
+        }
+        // Concurrent conns: the thread-local stamping machinery (fixed
+        // X25519 + scripted randoms) is shared across tasks pinned to
+        // the same worker threads — the interleaving the pair must
+        // survive.
+        let mut joins = Vec::new();
+        for i in 0..16 {
+            joins.push(tokio::spawn(one(100 + i)));
+        }
+        for j in joins {
+            j.await.expect("pair task");
+        }
+        assert_eq!(capture.relayed(), 26);
+    }
+
     #[tokio::test]
     async fn engine_client_roundtrips_through_the_listener_both_users() {
         // Fake credentials only (loopback, never real secrets).

@@ -197,7 +197,7 @@ use rand::RngCore;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::ring as ring_provider;
 use rustls::crypto::{CryptoProvider, GetRandomFailed, SecureRandom};
-use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme};
+use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tracing::debug;
@@ -583,30 +583,25 @@ fn jls_client_config(cfg: &JlsOut) -> Result<Arc<ClientConfig>> {
     let builder = ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| Error::config(format!("jls: tls: {e}")))?;
-    let mut config = if cfg.skip_cert_verify {
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
-            .with_no_client_auth()
-    } else {
-        // Same policy as transport::tls_client_config.
-        let mut roots = RootCertStore::empty();
-        let mut loaded = 0usize;
-        let certs = rustls_native_certs::load_native_certs()
-            .map_err(|e| Error::config(format!("jls: native cert store: {e}")))?;
-        for cert in certs {
-            roots
-                .add(cert)
-                .map_err(|e| Error::config(format!("jls: bad native cert: {e}")))?;
-            loaded += 1;
-        }
-        if loaded == 0 {
-            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        }
-        builder
-            .with_root_certificates(roots)
-            .with_no_client_auth()
-    };
+    // Chain verification is ALWAYS skipped on the plain path, exactly
+    // like the fingerprint path below (`ServerAuth::AcceptAny`): a
+    // spec-faithful JLS server's certificate is random camouflage by
+    // construction (`ca.NewRandomTLSKeyPair`, jls.go:154-161 — this
+    // file's own server half generates one per config in
+    // `generate_camouflage_cert`), so it can never chain to a root
+    // store and mihomo's client never verifies it (utls.go:58-60
+    // `InsecureSkipVerify`; the plain branch's fresh `tls.Config`,
+    // jls.go:102-111). JLS itself authenticates the peer — the
+    // ServerHello random check below is the authentication — and an
+    // engine-pair dial that honored `skip-cert-verify: false` died at
+    // `invalid peer certificate: UnknownIssuer` before the check could
+    // run. `JlsOut::skip_cert_verify` stays in the struct for the
+    // integrators that mirror it into their TLS settings; it cannot
+    // re-enable chain verification here.
+    let mut config = builder
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
+        .with_no_client_auth();
     let alpn: Vec<String> = if cfg.alpn.is_empty() {
         DEFAULT_ALPN.iter().map(|s| s.to_string()).collect()
     } else {
@@ -2013,6 +2008,25 @@ pub async fn server(
         user.username,
         cfg.users.len()
     );
+    // The WRITE-side mirror of the client's leftover replay: any bytes
+    // rustls still has queued once the handshake completed — the
+    // session-ticket flight, which `ExpectFinished::handle` emits in
+    // the same `process_new_packets` (rustls-0.23.37 server/tls13.rs:
+    // the `send_tickets` loop before `start_traffic`) — are flushed to
+    // the transport HERE, ahead of the session's first application
+    // write, instead of waiting inside the session for it. The Go
+    // server folds the tickets into the handshake's single flush
+    // (sendSessionTickets, handshake_server_tls13.go:940-966); holding
+    // them back would merely delay the client's peer-sequence advance,
+    // but emitting them at hand-off keeps the wire shape identical no
+    // matter which rustls version defers the ticket. Today this drains
+    // empty (the drive loop's drain already wrote the flight); it is
+    // the guarantee, not the cure.
+    let post_handshake = drain_server_tls(&mut tls);
+    if !post_handshake.is_empty() {
+        conn.write_all(&post_handshake).await?;
+        conn.flush().await?;
+    }
     // Records that arrived together with the Finished (early app data,
     // or this rustls server's session tickets) may still sit in the
     // read buffer — replay them into the session's transport.
@@ -2580,6 +2594,36 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(got, payload);
+    }
+
+    #[tokio::test]
+    async fn plain_path_never_verifies_the_camouflage_certificate() {
+        // The engine-pair regression (): `skip-cert-verify: false`
+        // used to arm rustls' root-store verifier on the plain path, and
+        // the dial then died at `invalid peer certificate: UnknownIssuer`
+        // before the ServerHello-random authentication could run — a
+        // spec-faithful JLS server's certificate is RANDOM camouflage
+        // (generate_camouflage_cert / ca.NewRandomTLSKeyPair,
+        // jls.go:154-161), so it can never chain to a root store and
+        // mihomo's client never verifies it (utls.go:58-60; the plain
+        // branch's fresh tls.Config). Both flag positions must
+        // therefore complete against the engine's own server half.
+        for skip in [false, true] {
+            let mut cfg = test_cfg("user1", "pass1");
+            cfg.skip_cert_verify = skip;
+            let user = JlsUser::new("user1", "pass1").unwrap();
+            let mut stream = connect_through_mimic(&cfg, &user).await.unwrap();
+
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let probe = format!("pair-with-skip-cert-verify-{skip}");
+            stream.write_all(probe.as_bytes()).await.unwrap();
+            let mut buf = vec![0u8; probe.len()];
+            tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(buf, probe.as_bytes());
+        }
     }
 
     #[tokio::test]
