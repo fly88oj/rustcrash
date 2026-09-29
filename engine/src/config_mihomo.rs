@@ -1728,7 +1728,20 @@ fn parse_proxy(
             server,
             port,
         },
-        "hysteria2" | "hy2" => OutboundKind::Hysteria2 {
+        "hysteria2" | "hy2" => {
+            // Port hopping (`ports` ranges + `hop-interval`, mihomo
+            // adapter/outbound/hysteria2.go:44-45) rides quic-go's ability
+            // to move an established connection to a new remote port;
+            // quinn cannot change an established connection's remote
+            // address, and re-dialing per hop would reset the tunnel every
+            // interval. Fail loudly instead of silently pinning one port.
+            if yaml_str(entry, "ports").is_some() || yaml_str(entry, "hop-interval").is_some() {
+                return Err(Error::config(format!(
+                    "proxy {name:?}: hysteria2 port hopping (ports/hop-interval) is \
+                     not implemented; configure a single port"
+                )));
+            }
+            OutboundKind::Hysteria2 {
             password: yaml_str(entry, "password").unwrap_or_default(),
             sni: yaml_str(entry, "sni"),
             skip_verify: entry
@@ -1748,6 +1761,7 @@ fn parse_proxy(
             server,
             port,
             ech: parse_ech_opts(entry, &name, &TransportKind::Tcp),
+        }
         },
         "tuic" => OutboundKind::Tuic {
             uuid: yaml_str(entry, "uuid")
@@ -3475,6 +3489,30 @@ rules:
         let tu = parsed.outbounds.iter().find(|o| o.name == "tu").unwrap();
         assert!(tu.udp, "tuic defaults udp to true");
         assert!(matches!(&tu.kind, OutboundKind::Tuic { .. }));
+    }
+
+    #[test]
+    fn hysteria2_port_hopping_fails_loudly() {
+        // mihomo's `ports` ranges + `hop-interval` (adapter/outbound/
+        // hysteria2.go:44-45) ride quic-go's mid-connection remote-port
+        // move; quinn can't, so hopping must be refused — not silently
+        // pinned to one port.
+        for extra in ["ports: 20000-30000", "hop-interval: 10"] {
+            let cfg = format!(
+                r#"
+mixed-port: 7890
+proxies:
+  - {{name: h2, type: hysteria2, server: h.example, port: 443, password: pw, {extra}}}
+rules:
+  - MATCH,h2
+"#
+            );
+            let err = load(&cfg).unwrap_err().to_string();
+            assert!(
+                err.contains("port hopping"),
+                "{extra} must name port hopping: {err}"
+            );
+        }
     }
 
     #[test]

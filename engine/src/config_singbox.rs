@@ -27,6 +27,8 @@ struct RawConfig {
     dns: Option<RawDns>,
     #[serde(default)]
     experimental: Option<RawExperimental>,
+    #[serde(default)]
+    services: Vec<BTreeMap<String, Json>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -117,6 +119,23 @@ pub fn load(text: &str) -> Result<EngineConfig> {
 
     if raw.outbounds.is_empty() {
         return Err(Error::config("sing-box config has no outbounds"));
+    }
+    // Services (sing-box 1.12+) are separate runtime services the engine
+    // does not run; a configured-but-dead service is a broken promise, so
+    // any entry fails loudly with its type named.
+    if let Some((i, svc)) = raw.services.iter().enumerate().next() {
+        let ty = json_str(svc, "type").unwrap_or_default();
+        if ty == "hysteria-realm" {
+            return Err(Error::config(format!(
+                "service #{i} ({ty}): the Hysteria Realm rendezvous service for \
+                 hysteria2 NAT traversal (sing-box 1.14) is not implemented by the \
+                 Rust engine yet; hy2 inbounds need a directly reachable listen port"
+            )));
+        }
+        return Err(Error::config(format!(
+            "service #{i} ({ty}): sing-box services are not implemented by the \
+             Rust engine yet"
+        )));
     }
     // sing-box always provides direct/block/dns even when undeclared.
     let declared: Vec<String> = raw
@@ -353,6 +372,23 @@ pub fn load(text: &str) -> Result<EngineConfig> {
                 })
             }
             "hysteria2" => {
+                // sing-box 1.14 hy2 surfaces the engine cannot honor: the
+                // Realm rendezvous (NAT traversal), multi-port hopping
+                // (`server_ports` — quinn cannot change an established
+                // connection's remote address, and re-dialing per hop
+                // would reset the tunnel every interval) and BBR profile
+                // selection (quinn ships no BBR). Loud-fail per the
+                // carried-or-rejected rule instead of silently pinning a
+                // single port/CC.
+                for key in ["realm", "server_ports", "bbr_profile"] {
+                    if outbound.get(key).is_some() {
+                        return Err(Error::config(format!(
+                            "outbound {tag:?}: hysteria2 {key} (sing-box 1.14) is not \
+                             implemented by the Rust engine yet; use a single \
+                             server_port (and default/brutal congestion control)"
+                        )));
+                    }
+                }
                 // salamander obfs: {"obfs": {"type": "salamander", "password": k}}
                 let obfs = outbound
                     .get("obfs")
@@ -879,18 +915,32 @@ fn parse_server_inbound(
                 .unwrap_or_default(),
             tls,
         },
-        "hysteria2" => ServerProtocol::Hysteria2 {
-            password: json_str(inbound, "password").unwrap_or_default(),
-            obfs: match inbound.get("obfs").and_then(Json::as_object) {
-                None => None,
-                Some(_) => {
+        "hysteria2" => {
+            // sing-box 1.14 hy2 inbound surfaces not implemented: the
+            // Realm rendezvous registration (NAT traversal) and BBR
+            // profile selection.
+            for key in ["realm", "bbr_profile"] {
+                if inbound.get(key).is_some() {
                     return Err(Error::config(format!(
-                        "inbound {tag:?}: hysteria2 server-side obfs is not implemented yet"
-                    )))
+                        "inbound {tag:?}: hysteria2 {key} (sing-box 1.14) is not \
+                         implemented by the Rust engine yet; the inbound needs a \
+                         directly reachable listen port"
+                    )));
                 }
-            },
-            tls,
-        },
+            }
+            ServerProtocol::Hysteria2 {
+                password: json_str(inbound, "password").unwrap_or_default(),
+                obfs: match inbound.get("obfs").and_then(Json::as_object) {
+                    None => None,
+                    Some(_) => {
+                        return Err(Error::config(format!(
+                            "inbound {tag:?}: hysteria2 server-side obfs is not implemented yet"
+                        )))
+                    }
+                },
+                tls,
+            }
+        }
         "tuic" => ServerProtocol::Tuic {
             uuid: first_user_field("uuid")
                 .or_else(|| json_str(inbound, "uuid"))
@@ -1787,6 +1837,67 @@ mod tests {
             &t.kind,
             OutboundKind::Tuic { udp_relay_mode: crate::proto::tuic::UdpRelayMode::Quic, .. }
         ));
+    }
+
+    #[test]
+    fn hysteria2_realm_and_114_fields_fail_loudly() {
+        // sing-box 1.14 hy2 surfaces (Realm rendezvous, multi-port
+        // hopping, BBR profile) must not be silently ignored.
+        let outbound_cases = [
+            (
+                r#"[{"type": "hysteria2", "tag": "h", "server": "x", "server_port": 1,
+                    "realm": {"server_url": "https://r.example", "realm_id": "a", "stun_servers": ["s"]}}]"#,
+                "realm",
+            ),
+            (
+                r#"[{"type": "hysteria2", "tag": "h", "server": "x", "server_ports": [1000, "2000-3000"]}]"#,
+                "server_ports",
+            ),
+            (
+                r#"[{"type": "hysteria2", "tag": "h", "server": "x", "server_port": 1, "bbr_profile": "standard"}]"#,
+                "bbr_profile",
+            ),
+        ];
+        for (outbounds, key) in outbound_cases {
+            let cfg = format!(
+                r#"{{"inbounds": [{{"type": "mixed", "listen_port": 1}}],
+                 "outbounds": {outbounds}}}"#
+            );
+            let err = load(&cfg).unwrap_err().to_string();
+            assert!(err.contains(key), "{key} must be named: {err}");
+        }
+        // The inbound side: a hy2 server inbound with realm registration.
+        let cfg = r#"
+{"inbounds": [
+   {"type": "mixed", "listen_port": 1},
+   {"type": "hysteria2", "tag": "srv", "listen": "::", "listen_port": 9000, "password": "p",
+    "realm": {"server_url": "https://r.example", "realm_id": "a", "stun_servers": ["s"]}}],
+ "outbounds": [{"type": "direct", "tag": "direct"}]}
+"#;
+        let err = load(cfg).unwrap_err().to_string();
+        assert!(err.contains("realm"), "inbound realm must be named: {err}");
+        // The companion rendezvous service.
+        let cfg = r#"
+{"inbounds": [{"type": "mixed", "listen_port": 1}],
+ "outbounds": [{"type": "direct", "tag": "direct"}],
+ "services": [{"type": "hysteria-realm", "tag": "r"}]}
+"#;
+        let err = load(cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("hysteria-realm"),
+            "the rendezvous service must be named: {err}"
+        );
+        // Any other service type is equally dead — name it too.
+        let cfg = r#"
+{"inbounds": [{"type": "mixed", "listen_port": 1}],
+ "outbounds": [{"type": "direct", "tag": "direct"}],
+ "services": [{"type": "some-future-service", "tag": "s"}]}
+"#;
+        let err = load(cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("some-future-service"),
+            "unknown service types must be named: {err}"
+        );
     }
 
     #[test]
