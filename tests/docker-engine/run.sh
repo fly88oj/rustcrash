@@ -5,6 +5,11 @@
 # ONE container on internal loopback 127.0.0.1 — hermetic by construction.
 set -u
 
+# Resource guard (2026-10-09 disk-full incident): refuse heavy work on
+# a full disk; watchdog prunes regenerable caches while this runs.
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/resource-guard.sh"
+guard_run
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 
@@ -42,6 +47,15 @@ echo "=== Starting container ==="
 docker compose -f "$COMPOSE_FILE" up -d >/dev/null
 
 DC="docker compose -f $COMPOSE_FILE"
+
+# Cert safety net: an image built from a `git archive` export (the matrix
+# suite shares this tag and builds that way) carries NO certs — the
+# fixtures are git-ignored. Copy the host-generated pair in before the
+# mihomo server starts, so cert-dependent rows cannot false-fail.
+if ! $DC exec -T rustcrash test -f /fixtures/certs/server.crt >/dev/null 2>&1; then
+    $DC cp "$CERT_DIR/." rustcrash:/fixtures/certs/ \
+        || { echo "cert copy into container failed"; exit 1; }
+fi
 sub() {
     $DC exec -T rustcrash "$@"
 }
