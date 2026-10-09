@@ -8,7 +8,7 @@ use std::sync::Arc;
 use socket2::{Protocol, SockRef, Socket};
 use tokio::sync::mpsc;
 
-use crate::addr::{NetAddr};
+use crate::addr::NetAddr;
 use crate::error::{Error, Result};
 use crate::inbound::{ListenerConfig, SharedRelay, TcpMeta};
 
@@ -42,6 +42,7 @@ pub async fn serve(cfg: &ListenerConfig, relay: SharedRelay) -> Result<SocketAdd
                             inbound: tag.clone(),
                             inbound_port: Some(port),
                             inbound_kind: "tproxy",
+                            in_user: None,
                         },
                         Box::new(stream),
                     );
@@ -82,9 +83,9 @@ impl TcpTransparentListener {
             .map_err(|e| Error::network(format!("tproxy reuse_port: {e}")))?;
         set_transparent(&SockRef::from(&socket), ip.is_ipv4())?;
         let addr = SocketAddr::new(ip, port);
-        socket.bind(&addr.into()).map_err(|e| {
-            crate::inbound::bind_failure("tproxy tcp", addr, e)
-        })?;
+        socket
+            .bind(&addr.into())
+            .map_err(|e| crate::inbound::bind_failure("tproxy tcp", addr, e))?;
         socket
             .listen(1024)
             .map_err(|e| Error::network(format!("tproxy listen: {e}")))?;
@@ -138,9 +139,9 @@ impl UdpTransparentSocket {
         set_transparent(&SockRef::from(&socket), ip.is_ipv4())?;
         set_recv_orig_dst(&SockRef::from(&socket), ip.is_ipv4())?;
         let addr = SocketAddr::new(ip, port);
-        socket.bind(&addr.into()).map_err(|e| {
-            crate::inbound::bind_failure("tproxy udp", addr, e)
-        })?;
+        socket
+            .bind(&addr.into())
+            .map_err(|e| crate::inbound::bind_failure("tproxy udp", addr, e))?;
         socket
             .set_nonblocking(true)
             .map_err(|e| Error::network(format!("tproxy udp nonblocking: {e}")))?;
@@ -226,8 +227,8 @@ fn recvmsg_intercepted(fd: std::os::fd::RawFd, buf: &mut [u8], is_v4: bool) -> R
     if n < 0 {
         return Err(Error::network(std::io::Error::last_os_error().to_string()));
     }
-    let src = storage_to_addr(&name)
-        .ok_or_else(|| Error::network("tproxy udp: no source address"))?;
+    let src =
+        storage_to_addr(&name).ok_or_else(|| Error::network("tproxy udp: no source address"))?;
     let dst = parse_orig_dst(&control, msg.msg_controllen as usize, is_v4)?;
     Ok(Intercepted {
         data: buf[..n as usize].to_vec(),
@@ -247,7 +248,10 @@ fn storage_to_addr(s: &libc::sockaddr_storage) -> Option<SocketAddr> {
         },
         libc::AF_INET6 => unsafe {
             let a: &libc::sockaddr_in6 = &*(s as *const _ as *const libc::sockaddr_in6);
-            Some(SocketAddr::new(a.sin6_addr.s6_addr.into(), u16::from_be(a.sin6_port)))
+            Some(SocketAddr::new(
+                a.sin6_addr.s6_addr.into(),
+                u16::from_be(a.sin6_port),
+            ))
         },
         _ => None,
     }
@@ -262,8 +266,7 @@ pub const IPV6_ORIGDSTADDR: libc::c_int = 74;
 fn parse_orig_dst(control: &[u8], len: usize, is_v4: bool) -> Result<SocketAddr> {
     let mut off = 0usize;
     while off + std::mem::size_of::<libc::cmsghdr>() <= len {
-        let hdr =
-            unsafe { &*(control.as_ptr().add(off) as *const libc::cmsghdr) };
+        let hdr = unsafe { &*(control.as_ptr().add(off) as *const libc::cmsghdr) };
         let data_off = off + std::mem::size_of::<libc::cmsghdr>();
         // cmsg_len is u32 on musl, usize on glibc — cast for both.
         #[cfg(target_env = "musl")]
@@ -326,12 +329,9 @@ async fn udp_pump(sock: UdpTransparentSocket, relay: SharedRelay, tag: String) -
                     None => {
                         let (up_tx, up_rx) = mpsc::channel::<(NetAddr, Vec<u8>)>(64);
                         let (down_tx, mut down_rx) = mpsc::channel::<(NetAddr, Vec<u8>)>(64);
-                        relay.clone().handle_udp(
-                            pkt.src,
-                            tag.clone(),
-                            up_rx,
-                            down_tx,
-                        );
+                        relay
+                            .clone()
+                            .handle_udp(pkt.src, tag.clone(), up_rx, down_tx);
                         // Reply pump: sends from a transparent socket
                         // bound to the original destination so the client
                         // sees the answer coming from where it sent.
@@ -364,7 +364,10 @@ async fn udp_pump(sock: UdpTransparentSocket, relay: SharedRelay, tag: String) -
             }
             Err(e) => {
                 let text = e.to_string();
-                if text.contains("EAGAIN") || text.contains("WouldBlock") || text.contains("os error 11") {
+                if text.contains("EAGAIN")
+                    || text.contains("WouldBlock")
+                    || text.contains("os error 11")
+                {
                     // Socket drained — wait for the next readiness edge.
                     io.readable().await?;
                 } else {
@@ -424,14 +427,21 @@ mod tests {
         // Rooted CI can bind; unprivileged local runs get a clean error.
         match result {
             Ok(_) => {}
-            Err(e) => assert!(e.to_string().contains("CAP_NET_ADMIN") || e.to_string().contains("Permission")),
+            Err(e) => assert!(
+                e.to_string().contains("CAP_NET_ADMIN") || e.to_string().contains("Permission")
+            ),
         }
     }
 
     struct NoopRelay;
 
     impl RelayHandler for NoopRelay {
-        fn handle_tcp(self: std::sync::Arc<Self>, _meta: TcpMeta, _client: crate::stream::BoxProxyStream) {}
+        fn handle_tcp(
+            self: std::sync::Arc<Self>,
+            _meta: TcpMeta,
+            _client: crate::stream::BoxProxyStream,
+        ) {
+        }
         fn handle_udp(
             self: std::sync::Arc<Self>,
             _: SocketAddr,

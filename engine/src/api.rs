@@ -149,7 +149,8 @@ async fn handle_connection(
                 .split('&')
                 .find_map(|kv| kv.strip_prefix("token="))
                 .map(percent_decode);
-            if bearer.as_deref() != Some(secret.as_str()) && query_token.as_deref() != Some(secret.as_str())
+            if bearer.as_deref() != Some(secret.as_str())
+                && query_token.as_deref() != Some(secret.as_str())
             {
                 write_json(&mut stream, 401, r#"{"message":"Unauthorized"}"#).await?;
                 return Ok(());
@@ -183,9 +184,7 @@ async fn dispatch(stream: &mut TcpStream, req: &Request, engine: &Arc<Engine>) -
         // mihomo server.go memory(): in-use allocator bytes streamed per
         // second. The engine does no pool accounting; the field is
         // reported as 0 so dashboards keep rendering.
-        ("GET", "/memory") => {
-            write_json(stream, 200, r#"{"memory":0}"#).await
-        }
+        ("GET", "/memory") => write_json(stream, 200, r#"{"memory":0}"#).await,
         ("GET", "/traffic") => {
             if req.is_websocket {
                 websocket_traffic(stream, req, engine).await
@@ -228,7 +227,12 @@ async fn dispatch(stream: &mut TcpStream, req: &Request, engine: &Arc<Engine>) -
                     })
                 })
                 .collect();
-            write_json(stream, 200, &serde_json::json!({ "rules": rules }).to_string()).await
+            write_json(
+                stream,
+                200,
+                &serde_json::json!({ "rules": rules }).to_string(),
+            )
+            .await
         }
         ("GET", "/connections") => {
             if req.is_websocket {
@@ -261,12 +265,9 @@ async fn dispatch(stream: &mut TcpStream, req: &Request, engine: &Arc<Engine>) -
                         pool.flush();
                         write_json(stream, 204, "").await
                     }
-                    None => write_json(
-                        stream,
-                        400,
-                        r#"{"message":"fake-ip is not enabled"}"#,
-                    )
-                    .await,
+                    None => {
+                        write_json(stream, 400, r#"{"message":"fake-ip is not enabled"}"#).await
+                    }
                 }
             } else {
                 write_json(stream, 400, r#"{"message":"DNS section is disabled"}"#).await
@@ -305,12 +306,14 @@ async fn dispatch(stream: &mut TcpStream, req: &Request, engine: &Arc<Engine>) -
         ("PUT", "/configs") | ("PATCH", "/configs") => {
             match apply_configs_patch(engine, &req.body).await {
                 Ok(()) => write_json(stream, 204, "").await,
-                Err(msg) => write_json(
-                    stream,
-                    400,
-                    &serde_json::json!({ "message": msg }).to_string(),
-                )
-                .await,
+                Err(msg) => {
+                    write_json(
+                        stream,
+                        400,
+                        &serde_json::json!({ "message": msg }).to_string(),
+                    )
+                    .await
+                }
             }
         }
         // mihomo provider.go getProviders(): the whole provider map —
@@ -494,8 +497,7 @@ fn query_param(query: &str, key: &str) -> Option<String> {
 /// config immutably); requesting those fields fails the whole request
 /// with the restart reason instead of half-applying.
 async fn apply_configs_patch(engine: &Arc<Engine>, body: &[u8]) -> std::result::Result<(), String> {
-    let v: serde_json::Value =
-        serde_json::from_slice(body).map_err(|_| "Bad body".to_string())?;
+    let v: serde_json::Value = serde_json::from_slice(body).map_err(|_| "Bad body".to_string())?;
     let obj = v.as_object().ok_or_else(|| "Bad body".to_string())?;
     for field in [
         "port",
@@ -573,12 +575,7 @@ async fn dns_query(stream: &mut TcpStream, req: &Request, engine: &Arc<Engine>) 
     let query = wire::build_query(0, &name, qtype);
     let resp = dns.handle(&query).await;
     let Ok(msg) = wire::parse(&resp) else {
-        return write_json(
-            stream,
-            500,
-            r#"{"message":"unparseable DNS response"}"#,
-        )
-        .await;
+        return write_json(stream, 500, r#"{"message":"unparseable DNS response"}"#).await;
     };
 
     let question: Vec<serde_json::Value> = msg
@@ -798,8 +795,7 @@ async fn group_delay(
     if registry.group(name).is_none() {
         return write_json(stream, 404, r#"{"message":"Group not found"}"#).await;
     }
-    let Some(timeout_ms) = query_param(&req.query, "timeout")
-        .and_then(|t| t.parse::<u64>().ok())
+    let Some(timeout_ms) = query_param(&req.query, "timeout").and_then(|t| t.parse::<u64>().ok())
     else {
         return write_json(stream, 400, r#"{"message":"Params invalid"}"#).await;
     };
@@ -807,16 +803,19 @@ async fn group_delay(
         // mihomo parses unsigned ranges ("200" / "200,301"); anything
         // non-numeric is a 400. The ranges themselves are not filtered
         // on yet (known groupbase gap).
-        if !expected
-            .split(',')
-            .all(|part| part.split('-').all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
-        {
+        if !expected.split(',').all(|part| {
+            part.split('-')
+                .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        }) {
             return write_json(stream, 400, r#"{"message":"Params invalid"}"#).await;
         }
     }
     let url = query_param(&req.query, "url")
         .unwrap_or_else(|| "http://www.gstatic.com/generate_204".into());
-    let members = registry.group(name).map(|g| g.cfg.members.clone()).unwrap_or_default();
+    let members = registry
+        .group(name)
+        .map(|g| g.cfg.members.clone())
+        .unwrap_or_default();
 
     let mut set = tokio::task::JoinSet::new();
     for member in members {
@@ -833,31 +832,33 @@ async fn group_delay(
             } else {
                 0
             };
-            engine.registry().record_latency(&member, ok.then_some(delay)).await;
+            engine
+                .registry()
+                .record_latency(&member, ok.then_some(delay))
+                .await;
             (member, delay)
         });
     }
-    let collected = tokio::time::timeout(
-        std::time::Duration::from_millis(timeout_ms),
-        async {
-            let mut out = serde_json::Map::new();
-            while let Some(joined) = set.join_next().await {
-                if let Ok((member, delay)) = joined {
-                    out.insert(member, serde_json::json!(delay));
-                }
+    let collected = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), async {
+        let mut out = serde_json::Map::new();
+        while let Some(joined) = set.join_next().await {
+            if let Ok((member, delay)) = joined {
+                out.insert(member, serde_json::json!(delay));
             }
-            out
-        },
-    )
+        }
+        out
+    })
     .await;
     match collected {
         Ok(map) => write_json(stream, 200, &serde_json::Value::Object(map).to_string()).await,
-        Err(_) => write_json(
-            stream,
-            504,
-            r#"{"message":"An error occurred in the delay test"}"#,
-        )
-        .await,
+        Err(_) => {
+            write_json(
+                stream,
+                504,
+                r#"{"message":"An error occurred in the delay test"}"#,
+            )
+            .await
+        }
     }
 }
 
@@ -926,12 +927,14 @@ async fn update_rule_provider(
     }
     match engine.reload_rule_provider(name) {
         Ok(()) => write_json(stream, 204, "").await,
-        Err(msg) => write_json(
-            stream,
-            503,
-            &serde_json::json!({ "message": msg }).to_string(),
-        )
-        .await,
+        Err(msg) => {
+            write_json(
+                stream,
+                503,
+                &serde_json::json!({ "message": msg }).to_string(),
+            )
+            .await
+        }
     }
 }
 // ---------------------------------------------------------------------------
@@ -1203,15 +1206,15 @@ pub(crate) fn install_loaded_provider(
     subscription_info: Option<SubscriptionUserInfo>,
     updated_at: Option<String>,
 ) {
-    proxy_providers()
-        .write()
-        .unwrap()
-        .insert(spec.name.clone(), ProxyProviderState {
+    proxy_providers().write().unwrap().insert(
+        spec.name.clone(),
+        ProxyProviderState {
             spec,
             proxies,
             updated_at,
             subscription_info,
-        });
+        },
+    );
 }
 
 /// Remove every installed provider (hermetic tests reset with this).
@@ -1243,8 +1246,7 @@ pub(crate) fn installed_provider_document(name: &str) -> Option<serde_json::Valu
 /// in parallel; sync tests use `blocking_lock`).
 #[cfg(test)]
 pub(crate) fn provider_table_test_lock() -> &'static tokio::sync::Mutex<()> {
-    static PROVIDER_TESTS: std::sync::OnceLock<tokio::sync::Mutex<()>> =
-        std::sync::OnceLock::new();
+    static PROVIDER_TESTS: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     PROVIDER_TESTS.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
@@ -1278,7 +1280,11 @@ async fn refetch_provider(name: &str) -> std::result::Result<(), String> {
 /// timestamp.
 async fn fetch_provider(
     spec: &ProxyProviderSpec,
-) -> Result<(Vec<OutboundConfig>, Option<SubscriptionUserInfo>, Option<String>)> {
+) -> Result<(
+    Vec<OutboundConfig>,
+    Option<SubscriptionUserInfo>,
+    Option<String>,
+)> {
     let (reply, subscription_info) = match &spec.vehicle {
         ProviderVehicle::File { path } => (
             tokio::fs::read_to_string(path)
@@ -1310,10 +1316,15 @@ pub(crate) fn rfc3339_utc(unix_secs: u64) -> String {
     const DAYS_IN_MONTH: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     let mut days = unix_secs / 86_400;
     let secs_of_day = unix_secs % 86_400;
-    let (h, m, s) = (secs_of_day / 3600, (secs_of_day / 60) % 60, secs_of_day % 60);
+    let (h, m, s) = (
+        secs_of_day / 3600,
+        (secs_of_day / 60) % 60,
+        secs_of_day % 60,
+    );
     let mut year = 1970u64;
     loop {
-        let leap = (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
+        let leap =
+            (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
         let year_days = if leap { 366 } else { 365 };
         if days >= year_days {
             days -= year_days;
@@ -1398,15 +1409,18 @@ impl HttpReply {
 /// it directly.
 pub(crate) fn http_get_sync(url: &str) -> Result<HttpReply> {
     use std::io::{Read, Write};
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| Error::config("only http:// provider URLs are supported (https fetch is not ported)"))?;
+    let rest = url.strip_prefix("http://").ok_or_else(|| {
+        Error::config("only http:// provider URLs are supported (https fetch is not ported)")
+    })?;
     let (host, port, path) = match rest.split_once('/') {
         Some((hostport, path)) => {
             let (host, port) = match hostport.rsplit_once(':') {
-                Some((h, p)) => (h.to_string(), p.parse::<u16>().map_err(|_| {
-                    Error::config(format!("invalid provider URL port in {url:?}"))
-                })?),
+                Some((h, p)) => (
+                    h.to_string(),
+                    p.parse::<u16>().map_err(|_| {
+                        Error::config(format!("invalid provider URL port in {url:?}"))
+                    })?,
+                ),
                 None => (hostport.to_string(), 80),
             };
             (host, port, format!("/{path}"))
@@ -1461,10 +1475,7 @@ pub(crate) fn http_get_sync(url: &str) -> Result<HttpReply> {
         out.push_str(&tail[..size]);
         rest = tail[size..].strip_prefix("\r\n").unwrap_or(&tail[size..]);
     }
-    Ok(HttpReply {
-        headers,
-        body: out,
-    })
+    Ok(HttpReply { headers, body: out })
 }
 
 /// A plain `http://` GET (the blocking [`http_get_sync`] core on the
@@ -1492,11 +1503,7 @@ async fn proxy_providers_payload() -> serde_json::Value {
 /// provider + proxyProvider routers: GET detail, PUT update with
 /// mihomo's 204/503 pair, GET per-proxy detail; the healthcheck route
 /// names its precise non-port).
-async fn proxy_provider_subroute(
-    stream: &mut TcpStream,
-    method: &str,
-    rest: &str,
-) -> Result<()> {
+async fn proxy_provider_subroute(stream: &mut TcpStream, method: &str, rest: &str) -> Result<()> {
     let (name, proxy) = match rest.split_once('/') {
         Some((name, proxy)) => (name, Some(proxy)),
         None => (rest, None),
@@ -1523,12 +1530,14 @@ async fn proxy_provider_subroute(
             Err(msg) if msg.contains("not found") => {
                 write_json(stream, 404, r#"{"message":"Provider not found"}"#).await
             }
-            Err(msg) => write_json(
-                stream,
-                503,
-                &serde_json::json!({ "message": msg }).to_string(),
-            )
-            .await,
+            Err(msg) => {
+                write_json(
+                    stream,
+                    503,
+                    &serde_json::json!({ "message": msg }).to_string(),
+                )
+                .await
+            }
         };
     }
     if method != "GET" {
@@ -1639,9 +1648,7 @@ fn spawn_provider_health_checks(engine: Arc<Engine>) {
             };
             let now = tokio::time::Instant::now();
             for spec in jobs {
-                let interval = std::time::Duration::from_secs(
-                    spec.health_check.interval.max(1),
-                );
+                let interval = std::time::Duration::from_secs(spec.health_check.interval.max(1));
                 let next = due.entry(spec.name.clone()).or_insert(now);
                 if now < *next {
                     continue;
@@ -1672,27 +1679,22 @@ async fn provider_health_round(engine: &Arc<Engine>, spec: &ProxyProviderSpec) {
             continue;
         };
         let started = std::time::Instant::now();
-        let sample = match crate::outbound::probe_expect(&spec.health_check.url, &outbound, &expected)
-            .await
-        {
-            Ok(()) => Some(started.elapsed().as_millis().min(u32::MAX as u128) as u32),
-            Err(_) => None,
-        };
+        let sample =
+            match crate::outbound::probe_expect(&spec.health_check.url, &outbound, &expected).await
+            {
+                Ok(()) => Some(started.elapsed().as_millis().min(u32::MAX as u128) as u32),
+                Err(_) => None,
+            };
         engine.registry().record_latency(&cfg.name, sample).await;
     }
 }
-
 
 async fn proxies_payload(engine: &Arc<Engine>) -> serde_json::Value {
     let registry = engine.registry();
     let mut map = serde_json::Map::new();
     let latencies = registry.latency_snapshot().await;
     for name in registry.leaf_names() {
-        let udp = registry
-            .resolve(&name)
-            .await
-            .map(|o| o.udp)
-            .unwrap_or(true);
+        let udp = registry.resolve(&name).await.map(|o| o.udp).unwrap_or(true);
         map.insert(
             name.clone(),
             serde_json::json!({
@@ -1879,7 +1881,11 @@ async fn ws_upgrade(stream: &mut TcpStream, req: &Request) -> Result<()> {
 }
 
 /// Server-side websocket for /traffic: one JSON object per second.
-async fn websocket_traffic(stream: &mut TcpStream, req: &Request, engine: &Arc<Engine>) -> Result<()> {
+async fn websocket_traffic(
+    stream: &mut TcpStream,
+    req: &Request,
+    engine: &Arc<Engine>,
+) -> Result<()> {
     ws_upgrade(stream, req).await?;
     let mut rx = engine.stats().subscribe_traffic();
     loop {
@@ -1990,7 +1996,6 @@ impl LogLevel {
         }
     }
 }
-
 
 /// `?level=` filter value → mihomo severity number (events with
 /// severity >= the requested one pass; `silent` mutes everything).
@@ -2104,8 +2109,6 @@ pub fn push_log_event(level: &str, payload: &str) {
         payload: payload.to_string(),
     }));
 }
-
-
 
 /// `GET /logs` — mihomo hub/route getLogs(): stream every log event at
 /// or above `?level=` (default info; an unknown level is a 400 like
@@ -2259,14 +2262,14 @@ mod tests {
         use crate::dns::wire;
         let mut msg = wire::build_query(3, "web.test", wire::TYPE_A);
         msg[2] = 0x81; // response
-        // CNAME web.test -> web.test (pointer rdata into the question).
+                       // CNAME web.test -> web.test (pointer rdata into the question).
         msg.extend_from_slice(&[0xC0, 0x0C]);
         msg.extend_from_slice(&5u16.to_be_bytes()); // CNAME
         msg.extend_from_slice(&1u16.to_be_bytes()); // IN
         msg.extend_from_slice(&60u32.to_be_bytes());
         msg.extend_from_slice(&2u16.to_be_bytes()); // rdlen
         msg.extend_from_slice(&[0xC0, 0x0C]); // name pointer
-        // A web.test -> 198.18.0.9
+                                              // A web.test -> 198.18.0.9
         msg.extend_from_slice(&[0xC0, 0x0C]);
         msg.extend_from_slice(&wire::TYPE_A.to_be_bytes());
         msg.extend_from_slice(&1u16.to_be_bytes());
@@ -2416,6 +2419,8 @@ mod tests {
             url: None,
             interval: 0,
             tolerance: 0,
+            lb_strategy: Default::default(),
+            lb_hash_key_in_user: false,
         }];
         let addr = start_api(cfg).await;
 
@@ -2437,7 +2442,10 @@ mod tests {
 
         let (status, body) = request(addr, "GET", "/group/Pick", b"").await;
         assert_eq!(status, 200);
-        assert!(body.contains("\"DIRECT\"") && body.contains("\"now\""), "body: {body}");
+        assert!(
+            body.contains("\"DIRECT\"") && body.contains("\"now\""),
+            "body: {body}"
+        );
 
         let (status, _) = request(addr, "GET", "/group/Nope", b"").await;
         assert_eq!(status, 404);
@@ -2455,8 +2463,7 @@ mod tests {
         cfg.dns = Some(fakeip_cfg());
         let addr = start_api(cfg).await;
 
-        let (status, body) =
-            request(addr, "GET", "/dns/query?name=web.test&type=A", b"").await;
+        let (status, body) = request(addr, "GET", "/dns/query?name=web.test&type=A", b"").await;
         assert_eq!(status, 200, "body: {body}");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["Status"], 0);
@@ -2561,6 +2568,7 @@ mod tests {
                 inbound: "test".into(),
                 inbound_port: None,
                 inbound_kind: "mixed",
+                in_user: None,
             },
             Box::new(client),
         );
@@ -2611,10 +2619,13 @@ mod tests {
 
         // Mid-flight proof: dribble bytes flow through the engine relay.
         let mut buf = [0u8; 8];
-        tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_exact(&mut buf))
-            .await
-            .expect("relay delivered dribble bytes")
-            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_exact(&mut buf),
+        )
+        .await
+        .expect("relay delivered dribble bytes")
+        .unwrap();
         assert_eq!(&buf, b"dribdrib");
 
         let id = wait_for_conns(addr, |ids| !ids.is_empty()).await[0];
@@ -2626,10 +2637,13 @@ mod tests {
         // The client sees EOF: the relay observed the cancel token and
         // dropped its end of the socket pair.
         let mut sink = Vec::new();
-        tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_to_end(&mut sink))
-            .await
-            .expect("client saw EOF within 5s of the api close")
-            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_to_end(&mut sink),
+        )
+        .await
+        .expect("client saw EOF within 5s of the api close")
+        .unwrap();
 
         // And the entry leaves the table once the relay folds its counters.
         wait_for_conns(addr, |ids| !ids.contains(&id)).await;
@@ -2679,8 +2693,7 @@ mod tests {
         let addr = start_api(cfg).await;
 
         // Prime the cache: one upstream exchange.
-        let (status, body) =
-            request(addr, "GET", "/dns/query?name=flush.test&type=A", b"").await;
+        let (status, body) = request(addr, "GET", "/dns/query?name=flush.test&type=A", b"").await;
         assert_eq!(status, 200, "body: {body}");
         assert!(body.contains("203.0.113.7"), "answer rendered: {body}");
         assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -2718,6 +2731,8 @@ mod tests {
             url: None,
             interval: 0,
             tolerance: 0,
+            lb_strategy: Default::default(),
+            lb_hash_key_in_user: false,
         }];
         let (addr, engine) = start_api_with_engine(cfg).await;
         let target = dribble_server().await;
@@ -2848,7 +2863,9 @@ mod tests {
         .unwrap();
         install_proxy_provider(ProxyProviderSpec {
             name: "sub1".into(),
-            vehicle: ProviderVehicle::File { path: sub.to_string_lossy().into_owned() },
+            vehicle: ProviderVehicle::File {
+                path: sub.to_string_lossy().into_owned(),
+            },
             interval: 0,
             health_check: ProviderHealthCheck::default(),
         })
@@ -2939,8 +2956,10 @@ mod tests {
         clear_proxy_providers().await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let sub_addr = listener.local_addr().unwrap();
-        let body_plain = "proxies:\n  - name: us-a\n    type: socks5\n    server: 10.0.0.1\n    port: 1080\n";
-        let body_chunked_body = "proxies:\n  - name: us-b\n    type: http\n    server: 10.0.0.2\n    port: 8080\n";
+        let body_plain =
+            "proxies:\n  - name: us-a\n    type: socks5\n    server: 10.0.0.1\n    port: 1080\n";
+        let body_chunked_body =
+            "proxies:\n  - name: us-b\n    type: http\n    server: 10.0.0.2\n    port: 8080\n";
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
                 let mut buf = vec![0u8; 4096];
@@ -2964,7 +2983,9 @@ mod tests {
         });
         install_proxy_provider(ProxyProviderSpec {
             name: "http-sub".into(),
-            vehicle: ProviderVehicle::Http { url: format!("http://127.0.0.1:{}/plain", sub_addr.port()) },
+            vehicle: ProviderVehicle::Http {
+                url: format!("http://127.0.0.1:{}/plain", sub_addr.port()),
+            },
             interval: 300,
             health_check: ProviderHealthCheck::default(),
         })
@@ -2972,7 +2993,9 @@ mod tests {
         .unwrap();
         install_proxy_provider(ProxyProviderSpec {
             name: "chunked-sub".into(),
-            vehicle: ProviderVehicle::Http { url: format!("http://127.0.0.1:{}/chunked", sub_addr.port()) },
+            vehicle: ProviderVehicle::Http {
+                url: format!("http://127.0.0.1:{}/chunked", sub_addr.port()),
+            },
             interval: 0,
             health_check: ProviderHealthCheck::default(),
         })
@@ -2993,7 +3016,9 @@ mod tests {
         // An https URL is the precise not-ported error.
         install_proxy_provider(ProxyProviderSpec {
             name: "tls-sub".into(),
-            vehicle: ProviderVehicle::Http { url: "https://example.com/sub".into() },
+            vehicle: ProviderVehicle::Http {
+                url: "https://example.com/sub".into(),
+            },
             interval: 0,
             health_check: ProviderHealthCheck::default(),
         })
@@ -3018,7 +3043,9 @@ mod tests {
         .unwrap();
         install_proxy_provider(ProxyProviderSpec {
             name: "json-sub".into(),
-            vehicle: ProviderVehicle::File { path: sub.to_string_lossy().into_owned() },
+            vehicle: ProviderVehicle::File {
+                path: sub.to_string_lossy().into_owned(),
+            },
             interval: 0,
             health_check: ProviderHealthCheck::default(),
         })
@@ -3075,6 +3102,8 @@ mod tests {
             url: None,
             interval: 0,
             tolerance: 0,
+            lb_strategy: Default::default(),
+            lb_hash_key_in_user: false,
         };
         cfg.groups = vec![pick("PickA"), pick("PickB")];
         let (addr, engine) = start_api_with_engine(cfg).await;
@@ -3176,11 +3205,8 @@ mod tests {
         for i in 0..80 {
             tracing::info!(target: "engine", "broadcast-logs-marker-{i}");
             let mut chunk = vec![0u8; 8192];
-            if let Ok(Ok(n)) = tokio::time::timeout(
-                std::time::Duration::from_millis(50),
-                c.read(&mut chunk),
-            )
-            .await
+            if let Ok(Ok(n)) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), c.read(&mut chunk)).await
             {
                 seen.push_str(&String::from_utf8_lossy(&chunk[..n]));
                 if seen.contains("broadcast-logs-marker") {
@@ -3192,7 +3218,10 @@ mod tests {
         assert!(got, "no log frame observed; saw: {seen}");
         let v = marker_json(&seen, "broadcast-logs-marker");
         assert_eq!(v["type"], "info");
-        assert!(v["payload"].as_str().unwrap().contains("broadcast-logs-marker"));
+        assert!(v["payload"]
+            .as_str()
+            .unwrap()
+            .contains("broadcast-logs-marker"));
         drop(c);
 
         // ?level=error gates info events out; error events pass.
@@ -3213,7 +3242,9 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         }
         let mut chunk = vec![0u8; 8192];
-        if let Ok(Ok(n)) = tokio::time::timeout(std::time::Duration::from_millis(250), c2.read(&mut chunk)).await {
+        if let Ok(Ok(n)) =
+            tokio::time::timeout(std::time::Duration::from_millis(250), c2.read(&mut chunk)).await
+        {
             noise.push_str(&String::from_utf8_lossy(&chunk[..n]));
         }
         assert!(
@@ -3227,11 +3258,9 @@ mod tests {
         let mut got = false;
         for i in 0..80 {
             tracing::error!(target: "engine", "broadcast-err-marker-{i}");
-            if let Ok(Ok(n)) = tokio::time::timeout(
-                std::time::Duration::from_millis(50),
-                c2.read(&mut chunk),
-            )
-            .await
+            if let Ok(Ok(n)) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), c2.read(&mut chunk))
+                    .await
             {
                 seen.push_str(&String::from_utf8_lossy(&chunk[..n]));
                 if seen.contains("broadcast-err-marker") {
@@ -3247,7 +3276,9 @@ mod tests {
         // After the proven-live point, an info event still never lands.
         tracing::info!(target: "engine", "fmt-gated-info-final");
         let mut tail = String::new();
-        if let Ok(Ok(n)) = tokio::time::timeout(std::time::Duration::from_millis(250), c2.read(&mut chunk)).await {
+        if let Ok(Ok(n)) =
+            tokio::time::timeout(std::time::Duration::from_millis(250), c2.read(&mut chunk)).await
+        {
             tail.push_str(&String::from_utf8_lossy(&chunk[..n]));
         }
         assert!(
@@ -3335,7 +3366,10 @@ mod tests {
         assert!(got, "no ws frame observed; saw: {frames}");
         let v = marker_json(&frames, "ws-broadcast-marker");
         assert_eq!(v["level"], "info", "payload: {frames}");
-        assert!(v["message"].as_str().unwrap().contains("ws-broadcast-marker"));
+        assert!(v["message"]
+            .as_str()
+            .unwrap()
+            .contains("ws-broadcast-marker"));
         assert!(v.get("fields").is_some(), "structured frame carries fields");
     }
 
@@ -3387,7 +3421,9 @@ mod tests {
 
         // No token → 401.
         let mut c = TcpStream::connect(addr).await.unwrap();
-        c.write_all(b"GET /version HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+        c.write_all(b"GET /version HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
         let mut buf = vec![0u8; 512];
         let n = c.read(&mut buf).await.unwrap();
         assert!(buf[..n].starts_with(b"HTTP/1.1 401"));
@@ -3395,7 +3431,8 @@ mod tests {
         // With token → 200.
         let mut c = TcpStream::connect(addr).await.unwrap();
         c.write_all(b"GET /version HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer sekrit\r\n\r\n")
-            .await.unwrap();
+            .await
+            .unwrap();
         let mut buf = vec![0u8; 512];
         let n = tokio::time::timeout(std::time::Duration::from_secs(5), c.read(&mut buf))
             .await
@@ -3437,7 +3474,10 @@ mod tests {
         );
         // Values may be floats (upstream parseValue falls back to
         // ParseFloat and truncates).
-        assert_eq!(parse_subscription_userinfo("total=1073741824.9").total, 1073741824);
+        assert_eq!(
+            parse_subscription_userinfo("total=1073741824.9").total,
+            1073741824
+        );
         // Unparsable values and `no=` fields are skipped, not fatal.
         let partial = parse_subscription_userinfo("upload=abc; total=5; noequals; odd=1");
         assert_eq!(partial.upload, 0);
@@ -3473,6 +3513,8 @@ mod tests {
             url: None,
             interval: 0,
             tolerance: 0,
+            lb_strategy: Default::default(),
+            lb_hash_key_in_user: false,
         };
         cfg.groups = vec![group("wg2-st"), group("wg2-nu"), group("wg2-pl")];
         register_group_flags(HashMap::from([
@@ -3614,7 +3656,9 @@ rules:
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 4096];
                     // Phase 1: the CONNECT head.
-                    let Ok(n) = sock.read(&mut buf).await else { return };
+                    let Ok(n) = sock.read(&mut buf).await else {
+                        return;
+                    };
                     let head = String::from_utf8_lossy(&buf[..n]).to_string();
                     if !head.starts_with("CONNECT ") {
                         let _ = sock.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
@@ -3624,7 +3668,9 @@ rules:
                         .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
                         .await;
                     // Phase 2: the tunneled GET (probe_expect's request).
-                    let Ok(n) = sock.read(&mut buf).await else { return };
+                    let Ok(n) = sock.read(&mut buf).await else {
+                        return;
+                    };
                     let got = String::from_utf8_lossy(&buf[..n]).to_string();
                     if got.starts_with("GET /generate_204") {
                         let _ = sock
@@ -3647,7 +3693,8 @@ rules:
         clear_proxy_providers().await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let sub_addr = listener.local_addr().unwrap();
-        let body = "proxies:\n  - name: sg-a\n    type: socks5\n    server: 10.0.0.3\n    port: 1080\n";
+        let body =
+            "proxies:\n  - name: sg-a\n    type: socks5\n    server: 10.0.0.3\n    port: 1080\n";
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
                 let mut buf = vec![0u8; 4096];

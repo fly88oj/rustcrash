@@ -85,10 +85,7 @@ impl FakeIpPool {
             }
         };
         let store: StoreFile = serde_json::from_slice(&raw).map_err(|e| {
-            Error::config(format!(
-                "fake-ip store {}: corrupt ({e})",
-                path.display()
-            ))
+            Error::config(format!("fake-ip store {}: corrupt ({e})", path.display()))
         })?;
         if store.version != 1 {
             return Err(Error::config(format!(
@@ -198,12 +195,27 @@ impl FakeIpPool {
         format!("{}/{}", Ipv4Addr::from(self.base), self.prefix)
     }
 
-    /// Get (or allocate) the fake address for a domain.
-    pub fn lookup_or_alloc(&self, domain: &str) -> IpAddr {
+    /// Get (or allocate) the fake address for a domain. Domains longer
+    /// than 255 bytes are refused (upstream dns/transport/fakeip 07512b1:
+    /// "domain name too long for fakeip" — they cannot be a DNS name).
+    pub fn lookup_or_alloc(&self, domain: &str) -> Result<IpAddr> {
+        self.lookup_or_alloc_flagged(domain).map(|(ip, _)| ip)
+    }
+
+    /// [`lookup_or_alloc`] reporting whether the address was freshly
+    /// allocated (a cache hit reports false — the store write-back
+    /// throttles on fresh allocations only).
+    pub fn lookup_or_alloc_flagged(&self, domain: &str) -> Result<(IpAddr, bool)> {
+        if domain.len() > 255 {
+            return Err(Error::protocol(format!(
+                "domain name too long for fakeip ({} bytes, max 255)",
+                domain.len()
+            )));
+        }
         let mut inner = self.inner.lock().unwrap();
         if let Some(ip) = inner.by_domain.get(domain).copied() {
             touch(&mut inner.order, domain);
-            return ip;
+            return Ok((ip, false));
         }
         // Evict when full.
         if inner.by_domain.len() as u32 >= self.size {
@@ -231,7 +243,7 @@ impl FakeIpPool {
         inner.by_domain.insert(domain.to_string(), ip);
         inner.by_ip.insert(ip, domain.to_string());
         inner.order.push(domain.to_string());
-        ip
+        Ok((ip, true))
     }
 
     /// Reverse lookup: domain for a fake address.
@@ -301,20 +313,20 @@ mod tests {
     #[test]
     fn alloc_and_reverse() {
         let pool = FakeIpPool::new("198.18.0.1/15").unwrap();
-        let a = pool.lookup_or_alloc("a.test");
-        let b = pool.lookup_or_alloc("b.test");
+        let a = pool.lookup_or_alloc("a.test").unwrap();
+        let b = pool.lookup_or_alloc("b.test").unwrap();
         assert_ne!(a, b);
         assert_eq!(pool.reverse(a).unwrap(), "a.test");
         assert_eq!(pool.reverse(b).unwrap(), "b.test");
         // Stable allocation.
-        assert_eq!(pool.lookup_or_alloc("a.test"), a);
+        assert_eq!(pool.lookup_or_alloc("a.test").unwrap(), a);
         assert_eq!(pool.len(), 2);
     }
 
     #[test]
     fn contains_bounds() {
         let pool = FakeIpPool::new("198.18.0.1/15").unwrap();
-        let a = pool.lookup_or_alloc("x.test");
+        let a = pool.lookup_or_alloc("x.test").unwrap();
         assert!(pool.contains(a));
         assert!(!pool.contains("8.8.8.8".parse().unwrap()));
         assert!(!pool.contains("::1".parse().unwrap()));
@@ -324,13 +336,13 @@ mod tests {
     fn lru_eviction() {
         // /30 → 2 usable slots.
         let pool = FakeIpPool::new("10.99.0.1/30").unwrap();
-        let a = pool.lookup_or_alloc("first.test");
-        let b = pool.lookup_or_alloc("second.test");
+        let a = pool.lookup_or_alloc("first.test").unwrap();
+        let b = pool.lookup_or_alloc("second.test").unwrap();
         assert_eq!(pool.len(), 2);
         // Touch `first` via reverse lookup so `second` is the LRU victim.
         assert_eq!(pool.reverse(a).as_deref(), Some("first.test"));
         // Allocating `third` evicts `second` and hands its address over.
-        let _c = pool.lookup_or_alloc("third.test");
+        let _c = pool.lookup_or_alloc("third.test").unwrap();
         assert_eq!(pool.len(), 2);
         // `first` survived; `second` no longer maps to its old address.
         assert_eq!(pool.reverse(a).as_deref(), Some("first.test"));
@@ -351,14 +363,14 @@ mod tests {
     #[test]
     fn flush_clears_everything() {
         let pool = FakeIpPool::new("198.18.0.1/15").unwrap();
-        let a = pool.lookup_or_alloc("gone.test");
+        let a = pool.lookup_or_alloc("gone.test").unwrap();
         assert_eq!(pool.len(), 1);
         pool.flush();
         assert!(pool.is_empty());
         assert_eq!(pool.reverse(a), None);
         // Allocation restarts from the beginning of the range.
         assert_eq!(
-            pool.lookup_or_alloc("fresh.test"),
+            pool.lookup_or_alloc("fresh.test").unwrap(),
             IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1))
         );
     }
@@ -382,8 +394,8 @@ mod tests {
     fn persist_reload_roundtrip() {
         let path = temp_store("roundtrip");
         let pool = FakeIpPool::new("198.18.0.1/15").unwrap();
-        let a = pool.lookup_or_alloc("a.test");
-        let b = pool.lookup_or_alloc("b.test");
+        let a = pool.lookup_or_alloc("a.test").unwrap();
+        let b = pool.lookup_or_alloc("b.test").unwrap();
         // Touch `a` so it is the most-recently-used; file order is LRU.
         assert_eq!(pool.reverse(a).as_deref(), Some("a.test"));
         pool.persist_to(&path).unwrap();
@@ -391,12 +403,12 @@ mod tests {
         let reloaded = FakeIpPool::load_from("198.18.0.1/15", &path).unwrap();
         assert_eq!(reloaded.len(), 2);
         // Same addresses handed out for the same domains.
-        assert_eq!(reloaded.lookup_or_alloc("a.test"), a);
-        assert_eq!(reloaded.lookup_or_alloc("b.test"), b);
+        assert_eq!(reloaded.lookup_or_alloc("a.test").unwrap(), a);
+        assert_eq!(reloaded.lookup_or_alloc("b.test").unwrap(), b);
         assert_eq!(reloaded.reverse(b).as_deref(), Some("b.test"));
         assert_eq!(reloaded.canonical_range(), "198.18.0.0/15");
         // A fresh allocation continues after the restored block.
-        let c = reloaded.lookup_or_alloc("c.test");
+        let c = reloaded.lookup_or_alloc("c.test").unwrap();
         assert_ne!(c, a);
         assert_ne!(c, b);
         assert!(reloaded.contains(c));
@@ -407,7 +419,7 @@ mod tests {
     fn reload_with_different_range_resets() {
         let path = temp_store("range-change");
         let pool = FakeIpPool::new("10.99.0.1/24").unwrap();
-        pool.lookup_or_alloc("stale.test");
+        pool.lookup_or_alloc("stale.test").unwrap();
         pool.persist_to(&path).unwrap();
 
         // The configured range shrank: the stored addresses may no
@@ -426,7 +438,7 @@ mod tests {
         let path = temp_store("missing");
         let pool = FakeIpPool::load_from("198.18.0.1/15", &path).unwrap();
         assert!(pool.is_empty());
-        assert!(pool.lookup_or_alloc("new.test").is_ipv4());
+        assert!(pool.lookup_or_alloc("new.test").unwrap().is_ipv4());
     }
 
     #[test]
@@ -454,6 +466,17 @@ mod tests {
     }
 
     #[test]
+    fn long_domain_is_refused() {
+        // upstream 07512b1: >255 bytes cannot be a DNS name — refuse
+        // instead of poisoning the store.
+        let pool = FakeIpPool::new("198.18.0.1/15").unwrap();
+        let long = "a".repeat(256);
+        let err = pool.lookup_or_alloc(&long).unwrap_err().to_string();
+        assert!(err.contains("too long"), "{err}");
+        assert_eq!(pool.len(), 0, "no allocation on refusal");
+    }
+
+    #[test]
     fn persist_creates_parent_directories() {
         let dir = std::env::temp_dir().join(format!(
             "rustcrash-fakeip-dirs-{}-{}",
@@ -462,7 +485,7 @@ mod tests {
         ));
         let path = dir.join("nested").join("store.json");
         let pool = FakeIpPool::new("198.18.0.1/15").unwrap();
-        pool.lookup_or_alloc("dir.test");
+        pool.lookup_or_alloc("dir.test").unwrap();
         pool.persist_to(&path).unwrap();
         assert!(path.is_file());
         let reloaded = FakeIpPool::load_from("198.18.0.1/15", &path).unwrap();

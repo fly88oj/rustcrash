@@ -220,14 +220,12 @@ impl NodeIdentity {
         let machine_key = match store.read_state(MACHINE_KEY_STATE_KEY) {
             Some(text) => {
                 let text = String::from_utf8_lossy(text).into_owned();
-                MachinePrivateKey::from_hex(
-                    text.strip_prefix("privkey:").unwrap_or(&text),
-                )
-                .map_err(|e| {
-                    std::io::Error::other(format!(
-                        "invalid key in {MACHINE_KEY_STATE_KEY}: {e}"
-                    ))
-                })?
+                MachinePrivateKey::from_hex(text.strip_prefix("privkey:").unwrap_or(&text))
+                    .map_err(|e| {
+                        std::io::Error::other(format!(
+                            "invalid key in {MACHINE_KEY_STATE_KEY}: {e}"
+                        ))
+                    })?
             }
             None => {
                 let key = MachinePrivateKey::generate();
@@ -240,12 +238,10 @@ impl NodeIdentity {
         // Node key (Persist under the legacy global key).
         let node_key = match store.read_state(LEGACY_GLOBAL_DAEMON_STATE_KEY) {
             Some(raw) => {
-                let persist: Persist = serde_json::from_slice(raw).map_err(|e| {
-                    std::io::Error::other(format!("invalid Persist state: {e}"))
-                })?;
-                node_private_from_text(&persist.private_node_key).ok_or_else(|| {
-                    std::io::Error::other("invalid PrivateNodeKey in state")
-                })?
+                let persist: Persist = serde_json::from_slice(raw)
+                    .map_err(|e| std::io::Error::other(format!("invalid Persist state: {e}")))?;
+                node_private_from_text(&persist.private_node_key)
+                    .ok_or_else(|| std::io::Error::other("invalid PrivateNodeKey in state"))?
             }
             None => {
                 let key = NodePrivateKey::generate();
@@ -259,11 +255,11 @@ impl NodeIdentity {
             }
         };
 
-    Ok(NodeIdentity {
-        machine_key,
-        node_key,
-    })
-}
+        Ok(NodeIdentity {
+            machine_key,
+            node_key,
+        })
+    }
 }
 
 /// Commit a rotated node key to the state store — the persist half of
@@ -313,7 +309,10 @@ mod tests {
         let raw = std::fs::read(&path).unwrap();
         let text = String::from_utf8(raw).unwrap();
         assert!(text.contains("\"_k\""), "{text}");
-        assert!(text.contains("dmFsdWU="), "base64(value) must be on disk: {text}");
+        assert!(
+            text.contains("dmFsdWU="),
+            "base64(value) must be on disk: {text}"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -355,8 +354,8 @@ mod tests {
         // Machine key: privkey: text under _machinekey (base64 wrapper is
         // the FileStore's).
         let store = FileStore::open(dir.path().join(STATE_FILE_NAME)).unwrap();
-        let mk = String::from_utf8_lossy(store.read_state(MACHINE_KEY_STATE_KEY).unwrap())
-            .into_owned();
+        let mk =
+            String::from_utf8_lossy(store.read_state(MACHINE_KEY_STATE_KEY).unwrap()).into_owned();
         assert_eq!(mk, format!("privkey:{}", id1.machine_key.to_hex()));
         let persist_raw = store.read_state(LEGACY_GLOBAL_DAEMON_STATE_KEY).unwrap();
         let persist: Persist = serde_json::from_slice(persist_raw).unwrap();
@@ -405,7 +404,10 @@ mod tests {
             serde_json::from_slice(store.read_state(LEGACY_GLOBAL_DAEMON_STATE_KEY).unwrap())
                 .unwrap();
         assert_eq!(persist.private_node_key, node_private_text(&fresh));
-        assert_eq!(persist.old_private_node_key, node_private_text(&first.node_key));
+        assert_eq!(
+            persist.old_private_node_key,
+            node_private_text(&first.node_key)
+        );
 
         let reloaded = NodeIdentity::load_or_generate(Some(dir.path()), false).unwrap();
         assert_eq!(reloaded.node_key.public(), fresh.public());

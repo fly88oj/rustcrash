@@ -13,7 +13,9 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::addr::{decode_socks_addr, encode_socks_addr, NetAddr};
 use crate::error::{Error, Result};
-use crate::proto::aead::{evp_bytes_to_key, ss2022_subkey, ss_subkey_legacy, Aead, AeadKind, SsNonce};
+use crate::proto::aead::{
+    evp_bytes_to_key, ss2022_subkey, ss_subkey_legacy, Aead, AeadKind, SsNonce,
+};
 use crate::stream::BoxProxyStream;
 
 /// Shadowsocks method.
@@ -68,9 +70,7 @@ impl SsMethod {
             // SIP022: the password IS a base64 PSK; no KDF allowed.
             let key = base64::engine::general_purpose::STANDARD
                 .decode(password.trim())
-                .map_err(|_| {
-                    Error::config("shadowsocks 2022 password must be a base64 PSK")
-                })?;
+                .map_err(|_| Error::config("shadowsocks 2022 password must be a base64 PSK"))?;
             if key.len() != self.key_len() {
                 return Err(Error::config(format!(
                     "shadowsocks 2022 PSK must be {} bytes, got {}",
@@ -253,9 +253,7 @@ impl SsStream {
                         "ss2022 response timestamp drift {drift}s exceeds replay window"
                     )));
                 }
-                let len = u16::from_be_bytes(
-                    pt[9 + salt_len..11 + salt_len].try_into().unwrap(),
-                );
+                let len = u16::from_be_bytes(pt[9 + salt_len..11 + salt_len].try_into().unwrap());
                 self.state = ReadState::Payload(len);
             }
             ReadState::Len => {
@@ -281,7 +279,11 @@ impl SsStream {
         Ok(())
     }
 
-    fn poll_read_inner(&mut self, cx: &mut Context<'_>, dst: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read_inner(
+        &mut self,
+        cx: &mut Context<'_>,
+        dst: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         loop {
             if !self.plain.is_empty() {
                 let n = self.plain.len().min(dst.remaining());
@@ -322,7 +324,11 @@ impl SsStream {
 }
 
 impl AsyncWrite for SsStream {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
@@ -356,7 +362,11 @@ impl AsyncWrite for SsStream {
 }
 
 impl AsyncRead for SsStream {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         self.poll_read_inner(cx, buf)
     }
 }
@@ -514,8 +524,7 @@ impl SsUdp {
                 let Ok(aead) = Aead::new(self.method.kind(), &subkey) else {
                     continue;
                 };
-                let Ok(payload) = aead.open(&[0u8; 12], &[], &data[self.method.key_len()..])
-                else {
+                let Ok(payload) = aead.open(&[0u8; 12], &[], &data[self.method.key_len()..]) else {
                     continue;
                 };
                 parse_udp_frame(&payload)

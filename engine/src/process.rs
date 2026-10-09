@@ -97,7 +97,11 @@ fn parse_proc_addr(field: &str) -> Option<SocketAddr> {
 fn inode_owner_pid(inode: u32) -> Option<u32> {
     let needle = format!("socket:[{inode}]");
     for entry in std::fs::read_dir("/proc").ok()?.flatten() {
-        let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
             continue;
         };
         let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
@@ -206,7 +210,10 @@ mod tests {
         let status = "Name:\tcurl\nUmask:\t0022\nState:\tS (sleeping)\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n";
         assert_eq!(parse_uid_from_status(status), Some(1000));
         // Only the first (real) uid of the four fields.
-        assert_eq!(parse_uid_from_status("Name:\tdaemon\nUid:\t0\t1000\t1000\t1000\n"), Some(0));
+        assert_eq!(
+            parse_uid_from_status("Name:\tdaemon\nUid:\t0\t1000\t1000\t1000\n"),
+            Some(0)
+        );
         // Missing Uid line / garbage number.
         assert_eq!(parse_uid_from_status("Name:\tcurl\nState:\tR\n"), None);
         assert_eq!(parse_uid_from_status("Uid:\tnot-a-number 1 1 1\n"), None);

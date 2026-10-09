@@ -74,9 +74,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::addr::{Host, NetAddr};
 use crate::error::{Error, Result};
-use tracing::debug;
 use crate::proto::aead::{Aead, AeadKind, SsNonce};
 use crate::stream::BoxProxyStream;
+use tracing::debug;
 
 /// `Version` byte that prefixes every snell request (snell.go:40,106).
 const PROTOCOL_VERSION: u8 = 0x01;
@@ -128,7 +128,11 @@ pub enum SnellFronting {
 
 /// Dial + fronting handshake: the client stack's `streamConnContext`
 /// (outbound snell.go:44-67).
-pub async fn fronting_connect(front: &SnellFronting, server: &str, port: u16) -> Result<BoxProxyStream> {
+pub async fn fronting_connect(
+    front: &SnellFronting,
+    server: &str,
+    port: u16,
+) -> Result<BoxProxyStream> {
     let tcp = dial_tcp_transport(server, port).await?;
     match front {
         SnellFronting::ShadowTls { password, host } => {
@@ -179,9 +183,7 @@ pub fn parse_version(raw: u8) -> Result<u8> {
         0 => Ok(DEFAULT_SNELL_VERSION),
         5 => Ok(4),
         1..=4 => Ok(raw),
-        other => Err(Error::config(format!(
-            "snell version error: {other}"
-        ))),
+        other => Err(Error::config(format!("snell version error: {other}"))),
     }
 }
 
@@ -379,7 +381,11 @@ mod argon2id {
             rest = &mut rest[32..];
         }
         let r = out_len.div_ceil(32) - 2;
-        let last_len = if out_len.is_multiple_of(64) { 64 } else { out_len - 32 * r };
+        let last_len = if out_len.is_multiple_of(64) {
+            64
+        } else {
+            out_len - 32 * r
+        };
         let tail = blake2b(last_len, &buffer);
         rest.copy_from_slice(&tail);
     }
@@ -546,7 +552,10 @@ mod argon2id {
     ) -> Vec<u8> {
         assert!(time >= 1 && threads >= 1);
 
-        let mut h0 = h0(password, salt, secret, data, time, memory_kib, threads, out_len).to_vec();
+        let mut h0 = h0(
+            password, salt, secret, data, time, memory_kib, threads, out_len,
+        )
+        .to_vec();
         h0.resize(72, 0); // + LE32(block) || LE32(lane) scratch
 
         let mut memory = memory_kib / (SYNC_POINTS * threads) * (SYNC_POINTS * threads);
@@ -576,7 +585,16 @@ mod argon2id {
             for slice in 0..SYNC_POINTS {
                 for lane in 0..threads {
                     process_segment(
-                        &mut blocks, n, slice, lane, lanes, segments, threads, memory, time, &zero,
+                        &mut blocks,
+                        n,
+                        slice,
+                        lane,
+                        lanes,
+                        segments,
+                        threads,
+                        memory,
+                        time,
+                        &zero,
                     );
                 }
             }
@@ -785,15 +803,18 @@ impl V3Conn {
         if payload.is_empty() {
             // writeZeroChunk → Write([]) — one sealed 2-byte length.
             let len_be = 0u16.to_be_bytes();
-            w.aead.seal(&w.nonce.advance(), b"", &len_be, &mut chunk_out)?;
+            w.aead
+                .seal(&w.nonce.advance(), b"", &len_be, &mut chunk_out)?;
             wbuf.extend_from_slice(&chunk_out);
             return Ok(());
         }
         for chunk in payload.chunks(V3_CHUNK) {
             chunk_out.clear();
             let len_be = (chunk.len() as u16).to_be_bytes();
-            w.aead.seal(&w.nonce.advance(), b"", &len_be, &mut chunk_out)?;
-            w.aead.seal(&w.nonce.advance(), b"", chunk, &mut chunk_out)?;
+            w.aead
+                .seal(&w.nonce.advance(), b"", &len_be, &mut chunk_out)?;
+            w.aead
+                .seal(&w.nonce.advance(), b"", chunk, &mut chunk_out)?;
             wbuf.extend_from_slice(&chunk_out);
         }
         Ok(())
@@ -882,7 +903,10 @@ struct V4Conn {
 enum V4Stage {
     Header,
     /// Padding and payload ciphertext lengths from a consumed header.
-    Body { padding_len: usize, payload_len: usize },
+    Body {
+        padding_len: usize,
+        payload_len: usize,
+    },
 }
 
 struct V4Crypto {
@@ -908,7 +932,8 @@ impl V4Conn {
         rand::rngs::OsRng.fill_bytes(&mut salt);
         // v4AEAD (v4.go:155-157): AES-128-GCM over the snell KDF.
         let aead = snell_aead(AeadKind::Aes128Gcm, psk, &salt)?;
-        let padding_delta = rand::rngs::OsRng.gen_range(0..u64::from(V4_INITIAL_PADDING_SPAN)) as u16;
+        let padding_delta =
+            rand::rngs::OsRng.gen_range(0..u64::from(V4_INITIAL_PADDING_SPAN)) as u16;
         Ok(V4Conn {
             inner,
             psk: psk.to_vec(),
@@ -965,7 +990,12 @@ impl V4Conn {
     /// `writeFrame` (v4.go:322-366). Wire: `[salt] || header_ct ||
     /// padding || payload_ct` — the padding is generated from the sealed
     /// payload, then every-other-byte swapped with it.
-    fn write_frame(&mut self, payload: &[u8], padding_len: usize, wbuf: &mut BytesMut) -> Result<()> {
+    fn write_frame(
+        &mut self,
+        payload: &[u8],
+        padding_len: usize,
+        wbuf: &mut BytesMut,
+    ) -> Result<()> {
         if payload.len() > MAX_LENGTH || padding_len > MAX_LENGTH {
             return Err(Error::protocol("snell v4: frame too large"));
         }
@@ -981,7 +1011,8 @@ impl V4Conn {
             wbuf.extend_from_slice(&w.salt);
             w.salt_sent = true;
         }
-        let mut frame_out = Vec::with_capacity(V4_HEADER_CIPHER + padding_len + payload.len() + TAG_SIZE);
+        let mut frame_out =
+            Vec::with_capacity(V4_HEADER_CIPHER + padding_len + payload.len() + TAG_SIZE);
         let header_nonce = w.nonce.advance();
         w.aead.seal(&header_nonce, b"", &header, &mut frame_out)?;
         let mut payload_ct = Vec::with_capacity(payload.len() + TAG_SIZE);
@@ -1065,9 +1096,15 @@ impl V4Conn {
                         return Err(Error::protocol("snell v4: frame too large"));
                     }
                     self.rbuf.advance(V4_HEADER_CIPHER);
-                    self.stage = V4Stage::Body { padding_len, payload_len };
+                    self.stage = V4Stage::Body {
+                        padding_len,
+                        payload_len,
+                    };
                 }
-                V4Stage::Body { padding_len, payload_len } => {
+                V4Stage::Body {
+                    padding_len,
+                    payload_len,
+                } => {
                     let total = padding_len + payload_len + TAG_SIZE;
                     if self.rbuf.len() < total {
                         return Ok(false);
@@ -1079,7 +1116,9 @@ impl V4Conn {
                         swap_padding(padding, payload_ct);
                     }
                     let r = self.reader.as_mut().expect("initialized above");
-                    let payload = r.aead.open(&r.nonce.advance(), b"", &frame[padding_len..])?;
+                    let payload = r
+                        .aead
+                        .open(&r.nonce.advance(), b"", &frame[padding_len..])?;
                     self.out.extend_from_slice(&payload);
                     self.stage = V4Stage::Header;
                     return Ok(true);
@@ -1121,11 +1160,16 @@ fn make_v4_padding(payload_ct: &[u8], padding_len: usize) -> Vec<u8> {
     if ratio <= 0.5 || ratio >= 1.6 {
         return random_padding(padding_len);
     }
-    let target_ratio_base = if payload_zeros < payload_ones { 0.4 } else { 1.6 };
+    let target_ratio_base = if payload_zeros < payload_ones {
+        0.4
+    } else {
+        1.6
+    };
     let jitter = random_unit_float();
     let target_ratio = target_ratio_base + jitter / 10.0;
     let total_bits = 8.0 * (padding_len + payload_ct.len()) as f64;
-    let target_ones = (total_bits * (target_ratio / (target_ratio + 1.0)) - payload_ones as f64) as i64;
+    let target_ones =
+        (total_bits * (target_ratio / (target_ratio + 1.0)) - payload_ones as f64) as i64;
     if target_ones < 0 || target_ones > 8 * padding_len as i64 {
         return random_padding(padding_len);
     }
@@ -1363,8 +1407,9 @@ impl SnellStream {
     /// first user read. mihomo reads the reply eagerly only for v4 UDP
     /// (adapter/outbound/snell.go:88-95).
     async fn wait_reply(&mut self) -> Result<()> {
-        let confirmed =
-            std::future::poll_fn(|cx| self.poll_reply(cx)).await.map_err(Error::from)?;
+        let confirmed = std::future::poll_fn(|cx| self.poll_reply(cx))
+            .await
+            .map_err(Error::from)?;
         if !confirmed {
             return Err(Error::network(
                 "snell: connection closed before the server reply",
@@ -1634,7 +1679,9 @@ pub async fn handshake(
             snell.wait_reply().await?;
         }
     } else {
-        snell.write_all(&request_header(target, cfg.version, false)?).await?;
+        snell
+            .write_all(&request_header(target, cfg.version, false)?)
+            .await?;
         snell.flush().await?;
     }
     debug!(target: "engine", "snell: request sent");
@@ -1651,8 +1698,7 @@ pub async fn handshake(
 /// The default dials plain TCP to `(server, port)`.
 pub type SnellDialFuture =
     Pin<Box<dyn std::future::Future<Output = Result<BoxProxyStream>> + Send>>;
-pub type SnellTransportDialer =
-    std::sync::Arc<dyn Fn() -> SnellDialFuture + Send + Sync>;
+pub type SnellTransportDialer = std::sync::Arc<dyn Fn() -> SnellDialFuture + Send + Sync>;
 
 /// `NewPool`'s options (pool.go:123-136): `WithAge(15000)`,
 /// `WithSize(10)`, evict = close.
@@ -1769,11 +1815,7 @@ impl SnellPool {
     }
 
     /// Override the idle policy (`NewPool`'s `WithAge`/`WithSize`).
-    pub fn with_limits(
-        mut self,
-        max_age: std::time::Duration,
-        max_idle: usize,
-    ) -> Self {
+    pub fn with_limits(mut self, max_age: std::time::Duration, max_idle: usize) -> Self {
         let shared = std::sync::Arc::get_mut(&mut self.shared)
             .expect("limits must be set before the pool is shared");
         shared.max_age = max_age;
@@ -1797,7 +1839,9 @@ impl SnellPool {
         };
         // WriteHeaderWithReuse(..., version, true) — the header write is
         // the "MarkReusable" gate (adapter snell.go:97-116).
-        snell.write_all(&request_header(target, self.shared.cfg.version, true)?).await?;
+        snell
+            .write_all(&request_header(target, self.shared.cfg.version, true)?)
+            .await?;
         snell.flush().await.map_err(Error::from)?;
         Ok(PooledSnell {
             stream: Some(snell),
@@ -1833,7 +1877,9 @@ pub struct PooledSnell {
 impl PooledSnell {
     /// Read access to the tunnel reply state for diagnostics.
     pub fn peer_half_closed(&self) -> bool {
-        self.stream.as_ref().is_some_and(SnellStream::peer_half_closed)
+        self.stream
+            .as_ref()
+            .is_some_and(SnellStream::peer_half_closed)
     }
 }
 
@@ -1920,7 +1966,9 @@ impl Drop for PooledSnell {
     /// the reply state and put the conn back. Otherwise the transport is
     /// dropped (closed).
     fn drop(&mut self) {
-        let Some(mut stream) = self.stream.take() else { return };
+        let Some(mut stream) = self.stream.take() else {
+            return;
+        };
         let reusable = self.half_closed && !self.failed && stream.peer_half_closed();
         if !reusable {
             return;
@@ -2349,9 +2397,7 @@ pub enum SnellServerRequest {
 /// reusable request finishes (the listener's `for { handleRequest }`,
 /// server.go:166-171). The listener closes over its relay context.
 pub type SnellServerNext = std::sync::Arc<
-    dyn Fn(SnellServerConn) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>>
-        + Send
-        + Sync,
+    dyn Fn(SnellServerConn) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
 >;
 
 /// A server-role snell connection over an established (optionally
@@ -2553,8 +2599,10 @@ impl AsyncWrite for SnellServerTcp {
             this.pending_plain = buf.len();
         }
         while !this.wbuf.is_empty() {
-            let n = ready!(Pin::new(this.conn.as_mut().expect("checked above").inner_mut())
-                .poll_write(cx, &this.wbuf))?;
+            let n = ready!(
+                Pin::new(this.conn.as_mut().expect("checked above").inner_mut())
+                    .poll_write(cx, &this.wbuf)
+            )?;
             if n == 0 {
                 this.failed = true;
                 return Poll::Ready(Err(io::Error::new(
@@ -2647,7 +2695,9 @@ impl Drop for SnellServerTcp {
             if !reply_written {
                 // writeCommandError(0x65, "Remote EOF") — and unlike the
                 // !reuse arm, the reuse path keeps the conn open.
-                let _ = conn.write_framed(&command_error_frame(REMOTE_EOF_CODE, "Remote EOF")).await;
+                let _ = conn
+                    .write_framed(&command_error_frame(REMOTE_EOF_CODE, "Remote EOF"))
+                    .await;
             }
             if reuse {
                 // Conn.Write(nil) — the zero-chunk half-close (only after
@@ -2659,12 +2709,7 @@ impl Drop for SnellServerTcp {
                 conn.reset_zero();
                 if let Some(next) = next {
                     if let Some(psk) = psk {
-                        next(SnellServerConn {
-                            conn,
-                            psk,
-                            version,
-                        })
-                        .await;
+                        next(SnellServerConn { conn, psk, version }).await;
                     }
                 }
             }
@@ -2888,10 +2933,7 @@ fn parse_http_request_head(head: &[u8]) -> Result<HttpRequestHead> {
         .next()
         .ok_or_else(|| Error::protocol("snell obfs http: empty request head"))?;
     let mut parts = request_line.split(' ');
-    let method = parts
-        .next()
-        .unwrap_or_default()
-        .to_ascii_uppercase();
+    let method = parts.next().unwrap_or_default().to_ascii_uppercase();
     let _uri = parts.next();
     let version = parts.next().unwrap_or_default();
     if method.is_empty() || !version.starts_with("HTTP/") {
@@ -2900,7 +2942,9 @@ fn parse_http_request_head(head: &[u8]) -> Result<HttpRequestHead> {
     let mut connection_upgrade = false;
     let mut content_length = 0usize;
     for line in lines {
-        let Some((name, value)) = line.split_once(':') else { continue };
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
         let name = name.trim().to_ascii_lowercase();
         let value = value.trim();
         match name.as_str() {
@@ -2910,9 +2954,9 @@ fn parse_http_request_head(head: &[u8]) -> Result<HttpRequestHead> {
                     .any(|t| t.trim().eq_ignore_ascii_case("upgrade"));
             }
             "content-length" => {
-                content_length = value.parse().map_err(|_| {
-                    Error::protocol("snell obfs http: malformed content-length")
-                })?;
+                content_length = value
+                    .parse()
+                    .map_err(|_| Error::protocol("snell obfs http: malformed content-length"))?;
             }
             _ => {}
         }
@@ -3211,10 +3255,7 @@ mod tests {
                 0x50
             ]
         );
-        assert_eq!(
-            request_header(&target, 4, true).unwrap()[1],
-            CMD_CONNECT_V2
-        );
+        assert_eq!(request_header(&target, 4, true).unwrap()[1], CMD_CONNECT_V2);
         assert_eq!(request_header(&target, 4, false).unwrap()[1], CMD_CONNECT);
         // Hosts beyond a u8 length are refused (not silently truncated).
         let long = NetAddr::new(Host::Domain("a".repeat(256)), 80);
@@ -3238,7 +3279,10 @@ mod tests {
         assert!(validate_udp(1, true).is_err());
         assert!(validate_udp(2, true).is_err());
         let err = validate_udp(2, true).unwrap_err();
-        assert!(err.to_string().contains("snell version 2 not support UDP"), "{err}");
+        assert!(
+            err.to_string().contains("snell version 2 not support UDP"),
+            "{err}"
+        );
         assert!(validate_udp(2, false).is_ok());
         assert!(validate_udp(3, true).is_ok());
     }
@@ -3250,7 +3294,10 @@ mod tests {
         swap_padding(&mut padding, &mut payload);
         // limit = min(8, 4): only indices 0 and 2 swap (v4.go:368-376);
         // padding bytes past the limit are untouched.
-        assert_eq!(padding, vec![0x55, 0xAA, 0x55, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA]);
+        assert_eq!(
+            padding,
+            vec![0x55, 0xAA, 0x55, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA]
+        );
         assert_eq!(payload, vec![0xAA, 0x55, 0xAA, 0x55]);
         swap_padding(&mut padding, &mut payload);
         assert_eq!(padding, vec![0xAAu8; 8]);
@@ -3261,10 +3308,7 @@ mod tests {
     fn bit_count_padding_has_exact_ones() {
         let p = bit_count_padding(16, 37);
         assert_eq!(p.len(), 16);
-        assert_eq!(
-            p.iter().map(|b| b.count_ones() as usize).sum::<usize>(),
-            37
-        );
+        assert_eq!(p.iter().map(|b| b.count_ones() as usize).sum::<usize>(), 37);
         let p = bit_count_padding(5, 40);
         assert!(p.iter().all(|b| *b == 0xFF));
         let p = bit_count_padding(5, 0);
@@ -3353,7 +3397,10 @@ mod tests {
                 return Ok(Vec::new());
             }
             let payload_ct = read_n(rd, size + TAG_SIZE).await?;
-            Ok(self.aead.open(&self.nonce.advance(), b"", &payload_ct).unwrap())
+            Ok(self
+                .aead
+                .open(&self.nonce.advance(), b"", &payload_ct)
+                .unwrap())
         }
 
         fn frame_chunk(&mut self, payload: &[u8], out: &mut Vec<u8>) {
@@ -3365,7 +3412,9 @@ mod tests {
                     out,
                 )
                 .unwrap();
-            self.aead.seal(&self.nonce.advance(), b"", payload, out).unwrap();
+            self.aead
+                .seal(&self.nonce.advance(), b"", payload, out)
+                .unwrap();
         }
 
         /// The zero chunk: the sealed `0x0000` length alone
@@ -3492,7 +3541,10 @@ mod tests {
 
         async fn read_frame(&mut self, rd: &mut (impl AsyncRead + Unpin)) -> io::Result<Vec<u8>> {
             let header_ct = read_n(rd, V4_HEADER_CIPHER).await?;
-            let header = self.aead.open(&self.nonce.advance(), b"", &header_ct).unwrap();
+            let header = self
+                .aead
+                .open(&self.nonce.advance(), b"", &header_ct)
+                .unwrap();
             assert_eq!(header[0], 4);
             let padding_len = u16::from_be_bytes([header[3], header[4]]) as usize;
             let payload_len = u16::from_be_bytes([header[5], header[6]]) as usize;
@@ -3521,9 +3573,13 @@ mod tests {
             header[0] = 4;
             header[3..5].copy_from_slice(&(0u16).to_be_bytes());
             header[5..7].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-            self.aead.seal(&self.nonce.advance(), b"", &header, out).unwrap();
+            self.aead
+                .seal(&self.nonce.advance(), b"", &header, out)
+                .unwrap();
             if !payload.is_empty() {
-                self.aead.seal(&self.nonce.advance(), b"", payload, out).unwrap();
+                self.aead
+                    .seal(&self.nonce.advance(), b"", payload, out)
+                    .unwrap();
             }
         }
     }
@@ -3671,11 +3727,15 @@ mod tests {
                 .contains(&padding_len),
             "initial padding outside the 0x100..0x1FF window: {padding_len}"
         );
-        let mut frame =
-            read_n(&mut server, padding_len + payload_len + TAG_SIZE).await.unwrap();
+        let mut frame = read_n(&mut server, padding_len + payload_len + TAG_SIZE)
+            .await
+            .unwrap();
         let (padding, payload_ct) = frame.split_at_mut(padding_len);
         swap_padding(padding, payload_ct);
-        let payload = dec.aead.open(&dec.nonce.advance(), b"", payload_ct).unwrap();
+        let payload = dec
+            .aead
+            .open(&dec.nonce.advance(), b"", payload_ct)
+            .unwrap();
         assert_eq!(payload, request_header(&target, 4, false).unwrap());
 
         // Frame 2: no padding, plain "tail".
@@ -3821,8 +3881,13 @@ mod tests {
         let psk = psk.to_string();
         let version = cfg.version;
         tokio::spawn(async move {
-            if let Err(e) =
-                udp_echo_mimic(server, psk.as_bytes().to_vec(), version, packets_per_request).await
+            if let Err(e) = udp_echo_mimic(
+                server,
+                psk.as_bytes().to_vec(),
+                version,
+                packets_per_request,
+            )
+            .await
             {
                 panic!("udp mimic failed: {e}");
             }
@@ -3986,7 +4051,7 @@ mod tests {
         // WriteUDPHeader's verbatim error (snell.go:129-131).
         for version in [1u8, 2] {
             let cfg = SnellOut {
-            fronting: None,
+                fronting: None,
                 server: "x".into(),
                 port: 1,
                 psk: "p".into(),
@@ -4568,7 +4633,7 @@ mod tests {
             let psk = test_psk();
             let transport = spawn_server(version, &psk).await;
             let cfg = SnellOut {
-            fronting: None,
+                fronting: None,
                 server: "127.0.0.1".into(),
                 port: 0,
                 psk: psk.clone(),
@@ -4696,7 +4761,7 @@ mod tests {
             let psk = test_psk();
             let transport = spawn_server(version, &psk).await;
             let cfg = SnellOut {
-            fronting: None,
+                fronting: None,
                 server: "127.0.0.1".into(),
                 port: 0,
                 psk: psk.clone(),
@@ -4707,11 +4772,10 @@ mod tests {
             let target = NetAddr::ip("8.8.8.8".parse().unwrap(), 53);
             udp.send_to(&target, b"query").await.unwrap();
             let mut buf = [0u8; 1500];
-            let (from, n) =
-                tokio::time::timeout(Duration::from_secs(10), udp.recv_from(&mut buf))
-                    .await
-                    .expect("udp response timeout")
-                    .unwrap();
+            let (from, n) = tokio::time::timeout(Duration::from_secs(10), udp.recv_from(&mut buf))
+                .await
+                .expect("udp response timeout")
+                .unwrap();
             assert_eq!(from.host, Host::Ip("8.8.4.4".parse().unwrap()));
             assert_eq!(from.port, 53);
             assert_eq!(&buf[..n], b"query");
@@ -4737,11 +4801,10 @@ mod tests {
         let target = NetAddr::domain("dns.example", 53).unwrap();
         udp.send_to(&target, b"dom").await.unwrap();
         let mut buf = [0u8; 1500];
-        let (from, n) =
-            tokio::time::timeout(Duration::from_secs(10), udp.recv_from(&mut buf))
-                .await
-                .expect("udp response timeout")
-                .unwrap();
+        let (from, n) = tokio::time::timeout(Duration::from_secs(10), udp.recv_from(&mut buf))
+            .await
+            .expect("udp response timeout")
+            .unwrap();
         assert_eq!(from.port, 53);
         assert_eq!(&buf[..n], b"dom");
         let err = snell_udp_response_frame(&target, b"x").unwrap_err();
@@ -4757,7 +4820,8 @@ mod tests {
         }
         let err = parse_server_version(6).unwrap_err();
         assert!(
-            err.to_string().contains("snell inbound version 6 is not supported"),
+            err.to_string()
+                .contains("snell inbound version 6 is not supported"),
             "{err}"
         );
         // writeCommandError layout: CommandError || code || msglen || msg.
@@ -4778,8 +4842,7 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(16 * 1024);
         let psk2 = psk.clone();
         tokio::spawn(async move {
-            let mut conn =
-                SnellServerConn::new(Box::new(server), psk2.as_bytes(), 3).unwrap();
+            let mut conn = SnellServerConn::new(Box::new(server), psk2.as_bytes(), 3).unwrap();
             match conn.read_request().await {
                 Ok(SnellServerRequest::Ping) => {} // answered inline
                 other => panic!("expected Ping, got {other:?}"),

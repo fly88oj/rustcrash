@@ -245,7 +245,11 @@ fn build_auth_request(password: &str, cc_rx: u64, padding: &str) -> Vec<u8> {
     put_qpack_literal(&mut block, b":authority", URL_HOST.as_bytes());
     put_qpack_literal(&mut block, b":path", URL_PATH.as_bytes());
     put_qpack_literal(&mut block, HDR_AUTH.as_bytes(), password.as_bytes());
-    put_qpack_literal(&mut block, HDR_CCRX.as_bytes(), cc_rx.to_string().as_bytes());
+    put_qpack_literal(
+        &mut block,
+        HDR_CCRX.as_bytes(),
+        cc_rx.to_string().as_bytes(),
+    );
     put_qpack_literal(&mut block, HDR_PADDING.as_bytes(), padding.as_bytes());
     let mut out = Vec::with_capacity(block.len() + 16);
     put_h3_frame(&mut out, H3_FRAME_HEADERS, &block);
@@ -298,24 +302,18 @@ async fn read_auth_response(
                 match event {
                     None => None,
                     Some(r) => Some(
-                        r.map_err(|e| {
-                            Error::network(format!("hysteria2 auth read: {e}"))
-                        })?
-                        .ok_or_else(|| {
-                            Error::protocol("hysteria2 auth: EOF before response")
-                        })?,
+                        r.map_err(|e| Error::network(format!("hysteria2 auth read: {e}")))?
+                            .ok_or_else(|| {
+                                Error::protocol("hysteria2 auth: EOF before response")
+                            })?,
                     ),
                 }
             } else {
                 Some(
                     recv.read(&mut chunk)
                         .await
-                        .map_err(|e| {
-                            Error::network(format!("hysteria2 auth read: {e}"))
-                        })?
-                        .ok_or_else(|| {
-                            Error::protocol("hysteria2 auth: EOF before response")
-                        })?,
+                        .map_err(|e| Error::network(format!("hysteria2 auth read: {e}")))?
+                        .ok_or_else(|| Error::protocol("hysteria2 auth: EOF before response"))?,
                 )
             };
             if let Some(n) = n {
@@ -425,8 +423,7 @@ fn parse_h3_headers_frame(buf: &[u8]) -> Result<Option<&[u8]>> {
             return Ok(None);
         };
         off += n;
-        let len =
-            usize::try_from(len).map_err(|_| Error::protocol("h3 frame too large"))?;
+        let len = usize::try_from(len).map_err(|_| Error::protocol("h3 frame too large"))?;
         let Some(payload) = buf.get(off..off + len) else {
             return Ok(None);
         };
@@ -506,7 +503,10 @@ const QPACK_STATIC_TABLE: &[(&str, &str)] = &[
     ("content-type", "text/plain;charset=utf-8"),
     ("range", "bytes=0-"),
     ("strict-transport-security", "max-age=31536000"),
-    ("strict-transport-security", "max-age=31536000;includesubdomains"),
+    (
+        "strict-transport-security",
+        "max-age=31536000;includesubdomains",
+    ),
     (
         "strict-transport-security",
         "max-age=31536000;includesubdomains;preload",
@@ -860,9 +860,7 @@ impl QpackDecoder {
         }
         // §4.5.1.1 "Base": one Sign bit + 7-bit delta, relative to the
         // Required Insert Count.
-        let sign = buf
-            .get(off)
-            .is_some_and(|b| b & 0x80 != 0);
+        let sign = buf.get(off).is_some_and(|b| b & 0x80 != 0);
         let (delta, n) = read_prefixed_int(buf, off, 7)
             .ok_or_else(|| Error::protocol("qpack: truncated base"))?;
         let mut off = n;
@@ -885,9 +883,7 @@ impl QpackDecoder {
                 let (name, value) = if is_static {
                     let (name, value) = QPACK_STATIC_TABLE
                         .get(idx as usize)
-                        .ok_or_else(|| {
-                            Error::protocol(format!("qpack: bad static index {idx}"))
-                        })?;
+                        .ok_or_else(|| Error::protocol(format!("qpack: bad static index {idx}")))?;
                     (name.to_string(), value.to_string())
                 } else {
                     // §3.2.5: relative 0 is the entry at absolute Base-1.
@@ -1001,7 +997,9 @@ impl QpackDecoder {
             ric -= full_range;
         }
         if ric == 0 {
-            return Err(Error::protocol("qpack: required insert count encoded as zero"));
+            return Err(Error::protocol(
+                "qpack: required insert count encoded as zero",
+            ));
         }
         Ok(ric)
     }
@@ -1203,7 +1201,9 @@ impl AsyncRead for Hysteria2Stream {
                         break;
                     }
                     Ok(None) => {}
-                    Err(e) => return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, e))),
+                    Err(e) => {
+                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, e)))
+                    }
                 }
                 let mut chunk = [0u8; 4096];
                 let mut rb = ReadBuf::new(&mut chunk);
@@ -1256,7 +1256,8 @@ pub fn tcp_request_header(addr: &str, padding: &str) -> Vec<u8> {
 /// has been consumed).
 #[cfg(test)]
 fn parse_tcp_request(data: &[u8]) -> Result<(String, usize, usize)> {
-    let (addr_len, mut off) = quic::read_varint(data).ok_or_else(|| Error::protocol("tcp req: short"))?;
+    let (addr_len, mut off) =
+        quic::read_varint(data).ok_or_else(|| Error::protocol("tcp req: short"))?;
     if addr_len == 0 || addr_len > MAX_ADDRESS_LENGTH as u64 {
         return Err(Error::protocol("tcp req: invalid address length"));
     }
@@ -1309,7 +1310,9 @@ fn parse_tcp_response(data: &[u8]) -> Result<Option<usize>> {
     }
     if status != 0 {
         let msg = String::from_utf8_lossy(msg).into_owned();
-        return Err(Error::network(format!("hysteria2 tcp: remote error: {msg}")));
+        return Err(Error::network(format!(
+            "hysteria2 tcp: remote error: {msg}"
+        )));
     }
     Ok(Some(off))
 }
@@ -1342,7 +1345,13 @@ pub async fn udp_send(conn: &quinn::Connection, target: &NetAddr, data: &[u8]) -
 
 /// `session(u32be) || packet(u16be) || frag_id(u8) || frag_count(u8) ||
 /// varint(len) || addr`.
-fn udp_message_header(session_id: u32, packet_id: u16, frag_id: u8, frag_count: u8, addr: &str) -> Vec<u8> {
+fn udp_message_header(
+    session_id: u32,
+    packet_id: u16,
+    frag_id: u8,
+    frag_count: u8,
+    addr: &str,
+) -> Vec<u8> {
     let mut buf = Vec::with_capacity(addr.len() + 16);
     buf.extend_from_slice(&session_id.to_be_bytes());
     buf.extend_from_slice(&packet_id.to_be_bytes());
@@ -1375,8 +1384,8 @@ pub fn parse_udp_message(msg: &[u8]) -> Result<UdpMessage<'_>> {
     let packet_id = u16::from_be_bytes([msg[4], msg[5]]);
     let frag_id = msg[6];
     let frag_count = msg[7];
-    let (addr_len, n) = quic::read_varint(&msg[8..])
-        .ok_or_else(|| Error::protocol("udp msg: short addr len"))?;
+    let (addr_len, n) =
+        quic::read_varint(&msg[8..]).ok_or_else(|| Error::protocol("udp msg: short addr len"))?;
     if addr_len == 0 || addr_len > MAX_ADDRESS_LENGTH as u64 {
         return Err(Error::protocol("udp msg: invalid address length"));
     }
@@ -1630,7 +1639,7 @@ mod tests {
     /// that used to die as "qpack: dynamic name reference").
     fn auth_ok_response() -> Vec<u8> {
         let mut block = vec![0x00, 0x00]; // prefix: ric 0, base 0
-        // :status — literal with static name idx 24 (T bit 0x10 set).
+                                          // :status — literal with static name idx 24 (T bit 0x10 set).
         quic::put_prefixed_int(&mut block, 0x50, 4, 24);
         put_test_string(&mut block, b"233", true);
         // date — literal with static name idx 6 (first byte 0x56).
@@ -1706,9 +1715,7 @@ mod tests {
                     // keep serving streams so the connection (and its
                     // handle) stays alive for the client's reads.
                     let uni_conn = conn.clone();
-                    tokio::spawn(async move {
-                        while uni_conn.accept_uni().await.is_ok() {}
-                    });
+                    tokio::spawn(async move { while uni_conn.accept_uni().await.is_ok() {} });
                     if let Ok((mut send, mut recv)) = conn.accept_bi().await {
                         let mut buf = [0u8; 1024];
                         // Wait for the request HEADERS to arrive.
@@ -1760,7 +1767,7 @@ mod tests {
     fn dynamic_qpack_exchange() -> (Vec<u8>, Vec<u8>) {
         let mut ins = Vec::new();
         put_prefixed_int(&mut ins, 0x20, 5, 512); // capacity 512
-        // abs 0: (hysteria-udp, true) — insert with literal name.
+                                                  // abs 0: (hysteria-udp, true) — insert with literal name.
         put_prefixed_int(&mut ins, 0x40, 5, 12);
         ins.extend_from_slice(b"hysteria-udp");
         put_prefixed_int(&mut ins, 0x00, 7, 4);
@@ -1801,11 +1808,8 @@ mod tests {
     /// QPACK encoder stream, response HEADERS referencing them).
     #[tokio::test]
     async fn hy2_server_mimic_dynamic_qpack_authenticates() {
-        let (sk_r, list) = crate::quic::tls13::test_server::ech_server_key(
-            &[21u8; 32],
-            0x71,
-            b"hy2-dyn.example",
-        );
+        let (sk_r, list) =
+            crate::quic::tls13::test_server::ech_server_key(&[21u8; 32], 0x71, b"hy2-dyn.example");
         let endpoint = crate::quic::tls13::test_server::start_quinn_server(
             crate::quic::tls13::ServerMode::EchAccept {
                 sk_r,
@@ -1823,9 +1827,7 @@ mod tests {
                 tokio::spawn(async move {
                     // Drain the client's uni control/QPACK streams.
                     let uni_conn = conn.clone();
-                    tokio::spawn(async move {
-                        while uni_conn.accept_uni().await.is_ok() {}
-                    });
+                    tokio::spawn(async move { while uni_conn.accept_uni().await.is_ok() {} });
                     // The server's own critical streams: control with an
                     // empty SETTINGS, QPACK encoder with the dynamic
                     // table instructions, and an (idle) QPACK decoder.
@@ -1883,11 +1885,8 @@ mod tests {
     /// `connect_ech` (precise error, no silent fallback).
     #[tokio::test]
     async fn ech_rejection_is_the_precise_error() {
-        let (_other_sk, other) = crate::quic::tls13::test_server::ech_server_key(
-            &[14u8; 32],
-            0x77,
-            b"rejector.example",
-        );
+        let (_other_sk, other) =
+            crate::quic::tls13::test_server::ech_server_key(&[14u8; 32], 0x77, b"rejector.example");
         let endpoint = crate::quic::tls13::test_server::start_quinn_server(
             crate::quic::tls13::ServerMode::EchReject {
                 retry_configs: Some(other.clone()),
@@ -1929,11 +1928,11 @@ mod tests {
         // list, which names the rejector's own key — the second attempt
         // is rejected again and surfaces the sentinel).
         assert!(
-            err.to_string().contains(crate::quic::tls13::ERR_ECH_REJECTED),
+            err.to_string()
+                .contains(crate::quic::tls13::ERR_ECH_REJECTED),
             "{err}"
         );
     }
-
 
     fn hex(b: &[u8]) -> String {
         b.iter().map(|x| format!("{x:02x}")).collect()
@@ -2058,7 +2057,10 @@ mod tests {
 
         // Truncated forms report incomplete rather than error.
         for cut in 0..resp.len() - 4 {
-            assert!(matches!(parse_tcp_response(&resp[..cut]), Ok(None)), "cut {cut}");
+            assert!(
+                matches!(parse_tcp_response(&resp[..cut]), Ok(None)),
+                "cut {cut}"
+            );
         }
     }
 
@@ -2150,13 +2152,16 @@ mod tests {
         let mut block = vec![0x00, 0x00];
         put_qpack_literal(&mut block, b"hysteria-udp", b"true");
         let fields = dec.decode_field_section(&block).unwrap().unwrap().fields;
-        assert_eq!(fields, vec![("hysteria-udp".to_string(), "true".to_string())]);
+        assert_eq!(
+            fields,
+            vec![("hysteria-udp".to_string(), "true".to_string())]
+        );
 
         // Dynamic references against an empty table are errors.
         assert!(dec.decode_field_section(&[0x00, 0x00, 0x80]).is_err()); // T=0
         assert!(dec.decode_field_section(&[0x00, 0x00, 0x1f]).is_err()); // post-base
-        // A section requiring inserts the table has not seen is blocked
-        // (RFC 9204 §2.1.2), not decoded.
+                                                                         // A section requiring inserts the table has not seen is blocked
+                                                                         // (RFC 9204 §2.1.2), not decoded.
         assert!(dec.decode_field_section(&[0x01]).unwrap().is_none());
     }
 
@@ -2208,7 +2213,9 @@ mod tests {
         let cut = stream.len() - 1;
         assert!(parse_h3_headers_frame(&stream[..cut]).unwrap().is_none());
         // A DATA frame with a short payload also just waits.
-        assert!(parse_h3_headers_frame(&[0x00, 0x04, 0x00]).unwrap().is_none());
+        assert!(parse_h3_headers_frame(&[0x00, 0x04, 0x00])
+            .unwrap()
+            .is_none());
     }
 
     const H3_FRAME_DATA_TEST: u64 = 0x0;
@@ -2289,7 +2296,7 @@ mod tests {
         let mut dec = QpackDecoder::default();
         let mut ins = Vec::new();
         put_prefixed_int(&mut ins, 0x20, 5, 512); // set capacity 512
-        // insert with literal name (hysteria-udp, true) -> abs 0
+                                                  // insert with literal name (hysteria-udp, true) -> abs 0
         put_prefixed_int(&mut ins, 0x40, 5, 12);
         ins.extend_from_slice(b"hysteria-udp");
         put_prefixed_int(&mut ins, 0x00, 7, 4);

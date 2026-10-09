@@ -316,10 +316,9 @@ mod tests {
 
         // Cancel AFTER the relay parks: watch::changed wakes it.
         let (_, _, h2) = stats.open("mixed", "tcp", &target, source);
-        let parked =
-            tokio::task::spawn(async move {
-                h2.cancelled().await;
-            });
+        let parked = tokio::task::spawn(async move {
+            h2.cancelled().await;
+        });
         // Give the waiter a beat to actually park on the watch.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(!parked.is_finished());

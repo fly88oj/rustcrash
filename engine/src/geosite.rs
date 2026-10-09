@@ -171,8 +171,7 @@ fn parse_entry(entry: &[u8], out: &mut HashMap<String, DomainMatcher>) -> Result
                 // this domain; the rest of the category survives. So do
                 // value-less entries — a keyword "" would match every
                 // domain (str::contains("")), poisoning the category.
-                if let Some((dtype, value)) = parse_domain(domain)?.filter(|(_, v)| !v.is_empty())
-                {
+                if let Some((dtype, value)) = parse_domain(domain)?.filter(|(_, v)| !v.is_empty()) {
                     let matcher = out.entry(code).or_default();
                     match dtype {
                         DomainType::Full => matcher.add_exact(&value),
@@ -249,13 +248,15 @@ fn parse_domain(domain: &[u8]) -> Result<Option<(DomainType, String)>> {
 /// Load a subset of entries by name (loading every entry of the real
 /// ~10 MB file costs memory; the engine loads only referenced names, or
 /// all when `names` is None).
-pub fn load_filtered(data: &[u8], names: Option<&[String]>) -> Result<HashMap<String, DomainMatcher>> {
+pub fn load_filtered(
+    data: &[u8],
+    names: Option<&[String]>,
+) -> Result<HashMap<String, DomainMatcher>> {
     let all = parse_geosite(data)?;
     match names {
         None => Ok(all),
         Some(want) => {
-            let want: std::collections::HashSet<&str> =
-                want.iter().map(|s| s.as_str()).collect();
+            let want: std::collections::HashSet<&str> = want.iter().map(|s| s.as_str()).collect();
             Ok(all
                 .into_iter()
                 .filter(|(k, _)| want.contains(k.as_str()))
@@ -315,9 +316,9 @@ mod tests {
         let entry = geosite_msg(
             "cn",
             &[
-                domain_msg(3, "full.example"),   // Full
-                domain_msg(2, "suffix.example"), // Domain (suffix)
-                domain_msg(0, "plain-key"),      // Plain (keyword)
+                domain_msg(3, "full.example"),    // Full
+                domain_msg(2, "suffix.example"),  // Domain (suffix)
+                domain_msg(0, "plain-key"),       // Plain (keyword)
                 domain_msg(1, "^re\\d+\\.test$"), // Regex
             ],
         );
@@ -341,8 +342,14 @@ mod tests {
     #[test]
     fn load_filtered_keeps_only_wanted() {
         let mut file = Vec::new();
-        file.extend_from_slice(&len_delimited(1, &geosite_msg("keep", &[domain_msg(2, "keep.test")])));
-        file.extend_from_slice(&len_delimited(1, &geosite_msg("drop", &[domain_msg(2, "drop.test")])));
+        file.extend_from_slice(&len_delimited(
+            1,
+            &geosite_msg("keep", &[domain_msg(2, "keep.test")]),
+        ));
+        file.extend_from_slice(&len_delimited(
+            1,
+            &geosite_msg("drop", &[domain_msg(2, "drop.test")]),
+        ));
         let want = vec!["keep".to_string()];
         let filtered = load_filtered(&file, Some(&want)).unwrap();
         assert!(filtered.contains_key("keep"));
@@ -408,7 +415,10 @@ mod tests {
         let mut with_attrs = domain_msg(2, "attr.example");
         with_attrs.extend_from_slice(&len_delimited(3, &attrs));
 
-        let file = len_delimited(1, &geosite_msg("cn", &[with_attrs, domain_msg(3, "plain.example")]));
+        let file = len_delimited(
+            1,
+            &geosite_msg("cn", &[with_attrs, domain_msg(3, "plain.example")]),
+        );
         let parsed = parse_geosite(&file).unwrap();
         let cn = &parsed["cn"];
         assert!(cn.matches("attr.example"));
@@ -420,12 +430,9 @@ mod tests {
         let mut file = Vec::new();
         file.extend_from_slice(&len_delimited(1, &[])); // empty entry
         file.extend_from_slice(&len_delimited(1, &geosite_msg("empty-dom", &[]))); // no domains
-        // zero-length domain message → proto3 defaults; the empty value
-        // is dropped (a "" keyword would match everything)
-        file.extend_from_slice(&len_delimited(
-            1,
-            &geosite_msg("zl", &[Vec::new()]),
-        ));
+                                                                                   // zero-length domain message → proto3 defaults; the empty value
+                                                                                   // is dropped (a "" keyword would match everything)
+        file.extend_from_slice(&len_delimited(1, &geosite_msg("zl", &[Vec::new()])));
         // Categories with no surviving domains carry no matcher — the
         // observable behavior (matches nothing) is identical to an
         // empty category in v2ray.
@@ -433,7 +440,10 @@ mod tests {
         assert!(!parsed.contains_key("empty-dom"));
         assert!(!parsed.contains_key("zl"));
         // A well-formed category after the empty ones still parses.
-        file.extend_from_slice(&len_delimited(1, &geosite_msg("ok", &[domain_msg(2, "ok.example")])));
+        file.extend_from_slice(&len_delimited(
+            1,
+            &geosite_msg("ok", &[domain_msg(2, "ok.example")]),
+        ));
         let parsed = parse_geosite(&file).unwrap();
         assert!(parsed["ok"].matches("x.ok.example"));
     }
@@ -451,8 +461,14 @@ mod tests {
     #[test]
     fn duplicate_category_names_merge() {
         let mut file = Vec::new();
-        file.extend_from_slice(&len_delimited(1, &geosite_msg("dup", &[domain_msg(3, "first.example")])));
-        file.extend_from_slice(&len_delimited(1, &geosite_msg("DUP", &[domain_msg(2, "second.example")])));
+        file.extend_from_slice(&len_delimited(
+            1,
+            &geosite_msg("dup", &[domain_msg(3, "first.example")]),
+        ));
+        file.extend_from_slice(&len_delimited(
+            1,
+            &geosite_msg("DUP", &[domain_msg(2, "second.example")]),
+        ));
         // Note: "DUP" upper-case — codes are lowercased, still the same
         // category.
         let parsed = parse_geosite(&file).unwrap();
@@ -538,18 +554,28 @@ mod tests {
     #[test]
     fn multi_category_file_roundtrip() {
         let mut file = Vec::new();
-        file.extend_from_slice(&len_delimited(1, &geosite_msg("cn", &[
-            domain_msg(2, "cn"),
-            domain_msg(3, "www.baidu.com"),
-            domain_msg(0, "taobao"),
-        ])));
-        file.extend_from_slice(&len_delimited(1, &geosite_msg("category-ads-all", &[
-            domain_msg(2, "doubleclick.net"),
-            domain_msg(1, "^ads?\\."),
-        ])));
-        file.extend_from_slice(&len_delimited(1, &geosite_msg("private", &[
-            domain_msg(3, "localhost"),
-        ])));
+        file.extend_from_slice(&len_delimited(
+            1,
+            &geosite_msg(
+                "cn",
+                &[
+                    domain_msg(2, "cn"),
+                    domain_msg(3, "www.baidu.com"),
+                    domain_msg(0, "taobao"),
+                ],
+            ),
+        ));
+        file.extend_from_slice(&len_delimited(
+            1,
+            &geosite_msg(
+                "category-ads-all",
+                &[domain_msg(2, "doubleclick.net"), domain_msg(1, "^ads?\\.")],
+            ),
+        ));
+        file.extend_from_slice(&len_delimited(
+            1,
+            &geosite_msg("private", &[domain_msg(3, "localhost")]),
+        ));
 
         let want = vec!["cn".to_string(), "private".to_string()];
         let got = load_filtered(&file, Some(&want)).unwrap();

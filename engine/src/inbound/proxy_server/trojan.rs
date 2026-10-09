@@ -16,8 +16,8 @@ use tokio::io::AsyncReadExt;
 
 use crate::error::{Error, Result};
 use crate::inbound::proxy_server::{
-    build_tls_config, ct_eq, hand_off, read_socks_addr, serve_with, spawn_framed_udp,
-    ServerConfig, ServerProtocol, ServerTls,
+    build_tls_config, ct_eq, hand_off, read_socks_addr, serve_with, spawn_framed_udp, ServerConfig,
+    ServerProtocol, ServerTls,
 };
 use crate::inbound::SharedRelay;
 use crate::proto::trojan::trojan_password_hex;
@@ -54,7 +54,9 @@ impl TrojanServer {
         relay: SharedRelay,
     ) -> Result<()> {
         let mut stream = match &self.tls {
-            Some(config) => crate::inbound::proxy_server::tls_accept(config.clone(), stream).await?,
+            Some(config) => {
+                crate::inbound::proxy_server::tls_accept(config.clone(), stream).await?
+            }
             None => stream,
         };
 
@@ -100,7 +102,9 @@ impl TrojanServer {
 /// Serve a Trojan listener; returns the bound address.
 pub async fn serve(cfg: &ServerConfig, relay: SharedRelay) -> Result<SocketAddr> {
     let ServerProtocol::Trojan { password, tls } = &cfg.protocol else {
-        return Err(Error::config("trojan::serve called with a non-trojan protocol"));
+        return Err(Error::config(
+            "trojan::serve called with a non-trojan protocol",
+        ));
     };
     let server = TrojanServer::new(password, tls.as_ref())?;
     let tag = cfg.tag.clone();
@@ -157,7 +161,11 @@ mod tests {
     }
 
     /// Handshake + echo one payload over an established transport.
-    async fn roundtrip_over(transport: BoxProxyStream, password: &str, port: u16) -> (Vec<u8>, NetAddr) {
+    async fn roundtrip_over(
+        transport: BoxProxyStream,
+        password: &str,
+        port: u16,
+    ) -> (Vec<u8>, NetAddr) {
         let target = NetAddr::domain("echo.test", 443).unwrap();
         let mut stream = crate::proto::trojan::TrojanStream::handshake(
             transport,
@@ -203,6 +211,7 @@ mod tests {
                 server_name: Some("localhost".into()),
                 skip_cert_verify: true,
                 alpn: Vec::new(),
+                ..Default::default()
             },
         )
         .await
@@ -247,8 +256,7 @@ mod tests {
         let target = NetAddr::domain("echo.test", 443).unwrap();
         let tcp = TcpStream::connect(addr).await.unwrap();
         // Like the outbound, the association header carries no real target.
-        let placeholder =
-            NetAddr::ip(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+        let placeholder = NetAddr::ip(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
         let mut stream = crate::proto::trojan::TrojanStream::handshake(
             Box::new(tcp),
             &client(&password, addr.port()),

@@ -157,7 +157,10 @@ pub struct ConnContext<'a> {
     pub process: Option<&'a str>,
     /// Owner uid of the client process (UID rules).
     pub uid: Option<u32>,
-    /// Owner username of the client process (IN-USER rules).
+    /// The username that authenticated on the inbound listener (mihomo
+    /// metadata.InUser, constant/metadata.go:204) — IN-USER rules and
+    /// load-balance `hash-key: in-user` match on it. NOT the client
+    /// process owner (UID covers the process-identity side).
     pub user: Option<&'a str>,
     /// IPv4 DSCP field, when the inbound carries it. Only meaningful
     /// on TUN inbounds upstream; always None from the current
@@ -199,12 +202,24 @@ pub enum RuleMatcher {
     DomainSuffix(String),
     DomainKeyword(String),
     DomainRegex(Box<regex::Regex>),
-    IpCidr { net: IpNet, src: bool, no_resolve: bool },
-    GeoIp { country: String, no_resolve: bool },
-    Geosite { name: String },
+    IpCidr {
+        net: IpNet,
+        src: bool,
+        no_resolve: bool,
+    },
+    GeoIp {
+        country: String,
+        no_resolve: bool,
+    },
+    Geosite {
+        name: String,
+    },
     PortDst(PortRange),
     PortSrc(PortRange),
-    RuleSet { name: String, no_resolve: bool },
+    RuleSet {
+        name: String,
+        no_resolve: bool,
+    },
     /// Matches only while the engine runs in the given mode
     /// (`rule`/`global`/`direct`) — sing-box's `clash_mode`.
     ClashMode(String),
@@ -230,17 +245,29 @@ pub enum RuleMatcher {
     Dscp(u8),
     /// IP-ASN,<as-number> — destination ASN from the ASN mmdb;
     /// needs destination resolution like GEOIP unless `no-resolve`.
-    IpAsn { asn: u32, no_resolve: bool },
+    IpAsn {
+        asn: u32,
+        no_resolve: bool,
+    },
     /// IP-SUFFIX,<dotted tail like `8.8`> — matches when the suffix
     /// equals the tail segments of any destination IP (v4: last
     /// octets, v6: last hextets, hex case-insensitive).
-    IpSuffix { suffix: String, no_resolve: bool },
+    IpSuffix {
+        suffix: String,
+        no_resolve: bool,
+    },
     /// PROCESS-NAME / PROCESS-PATH — matched against the resolved process.
-    Process { pattern: String, path: bool },
+    Process {
+        pattern: String,
+        path: bool,
+    },
     /// AND,(<sub-rules>) / OR,(<sub-rules>) logic rules. Sub-rules are
     /// the same clash-style rule strings, joined with `&&` inside the
     /// parentheses to stay comma-free.
-    Logic { mode: LogicMode, sub: Vec<Rule> },
+    Logic {
+        mode: LogicMode,
+        sub: Vec<Rule>,
+    },
     MatchAll,
 }
 
@@ -308,7 +335,11 @@ impl Rule {
             return Err(Error::config(format!("malformed rule {line:?}")));
         }
         let no_resolve = parts.last() == Some(&"no-resolve");
-        let needed = if no_resolve { parts.len() - 1 } else { parts.len() };
+        let needed = if no_resolve {
+            parts.len() - 1
+        } else {
+            parts.len()
+        };
         let kind = parts[0].to_ascii_uppercase();
         let (matcher, outbound) = match (kind.as_str(), needed) {
             ("DOMAIN", 3) => (
@@ -323,12 +354,14 @@ impl Rule {
                 RuleMatcher::DomainKeyword(parts[1].to_ascii_lowercase()),
                 parts[2].to_string(),
             ),
-            ("DOMAIN-REGEX", 3) => (
-                RuleMatcher::DomainRegex(Box::new(regex::Regex::new(parts[1]).map_err(
-                    |e| Error::config(format!("bad rule regex {:?}: {e}", parts[1])),
-                )?)),
-                parts[2].to_string(),
-            ),
+            ("DOMAIN-REGEX", 3) => {
+                (
+                    RuleMatcher::DomainRegex(Box::new(regex::Regex::new(parts[1]).map_err(
+                        |e| Error::config(format!("bad rule regex {:?}: {e}", parts[1])),
+                    )?)),
+                    parts[2].to_string(),
+                )
+            }
             ("DOMAIN-WILDCARD", 3) => (
                 // mihomo wildcard: `*` matches any run, `+.` = subdomain
                 // OR apex; anchored like a full domain match.
@@ -419,9 +452,7 @@ impl Rule {
                     .parse()
                     .map_err(|_| Error::config(format!("bad DSCP value {:?}", parts[1])))?;
                 if dscp > 63 {
-                    return Err(Error::config(format!(
-                        "DSCP must be 0-63, got {dscp}"
-                    )));
+                    return Err(Error::config(format!("DSCP must be 0-63, got {dscp}")));
                 }
                 (RuleMatcher::Dscp(dscp), parts[2].to_string())
             }
@@ -442,11 +473,17 @@ impl Rule {
                 parts[2].to_string(),
             ),
             ("PROCESS-NAME", 3) => (
-                RuleMatcher::Process { pattern: parts[1].to_string(), path: false },
+                RuleMatcher::Process {
+                    pattern: parts[1].to_string(),
+                    path: false,
+                },
                 parts[2].to_string(),
             ),
             ("PROCESS-PATH", 3) => (
-                RuleMatcher::Process { pattern: parts[1].to_string(), path: true },
+                RuleMatcher::Process {
+                    pattern: parts[1].to_string(),
+                    path: true,
+                },
                 parts[2].to_string(),
             ),
             ("MATCH", 2) => (RuleMatcher::MatchAll, parts[1].to_string()),
@@ -509,7 +546,9 @@ impl Rule {
         let payload = rest[1..end].trim();
         let outbound = rest[end + 1..].trim().trim_start_matches(',').trim();
         if payload.is_empty() {
-            return Err(Error::config(format!("logic rule has no sub-rules: {line:?}")));
+            return Err(Error::config(format!(
+                "logic rule has no sub-rules: {line:?}"
+            )));
         }
         // Missing outbound (nested form) gets a stub the config
         // validator will reject if it ever leaks to the top level.
@@ -519,7 +558,9 @@ impl Rule {
             .map(|s| parse_sub_rule(&s))
             .collect::<Result<Vec<_>>>()?;
         if sub.is_empty() {
-            return Err(Error::config(format!("logic rule has no sub-rules: {line:?}")));
+            return Err(Error::config(format!(
+                "logic rule has no sub-rules: {line:?}"
+            )));
         }
         // mihomo's NOT takes exactly one sub-rule — refuse the rest
         // rather than silently using the first.
@@ -549,10 +590,7 @@ impl Rule {
                 .host
                 .as_domain()
                 .is_some_and(|d| d.contains(kw.as_str())),
-            RuleMatcher::DomainRegex(re) => ctx
-                .host
-                .as_domain()
-                .is_some_and(|d| re.is_match(d)),
+            RuleMatcher::DomainRegex(re) => ctx.host.as_domain().is_some_and(|d| re.is_match(d)),
             RuleMatcher::IpCidr { net, src, .. } => {
                 if *src {
                     ctx.source_ip.is_some_and(|ip| net.contains(ip))
@@ -575,9 +613,7 @@ impl Rule {
             RuleMatcher::RuleSet { name, .. } => match providers.get(name) {
                 None => false,
                 Some(kind) => match &*kind {
-                    RuleSetKind::Domain(m) => {
-                        ctx.host.as_domain().is_some_and(|d| m.matches(d))
-                    }
+                    RuleSetKind::Domain(m) => ctx.host.as_domain().is_some_and(|d| m.matches(d)),
                     RuleSetKind::IpCidr(nets) => ctx
                         .ips()
                         .iter()
@@ -597,17 +633,18 @@ impl Rule {
                 .split('/')
                 .any(|k| ctx.inbound_kind.eq_ignore_ascii_case(k)),
             RuleMatcher::Uid(range) => ctx.uid.is_some_and(|u| range.contains(u)),
-            RuleMatcher::InUser(users) => ctx
-                .user
-                .is_some_and(|u| users.split('/').any(|w| w == u)),
-            RuleMatcher::Dscp(dscp) => ctx.dscp == Some(*dscp),
-            RuleMatcher::IpAsn { asn, .. } => {
-                ctx.ips().iter().any(|ip| geo.asn(*ip) == Some(*asn))
+            RuleMatcher::InUser(users) => {
+                ctx.user.is_some_and(|u| users.split('/').any(|w| w == u))
             }
+            RuleMatcher::Dscp(dscp) => ctx.dscp == Some(*dscp),
+            RuleMatcher::IpAsn { asn, .. } => ctx.ips().iter().any(|ip| geo.asn(*ip) == Some(*asn)),
             RuleMatcher::IpSuffix { suffix, .. } => {
                 ctx.ips().iter().any(|ip| ip_matches_suffix(*ip, suffix))
             }
-            RuleMatcher::Process { pattern, path: is_path } => ctx.process.is_some_and(|p| {
+            RuleMatcher::Process {
+                pattern,
+                path: is_path,
+            } => ctx.process.is_some_and(|p| {
                 if *is_path {
                     // mihomo matches PROCESS-PATH exactly.
                     p == pattern
@@ -636,7 +673,9 @@ impl Rule {
 
 fn matcher_needs_ip(m: &RuleMatcher) -> bool {
     match m {
-        RuleMatcher::IpCidr { src, no_resolve, .. } => !*src && !*no_resolve,
+        RuleMatcher::IpCidr {
+            src, no_resolve, ..
+        } => !*src && !*no_resolve,
         RuleMatcher::GeoIp { no_resolve, .. } => !*no_resolve,
         RuleMatcher::IpAsn { no_resolve, .. } => !*no_resolve,
         RuleMatcher::IpSuffix { no_resolve, .. } => !*no_resolve,
@@ -713,7 +752,6 @@ fn ip_matches_suffix(ip: IpAddr, suffix: &str) -> bool {
     let tail = &segments[segments.len() - suffix_segments.len()..];
     tail.iter().zip(&suffix_segments).all(|(seg, s)| seg == s)
 }
-
 
 /// Loaded rule-provider sets.
 ///
@@ -798,7 +836,8 @@ impl DomainMatcher {
     }
 
     pub fn add_suffix(&mut self, suffix: &str) {
-        self.suffix.push(suffix.trim().trim_start_matches('.').to_ascii_lowercase());
+        self.suffix
+            .push(suffix.trim().trim_start_matches('.').to_ascii_lowercase());
     }
 
     pub fn add_keyword(&mut self, kw: &str) {
@@ -806,9 +845,10 @@ impl DomainMatcher {
     }
 
     pub fn add_regex(&mut self, pattern: &str) -> Result<()> {
-        self.regex.push(regex::Regex::new(pattern).map_err(|e| {
-            Error::config(format!("bad domain-set regex {pattern:?}: {e}"))
-        })?);
+        self.regex.push(
+            regex::Regex::new(pattern)
+                .map_err(|e| Error::config(format!("bad domain-set regex {pattern:?}: {e}")))?,
+        );
         Ok(())
     }
 
@@ -832,7 +872,6 @@ impl DomainMatcher {
         }
         self.regex.iter().any(|r| r.is_match(&d))
     }
-
 }
 
 /// GeoIP country lookup (mmdb) and geosite .dat matcher, wired in by the
@@ -846,8 +885,6 @@ pub struct GeoLookups {
     pub asn_mmdb: Option<maxminddb::Reader<Vec<u8>>>,
     pub geosite: std::collections::HashMap<String, DomainMatcher>,
 }
-
-
 
 impl GeoLookups {
     /// ISO country code for an IP from the MaxMind database.
@@ -962,9 +999,10 @@ pub fn needs_process(rules: &[Rule]) -> bool {
 fn matcher_needs_process(m: &RuleMatcher) -> bool {
     match m {
         RuleMatcher::Process { .. } => true,
-        // UID / IN-USER read the client process owner through the same
-        // /proc walk.
-        RuleMatcher::Uid(_) | RuleMatcher::InUser(_) => true,
+        // UID reads the client process owner through the /proc walk;
+        // IN-USER matches the inbound-authenticated user carried on the
+        // connection (no /proc dependency).
+        RuleMatcher::Uid(_) => true,
         RuleMatcher::Logic { sub, .. } => sub.iter().any(|r| matcher_needs_process(&r.matcher)),
         _ => false,
     }
@@ -1137,18 +1175,35 @@ mod tests {
         assert_eq!(r.outbound, "PROXY");
 
         let r = Rule::parse("IP-CIDR,10.0.0.0/8,DIRECT,no-resolve").unwrap();
-        assert!(matches!(&r.matcher, RuleMatcher::IpCidr { no_resolve: true, .. }));
+        assert!(matches!(
+            &r.matcher,
+            RuleMatcher::IpCidr {
+                no_resolve: true,
+                ..
+            }
+        ));
 
         let r = Rule::parse("DST-PORT,8000-8080,PROXY").unwrap();
-        assert!(matches!(&r.matcher, RuleMatcher::PortDst(PortRange { start: 8000, end: 8080 })));
+        assert!(matches!(
+            &r.matcher,
+            RuleMatcher::PortDst(PortRange {
+                start: 8000,
+                end: 8080
+            })
+        ));
 
         let r = Rule::parse("MATCH,Auto").unwrap();
         assert!(matches!(r.matcher, RuleMatcher::MatchAll));
 
         let r = Rule::parse("PROCESS-NAME,curl,DIRECT").unwrap();
-        assert!(matches!(&r.matcher, RuleMatcher::Process { pattern, path: false } if pattern == "curl"));
+        assert!(
+            matches!(&r.matcher, RuleMatcher::Process { pattern, path: false } if pattern == "curl")
+        );
         let r = Rule::parse("PROCESS-PATH,/usr/bin/curl,DIRECT").unwrap();
-        assert!(matches!(&r.matcher, RuleMatcher::Process { path: true, .. }));
+        assert!(matches!(
+            &r.matcher,
+            RuleMatcher::Process { path: true, .. }
+        ));
 
         assert!(Rule::parse("SUB-RULE,(A,B),X").is_err());
         assert!(Rule::parse("").is_err());
@@ -1183,8 +1238,7 @@ mod tests {
         assert!(not.evaluate(&c, &sets, &geo));
 
         // Nested logic inside AND.
-        let nested =
-            Rule::parse("AND,((NETWORK,tcp),(NOT,((DST-PORT,80)))),P").unwrap();
+        let nested = Rule::parse("AND,((NETWORK,tcp),(NOT,((DST-PORT,80)))),P").unwrap();
         assert!(nested.evaluate(&c, &sets, &geo));
 
         // Metadata rules.
@@ -1333,7 +1387,10 @@ mod tests {
                     // (exactly one exact domain, no torn state).
                     match &*kind {
                         RuleSetKind::Domain(m) => {
-                            assert!(m.matches("host0.test") || (1..1000).any(|i| m.matches(&format!("host{i}.test"))));
+                            assert!(
+                                m.matches("host0.test")
+                                    || (1..1000).any(|i| m.matches(&format!("host{i}.test")))
+                            );
                         }
                         _ => panic!("wrong kind"),
                     }
@@ -1391,14 +1448,28 @@ mod tests {
     fn u32_range_parses_single_and_range() {
         assert_eq!(
             "1000".parse::<U32Range>().unwrap(),
-            U32Range { start: 1000, end: 1000 }
+            U32Range {
+                start: 1000,
+                end: 1000
+            }
         );
         assert_eq!(
             "1000-2000".parse::<U32Range>().unwrap(),
-            U32Range { start: 1000, end: 2000 }
+            U32Range {
+                start: 1000,
+                end: 2000
+            }
         );
-        assert!(U32Range { start: 0, end: u32::MAX }.contains(u32::MAX));
-        assert!(!U32Range { start: 100, end: 200 }.contains(99));
+        assert!(U32Range {
+            start: 0,
+            end: u32::MAX
+        }
+        .contains(u32::MAX));
+        assert!(!U32Range {
+            start: 100,
+            end: 200
+        }
+        .contains(99));
         // u32 bounds and garbage rejected.
         assert!("0-4294967296".parse::<U32Range>().is_err());
         assert!("-1".parse::<U32Range>().is_err());
@@ -1470,15 +1541,25 @@ mod tests {
         assert_eq!(geo.asn("1.1.1.1".parse().unwrap()), None);
 
         let r = Rule::parse("IP-ASN,13335,PROXY").unwrap();
-        assert!(
-            matches!(&r.matcher, RuleMatcher::IpAsn { asn: 13335, no_resolve: false })
-        );
+        assert!(matches!(
+            &r.matcher,
+            RuleMatcher::IpAsn {
+                asn: 13335,
+                no_resolve: false
+            }
+        ));
         assert!(r.needs_ip());
         // Without an ASN mmdb wired the rule never matches.
         assert!(!r.evaluate(&c, &sets, &geo));
 
         let nr = Rule::parse("IP-ASN,13335,PROXY,no-resolve").unwrap();
-        assert!(matches!(&nr.matcher, RuleMatcher::IpAsn { no_resolve: true, .. }));
+        assert!(matches!(
+            &nr.matcher,
+            RuleMatcher::IpAsn {
+                no_resolve: true,
+                ..
+            }
+        ));
         assert!(!nr.needs_ip());
         assert!(Rule::parse("IP-ASN,not-a-number,P").is_err());
 
@@ -1498,7 +1579,9 @@ mod tests {
         let ip = |s: &str| Host::Ip(s.parse().unwrap());
 
         let rule = Rule::parse("IP-SUFFIX,8.8,PROXY").unwrap();
-        assert!(matches!(&rule.matcher, RuleMatcher::IpSuffix { suffix, no_resolve: false } if suffix == "8.8"));
+        assert!(
+            matches!(&rule.matcher, RuleMatcher::IpSuffix { suffix, no_resolve: false } if suffix == "8.8")
+        );
         assert!(rule.needs_ip());
         // Tail octets of the destination.
         assert!(rule.evaluate(&ctx(&ip("1.2.8.8"), 53), &sets, &geo));
@@ -1512,7 +1595,10 @@ mod tests {
         // Any resolved IP may satisfy it.
         let domain = Host::Domain("example.com".into());
         let mut c = ctx(&domain, 53);
-        c.resolved = Some(vec!["10.0.0.1".parse().unwrap(), "10.0.8.8".parse().unwrap()]);
+        c.resolved = Some(vec![
+            "10.0.0.1".parse().unwrap(),
+            "10.0.8.8".parse().unwrap(),
+        ]);
         assert!(rule.evaluate(&c, &sets, &geo));
 
         // IPv6: last hextets, hex compared case-insensitively (the
@@ -1531,7 +1617,13 @@ mod tests {
 
         // no-resolve variant and payload validation.
         let nr = Rule::parse("IP-SUFFIX,8.8,P,no-resolve").unwrap();
-        assert!(matches!(&nr.matcher, RuleMatcher::IpSuffix { no_resolve: true, .. }));
+        assert!(matches!(
+            &nr.matcher,
+            RuleMatcher::IpSuffix {
+                no_resolve: true,
+                ..
+            }
+        ));
         assert!(!nr.needs_ip());
         assert!(Rule::parse("IP-SUFFIX,8..8,P").is_err());
         assert!(Rule::parse("IP-SUFFIX,.8,P").is_err());
@@ -1596,10 +1688,7 @@ mod tests {
         let c = ctx(&host, 443);
         let sets = RuleSets::default();
         let geo = GeoLookups::default();
-        let t = table(
-            &["DOMAIN-SUFFIX,example.com,PROXY", "MATCH,DIRECT"],
-            vec![],
-        );
+        let t = table(&["DOMAIN-SUFFIX,example.com,PROXY", "MATCH,DIRECT"], vec![]);
         let MatchOutcome::Route { rule, index } = t.walk(&c, &sets, &geo) else {
             panic!("expected Route");
         };
@@ -1624,7 +1713,12 @@ mod tests {
         let geo = GeoLookups::default();
         let t = table(
             &["DST-PORT,443,direct", "MATCH,PROXY"],
-            vec![(0, RuleAction::Sniff { sniffer: vec!["tls".into()] })],
+            vec![(
+                0,
+                RuleAction::Sniff {
+                    sniffer: vec!["tls".into()],
+                },
+            )],
         );
         let MatchOutcome::Sniff {
             action,
@@ -1646,8 +1740,7 @@ mod tests {
         // hits the MATCH rule.
         let sniffed = Host::Domain("cdn.example.com".into());
         let c2 = ctx(&sniffed, 443);
-        let MatchOutcome::Route { rule, index } = t.match_from(resume_at, &c2, &sets, &geo)
-        else {
+        let MatchOutcome::Route { rule, index } = t.match_from(resume_at, &c2, &sets, &geo) else {
             panic!("expected Route after sniff");
         };
         assert_eq!((rule.outbound.as_str(), index), ("PROXY", 1));
@@ -1693,8 +1786,7 @@ mod tests {
         assert!(!t.rules()[1].evaluate(&c, &sets, &geo));
         let mut c2 = ctx(&host, 80);
         c2.resolved = Some(vec!["1.2.3.4".parse().unwrap()]);
-        let MatchOutcome::Route { rule, index } = t.match_from(resume_at, &c2, &sets, &geo)
-        else {
+        let MatchOutcome::Route { rule, index } = t.match_from(resume_at, &c2, &sets, &geo) else {
             panic!("expected Route after resolve");
         };
         assert_eq!((rule.outbound.as_str(), index), ("PROXY", 1));
@@ -1740,11 +1832,7 @@ mod tests {
         let sets = RuleSets::default();
         let geo = GeoLookups::default();
         let t = table(
-            &[
-                "NETWORK,tcp,direct",
-                "DST-PORT,443,direct",
-                "MATCH,PROXY",
-            ],
+            &["NETWORK,tcp,direct", "DST-PORT,443,direct", "MATCH,PROXY"],
             vec![
                 (0, RuleAction::Sniff { sniffer: vec![] }),
                 (1, RuleAction::Resolve),
@@ -1753,8 +1841,7 @@ mod tests {
         let MatchOutcome::Sniff { resume_at: r1, .. } = t.walk(&c, &sets, &geo) else {
             panic!("expected Sniff");
         };
-        let MatchOutcome::Resolve { resume_at: r2, .. } = t.match_from(r1, &c, &sets, &geo)
-        else {
+        let MatchOutcome::Resolve { resume_at: r2, .. } = t.match_from(r1, &c, &sets, &geo) else {
             panic!("expected Resolve");
         };
         assert_eq!(r2, 2);

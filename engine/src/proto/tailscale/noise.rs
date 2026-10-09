@@ -95,8 +95,7 @@ pub fn protocol_version_prologue(version: u16) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 const BLAKE2S_IV: [u32; 8] = [
-    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-    0x5be0cd19,
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
 const SIGMA: [[usize; 16]; 10] = [
@@ -549,11 +548,7 @@ pub fn client_deferred(
         &mut init[INITIATION_HEADER_LEN + 32..INITIATION_HEADER_LEN + 32 + 48],
     )?;
     let cipher = s.mix_dh(machine_key.secret(), control_key.as_bytes())?;
-    s.encrypt_and_hash(
-        &cipher,
-        &[],
-        &mut init[INITIATION_HEADER_LEN + 32 + 48..],
-    )?;
+    s.encrypt_and_hash(&cipher, &[], &mut init[INITIATION_HEADER_LEN + 32 + 48..])?;
 
     Ok((
         init.to_vec(),
@@ -833,7 +828,14 @@ impl<S> std::fmt::Debug for NoiseConn<S> {
         f.debug_struct("NoiseConn")
             .field("version", &self.version)
             .field("peer", &self.peer)
-            .field("handshake_hash", &self.handshake_hash.iter().map(|b| format!("{b:02x}")).collect::<String>())
+            .field(
+                "handshake_hash",
+                &self
+                    .handshake_hash
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -1004,10 +1006,10 @@ mod tests {
         );
         // HMAC-BLAKE2s long-key path (key > 64 bytes gets hashed).
         let long = vec![0x66u8; 200];
-        assert_eq!(
-            hex(&hmac_blake2s(&long, b"x")),
-            { let hashed = blake2s256(&long); hex(&hmac_blake2s(&hashed, b"x")) }
-        );
+        assert_eq!(hex(&hmac_blake2s(&long, b"x")), {
+            let hashed = blake2s256(&long);
+            hex(&hmac_blake2s(&hashed, b"x"))
+        });
     }
 
     #[test]
@@ -1093,14 +1095,9 @@ mod tests {
             [r1, r2].concat()
         });
 
-        let mut client = client_handshake(
-            client_stream,
-            &machine_key,
-            &control_pub,
-            148,
-        )
-        .await
-        .expect("client handshake");
+        let mut client = client_handshake(client_stream, &machine_key, &control_pub, 148)
+            .await
+            .expect("client handshake");
         assert_eq!(client.protocol_version(), 148);
         assert_eq!(*client.peer(), control_pub);
         let hh = client.handshake_hash();
@@ -1140,14 +1137,9 @@ mod tests {
             assert!(res.is_err(), "server cannot decrypt the initiation");
         });
 
-        let err = client_handshake(
-            client_stream,
-            &machine_key,
-            &control_key.public(),
-            148,
-        )
-        .await
-        .unwrap_err();
+        let err = client_handshake(client_stream, &machine_key, &control_key.public(), 148)
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains("reading response header"),
             "the client sees the dropped connection: {err}"
@@ -1199,10 +1191,9 @@ mod tests {
         let (client_stream, mut server_stream) = tokio::io::duplex(4096);
 
         let client = tokio::spawn(async move {
-            let mut c =
-                client_handshake(client_stream, &machine_key, &control_pub, 148)
-                    .await
-                    .unwrap();
+            let mut c = client_handshake(client_stream, &machine_key, &control_pub, 148)
+                .await
+                .unwrap();
             c.send(b"first").await.unwrap();
             let got = c.recv().await.unwrap();
             (c, got)

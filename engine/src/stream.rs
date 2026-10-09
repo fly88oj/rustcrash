@@ -26,7 +26,10 @@ pub struct ByteCounters {
 
 impl ByteCounters {
     pub fn snapshot(&self) -> (u64, u64) {
-        (self.rx.load(Ordering::Relaxed), self.tx.load(Ordering::Relaxed))
+        (
+            self.rx.load(Ordering::Relaxed),
+            self.tx.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -43,7 +46,11 @@ impl<S> CountingStream<S> {
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<S> {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         let before = buf.filled().len();
         let out = Pin::new(&mut self.inner).poll_read(cx, buf);
         if let Poll::Ready(Ok(())) = &out {
@@ -57,7 +64,11 @@ impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<S> {
 }
 
 impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<S> {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         let out = Pin::new(&mut self.inner).poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = &out {
             self.counters.tx.fetch_add(*n as u64, Ordering::Relaxed);

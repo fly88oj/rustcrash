@@ -400,7 +400,10 @@ fn consume_response(
         peer_index: sender,
         created: now,
         last_tx: now,
-        send: (ChaCha20Poly1305::new_from_slice(&send_key).expect("32-byte key"), 0),
+        send: (
+            ChaCha20Poly1305::new_from_slice(&send_key).expect("32-byte key"),
+            0,
+        ),
         recv: (
             ChaCha20Poly1305::new_from_slice(&recv_key).expect("32-byte key"),
             0,
@@ -449,7 +452,10 @@ impl Session {
             .0
             .decrypt(
                 (&aead_nonce(counter)).into(),
-                Payload { msg: data, aad: &[] },
+                Payload {
+                    msg: data,
+                    aad: &[],
+                },
             )
             .map_err(|_| Error::crypto("wg: transport open failed"))?;
         if !self.recv.2.accept(counter) {
@@ -510,8 +516,7 @@ impl DerpCarrier {
             app_name: "rustcrash".into(),
             ..Default::default()
         };
-        let mut client =
-            super::derp::derp_connect(&route.url, our_node_key, &opts).await?;
+        let mut client = super::derp::derp_connect(&route.url, our_node_key, &opts).await?;
         // First message is always ServerInfo (derp_client.go:447-462).
         match client.recv().await? {
             super::derp::DerpMessage::ServerInfo(_) => {}
@@ -607,7 +612,8 @@ impl DiscoState {
     /// (`discoPingTimeout`, endpoint.go:1236-1252).
     fn expire_sent(&mut self) {
         let now = Instant::now();
-        self.sent.retain(|_, sp| now.duration_since(sp.at) < DISCO_PING_TIMEOUT);
+        self.sent
+            .retain(|_, sp| now.duration_since(sp.at) < DISCO_PING_TIMEOUT);
     }
 
     /// Every direct candidate to ping: the configured/learned endpoint
@@ -856,7 +862,9 @@ fn udp_target_addr(
     local_ipv6: Option<Ipv6Addr>,
 ) -> Result<SocketAddr> {
     match &target.host {
-        crate::addr::Host::Ip(IpAddr::V4(ip)) => Ok(SocketAddr::V4(SocketAddrV4::new(*ip, target.port))),
+        crate::addr::Host::Ip(IpAddr::V4(ip)) => {
+            Ok(SocketAddr::V4(SocketAddrV4::new(*ip, target.port)))
+        }
         crate::addr::Host::Ip(IpAddr::V6(ip)) => match local_ipv6 {
             Some(_) => Ok(SocketAddr::V6(SocketAddrV6::new(*ip, target.port, 0, 0))),
             None => Err(Error::network(format!(
@@ -950,7 +958,10 @@ impl tokio::io::AsyncWrite for TsTcpStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         self.shared.lock().write_closed = true;
         self.shared.wake.notify_one();
         Poll::Ready(Ok(()))
@@ -1212,9 +1223,7 @@ impl Tunnel {
     fn local_address_for(&self, dst: &SocketAddr) -> IpAddress {
         match dst {
             SocketAddr::V4(_) => IpAddress::Ipv4(self.local_ipv4),
-            SocketAddr::V6(_) => {
-                IpAddress::Ipv6(self.local_ipv6.unwrap_or(Ipv6Addr::UNSPECIFIED))
-            }
+            SocketAddr::V6(_) => IpAddress::Ipv6(self.local_ipv6.unwrap_or(Ipv6Addr::UNSPECIFIED)),
         }
     }
 
@@ -1347,8 +1356,7 @@ impl Tunnel {
     /// carrier is tried while handshaking (parallel probing).
     async fn send_wg(&mut self, msg: &[u8]) -> Result<()> {
         let confirmed = self.disco.as_ref().and_then(|d| d.trusted_direct());
-        let via_derp_only =
-            self.direct_dst.is_none() || (self.learned_derp && confirmed.is_none());
+        let via_derp_only = self.direct_dst.is_none() || (self.learned_derp && confirmed.is_none());
         if let Some(dst) = confirmed.or(self.direct_dst) {
             if !via_derp_only {
                 let sock = self.udp_sock.as_ref().ok_or_else(|| {
@@ -1384,7 +1392,9 @@ impl Tunnel {
         for ep in d.candidates(self.direct_dst) {
             // "the minimum time between pings to an endpoint"
             // (discoPingInterval; upstream resets this on CallMeMaybe).
-            if d.last_ping.get(&ep).is_some_and(|at| now.duration_since(*at) < DISCO_PING_INTERVAL)
+            if d.last_ping
+                .get(&ep)
+                .is_some_and(|at| now.duration_since(*at) < DISCO_PING_INTERVAL)
             {
                 continue;
             }
@@ -1393,8 +1403,11 @@ impl Tunnel {
                 node_key: Some(d.node_pub),
                 padding: 0,
             };
-            let Ok(pkt) = super::disco::seal(&d.our, &d.peer, &super::disco::DiscoMessage::Ping(ping.clone()))
-            else {
+            let Ok(pkt) = super::disco::seal(
+                &d.our,
+                &d.peer,
+                &super::disco::DiscoMessage::Ping(ping.clone()),
+            ) else {
                 continue;
             };
             d.sent.insert(ping.txid, SentPing { to: ep, at: now });
@@ -1614,12 +1627,13 @@ impl Tunnel {
         let action = match self.session.as_ref() {
             Some(s) if now.duration_since(s.created) >= REJECT_AFTER_TIME => Some(Action::Expire),
             Some(s)
-                if now.duration_since(s.created) >= REKEY_AFTER_TIME
-                    || s.send.1 >= (1 << 60) =>
+                if now.duration_since(s.created) >= REKEY_AFTER_TIME || s.send.1 >= (1 << 60) =>
             {
                 Some(Action::Rekey)
             }
-            Some(s) if now.duration_since(s.last_tx) >= KEEPALIVE_TIMEOUT => Some(Action::Keepalive),
+            Some(s) if now.duration_since(s.last_tx) >= KEEPALIVE_TIMEOUT => {
+                Some(Action::Keepalive)
+            }
             _ => None,
         };
         match action {
@@ -1714,16 +1728,21 @@ impl Tunnel {
                 // None), so replies of either family reach the socket.
                 if let Err(e) = sock.bind(IpListenEndpoint { addr: None, port }) {
                     self.used_ports.remove(&port);
-                    let _ = reply.send(Err(Error::network(format!(
-                        "tailscale: udp bind: {e:?}"
-                    ))));
+                    let _ = reply.send(Err(Error::network(format!("tailscale: udp bind: {e:?}"))));
                     return;
                 }
                 let handle = self.sockets.add(sock);
                 let id = self.next_udp_id;
                 self.next_udp_id += 1;
                 let (tx, rx) = mpsc::channel::<(NetAddr, Vec<u8>)>(64);
-                self.udp_socks.insert(id, UdpSock { handle, port, down: tx });
+                self.udp_socks.insert(
+                    id,
+                    UdpSock {
+                        handle,
+                        port,
+                        down: tx,
+                    },
+                );
                 let _ = reply.send(Ok((id, rx)));
                 self.wake.notify_one();
             }
@@ -1911,8 +1930,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v4.port(), 53);
-        let dom = udp_target_addr(&NetAddr::domain("peer.tail-scale.ts.net", 53).unwrap(), "send", None)
-            .unwrap_err();
+        let dom = udp_target_addr(
+            &NetAddr::domain("peer.tail-scale.ts.net", 53).unwrap(),
+            "send",
+            None,
+        )
+        .unwrap_err();
         assert!(dom.to_string().contains("resolve before sending"), "{dom}");
         let v6 = udp_target_addr(
             &NetAddr::ip("fd7a:115c:a1e0::1".parse::<std::net::IpAddr>().unwrap(), 53),
@@ -2124,8 +2147,9 @@ mod tests {
         // Every stream echoes multi-segment bursts, interleaved.
         for round in 0..4u32 {
             for (i, stream) in streams.iter_mut().enumerate() {
-                let chunk: Vec<u8> =
-                    (0..8 * 1024).map(|k| (k as u32 + round + i as u32) as u8).collect();
+                let chunk: Vec<u8> = (0..8 * 1024)
+                    .map(|k| (k as u32 + round + i as u32) as u8)
+                    .collect();
                 tokio::time::timeout(Duration::from_secs(30), stream.write_all(&chunk))
                     .await
                     .expect("concurrent stream write must not stall")

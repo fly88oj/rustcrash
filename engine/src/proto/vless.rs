@@ -88,7 +88,11 @@ impl VlessStream {
 }
 
 impl AsyncWrite for VlessStream {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         if !self.pending.is_empty() {
             let hdr = std::mem::take(&mut self.pending);
             ready!(ready_write_all(&mut self.inner, cx, &hdr))?;
@@ -106,7 +110,11 @@ impl AsyncWrite for VlessStream {
 }
 
 impl AsyncRead for VlessStream {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         // Response: version(1) + addons-length(1) then data.
         if !self.consumed_resp_header {
             // Read exactly two bytes using the pending buffer.
@@ -178,8 +186,6 @@ mod tests {
     use super::*;
     use crate::addr::Host;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-
 
     #[tokio::test]
     async fn handshake_header_bytes() {

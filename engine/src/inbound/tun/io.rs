@@ -360,9 +360,7 @@ mod tests {
         Ok(b.to_vec())
     }
 
-    fn recv_one(
-        rx: &mut mpsc::Receiver<Vec<u8>>,
-    ) -> Option<Vec<u8>> {
+    fn recv_one(rx: &mut mpsc::Receiver<Vec<u8>>) -> Option<Vec<u8>> {
         // Real-clock deadline; the thread runs independently of this runtime.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {

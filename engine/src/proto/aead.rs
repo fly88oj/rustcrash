@@ -25,7 +25,6 @@ impl AeadKind {
             AeadKind::Aes256Gcm | AeadKind::Chacha20Poly1305 => 32,
         }
     }
-
 }
 
 enum Cipher {
@@ -49,8 +48,12 @@ impl Aead {
             )));
         }
         let cipher = match kind {
-            AeadKind::Aes128Gcm => Cipher::Aes128(Box::new(Aes128Gcm::new_from_slice(key).unwrap())),
-            AeadKind::Aes256Gcm => Cipher::Aes256(Box::new(Aes256Gcm::new_from_slice(key).unwrap())),
+            AeadKind::Aes128Gcm => {
+                Cipher::Aes128(Box::new(Aes128Gcm::new_from_slice(key).unwrap()))
+            }
+            AeadKind::Aes256Gcm => {
+                Cipher::Aes256(Box::new(Aes256Gcm::new_from_slice(key).unwrap()))
+            }
             AeadKind::Chacha20Poly1305 => {
                 Cipher::Chacha(Box::new(ChaCha20Poly1305::new_from_slice(key).unwrap()))
             }
@@ -59,11 +62,24 @@ impl Aead {
     }
 
     /// Append `ciphertext || tag` of `plain` to `out` under `nonce`.
-    pub fn seal(&self, nonce: &[u8; 12], aad: &[u8], plain: &[u8], out: &mut Vec<u8>) -> Result<()> {
+    pub fn seal(
+        &self,
+        nonce: &[u8; 12],
+        aad: &[u8],
+        plain: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
         let ct = match &self.cipher {
-            Cipher::Aes128(c) => c.encrypt(nonce.into(), aes_gcm::aead::Payload { msg: plain, aad }),
-            Cipher::Aes256(c) => c.encrypt(nonce.into(), aes_gcm::aead::Payload { msg: plain, aad }),
-            Cipher::Chacha(c) => c.encrypt(nonce.into(), chacha20poly1305::aead::Payload { msg: plain, aad }),
+            Cipher::Aes128(c) => {
+                c.encrypt(nonce.into(), aes_gcm::aead::Payload { msg: plain, aad })
+            }
+            Cipher::Aes256(c) => {
+                c.encrypt(nonce.into(), aes_gcm::aead::Payload { msg: plain, aad })
+            }
+            Cipher::Chacha(c) => c.encrypt(
+                nonce.into(),
+                chacha20poly1305::aead::Payload { msg: plain, aad },
+            ),
         }
         .map_err(|_| Error::crypto("aead seal failed"))?;
         out.extend_from_slice(&ct);
@@ -75,9 +91,14 @@ impl Aead {
         let pt = match &self.cipher {
             Cipher::Aes128(c) => c.decrypt(nonce.into(), aes_gcm::aead::Payload { msg: ct, aad }),
             Cipher::Aes256(c) => c.decrypt(nonce.into(), aes_gcm::aead::Payload { msg: ct, aad }),
-            Cipher::Chacha(c) => c.decrypt(nonce.into(), chacha20poly1305::aead::Payload { msg: ct, aad }),
+            Cipher::Chacha(c) => c.decrypt(
+                nonce.into(),
+                chacha20poly1305::aead::Payload { msg: ct, aad },
+            ),
         }
-        .map_err(|_| Error::crypto("aead open failed (wrong key, corrupted stream, or replayed salt"))?;
+        .map_err(|_| {
+            Error::crypto("aead open failed (wrong key, corrupted stream, or replayed salt")
+        })?;
         Ok(pt)
     }
 }
@@ -169,7 +190,8 @@ pub fn ss2022_subkey(key: &[u8], salt: &[u8], out_len: usize) -> Vec<u8> {
     let mut material = Vec::with_capacity(key.len() + salt.len());
     material.extend_from_slice(key);
     material.extend_from_slice(salt);
-    blake3::derive_key("shadowsocks 2022 session subkey", &material[..]).to_vec()[..out_len].to_vec()
+    blake3::derive_key("shadowsocks 2022 session subkey", &material[..]).to_vec()[..out_len]
+        .to_vec()
 }
 
 #[cfg(test)]
@@ -178,7 +200,11 @@ mod tests {
 
     #[test]
     fn seal_open_roundtrip_all_kinds() {
-        for kind in [AeadKind::Aes128Gcm, AeadKind::Aes256Gcm, AeadKind::Chacha20Poly1305] {
+        for kind in [
+            AeadKind::Aes128Gcm,
+            AeadKind::Aes256Gcm,
+            AeadKind::Chacha20Poly1305,
+        ] {
             let aead = Aead::new(kind, &[7u8; 32][..kind.key_len()]).unwrap();
             let mut ct = Vec::new();
             aead.seal(&[0u8; 12], b"aad", b"hello", &mut ct).unwrap();

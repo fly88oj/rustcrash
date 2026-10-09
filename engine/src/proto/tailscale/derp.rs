@@ -116,7 +116,10 @@ fn hsalsa20(key: &[u8; 32], nonce16: &[u8; 16]) -> [u8; 32] {
     x[15] = SALSA_SIGMA[3];
     salsa20_rounds(&mut x);
     let mut out = [0u8; 32];
-    for (i, &w) in [x[0], x[5], x[10], x[15], x[6], x[7], x[8], x[9]].iter().enumerate() {
+    for (i, &w) in [x[0], x[5], x[10], x[15], x[6], x[7], x[8], x[9]]
+        .iter()
+        .enumerate()
+    {
         out[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
     }
     out
@@ -145,7 +148,12 @@ pub(crate) fn poly1305(key: &[u8; 32], msg: &[u8]) -> [u8; 16] {
         ((r_full >> 78) & 0x03ff_ffff) as u32,
         ((r_full >> 104) & 0x03ff_ffff) as u32,
     ];
-    let pad = [le(&key[16..20]), le(&key[20..24]), le(&key[24..28]), le(&key[28..32])];
+    let pad = [
+        le(&key[16..20]),
+        le(&key[20..24]),
+        le(&key[24..28]),
+        le(&key[28..32]),
+    ];
     let mut h = [0u32; 5];
 
     let mut blocks = |m: &[u8], hibit: u32| {
@@ -448,7 +456,10 @@ impl std::fmt::Debug for NodePublicKey {
         write!(
             f,
             "NodePublicKey({})",
-            self.0.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            self.0
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
         )
     }
 }
@@ -579,7 +590,11 @@ pub struct ClientInfo {
     pub version: i32,
     #[serde(rename = "CanAckPings", default)]
     pub can_ack_pings: bool,
-    #[serde(rename = "IsProber", default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(
+        rename = "IsProber",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
     pub is_prober: bool,
     #[serde(rename = "AppName", default, skip_serializing_if = "String::is_empty")]
     pub app_name: String,
@@ -621,12 +636,23 @@ pub struct ServerInfoMessage {
 pub enum DerpMessage {
     ServerInfo(ServerInfoMessage),
     KeepAlive,
-    PeerGone { peer: [u8; 32], reason: u8 },
-    ReceivedPacket { source: [u8; 32], data: Vec<u8> },
+    PeerGone {
+        peer: [u8; 32],
+        reason: u8,
+    },
+    ReceivedPacket {
+        source: [u8; 32],
+        data: Vec<u8>,
+    },
     Ping([u8; 8]),
     Pong([u8; 8]),
-    Health { problem: String },
-    ServerRestarting { reconnect_in_ms: u32, try_for_ms: u32 },
+    Health {
+        problem: String,
+    },
+    ServerRestarting {
+        reconnect_in_ms: u32,
+        try_for_ms: u32,
+    },
 }
 
 /// Options for [`DerpClient::new`] — the wire-relevant subset of
@@ -696,14 +722,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> DerpClient<S> {
             Some(k) => k,
             None => recv_server_key(&mut stream).await?,
         };
-        send_client_key(
-            &mut stream,
-            &private_key,
-            &public_key,
-            &server_key,
-            &opts,
-        )
-        .await?;
+        send_client_key(&mut stream, &private_key, &public_key, &server_key, &opts).await?;
         Ok(DerpClient {
             stream,
             server_key,
@@ -795,11 +814,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> DerpClient<S> {
                     .map_err(|e| {
                         Error::crypto(format!(
                             "derp: failed to open naclbox from server key {}: {e}",
-                            self.server_key.as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>()
+                            self.server_key
+                                .as_bytes()
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<String>()
                         ))
                     })?;
-                    let info: ServerInfo = serde_json::from_slice(&msg)
-                        .map_err(|e| Error::protocol(format!("derp: invalid serverInfo JSON: {e}")))?;
+                    let info: ServerInfo = serde_json::from_slice(&msg).map_err(|e| {
+                        Error::protocol(format!("derp: invalid serverInfo JSON: {e}"))
+                    })?;
                     return Ok(DerpMessage::ServerInfo(ServerInfoMessage {
                         token_bucket_bytes_per_second: info.token_bucket_bytes_per_second,
                         token_bucket_bytes_burst: info.token_bucket_bytes_burst,
@@ -857,9 +881,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> DerpClient<S> {
                         continue;
                     }
                     return Ok(DerpMessage::ServerRestarting {
-                        reconnect_in_ms: u32::from_be_bytes(
-                            payload[0..4].try_into().unwrap(),
-                        ),
+                        reconnect_in_ms: u32::from_be_bytes(payload[0..4].try_into().unwrap()),
                         try_for_ms: u32::from_be_bytes(payload[4..8].try_into().unwrap()),
                     });
                 }
@@ -978,6 +1000,7 @@ pub async fn derp_connect(
             server_name: Some(host.clone()),
             skip_cert_verify: opts.skip_cert_verify,
             alpn: Vec::new(),
+            ..Default::default()
         };
         tls_connect(Box::new(tcp), &host, &settings)
             .await
@@ -1045,9 +1068,7 @@ where
     let status = head.split("\r\n").next().unwrap_or_default();
     if !status.contains(" 101") {
         // derphttp_client.go:552-556.
-        return Err(Error::protocol(format!(
-            "derphttp: GET failed: {status}"
-        )));
+        return Err(Error::protocol(format!("derphttp: GET failed: {status}")));
     }
     Ok(stream)
 }
@@ -1103,8 +1124,7 @@ mod tests {
         // alice to bob.
         let alice = [1u8; 32];
         let bob_secret = [2u8; 32];
-        let alice_public =
-            curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(alice).0;
+        let alice_public = curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(alice).0;
         let bob_public =
             curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(bob_secret).0;
         let msg = [3u8; 64];
@@ -1126,9 +1146,11 @@ mod tests {
         sealed.extend_from_slice(&ct);
         assert_eq!(
             sealed,
-            hex("78ea30b19d2341ebbdba54180f821eec265cf86312549bea8a37652a8bb94f07\
+            hex(
+                "78ea30b19d2341ebbdba54180f821eec265cf86312549bea8a37652a8bb94f07\
                 b78a73ed1708085e6ddd0e943bbdeb8755079a37eb31d86163ce241164a4762\
-                9c0539f330b4914cd135b3855bc2a2dfc"),
+                9c0539f330b4914cd135b3855bc2a2dfc"
+            ),
             "the whole chain (X25519, HSalsa20, Salsa20, Poly1305) must match NaCl"
         );
 
@@ -1153,12 +1175,8 @@ mod tests {
         // 69696ee9...73d6) = dc908d...; the Salsa20 block 0 under
         // that subkey with nonce suffix 8219e0036b7a0b37 (verified
         // against libsodium's construction via pycryptodome).
-        let firstkey = unhex32(
-            "1b27556473e985d462cd51197a9a46c76009549eac6474f206c4ee0844f68389",
-        );
-        let n16: [u8; 16] = hex("69696ee955b62b73cd62bda875fc73d6")
-            .try_into()
-            .unwrap();
+        let firstkey = unhex32("1b27556473e985d462cd51197a9a46c76009549eac6474f206c4ee0844f68389");
+        let n16: [u8; 16] = hex("69696ee955b62b73cd62bda875fc73d6").try_into().unwrap();
         let sub = hsalsa20(&firstkey, &n16);
         assert_eq!(
             sub,
@@ -1197,17 +1215,11 @@ mod tests {
             .try_into()
             .unwrap();
         let tag = poly1305(&key, b"Cryptographic Forum Research Group");
-        assert_eq!(
-            tag,
-            hex("a8061dc1305136c6c22b8baf0c0127a9").as_slice()
-        );
+        assert_eq!(tag, hex("a8061dc1305136c6c22b8baf0c0127a9").as_slice());
         // §2.5.2's example spans two blocks plus a partial third (34
         // bytes), exercising every path; the empty-message tag is
         // structurally the pad half of the key (accumulator 0).
-        assert_eq!(
-            poly1305(&key, b""),
-            key[16..32].to_vec().as_slice()
-        );
+        assert_eq!(poly1305(&key, b""), key[16..32].to_vec().as_slice());
     }
 
     #[test]
@@ -1229,10 +1241,7 @@ mod tests {
         // ServerInfo (derp.go:302-309).
         let si: ServerInfo = serde_json::from_str(r#"{"version":2}"#).unwrap();
         assert_eq!(si.version, 2);
-        assert_eq!(
-            serde_json::to_string(&ServerInfo::default()).unwrap(),
-            "{}"
-        );
+        assert_eq!(serde_json::to_string(&ServerInfo::default()).unwrap(), "{}");
     }
 
     #[test]
@@ -1319,7 +1328,9 @@ mod tests {
         let mut greeting = Vec::new();
         greeting.extend_from_slice(MAGIC);
         greeting.extend_from_slice(server_key.public().as_bytes());
-        write_frame(&mut sock, FRAME_SERVER_KEY, &greeting).await.unwrap();
+        write_frame(&mut sock, FRAME_SERVER_KEY, &greeting)
+            .await
+            .unwrap();
 
         // FrameClientInfo: peer key + naclbox(ClientInfo JSON).
         let (t, payload) = read_frame(&mut sock).await.unwrap();
@@ -1360,10 +1371,7 @@ mod tests {
 
             // FrameServerInfo to both (derp.go:74; naclbox JSON).
             let info_json = br#"{"version":2}"#.to_vec();
-            for (sock, peer) in [
-                (&mut sock_b, &peer_b),
-                (&mut sock_a, &peer_a),
-            ] {
+            for (sock, peer) in [(&mut sock_b, &peer_b), (&mut sock_a, &peer_a)] {
                 let boxed = box_seal(server_key.secret(), peer.as_bytes(), &info_json).unwrap();
                 write_frame(sock, FRAME_SERVER_INFO, &boxed).await.unwrap();
             }
@@ -1405,7 +1413,13 @@ mod tests {
                     }
                 }
             }
-            (peer_a, peer_b, saw_pong_sent, saw_note_preferred, relayed_packet)
+            (
+                peer_a,
+                peer_b,
+                saw_pong_sent,
+                saw_note_preferred,
+                relayed_packet,
+            )
         });
 
         // Peer B registers FIRST (deterministic accept order), then

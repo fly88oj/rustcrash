@@ -72,7 +72,6 @@ impl ListenerKind {
             ListenerKind::Tproxy => "tproxy",
         }
     }
-
 }
 
 /// Metadata for one relayed TCP connection.
@@ -85,6 +84,12 @@ pub struct TcpMeta {
     pub inbound_port: Option<u16>,
     /// Listener kind name (mixed/socks/http/redir/tproxy) for IN-TYPE.
     pub inbound_kind: &'static str,
+    /// The username that authenticated this connection on an
+    /// authenticating listener (mihomo metadata.InUser, set via
+    /// inbound.WithInUser on http/socks auth success) — IN-USER rules
+    /// and load-balance `hash-key: in-user` match on it. `None` on
+    /// transparent inbounds and unauthenticated requests.
+    pub in_user: Option<String>,
 }
 
 /// The engine's entry points, handed to every listener.
@@ -116,11 +121,7 @@ pub type InboundAuth = Vec<(String, String)>;
 /// Verify one presented credential pair against the configured list
 /// (mihomo component/auth-userpass and the http authenticator compare
 /// plaintext pairs the same way).
-pub(crate) fn auth_accepted(
-    authentication: &[(String, String)],
-    user: &[u8],
-    pass: &[u8],
-) -> bool {
+pub(crate) fn auth_accepted(authentication: &[(String, String)], user: &[u8], pass: &[u8]) -> bool {
     let user = String::from_utf8_lossy(user);
     let pass = String::from_utf8_lossy(pass);
     authentication
@@ -236,7 +237,10 @@ mod tests {
     fn listener_kind_parsing() {
         assert_eq!(ListenerKind::parse("mixed").unwrap(), ListenerKind::Mixed);
         assert_eq!(ListenerKind::parse("tproxy").unwrap(), ListenerKind::Tproxy);
-        assert_eq!(ListenerKind::parse("redirect").unwrap(), ListenerKind::Redir);
+        assert_eq!(
+            ListenerKind::parse("redirect").unwrap(),
+            ListenerKind::Redir
+        );
         // A tun device has no listen port — it is declared via the
         // config's tun section, so the kind parser points there.
         let err = ListenerKind::parse("tun").unwrap_err().to_string();

@@ -326,7 +326,13 @@ pub fn build_fake_random(user: &JlsUser, random16: &[u8], auth_data: &[u8]) -> R
     let mut seed = random16.to_vec();
     loop {
         let sealed = aead
-            .encrypt(nonce, Payload { msg: &seed, aad: &[] })
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: &seed,
+                    aad: &[],
+                },
+            )
             .map_err(|_| Error::crypto("jls: fake random seal failed"))?;
         let fake: [u8; 32] = sealed
             .try_into()
@@ -349,7 +355,13 @@ pub fn check_fake_random(user: &JlsUser, fake_random: &[u8], auth_data: &[u8]) -
     let aead = jls_aead(user, auth_data);
     let nonce = jls_hash(&user.username, auth_data);
     let nonce = aes_gcm::Nonce::<U32>::from_slice(&nonce);
-    match aead.decrypt(nonce, Payload { msg: fake_random, aad: &[] }) {
+    match aead.decrypt(
+        nonce,
+        Payload {
+            msg: fake_random,
+            aad: &[],
+        },
+    ) {
         Ok(plain) => plain.len() == RANDOM_SEED_LEN,
         Err(_) => false,
     }
@@ -426,7 +438,10 @@ static JLS_RANDOM: JlsRandom = JlsRandom;
 impl SecureRandom for JlsRandom {
     fn fill(&self, buf: &mut [u8]) -> std::result::Result<(), GetRandomFailed> {
         let scripted = DRAW_SCRIPT.with_borrow_mut(|s| {
-            if s.first().map(|front| front.len() == buf.len()).unwrap_or(false) {
+            if s.first()
+                .map(|front| front.len() == buf.len())
+                .unwrap_or(false)
+            {
                 let front = s.remove(0);
                 buf.copy_from_slice(&front);
                 true
@@ -461,7 +476,8 @@ impl rustls::crypto::SupportedKxGroup for FixedX25519 {
     fn start(
         &self,
     ) -> std::result::Result<Box<dyn rustls::crypto::ActiveKeyExchange>, rustls::Error> {
-        FIXED_KEY.with(Cell::get)
+        FIXED_KEY
+            .with(Cell::get)
             .map(|(scalar, public)| {
                 Box::new(FixedExchange { scalar, public })
                     as Box<dyn rustls::crypto::ActiveKeyExchange>
@@ -482,8 +498,9 @@ impl rustls::crypto::ActiveKeyExchange for FixedExchange {
         let peer: [u8; 32] = peer_pub_key
             .try_into()
             .map_err(|_| rustls::Error::General("jls: bad X25519 key share".into()))?;
-        let shared =
-            curve25519_dalek::montgomery::MontgomeryPoint(peer).mul_clamped(self.scalar).0;
+        let shared = curve25519_dalek::montgomery::MontgomeryPoint(peer)
+            .mul_clamped(self.scalar)
+            .0;
         if shared.iter().all(|b| *b == 0) {
             return Err(rustls::Error::General(
                 "jls: X25519 peer key share is a low-order point".into(),
@@ -703,8 +720,7 @@ fn build_stamped_client_hello(
             || flight2[..RECORD_RANDOM_OFFSET] != flight1[..RECORD_RANDOM_OFFSET]
             || flight2[RECORD_RANDOM_OFFSET + HELLO_RANDOM_LEN..]
                 != flight1[RECORD_RANDOM_OFFSET + HELLO_RANDOM_LEN..]
-            || flight2[RECORD_RANDOM_OFFSET..RECORD_RANDOM_OFFSET + HELLO_RANDOM_LEN]
-                != fake_random
+            || flight2[RECORD_RANDOM_OFFSET..RECORD_RANDOM_OFFSET + HELLO_RANDOM_LEN] != fake_random
         {
             return Err(Error::crypto(
                 "jls: could not stamp the ClientHello random (rustls ClientHello layout changed)",
@@ -1188,13 +1204,8 @@ async fn connect_fingerprint(
     // certificate is random; the CertificateVerify *signature* is still
     // checked inside tls13.rs. `skip_cert_verify` has no effect here,
     // matching upstream.
-    let stream = engine_tls13::connect(
-        Box::new(guard),
-        &hello,
-        &secret,
-        ServerAuth::AcceptAny,
-    )
-    .await?;
+    let stream =
+        engine_tls13::connect(Box::new(guard), &hello, &secret, ServerAuth::AcceptAny).await?;
     if auth_failed.load(std::sync::atomic::Ordering::Acquire) {
         // `utls.go:106-112`: the handshake completed but the ServerHello
         // random did not verify — finish with a plausible HTTP request
@@ -1395,7 +1406,7 @@ where
     hpack_header(&mut block, "accept-encoding", "gzip");
     hpack_header(&mut block, "cookie", &format!("padding={padding}"));
     conn.write_all(&h2_frame(
-        0x1, /* HEADERS */
+        0x1,       /* HEADERS */
         0x4 | 0x1, /* END_HEADERS | END_STREAM (no body on a GET) */
         1,
         &block,
@@ -1408,8 +1419,7 @@ where
     let mut head = [0u8; 9];
     loop {
         conn.read_exact(&mut head).await?;
-        let len =
-            usize::from(head[0]) << 16 | usize::from(head[1]) << 8 | usize::from(head[2]);
+        let len = usize::from(head[0]) << 16 | usize::from(head[1]) << 8 | usize::from(head[2]);
         let kind = head[3];
         let flags = head[4];
         let stream = u32::from_be_bytes([head[5], head[6], head[7], head[8]]);
@@ -1487,9 +1497,8 @@ async fn connect_plain(
             server_hello_checked = true;
             let random = record_random(&record)
                 .ok_or_else(|| Error::protocol("jls: server flight shorter than a ServerHello"))?;
-            let auth_data =
-                hello_auth_data(&record[RECORD_HEADER_LEN..], HS_SERVER_HELLO)
-                    .map_err(|_| Error::protocol("jls: malformed ServerHello"))?;
+            let auth_data = hello_auth_data(&record[RECORD_HEADER_LEN..], HS_SERVER_HELLO)
+                .map_err(|_| Error::protocol("jls: malformed ServerHello"))?;
             if !check_fake_random(user, &random, &auth_data) {
                 return Err(Error::crypto(ERR_AUTH_FAILED));
             }
@@ -1675,8 +1684,7 @@ fn der_utctime(unix_secs: i64) -> Vec<u8> {
 /// self-signed ECDSA P-256 certificate with a random common name and
 /// serial. The engine's own client paths never verify the chain (JLS
 /// authenticates the peer), so the minimal shape suffices.
-fn generate_camouflage_cert(
-) -> Result<(
+fn generate_camouflage_cert() -> Result<(
     rustls::pki_types::CertificateDer<'static>,
     rustls::pki_types::PrivateKeyDer<'static>,
 )> {
@@ -1696,7 +1704,11 @@ fn generate_camouflage_cert(
     // SubjectPublicKeyInfo: ecPublicKey + prime256v1, uncompressed point.
     let mut alg = Vec::new();
     der_put(&mut alg, 0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]); // 1.2.840.10045.2.1
-    der_put(&mut alg, 0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]); // prime256v1
+    der_put(
+        &mut alg,
+        0x06,
+        &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07],
+    ); // prime256v1
     let mut alg_id = Vec::new();
     der_put(&mut alg_id, 0x30, &alg);
     let mut spki_bitstring = Vec::new();
@@ -1774,9 +1786,7 @@ fn generate_camouflage_cert(
 
     Ok((
         rustls::pki_types::CertificateDer::from(cert),
-        rustls::pki_types::PrivateKeyDer::Pkcs8(
-            pkcs8.as_ref().to_vec().into(),
-        ),
+        rustls::pki_types::PrivateKeyDer::Pkcs8(pkcs8.as_ref().to_vec().into()),
     ))
 }
 
@@ -1833,8 +1843,7 @@ fn client_hello_sni(hello: &[u8]) -> Option<String> {
                     && std::str::from_utf8(&hello[name_start..name_start + nlen]).is_ok()
                 {
                     return Some(
-                        String::from_utf8_lossy(&hello[name_start..name_start + nlen])
-                            .into_owned(),
+                        String::from_utf8_lossy(&hello[name_start..name_start + nlen]).into_owned(),
                     );
                 }
                 p = name_start + nlen;
@@ -1949,7 +1958,10 @@ pub enum JlsServerHandshake {
     /// conn.go:1584-1592): upstream runs `relayFallback` here and
     /// reports `ErrFallbackCompleted`; this port hands the conn + the
     /// recorded prefix to the listener, which relays toward `dest`.
-    Fallback { conn: BoxProxyStream, prefix: Vec<u8> },
+    Fallback {
+        conn: BoxProxyStream,
+        prefix: Vec<u8>,
+    },
 }
 
 /// `jls.Server` (transport/jls/jls.go:176-197): run the JLS-authenticated
@@ -1968,10 +1980,7 @@ pub enum JlsServerHandshake {
 ///   handshake_server_tls13.go:242-247); nothing has been written.
 /// * `Err` — the handshake failed AFTER a flight reached the client
 ///   (`recorder.wroteToClient()`, jls.go:183-186): the caller closes.
-pub async fn server(
-    cfg: &JlsServerConfig,
-    conn: BoxProxyStream,
-) -> Result<JlsServerHandshake> {
+pub async fn server(cfg: &JlsServerConfig, conn: BoxProxyStream) -> Result<JlsServerHandshake> {
     let mut conn = conn;
     let mut rbuf = BytesMut::with_capacity(16 * 1024);
     let mut prefix = Vec::new();
@@ -1989,7 +1998,8 @@ pub async fn server(
     conn.flush().await?;
     while tls.is_handshaking() {
         let record = read_one_record(&mut conn, &mut rbuf).await?;
-        feed_records(&mut tls, &record).map_err(|e| Error::network(format!("jls: tls read: {e}")))?;
+        feed_records(&mut tls, &record)
+            .map_err(|e| Error::network(format!("jls: tls read: {e}")))?;
         tls.process_new_packets().map_err(|e| {
             // A flight already reached the client: hard failure, no
             // fallback (recorder.wroteToClient, jls.go:183-186).
@@ -2186,8 +2196,8 @@ impl BitRateLimiter {
             return;
         }
         // interval = n * 8 * Second / rateBps, in microseconds.
-        let interval_us = (n as u64).saturating_mul(8).saturating_mul(1_000_000)
-            / self.rate_bps.max(1);
+        let interval_us =
+            (n as u64).saturating_mul(8).saturating_mul(1_000_000) / self.rate_bps.max(1);
         let now = tokio::time::Instant::now();
         let ready = self.next.map_or(now, |t| t.max(now));
         self.next = Some(ready + std::time::Duration::from_micros(interval_us));
@@ -2312,8 +2322,8 @@ mod tests {
 
     use aes_gcm::{Aes128Gcm, Aes256Gcm};
     use hkdf::Hkdf;
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use rustls::crypto::ring as ring_provider;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use rustls::ServerConnection;
     use sha2::{Sha256, Sha384};
     use tokio::io::DuplexStream;
@@ -2511,7 +2521,10 @@ mod tests {
         config: JlsServerConfig,
     ) -> std::result::Result<(), String> {
         match server(&config, Box::new(io)).await {
-            Ok(JlsServerHandshake::Authenticated { mut stream, user: who }) => {
+            Ok(JlsServerHandshake::Authenticated {
+                mut stream,
+                user: who,
+            }) => {
                 // UserFromConn (transport/jls/jls.go:192-196): the
                 // authenticated user is recoverable per conn.
                 assert_eq!(who, user.username);
@@ -2666,10 +2679,7 @@ mod tests {
             Ok(_) => panic!("a plain TLS server must not pass JLS authentication"),
             Err(e) => e,
         };
-        assert!(
-            err.to_string().contains(ERR_AUTH_FAILED),
-            "{err}"
-        );
+        assert!(err.to_string().contains(ERR_AUTH_FAILED), "{err}");
     }
 
     /// A rustls server with the stock provider (ordinary randoms).
@@ -2803,10 +2813,7 @@ mod tests {
     /// fingerprint client to it.
     async fn connect_fp_through_mimic(
         cfg: &JlsOut,
-    ) -> (
-        BoxProxyStream,
-        tokio::sync::oneshot::Receiver<Vec<u8>>,
-    ) {
+    ) -> (BoxProxyStream, tokio::sync::oneshot::Receiver<Vec<u8>>) {
         let (client, server) = tokio::io::duplex(256 * 1024);
         let user = JlsUser::new(&cfg.username, &cfg.password).unwrap();
         let server_config = test_server_cfg(std::slice::from_ref(&user));
@@ -2843,9 +2850,8 @@ mod tests {
         assert_eq!(&record[..3], &[0x16, 0x03, 0x01], "handshake record");
         let hello = &record[RECORD_HEADER_LEN..];
         assert_eq!(hello[0], HS_CLIENT_HELLO);
-        let len24 = (usize::from(hello[1]) << 16)
-            | (usize::from(hello[2]) << 8)
-            | usize::from(hello[3]);
+        let len24 =
+            (usize::from(hello[1]) << 16) | (usize::from(hello[2]) << 8) | usize::from(hello[3]);
         assert_eq!(len24, hello.len() - 4, "handshake length");
         // Handshake message layout: 4 header + 2 version + 32 random +
         // 1 sid length + 32 session id + 2 cipher-list length.
@@ -2856,9 +2862,11 @@ mod tests {
             "cipher list leads with GREASE {cs0:02x?}"
         );
         // The random is the fakeRandom (sealed), never plain zero bytes.
-        assert!(hello[HELLO_RANDOM_OFFSET..HELLO_RANDOM_OFFSET + HELLO_RANDOM_LEN]
-            .iter()
-            .any(|b| *b != 0));
+        assert!(
+            hello[HELLO_RANDOM_OFFSET..HELLO_RANDOM_OFFSET + HELLO_RANDOM_LEN]
+                .iter()
+                .any(|b| *b != 0)
+        );
         assert!(hello.windows(2).any(|w| w == [0x44, 0x69]), "ALPS present");
         assert!(
             hello.windows(2).any(|w| w == [0x00, 0x1b]),
@@ -2903,7 +2911,9 @@ mod tests {
         assert_eq!(&hello[73..75], &[0x13, 0x01], "TLS_AES_128_GCM first");
         // record_size_limit 0x4001: ext type ‖ u16 len ‖ limit.
         assert!(
-            hello.windows(6).any(|w| w == [0x00, 0x1c, 0x00, 0x02, 0x40, 0x01]),
+            hello
+                .windows(6)
+                .any(|w| w == [0x00, 0x1c, 0x00, 0x02, 0x40, 0x01]),
             "record_size_limit 0x4001 present"
         );
         assert!(
@@ -3003,7 +3013,13 @@ mod tests {
         )
         .unwrap();
         // alpn == nil → DefaultALPN (jls.go:166-168).
-        assert_eq!(cfg.alpn, DEFAULT_ALPN.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            cfg.alpn,
+            DEFAULT_ALPN
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        );
         let cfg = JlsServerConfig::new(
             "jls.test",
             vec![JlsUser::new("user1", "pass1").unwrap()],
@@ -3020,7 +3036,10 @@ mod tests {
         let (cert, key) = generate_camouflage_cert().unwrap();
         let pk = crate::proto::reality::tls13::der::public_key(cert.as_ref()).unwrap();
         assert!(
-            matches!(pk, crate::proto::reality::tls13::der::PublicKey::EcdsaP256(_)),
+            matches!(
+                pk,
+                crate::proto::reality::tls13::der::PublicKey::EcdsaP256(_)
+            ),
             "camouflage SPKI is not P-256"
         );
         // The signing key parses with the same PKCS#8 (rustls accepted it
@@ -3166,9 +3185,12 @@ mod tests {
         let request = b"POST /x HTTP/1.1\r\n\r\n".to_vec();
         let mut client = client;
         client.write_all(&request).await.unwrap();
-        let server_cfg =
-            JlsServerConfig::new("jls.test", vec![JlsUser::new("u", "p").unwrap()], Vec::new())
-                .unwrap();
+        let server_cfg = JlsServerConfig::new(
+            "jls.test",
+            vec![JlsUser::new("u", "p").unwrap()],
+            Vec::new(),
+        )
+        .unwrap();
         let task = tokio::spawn(async move { server(&server_cfg, Box::new(server_end)).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
         drop(client);
@@ -3258,12 +3280,8 @@ mod tests {
             let dest = dest.clone();
             async move {
                 let (mut client, server_end) = tokio::io::duplex(256 * 1024);
-                let relay = tokio::spawn(relay_fallback(
-                    Box::new(server_end),
-                    Vec::new(),
-                    dest,
-                    rate,
-                ));
+                let relay =
+                    tokio::spawn(relay_fallback(Box::new(server_end), Vec::new(), dest, rate));
                 let payload = vec![0x61u8; 12_000];
                 let start = Instant::now();
                 client.write_all(&payload).await.unwrap();
@@ -3296,7 +3314,10 @@ mod tests {
         assert_eq!(rate_limit_burst(8_000_000), 10_000);
         assert_eq!(rate_limit_burst(1_000), 1); // clamped up
         assert_eq!(rate_limit_burst(1), 1);
-        assert_eq!(rate_limit_burst(u64::MAX / 8), MAX_RATE_LIMIT_BURST_BYTES as usize);
+        assert_eq!(
+            rate_limit_burst(u64::MAX / 8),
+            MAX_RATE_LIMIT_BURST_BYTES as usize
+        );
     }
 
     #[tokio::test]
@@ -3308,7 +3329,10 @@ mod tests {
         let start = Instant::now();
         // 1000 bytes at 64 kbps = 125 ms.
         limiter.wait_n(1000).await;
-        assert!(start.elapsed() < Duration::from_millis(80), "first wait slept");
+        assert!(
+            start.elapsed() < Duration::from_millis(80),
+            "first wait slept"
+        );
         limiter.wait_n(1000).await;
         assert!(
             start.elapsed() >= Duration::from_millis(100),
@@ -3359,11 +3383,10 @@ mod tests {
                 let seen = seen2.clone();
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut tls =
-                        match tokio_rustls::TlsAcceptor::from(config).accept(sock).await {
-                            Ok(t) => t,
-                            Err(_) => return,
-                        };
+                    let mut tls = match tokio_rustls::TlsAcceptor::from(config).accept(sock).await {
+                        Ok(t) => t,
+                        Err(_) => return,
+                    };
                     let mut buf = [0u8; 2048];
                     loop {
                         match tls.read(&mut buf).await {
@@ -3414,11 +3437,10 @@ mod tests {
                 let seen = seen2.clone();
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut tls =
-                        match tokio_rustls::TlsAcceptor::from(config).accept(sock).await {
-                            Ok(t) => t,
-                            Err(_) => return,
-                        };
+                    let mut tls = match tokio_rustls::TlsAcceptor::from(config).accept(sock).await {
+                        Ok(t) => t,
+                        Err(_) => return,
+                    };
                     // h2c server: preface, SETTINGS, then the one request.
                     let mut preface = vec![0u8; 24];
                     if tls.read_exact(&mut preface).await.is_err()
@@ -3527,15 +3549,24 @@ mod tests {
             if !seen.lock().unwrap().is_empty() {
                 break;
             }
-            assert!(Instant::now() < deadline, "camouflage site never saw the GET");
+            assert!(
+                Instant::now() < deadline,
+                "camouflage site never saw the GET"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let request = String::from_utf8_lossy(&seen.lock().unwrap().clone()).into_owned();
         let mut lines = request.split("\r\n");
         assert_eq!(lines.next(), Some("GET / HTTP/1.1"), "{request}");
         assert!(lines.clone().any(|l| l == "Host: jls.test"), "{request}");
-        assert!(lines.clone().any(|l| l == "User-Agent: Chrome"), "{request}");
-        assert!(lines.clone().any(|l| l == "Accept-Encoding: gzip"), "{request}");
+        assert!(
+            lines.clone().any(|l| l == "User-Agent: Chrome"),
+            "{request}"
+        );
+        assert!(
+            lines.clone().any(|l| l == "Accept-Encoding: gzip"),
+            "{request}"
+        );
         let cookie = lines
             .clone()
             .find(|l| l.starts_with("Cookie: padding="))
@@ -3551,7 +3582,11 @@ mod tests {
         let (dest, seen) = spawn_camo_site_h2().await;
         let addr = spawn_jls_listener(dest).await;
 
-        let cfg = fp_cfg("user1", "wrong-pass", UtslProfile::parse("firefox").unwrap());
+        let cfg = fp_cfg(
+            "user1",
+            "wrong-pass",
+            UtslProfile::parse("firefox").unwrap(),
+        );
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let err = match connect(&cfg, Box::new(tcp) as BoxProxyStream).await {
             Ok(_) => panic!("a wrong password must not authenticate"),
@@ -3564,7 +3599,10 @@ mod tests {
             if !seen.lock().unwrap().is_empty() {
                 break;
             }
-            assert!(Instant::now() < deadline, "camouflage site never saw the request");
+            assert!(
+                Instant::now() < deadline,
+                "camouflage site never saw the request"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         // The request HEADERS block (literal HPACK, no Huffman): the
@@ -3708,10 +3746,22 @@ mod tests {
             let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
             let sealed = match &self.aead {
                 MimicAead::Aes256(a) => a
-                    .encrypt(nonce, Payload { msg: &inner, aad: &record })
+                    .encrypt(
+                        nonce,
+                        Payload {
+                            msg: &inner,
+                            aad: &record,
+                        },
+                    )
                     .expect("mimic seal"),
                 MimicAead::Aes128(a) => a
-                    .encrypt(nonce, Payload { msg: &inner, aad: &record })
+                    .encrypt(
+                        nonce,
+                        Payload {
+                            msg: &inner,
+                            aad: &record,
+                        },
+                    )
                     .expect("mimic seal"),
             };
             record.extend_from_slice(&sealed);
@@ -3758,11 +3808,7 @@ mod tests {
     /// shared secret the server holds. Panics if the two sides did not
     /// agree on the handshake keys (the decrypted flight would not
     /// authenticate).
-    fn mimic_server_app_keys(
-        client_hello_msg: &[u8],
-        flight: &[u8],
-        shared: &[u8],
-    ) -> MimicCrypto {
+    fn mimic_server_app_keys(client_hello_msg: &[u8], flight: &[u8], shared: &[u8]) -> MimicCrypto {
         // Record 0 of the flight is the (stamped) ServerHello.
         let sh_len = usize::from(u16::from_be_bytes([flight[3], flight[4]]));
         let sh_msg = &flight[RECORD_HEADER_LEN..RECORD_HEADER_LEN + sh_len];
@@ -3854,10 +3900,9 @@ mod tests {
         let server_config = test_server_cfg(std::slice::from_ref(&user));
         let (client, server_io) = tokio::io::duplex(256 * 1024);
         let mut server_io: BoxProxyStream = Box::new(server_io);
-        let client_task = tokio::spawn(tokio::time::timeout(
-            Duration::from_secs(20),
-            async move { connect(&cfg, Box::new(client) as BoxProxyStream).await },
-        ));
+        let client_task = tokio::spawn(tokio::time::timeout(Duration::from_secs(20), async move {
+            connect(&cfg, Box::new(client) as BoxProxyStream).await
+        }));
 
         // The production server read/stamp phase, driven by hand so the
         // final flight is written exactly like Go's single flush.
@@ -3867,16 +3912,14 @@ mod tests {
             .await
             .expect("a ClientHello");
         let authed = authenticate_client_hello(&server_config, &hello).expect("JLS auth");
-        let (mut tls_srv, flight) =
-            stamped_server_handshake(&server_config.tls, &prefix, &authed)
-                .expect("stamped server flight");
+        let (mut tls_srv, flight) = stamped_server_handshake(&server_config.tls, &prefix, &authed)
+            .expect("stamped server flight");
         let server_scalar = TEST_SERVER_SCALAR
             .with_borrow_mut(|s| s.take())
             .expect("server scalar captured");
-        let client_share =
-            crate::proto::reality::tls13::test_server::parse_client_hello(&hello)
-                .expect("parseable ClientHello")
-                .x25519_share;
+        let client_share = crate::proto::reality::tls13::test_server::parse_client_hello(&hello)
+            .expect("parseable ClientHello")
+            .x25519_share;
         let shared = curve25519_dalek::montgomery::MontgomeryPoint(client_share)
             .mul_clamped(server_scalar)
             .0;

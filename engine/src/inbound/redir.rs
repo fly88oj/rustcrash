@@ -17,7 +17,9 @@ pub async fn serve(cfg: &ListenerConfig, relay: SharedRelay) -> Result<SocketAdd
         .map_err(|e| {
             crate::inbound::bind_failure("redir", format!("{}:{}", cfg.bind, cfg.port), e)
         })?;
-    let addr = listener.local_addr().map_err(|e| Error::network(e.to_string()))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| Error::network(e.to_string()))?;
     let port = addr.port();
     let tag = cfg.tag.clone();
     tokio::spawn(async move {
@@ -53,6 +55,7 @@ pub async fn serve(cfg: &ListenerConfig, relay: SharedRelay) -> Result<SocketAdd
                     inbound: tag.clone(),
                     inbound_port: Some(port),
                     inbound_kind: "redir",
+                    in_user: None,
                 },
                 Box::new(stream),
             );
@@ -64,7 +67,9 @@ pub async fn serve(cfg: &ListenerConfig, relay: SharedRelay) -> Result<SocketAdd
 /// `SO_ORIGINAL_DST` on an accepted NAT-redirected socket.
 fn original_dst(stream: &tokio::net::TcpStream) -> Result<NetAddr> {
     let fd = stream.as_raw_fd();
-    let peer = stream.peer_addr().map_err(|e| Error::network(e.to_string()))?;
+    let peer = stream
+        .peer_addr()
+        .map_err(|e| Error::network(e.to_string()))?;
     unsafe {
         if peer.is_ipv4() {
             let mut addr: libc::sockaddr_in = std::mem::zeroed();
@@ -107,4 +112,3 @@ fn original_dst(stream: &tokio::net::TcpStream) -> Result<NetAddr> {
 /// `IP6T_SO_ORIGINAL_DST` — stable kernel ABI value the libc crate does
 /// not export (linux/netfilter_ipv6/ip6_tables.h).
 pub const IP6T_SO_ORIGINAL_DST: libc::c_int = 80;
-

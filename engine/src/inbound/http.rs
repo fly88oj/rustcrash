@@ -22,7 +22,9 @@ pub async fn serve(
         .map_err(|e| {
             crate::inbound::bind_failure("http", format!("{}:{}", cfg.bind, cfg.port), e)
         })?;
-    let addr = listener.local_addr().map_err(|e| Error::network(e.to_string()))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| Error::network(e.to_string()))?;
     let tag = cfg.tag.clone();
     let authentication = authentication.to_vec();
     tokio::spawn(async move {
@@ -36,8 +38,16 @@ pub async fn serve(
             let tag = tag.clone();
             let authentication = authentication.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    handle(Box::new(stream), peer, tag, port, "http", authentication, relay).await
+                if let Err(e) = handle(
+                    Box::new(stream),
+                    peer,
+                    tag,
+                    port,
+                    "http",
+                    authentication,
+                    relay,
+                )
+                .await
                 {
                     tracing::debug!(target: "engine", "http-in {peer}: {e}");
                 }
@@ -57,7 +67,16 @@ pub async fn handle_stream(
     authentication: Vec<(String, String)>,
     relay: SharedRelay,
 ) -> Result<()> {
-    handle(stream, peer, tag, inbound_port, inbound_kind, authentication, relay).await
+    handle(
+        stream,
+        peer,
+        tag,
+        inbound_port,
+        inbound_kind,
+        authentication,
+        relay,
+    )
+    .await
 }
 
 async fn handle(
@@ -74,27 +93,47 @@ async fn handle(
     // mihomo `authentication`: when credentials are configured the
     // proxy demands Proxy-Authorization (Basic) on every request —
     // missing or wrong pairs draw a 407 challenge and the connection
-    // closes, exactly like mihomo's http listener.
-    if !authentication.is_empty() && !proxy_authorized(&head, &authentication) {
+    // closes, exactly like mihomo's http listener. The challenge carries
+    // charset="UTF-8" (sing-box's rewritten server header.go).
+    // One Basic parser answers both questions — did auth pass, and WHO
+    // authenticated (mihomo WithInUser carries the username onward) — so
+    // `Basic  <b64>` (extra spaces) can never authenticate while leaving
+    // in_user empty.
+    let auth_user = authenticate_basic(&head, &authentication);
+    if !authentication.is_empty() && auth_user.is_none() {
         stream
             .write_all(
                 b"HTTP/1.1 407 Proxy Authentication Required\r\n\
-                  Proxy-Authenticate: Basic realm=\"rustcrash\"\r\n\
+                  Proxy-Authenticate: Basic realm=\"rustcrash\", charset=\"UTF-8\"\r\n\
                   Content-Length: 0\r\n\r\n",
             )
             .await?;
-        return Err(Error::protocol(format!("http-in {peer}: authentication failed")));
+        return Err(Error::protocol(format!(
+            "http-in {peer}: authentication failed"
+        )));
     }
     let mut lines = head.split("\r\n");
     let request_line = lines.next().unwrap_or_default().to_string();
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_ascii_uppercase();
     let uri = parts.next().unwrap_or_default().to_string();
+    // The authenticated user rides the connection metadata (mihomo
+    // listener/http/proxy.go: additions[inUserIdx] = WithInUser(user)) —
+    // IN-USER rules and load-balance hash-key match on it.
 
     if method == "CONNECT" {
         let target = parse_hostport(&uri)?;
+        // Mirror the request's HTTP version in the response line —
+        // mihomo's uplay workaround (listener/http/proxy.go writes
+        // "HTTP/%d.%d 200 ..." from request.ProtoMajor/Minor).
+        let proto = request_line
+            .split_whitespace()
+            .nth(2)
+            .and_then(|v| v.split('/').nth(1))
+            .filter(|v| *v == "1.0")
+            .unwrap_or("1.1");
         stream
-            .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            .write_all(format!("HTTP/{proto} 200 Connection established\r\n\r\n").as_bytes())
             .await?;
         relay.handle_tcp(
             TcpMeta {
@@ -103,27 +142,61 @@ async fn handle(
                 inbound: tag,
                 inbound_port,
                 inbound_kind,
+                in_user: auth_user,
             },
             Box::new(stream),
         );
         Ok(())
     } else {
-        // Absolute-form proxying: rewrite to origin-form and replay.
-        let target = parse_absolute_uri(&uri)?;
-        let after_scheme = uri.split_once("://").map(|(_, r)| r).unwrap_or(uri.as_str());
+        // Absolute-form proxying: rewrite to origin-form and replay. An
+        // unschemable/non-http(s) target draws a 400 like sing-box's
+        // forward handler ("invalid forward target"), not a bare close.
+        let target = match parse_absolute_uri(&uri) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 400 Bad Request\r\n\
+                          Content-Length: 21\r\n\r\ninvalid forward target",
+                    )
+                    .await;
+                return Err(Error::protocol(format!("http-in {peer}: {e}")));
+            }
+        };
+        let after_scheme = uri
+            .split_once("://")
+            .map(|(_, r)| r)
+            .unwrap_or(uri.as_str());
         let origin_path = match after_scheme.find('/') {
             Some(i) => &after_scheme[i..],
             None => "/",
         }
         .to_string();
         let mut rebuilt = format!("{method} {origin_path} HTTP/1.1\r\n");
+        // Headers named in the request's `Connection:` token list are
+        // hop-by-hop too (removeHopByHopHeaders).
+        let conn_tokens: Vec<String> = head
+            .lines()
+            .filter_map(|l| {
+                let (name, value) = l.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("connection")
+                    .then(|| value.to_ascii_lowercase())
+            })
+            .flat_map(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         for line in lines {
             if line.is_empty() {
                 continue;
             }
-            // Drop proxy-scoped headers.
-            let lower = line.to_ascii_lowercase();
-            if lower.starts_with("proxy-connection:") || lower.starts_with("proxy-authorization:") {
+            // Drop hop-by-hop headers (mihomo removeHopByHopHeaders: the
+            // fixed set plus everything named in Connection tokens).
+            if is_hop_by_hop_header(line, &conn_tokens) {
                 continue;
             }
             rebuilt.push_str(line);
@@ -132,6 +205,9 @@ async fn handle(
         rebuilt.push_str("\r\n");
         // Plain HTTP proxying relays the origin's response verbatim — no
         // intermediate 200 here (that would shadow the real response).
+        // One request per connection: the relay owns the socket while the
+        // origin streams the response (mihomo instead loops keep-alive
+        // requests through an in-process http.Client).
         relay.handle_tcp(
             TcpMeta {
                 target,
@@ -139,6 +215,7 @@ async fn handle(
                 inbound: tag,
                 inbound_port,
                 inbound_kind,
+                in_user: auth_user,
             },
             Box::new(crate::inbound::PrependStream::new(
                 stream,
@@ -149,35 +226,71 @@ async fn handle(
     }
 }
 
-/// `host:port` (port defaults to 80).
-pub fn parse_hostport(s: &str) -> Result<NetAddr> {
-    let (host, port) = split_hostport(s, 80)?;
-    Ok(NetAddr::new(host, port))
-}
-
-/// Whether the request head carries valid `Proxy-Authorization: Basic
-/// base64(user:pass)` credentials (the one scheme mihomo's inbound
-/// authenticator accepts for HTTP proxies).
-fn proxy_authorized(head: &str, authentication: &[(String, String)]) -> bool {
+/// The username that authenticated this request via
+/// `Proxy-Authorization: Basic`, when credentials are configured and one
+/// matched. Doubles as the AUTH GATE: an empty credential list demands
+/// nothing (headers ignored, like mihomo's nil authenticator).
+fn authenticate_basic(head: &str, authentication: &[(String, String)]) -> Option<String> {
     use base64::Engine as _;
     for line in head.split("\r\n") {
-        let Some((name, value)) = line.split_once(':') else { continue };
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
         if !name.trim().eq_ignore_ascii_case("proxy-authorization") {
             continue;
         }
         let value = value.trim();
-        let Some(b64) = value.strip_prefix("Basic ").or_else(|| value.strip_prefix("basic ")) else {
+        let Some(b64) = value
+            .strip_prefix("Basic ")
+            .or_else(|| value.strip_prefix("basic "))
+            .map(str::trim)
+        else {
             continue;
         };
-        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
-            let pair = String::from_utf8_lossy(&decoded);
-            let (user, pass) = pair.split_once(':').unwrap_or((pair.as_ref(), ""));
-            if crate::inbound::auth_accepted(authentication, user.as_bytes(), pass.as_bytes()) {
-                return true;
-            }
+        let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64) else {
+            continue;
+        };
+        let Ok(text) = String::from_utf8(decoded) else {
+            continue;
+        };
+        let (user, pass) = text.split_once(':').unwrap_or((text.as_str(), ""));
+        if crate::inbound::auth_accepted(authentication, user.as_bytes(), pass.as_bytes()) {
+            return Some(user.to_string());
         }
     }
-    false
+    None
+}
+
+/// Hop-by-hop header test: the union of mihomo's and sing-box's
+/// removeHopByHopHeaders sets (both trailer spellings, keep-alive), plus
+/// any header named in the request's `Connection:` token list
+/// (`conn_tokens`, pre-lowercased). A superset of each source is safe —
+/// these headers never belong on an origin request.
+fn is_hop_by_hop_header(line: &str, conn_tokens: &[String]) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let Some((name, _)) = lower.split_once(':') else {
+        return false;
+    };
+    let name = name.trim();
+    const HOP_BY_HOP: &[&str] = &[
+        "connection",
+        "proxy-connection",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "keep-alive",
+        "te",
+        "trailer",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+    ];
+    HOP_BY_HOP.contains(&name) || conn_tokens.iter().any(|t| t == name)
+}
+
+/// `host:port` (port defaults to 80).
+pub fn parse_hostport(s: &str) -> Result<NetAddr> {
+    let (host, port) = split_hostport(s, 80)?;
+    Ok(NetAddr::new(host, port))
 }
 
 fn split_hostport(s: &str, default_port: u16) -> Result<(Host, u16)> {
@@ -206,15 +319,21 @@ fn split_hostport(s: &str, default_port: u16) -> Result<(Host, u16)> {
 }
 
 fn parse_absolute_uri(uri: &str) -> Result<NetAddr> {
-    let rest = uri
-        .split_once("://")
-        .map(|(_, r)| r)
-        .unwrap_or(uri);
+    // Plain forwarding accepts only the http and ws schemes (sing-box
+    // forwardDestination: everything else — https over a plain proxy,
+    // ftp, … — is a client error, not a tunnel).
+    if let Some((scheme, _)) = uri.split_once("://") {
+        let scheme = scheme.to_ascii_lowercase();
+        if scheme != "http" && scheme != "ws" {
+            return Err(Error::protocol(format!(
+                "http-in: plain forwarding accepts only http/ws URIs, got {scheme:?} \
+                 (use CONNECT for tunnels)"
+            )));
+        }
+    }
+    let rest = uri.split_once("://").map(|(_, r)| r).unwrap_or(uri);
     // authority is up to the first '/', '?' or '#'
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
     let (host, port) = split_hostport(authority, 80)?;
     Ok(NetAddr::new(host, port))
 }
@@ -224,15 +343,19 @@ mod tests {
     use super::*;
     use crate::inbound::RelayHandler;
     use crate::inbound::{ListenerConfig, ListenerKind};
-    use tokio::io::AsyncReadExt;
     use std::sync::Arc;
+    use tokio::io::AsyncReadExt;
     use tokio::sync::mpsc;
 
-    struct Capture(std::sync::Mutex<Vec<NetAddr>>);
+    struct Capture(
+        std::sync::Mutex<Vec<NetAddr>>,
+        std::sync::Mutex<Vec<Option<String>>>,
+    );
 
     impl RelayHandler for Capture {
         fn handle_tcp(self: std::sync::Arc<Self>, meta: TcpMeta, mut client: BoxProxyStream) {
             self.0.lock().unwrap().push(meta.target.clone());
+            self.1.lock().unwrap().push(meta.in_user.clone());
             tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut all = Vec::new();
@@ -274,7 +397,10 @@ mod tests {
             port: 0,
             kind: ListenerKind::Http,
         };
-        let capture = Arc::new(Capture(std::sync::Mutex::new(vec![])));
+        let capture = Arc::new(Capture(
+            std::sync::Mutex::new(vec![]),
+            std::sync::Mutex::new(vec![]),
+        ));
         let bound = serve(&cfg, &[], capture.clone()).await.unwrap();
         let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
         c.write_all(b"CONNECT site.test:443 HTTP/1.1\r\nHost: site.test:443\r\n\r\n")
@@ -304,7 +430,10 @@ mod tests {
             port: 0,
             kind: ListenerKind::Http,
         };
-        let capture = Arc::new(Capture(std::sync::Mutex::new(vec![])));
+        let capture = Arc::new(Capture(
+            std::sync::Mutex::new(vec![]),
+            std::sync::Mutex::new(vec![]),
+        ));
         let bound = serve(&cfg, &[], capture.clone()).await.unwrap();
         let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
         c.write_all(b"GET http://plain.test/path?q=1 HTTP/1.1\r\nHost: plain.test\r\n\r\nmore")
@@ -352,7 +481,10 @@ mod tests {
             port: 0,
             kind: ListenerKind::Http,
         };
-        let capture = Arc::new(Capture(std::sync::Mutex::new(vec![])));
+        let capture = Arc::new(Capture(
+            std::sync::Mutex::new(vec![]),
+            std::sync::Mutex::new(vec![]),
+        ));
         let auth = vec![("e2e-user".to_string(), "e2e-pass".to_string())];
         let bound = serve(&cfg, &auth, capture.clone()).await.unwrap();
 
@@ -373,6 +505,13 @@ mod tests {
         // Right pair: the tunnel opens.
         let right = base64::engine::general_purpose::STANDARD.encode("e2e-user:e2e-pass");
         assert!(relay_ok(bound, Some(&format!("Basic {right}"))).await);
+        // The authenticated username rides the connection metadata
+        // (mihomo WithInUser): IN-USER rules / lb hash-key match on it.
+        assert_eq!(
+            capture.1.lock().unwrap().last(),
+            Some(&Some("e2e-user".to_string())),
+            "in_user must carry the authenticated username"
+        );
 
         // An empty credential list keeps the proxy open (mihomo default).
         let open = serve(

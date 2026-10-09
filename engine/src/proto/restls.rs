@@ -97,7 +97,9 @@ use rand::RngCore;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::ring as ring_provider;
 use rustls::crypto::{CryptoProvider, GetRandomFailed, SecureRandom};
-use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme};
+use rustls::{
+    ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::mpsc;
 use tracing::debug;
@@ -364,9 +366,15 @@ fn client_hello_x25519_share(record: &[u8]) -> Option<Vec<u8>> {
     }
     // Walk past session id, cipher suites and compression to the extensions.
     let mut off = SESSION_ID_INDEX + record[SESSION_ID_LENGTH_INDEX] as usize;
-    let suite_len = usize::from(u16::from_be_bytes([*record.get(off)?, *record.get(off + 1)?]));
+    let suite_len = usize::from(u16::from_be_bytes([
+        *record.get(off)?,
+        *record.get(off + 1)?,
+    ]));
     off += 2 + suite_len + 2;
-    let ext_len = usize::from(u16::from_be_bytes([*record.get(off)?, *record.get(off + 1)?]));
+    let ext_len = usize::from(u16::from_be_bytes([
+        *record.get(off)?,
+        *record.get(off + 1)?,
+    ]));
     off += 2;
     let mut rest = record.get(off..off + ext_len)?;
     while rest.len() >= 4 {
@@ -460,8 +468,11 @@ struct FixedExchange {
 }
 
 impl rustls::crypto::SupportedKxGroup for FixedX25519 {
-    fn start(&self) -> std::result::Result<Box<dyn rustls::crypto::ActiveKeyExchange>, rustls::Error> {
-        FIXED_KEY.with(Cell::get)
+    fn start(
+        &self,
+    ) -> std::result::Result<Box<dyn rustls::crypto::ActiveKeyExchange>, rustls::Error> {
+        FIXED_KEY
+            .with(Cell::get)
             .map(|(scalar, public)| {
                 Box::new(FixedExchange { scalar, public })
                     as Box<dyn rustls::crypto::ActiveKeyExchange>
@@ -482,7 +493,9 @@ impl rustls::crypto::ActiveKeyExchange for FixedExchange {
         let peer: [u8; 32] = peer_pub_key
             .try_into()
             .map_err(|_| rustls::Error::General("restls: bad X25519 key share".into()))?;
-        let shared = curve25519_dalek::montgomery::MontgomeryPoint(peer).mul_clamped(self.scalar).0;
+        let shared = curve25519_dalek::montgomery::MontgomeryPoint(peer)
+            .mul_clamped(self.scalar)
+            .0;
         if shared.iter().all(|b| *b == 0) {
             return Err(rustls::Error::General(
                 "restls: X25519 peer key share is a low-order point".into(),
@@ -579,9 +592,7 @@ fn restls_config(cfg: &RestlsOut) -> Result<Arc<ClientConfig>> {
         if loaded == 0 {
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         }
-        builder
-            .with_root_certificates(roots)
-            .with_no_client_auth()
+        builder.with_root_certificates(roots).with_no_client_auth()
     };
     Ok(Arc::new(config))
 }
@@ -592,7 +603,8 @@ fn drain_tls(conn: &mut ClientConnection) -> Result<Vec<u8>> {
     while conn.wants_write() {
         if conn
             .write_tls(&mut out)
-            .map_err(|e| Error::config(format!("restls: tls write: {e}")))? == 0
+            .map_err(|e| Error::config(format!("restls: tls write: {e}")))?
+            == 0
         {
             break;
         }
@@ -733,7 +745,8 @@ impl RestlsStream {
     /// of `data` it consumed, and whether the writer must now wait for a
     /// peer record (`needInterrupt && !fakeResponse`).
     fn build_record(&mut self, data: &[u8], fake_response: bool) -> Result<(Vec<u8>, usize, bool)> {
-        let (payload_len, data_len, padding_len, command) = self.act_according_to_script(data.len())?;
+        let (payload_len, data_len, padding_len, command) =
+            self.act_according_to_script(data.len())?;
         if payload_len == 0 {
             return Ok((Vec::new(), 0, false));
         }
@@ -753,7 +766,12 @@ impl RestlsStream {
         let body = &rec[auth_off + AUTH_HEADER_LEN..];
         let sample = &body[..body.len().min(32)];
         let mask_digest = {
-            let mut h = auth_header_hasher(&self.secret, &self.server_random, DIR_TO_SERVER, self.to_server);
+            let mut h = auth_header_hasher(
+                &self.secret,
+                &self.server_random,
+                DIR_TO_SERVER,
+                self.to_server,
+            );
             h.update(sample);
             *h.finalize().as_bytes()
         };
@@ -762,13 +780,21 @@ impl RestlsStream {
         region[AUTH_MAC_LEN..AUTH_MAC_LEN + CMD_LEN]
             .copy_from_slice(&(data_len as u16).to_be_bytes());
         region[AUTH_MAC_LEN + CMD_LEN..AUTH_HEADER_LEN].copy_from_slice(&command.to_bytes());
-        xor_with_mac(&mut region[AUTH_MAC_LEN..AUTH_HEADER_LEN], &mask_digest[..MASK_LEN]);
+        xor_with_mac(
+            &mut region[AUTH_MAC_LEN..AUTH_HEADER_LEN],
+            &mask_digest[..MASK_LEN],
+        );
         // authMac = MAC(base ‖ [clientFinished] ‖ record header ‖
         // region[8:]) — the masked length and command, data and padding,
         // in that order; the Finished record prefixes the FIRST framed
         // record only (conn.go write0x17AuthHeader takeClientFinished).
         let auth_digest = {
-            let mut h = auth_header_hasher(&self.secret, &self.server_random, DIR_TO_SERVER, self.to_server);
+            let mut h = auth_header_hasher(
+                &self.secret,
+                &self.server_random,
+                DIR_TO_SERVER,
+                self.to_server,
+            );
             if let Some(fin) = &self.client_fin {
                 h.update(fin);
             }
@@ -790,19 +816,23 @@ impl RestlsStream {
             return Err(Error::protocol("restls: record is not application data"));
         }
         if record.len() < RECORD_HEADER_LEN + AUTH_HEADER_LEN {
-            return Err(Error::protocol("restls: record shorter than the auth header"));
+            return Err(Error::protocol(
+                "restls: record shorter than the auth header",
+            ));
         }
         let header = &record[..RECORD_HEADER_LEN];
         let region = &record[RECORD_HEADER_LEN..];
         let body = &region[AUTH_HEADER_LEN..];
         let sample = &body[..body.len().min(32)];
         let mask_digest = {
-            let mut h = auth_header_hasher(&self.secret, &self.server_random, DIR_TO_CLIENT, counter);
+            let mut h =
+                auth_header_hasher(&self.secret, &self.server_random, DIR_TO_CLIENT, counter);
             h.update(sample);
             *h.finalize().as_bytes()
         };
         let auth_digest = {
-            let mut h = auth_header_hasher(&self.secret, &self.server_random, DIR_TO_CLIENT, counter);
+            let mut h =
+                auth_header_hasher(&self.secret, &self.server_random, DIR_TO_CLIENT, counter);
             h.update(header);
             h.update(&region[AUTH_MAC_LEN..]);
             *h.finalize().as_bytes()
@@ -1157,8 +1187,7 @@ pub async fn connect(cfg: &RestlsOut, transport: BoxProxyStream) -> Result<BoxPr
             "restls: handshake completed without the server authentication record",
         ));
     }
-    let server_random =
-        srv_random.ok_or_else(|| Error::protocol("restls: no ServerHello seen"))?;
+    let server_random = srv_random.ok_or_else(|| Error::protocol("restls: no ServerHello seen"))?;
     // The raw Finished record: the last 0x17 record the client wrote
     // during the handshake. Its bytes prefix the first framed record's
     // authMac (conn.go:1205 captureClientFinished / 1411 takeClientFinished).
@@ -1198,7 +1227,6 @@ fn split_tls_records(mut data: &[u8]) -> Vec<Vec<u8>> {
     }
     out
 }
-
 
 // ---------------------------------------------------------------------------
 // Server half (restls-client-go restls_server.go, the `tls.RestlsServer`
@@ -1246,9 +1274,8 @@ fn restls_host_port(host: &str) -> String {
 
 /// RFC 8446 HelloRetryRequest random (a fixed constant).
 const HELLO_RETRY_REQUEST_RANDOM: [u8; 32] = [
-    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8,
-    0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8,
-    0x33, 0x9c,
+    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+    0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
 ];
 
 const EXT_PRE_SHARED_KEY: u16 = 41;
@@ -1276,7 +1303,8 @@ fn parse_client_hello_record(record: &[u8]) -> Option<ClientHelloInfo> {
     if payload[0] != 0x01 {
         return None;
     }
-    let n = (usize::from(payload[1]) << 16) | (usize::from(payload[2]) << 8) | usize::from(payload[3]);
+    let n =
+        (usize::from(payload[1]) << 16) | (usize::from(payload[2]) << 8) | usize::from(payload[3]);
     if payload.len() < 4 + n {
         return None;
     }
@@ -1374,7 +1402,8 @@ fn parse_server_hello_record(record: &[u8]) -> Option<ServerHelloInfo> {
     if payload.len() < 4 || payload[0] != HS_SERVER_HELLO {
         return None;
     }
-    let n = (usize::from(payload[1]) << 16) | (usize::from(payload[2]) << 8) | usize::from(payload[3]);
+    let n =
+        (usize::from(payload[1]) << 16) | (usize::from(payload[2]) << 8) | usize::from(payload[3]);
     let msg = payload.get(4..4 + n)?;
     if msg.len() < 2 + 32 + 1 {
         return None;
@@ -1683,7 +1712,10 @@ impl RestlsServerStream {
         region[AUTH_MAC_LEN..AUTH_MAC_LEN + CMD_LEN]
             .copy_from_slice(&(data_len as u16).to_be_bytes());
         region[AUTH_MAC_LEN + CMD_LEN..AUTH_HEADER_LEN].copy_from_slice(&command.to_bytes());
-        xor_with_mac(&mut region[AUTH_MAC_LEN..AUTH_HEADER_LEN], &mask_digest[..MASK_LEN]);
+        xor_with_mac(
+            &mut region[AUTH_MAC_LEN..AUTH_HEADER_LEN],
+            &mask_digest[..MASK_LEN],
+        );
         let auth_digest = {
             let mut h = auth_header_hasher(
                 &self.secret,
@@ -1750,7 +1782,11 @@ impl RestlsServerStream {
     /// `noteClientRecord` (restls_server.go:1312-1319): a client record
     /// arrived; unblock a writer paused by an `ActResponse` script line.
     fn note_client_record(&self) {
-        let mut awaiting = self.shared.awaiting.lock().unwrap_or_else(|e| e.into_inner());
+        let mut awaiting = self
+            .shared
+            .awaiting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if *awaiting {
             *awaiting = false;
             self.shared.wake.notify_one();
@@ -1758,11 +1794,19 @@ impl RestlsServerStream {
     }
 
     fn awaiting_client_record(&self) -> bool {
-        *self.shared.awaiting.lock().unwrap_or_else(|e| e.into_inner())
+        *self
+            .shared
+            .awaiting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     fn set_awaiting(&self) {
-        *self.shared.awaiting.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        *self
+            .shared
+            .awaiting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = true;
     }
 
     /// Try to consume one complete framed record from `rbuf`;
@@ -1831,7 +1875,11 @@ impl RestlsServerStream {
                     }
                     self.wbuf.extend_from_slice(&record);
                     self.to_client += 1;
-                    *self.shared.to_client.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+                    *self
+                        .shared
+                        .to_client
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) += 1;
                     ready!(Self::flush_wbuf(self, cx))?;
                 }
                 Poll::Ready(None) | Poll::Pending => return Poll::Ready(Ok(())),
@@ -1932,7 +1980,11 @@ impl AsyncWrite for RestlsServerStream {
         // `Close` → `writeCachedCloseNotify`: the short target records
         // cached by the pump go out before the half-close.
         {
-            let mut cache = this.shared.close_notify.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cache = this
+                .shared
+                .close_notify
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if !cache.is_empty() {
                 this.wbuf.extend_from_slice(&cache);
                 cache.clear();
@@ -2034,9 +2086,7 @@ pub async fn server(cfg: &RestlsServerConfig, inbound: BoxProxyStream) -> Result
             let _ = inbound.write_all(&first_server).await;
             let leftover = [first, rbuf.to_vec()].concat();
             let tleftover = [first_server, trbuf.to_vec()].concat();
-            return Err(
-                relay_raw(inbound, target, cfg.rate_limit, leftover, tleftover).await,
-            );
+            return Err(relay_raw(inbound, target, cfg.rate_limit, leftover, tleftover).await);
         }
     };
     if server_hello.random == HELLO_RETRY_REQUEST_RANDOM {
@@ -2267,8 +2317,8 @@ mod tests {
 
     use std::time::Duration;
 
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use rustls::crypto::ring as ring_provider;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use tokio::io::DuplexStream;
 
     // ------------------------------------------------------------- script
@@ -2321,7 +2371,10 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, restls_secret("other"));
         // Deterministic: BLAKE3 derive-key is a function of context+input.
-        assert_eq!(a, blake3::derive_key("restls-traffic-key", b"hunter2-secret"));
+        assert_eq!(
+            a,
+            blake3::derive_key("restls-traffic-key", b"hunter2-secret")
+        );
     }
 
     /// Independent transcription of the server-side check on a framed
@@ -2395,19 +2448,30 @@ mod tests {
         assert_eq!(rec.len(), RECORD_HEADER_LEN + payload_len);
 
         // The server-side transcription accepts it.
-        let (data, cmd) = upstream_extract(&secret, &server_random, DIR_TO_SERVER, 0, None, &rec).unwrap();
+        let (data, cmd) =
+            upstream_extract(&secret, &server_random, DIR_TO_SERVER, 0, None, &rec).unwrap();
         assert_eq!(data, b"hello world".to_vec());
         assert_eq!(cmd, Cmd::Response(1));
 
         // A wrong counter fails the authMac.
         assert!(upstream_extract(&secret, &server_random, DIR_TO_SERVER, 1, None, &rec).is_err());
         // A wrong secret fails.
-        assert!(upstream_extract(&restls_secret("other"), &server_random, DIR_TO_SERVER, 0, None, &rec).is_err());
+        assert!(upstream_extract(
+            &restls_secret("other"),
+            &server_random,
+            DIR_TO_SERVER,
+            0,
+            None,
+            &rec
+        )
+        .is_err());
         // Flipping one payload bit breaks the authMac (padding is covered).
         let mut tampered = rec.clone();
         let last = tampered.len() - 1;
         tampered[last] ^= 1;
-        assert!(upstream_extract(&secret, &server_random, DIR_TO_SERVER, 0, None, &tampered).is_err());
+        assert!(
+            upstream_extract(&secret, &server_random, DIR_TO_SERVER, 0, None, &tampered).is_err()
+        );
     }
 
     #[test]
@@ -2434,7 +2498,8 @@ mod tests {
         assert!(!interrupt);
         let payload_len = u16::from_be_bytes([rec[3], rec[4]]) as usize;
         assert!(((19 + AUTH_HEADER_LEN)..=(118 + AUTH_HEADER_LEN)).contains(&payload_len));
-        let (data, cmd) = upstream_extract(&secret, &[1u8; 32], DIR_TO_SERVER, 0, None, &rec).unwrap();
+        let (data, cmd) =
+            upstream_extract(&secret, &[1u8; 32], DIR_TO_SERVER, 0, None, &rec).unwrap();
         assert!(data.is_empty());
         assert_eq!(cmd, Cmd::Noop);
     }
@@ -2537,7 +2602,9 @@ mod tests {
         // 1. The ClientHello must carry the authenticated session id.
         let mut hello = Vec::new();
         let mut header = [0u8; RECORD_HEADER_LEN];
-        rd.read_exact(&mut header).await.map_err(|e| e.to_string())?;
+        rd.read_exact(&mut header)
+            .await
+            .map_err(|e| e.to_string())?;
         let len = u16::from_be_bytes([header[3], header[4]]) as usize;
         hello.extend_from_slice(&header);
         hello.resize(RECORD_HEADER_LEN + len, 0);
@@ -2707,7 +2774,8 @@ mod tests {
                 // records.
                 let mut rest = data;
                 while !rest.is_empty() {
-                    let rec = mimic_record(&secret, &server_random, &script, to_client, rest, false);
+                    let rec =
+                        mimic_record(&secret, &server_random, &script, to_client, rest, false);
                     to_client += 1;
                     // How much of `rest` this record carried.
                     let carried = {
@@ -2746,9 +2814,7 @@ mod tests {
         }
     }
 
-    async fn connect_through_mimic(
-        cfg: &RestlsOut,
-    ) -> Result<BoxProxyStream> {
+    async fn connect_through_mimic(cfg: &RestlsOut) -> Result<BoxProxyStream> {
         let (client, server) = tokio::io::duplex(256 * 1024);
         let secret = restls_secret(&cfg.password);
         let server_config = test_server_config();
@@ -2839,7 +2905,9 @@ mod tests {
         let mut cfg = test_cfg("pw");
         cfg.version = "tls11".into();
         let (client, _server) = tokio::io::duplex(64);
-        assert!(connect(&cfg, Box::new(client) as BoxProxyStream).await.is_err());
+        assert!(connect(&cfg, Box::new(client) as BoxProxyStream)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

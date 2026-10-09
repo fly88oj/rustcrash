@@ -328,7 +328,9 @@ pub fn parse_port_range(spec: &str) -> Result<(u16, u16)> {
 /// (`port == 0` means "unset" — mihomo's protobuf `Port` default.)
 pub fn validate_ports(port: u16, port_range: Option<(u16, u16)>) -> Result<()> {
     if port == 0 && port_range.is_none() {
-        return Err(Error::config("mieru: either port or port-range must be set"));
+        return Err(Error::config(
+            "mieru: either port or port-range must be set",
+        ));
     }
     if port != 0 && port_range.is_some() {
         return Err(Error::config(
@@ -354,7 +356,9 @@ fn endpoint_ports(port: u16, port_range: Option<(u16, u16)>) -> Vec<u16> {
 /// a uniformly random endpoint port per underlay dial.
 fn pick_port(ports: &[u16]) -> Result<u16> {
     if ports.is_empty() {
-        return Err(Error::config("mieru: either port or port-range must be set"));
+        return Err(Error::config(
+            "mieru: either port or port-range must be set",
+        ));
     }
     // rand::random usize; modulo bias is negligible for ≤ 65535 ports.
     Ok(ports[rand::random::<usize>() % ports.len()])
@@ -606,7 +610,9 @@ impl StatelessCipher {
     /// Stateless `Decrypt` (cipher.go:160-189): nonce from the prefix.
     fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
         if ciphertext.len() < NONCE_SIZE + TAG_SIZE {
-            return Err(Error::protocol("mieru: datagram shorter than a sealed block"));
+            return Err(Error::protocol(
+                "mieru: datagram shorter than a sealed block",
+            ));
         }
         let nonce: [u8; NONCE_SIZE] = ciphertext[..NONCE_SIZE].try_into().expect("fixed size");
         self.open(&nonce, &ciphertext[NONCE_SIZE..])
@@ -757,7 +763,10 @@ struct InboundMeta {
 fn is_session_protocol(p: u8) -> bool {
     matches!(
         p,
-        OPEN_SESSION_REQUEST | OPEN_SESSION_RESPONSE | CLOSE_SESSION_REQUEST | CLOSE_SESSION_RESPONSE
+        OPEN_SESSION_REQUEST
+            | OPEN_SESSION_RESPONSE
+            | CLOSE_SESSION_REQUEST
+            | CLOSE_SESSION_RESPONSE
     )
 }
 
@@ -783,13 +792,7 @@ fn parse_metadata(b: &[u8]) -> Result<InboundMeta> {
     }
     let is_session = is_session_protocol(b[0]);
     let (payload_len, suffix_len, prefix_len, un_ack, window) = if is_session {
-        (
-            u16::from_be_bytes([b[15], b[16]]),
-            b[17],
-            0u8,
-            0u32,
-            0u16,
-        )
+        (u16::from_be_bytes([b[15], b[16]]), b[17], 0u8, 0u32, 0u16)
     } else {
         (
             u16::from_be_bytes([b[22], b[23]]),
@@ -851,7 +854,12 @@ struct MieruStream {
 impl MieruStream {
     /// `writeOneSegment` — session-struct path (open/close request,
     /// response), piggybacking `payload` (≤ [`MAX_SESSION_OPEN_PAYLOAD`]).
-    fn build_session_segment(&mut self, protocol: u8, status: u8, payload: &[u8]) -> Result<Vec<u8>> {
+    fn build_session_segment(
+        &mut self,
+        protocol: u8,
+        status: u8,
+        payload: &[u8],
+    ) -> Result<Vec<u8>> {
         let suffix = open_padding_len(&self.send.username);
         let meta = session_struct(
             protocol,
@@ -922,9 +930,7 @@ impl MieruStream {
             }
             DATA_SERVER_TO_CLIENT => {
                 if meta.session_id != self.session_id {
-                    return Err(Error::protocol(
-                        "mieru: data segment for a foreign session",
-                    ));
+                    return Err(Error::protocol("mieru: data segment for a foreign session"));
                 }
             }
             ACK_SERVER_TO_CLIENT => { /* inputAck: no-op on stream */ }
@@ -973,8 +979,12 @@ fn parse_stream_segment(
         *first_read = false;
         let meta = parse_metadata(&plain)?;
         match meta.protocol {
-            OPEN_SESSION_REQUEST | OPEN_SESSION_RESPONSE | CLOSE_SESSION_REQUEST
-            | CLOSE_SESSION_RESPONSE | DATA_SERVER_TO_CLIENT | ACK_SERVER_TO_CLIENT => {}
+            OPEN_SESSION_REQUEST
+            | OPEN_SESSION_RESPONSE
+            | CLOSE_SESSION_REQUEST
+            | CLOSE_SESSION_RESPONSE
+            | DATA_SERVER_TO_CLIENT
+            | ACK_SERVER_TO_CLIENT => {}
             other => {
                 return Err(Error::protocol(format!(
                     "mieru: unknown inbound protocol {other}"
@@ -1189,7 +1199,10 @@ impl RttStats {
         if self.srtt.is_zero() {
             return Duration::from_secs(2);
         }
-        let floor = self.mean_deviation.saturating_mul(4).max(Duration::from_millis(10));
+        let floor = self
+            .mean_deviation
+            .saturating_mul(4)
+            .max(Duration::from_millis(10));
         (self.srtt + floor + self.max_ack_delay).mul_f64(self.rto_multiplier)
     }
 
@@ -1209,7 +1222,10 @@ impl RttStats {
                 .mean_deviation
                 .mul_f64(0.75)
                 .saturating_add(dev.mul_f64(0.25));
-            self.srtt = self.srtt.mul_f64(0.875).saturating_add(sample.mul_f64(0.125));
+            self.srtt = self
+                .srtt
+                .mul_f64(0.875)
+                .saturating_add(sample.mul_f64(0.125));
         }
     }
 }
@@ -1295,10 +1311,8 @@ fn now_seconds() -> f64 {
 /// `maxPaddingSize` for the packet transport (padding.go:95-106):
 /// `clamp(MTU − fragmentSize − packetOverhead − existing, 0, 255)`.
 fn packet_max_padding(payload_len: usize, existing: usize) -> usize {
-    let res = DEFAULT_MTU as isize
-        - payload_len as isize
-        - PACKET_OVERHEAD as isize
-        - existing as isize;
+    let res =
+        DEFAULT_MTU as isize - payload_len as isize - PACKET_OVERHEAD as isize - existing as isize;
     res.clamp(0, 255) as usize
 }
 
@@ -1328,9 +1342,7 @@ fn packet_data_padding_len(max: usize) -> usize {
 
 /// `randomHeartbeatJitter` (session.go:1512-1515).
 fn random_heartbeat_jitter() -> Duration {
-    Duration::from_nanos(
-        rand::random::<u64>() % SESSION_HEARTBEAT_JITTER.as_nanos() as u64,
-    )
+    Duration::from_nanos(rand::random::<u64>() % SESSION_HEARTBEAT_JITTER.as_nanos() as u64)
 }
 
 /// One outbound segment awaiting acknowledgement (segment.go:87-95: the
@@ -1809,7 +1821,8 @@ impl PacketEngine {
         // ACK or heartbeat if needed (not limited by the window).
         let now = Instant::now();
         let ack_due = self.ack_pending && now >= self.ack_deadline;
-        let heartbeat_due = now.duration_since(self.last_tx) > SESSION_HEARTBEAT + self.heartbeat_jitter;
+        let heartbeat_due =
+            now.duration_since(self.last_tx) > SESSION_HEARTBEAT + self.heartbeat_jitter;
         if !self.opening() && !self.closed && (ack_due || heartbeat_due) {
             self.ack_pending = false;
             let seq = self.next_send.saturating_sub(1);
@@ -1854,9 +1867,10 @@ impl PacketEngine {
                 &seg.payload,
             )?
         };
-        self.io.send(&wire).await.map_err(|e| {
-            Error::network(format!("mieru: udp underlay send failed: {e}"))
-        })?;
+        self.io
+            .send(&wire)
+            .await
+            .map_err(|e| Error::network(format!("mieru: udp underlay send failed: {e}")))?;
         self.last_tx = Instant::now();
         Ok(())
     }
@@ -1938,7 +1952,8 @@ impl PacketEngine {
         if meta.session_id != self.session_id {
             return;
         }
-        self.ingest(meta, &nonce, &dgram[PACKET_NON_HEADER_POSITION..]).await;
+        self.ingest(meta, &nonce, &dgram[PACKET_NON_HEADER_POSITION..])
+            .await;
     }
 
     /// Post-metadata session dispatch — shared by the socket path above
@@ -2002,8 +2017,7 @@ impl PacketEngine {
                     return;
                 }
                 let seq = self.alloc_seq();
-                let response =
-                    self.build_session_wire(CLOSE_SESSION_RESPONSE, seq, 0, &[]);
+                let response = self.build_session_wire(CLOSE_SESSION_RESPONSE, seq, 0, &[]);
                 if let Ok(wire) = response {
                     let _ = self.io.send(&wire).await;
                 }
@@ -2026,11 +2040,7 @@ impl PacketEngine {
     /// an RTT sample and a CUBIC ack.
     fn prune_acked(&mut self, un_ack: u32) {
         let now = Instant::now();
-        while self
-            .send_buf
-            .front()
-            .is_some_and(|seg| seg.seq < un_ack)
-        {
+        while self.send_buf.front().is_some_and(|seg| seg.seq < un_ack) {
             let seg = self.send_buf.pop_front().expect("front checked");
             self.rtt.update(now.duration_since(seg.tx_time));
             self.cubic.on_ack();
@@ -2042,9 +2052,7 @@ impl PacketEngine {
     async fn deliver_in_order(&mut self) {
         while let Some(payload) = self.recv_buf.remove(&self.next_recv) {
             self.next_recv = self.next_recv.wrapping_add(1);
-            if !payload.is_empty()
-                && self.app.write_all(&payload).await.is_err()
-            {
+            if !payload.is_empty() && self.app.write_all(&payload).await.is_err() {
                 // The application is gone.
                 self.closed = true;
                 return;
@@ -2185,7 +2193,8 @@ impl UnderlayHandle {
     }
 
     fn disable(&self) {
-        self.disabled.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.disabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// `underlay.Close()`: stop scheduling on it and tear the transport
@@ -2336,8 +2345,13 @@ async fn run_tcp_underlay_reader(
     let mut prefix_done = false;
     let mut first_read = true;
     loop {
-        match parse_stream_segment(&mut recv, &mut rbuf, &mut pending_meta, &mut prefix_done, &mut first_read)
-        {
+        match parse_stream_segment(
+            &mut recv,
+            &mut rbuf,
+            &mut pending_meta,
+            &mut prefix_done,
+            &mut first_read,
+        ) {
             Ok(Some((meta, payload))) => {
                 counters
                     .in_bytes
@@ -2620,7 +2634,8 @@ impl MieruMux {
     /// underlay (upstream's pick is random; tests need determinism).
     #[cfg(test)]
     fn force_reuse(&self) {
-        self.force_reuse.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.force_reuse
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// `cleanUnderlay(true)` (mux.go:412, 775-829): drop finished
@@ -2640,8 +2655,15 @@ impl MieruMux {
             }
             let limit = 512u64 << self.multiplex_factor;
             if limit > 0
-                && (h.counters.in_bytes.load(std::sync::atomic::Ordering::Relaxed) > limit
-                    || h.counters.out_bytes.load(std::sync::atomic::Ordering::Relaxed) > limit)
+                && (h
+                    .counters
+                    .in_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    > limit
+                    || h.counters
+                        .out_bytes
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        > limit)
             {
                 h.disable();
             }
@@ -2874,9 +2896,7 @@ impl MieruMux {
     /// the multiplexor: a SOCKS5 CONNECT session for `target`, possibly
     /// sharing an underlay with other sessions.
     pub async fn connect(&self, target: &NetAddr) -> Result<BoxProxyStream> {
-        Ok(Box::new(
-            self.dial(target, SOCKS5_CONNECT_CMD).await?,
-        ))
+        Ok(Box::new(self.dial(target, SOCKS5_CONNECT_CMD).await?))
     }
 
     /// mihomo `Mieru.ListenPacketContext` (adapter/outbound/mieru.go:88-104)
@@ -2950,19 +2970,13 @@ async fn socks5_handshake(
 /// Dial a fresh mieru session for `target` over the configured transport
 /// and complete the SOCKS5 handshake with `cmd` — `client.DialContext`
 /// (apis/client/client.go:120-142) for both transports.
-async fn dial_session(
-    cfg: &MieruOut,
-    target: &NetAddr,
-    cmd: u8,
-) -> Result<BoxProxyStream> {
+async fn dial_session(cfg: &MieruOut, target: &NetAddr, cmd: u8) -> Result<BoxProxyStream> {
     match cfg.transport {
         MieruTransport::Tcp => {
             let port = pick_port(&cfg.endpoint_ports())?;
             let tcp = tokio::net::TcpStream::connect((cfg.server.as_str(), port))
                 .await
-                .map_err(|e| {
-                    Error::network(format!("mieru: dial {}:{port}: {e}", cfg.server))
-                })?;
+                .map_err(|e| Error::network(format!("mieru: dial {}:{port}: {e}", cfg.server)))?;
             let _ = tcp.set_nodelay(true);
             debug!(
                 target: "engine",
@@ -3272,7 +3286,17 @@ mod tests {
         assert_eq!(u16::from_be_bytes(ss[15..17].try_into().unwrap()), 0x0102);
         assert_eq!(ss[17], 3);
 
-        let das = data_ack_struct(DATA_CLIENT_TO_SERVER, 0xAABBCCDD, 5, 0, 4096, 0, 11, 0x0203, 22);
+        let das = data_ack_struct(
+            DATA_CLIENT_TO_SERVER,
+            0xAABBCCDD,
+            5,
+            0,
+            4096,
+            0,
+            11,
+            0x0203,
+            22,
+        );
         assert_eq!(das[0], DATA_CLIENT_TO_SERVER);
         assert_eq!(u32::from_be_bytes(das[14..18].try_into().unwrap()), 0);
         assert_eq!(u16::from_be_bytes(das[18..20].try_into().unwrap()), 4096);
@@ -3432,7 +3456,10 @@ mod tests {
                 let mut inbound = Vec::new();
                 let is_session = matches!(
                     meta.protocol,
-                    OPEN_SESSION_REQUEST | OPEN_SESSION_RESPONSE | CLOSE_SESSION_REQUEST | CLOSE_SESSION_RESPONSE
+                    OPEN_SESSION_REQUEST
+                        | OPEN_SESSION_RESPONSE
+                        | CLOSE_SESSION_REQUEST
+                        | CLOSE_SESSION_RESPONSE
                 );
                 if !is_session && meta.prefix_len > 0 {
                     skip(&mut rd, meta.prefix_len as usize).await?;
@@ -3610,8 +3637,7 @@ mod tests {
         let target = NetAddr::domain("deny.example", 443).unwrap();
         // The mimic drops the connection when discovery fails; the client
         // must surface an authentication/EOF failure, never success.
-        let err = match tokio::time::timeout(Duration::from_secs(20), connect(&bad, &target))
-            .await
+        let err = match tokio::time::timeout(Duration::from_secs(20), connect(&bad, &target)).await
         {
             Ok(Ok(_)) => panic!("a wrong password must not authenticate"),
             Ok(Err(e)) => e,
@@ -3708,11 +3734,7 @@ mod tests {
 
         /// The server-side wire parsing half of `readOneSegment` for one
         /// known session (discovery + segment decode).
-        fn decode(
-            &self,
-            key: &[u8; KEY_LEN],
-            dgram: &[u8],
-        ) -> Option<(InboundMeta, Vec<u8>)> {
+        fn decode(&self, key: &[u8; KEY_LEN], dgram: &[u8]) -> Option<(InboundMeta, Vec<u8>)> {
             if dgram.len() < PACKET_NON_HEADER_POSITION {
                 return None;
             }
@@ -3767,15 +3789,19 @@ mod tests {
                     assert_ne!(meta.session_id, 0);
                     session_id = meta.session_id;
                     next_recv = meta.seq + 1;
-                    let wire =
-                        Self::session_wire(&cipher, session_id, OPEN_SESSION_RESPONSE, next_send, &socks_reply)
-                            .unwrap();
+                    let wire = Self::session_wire(
+                        &cipher,
+                        session_id,
+                        OPEN_SESSION_RESPONSE,
+                        next_send,
+                        &socks_reply,
+                    )
+                    .unwrap();
                     next_send += 1;
                     let _ = sock.send_to(&wire, peer).await;
                     assert!(payload.starts_with(&[SOCKS5_VERSION]));
                     assert!(
-                        payload[1] == SOCKS5_CONNECT_CMD
-                            || payload[1] == SOCKS5_UDP_ASSOCIATE_CMD,
+                        payload[1] == SOCKS5_CONNECT_CMD || payload[1] == SOCKS5_UDP_ASSOCIATE_CMD,
                         "unexpected socks5 command {}",
                         payload[1]
                     );
@@ -3784,9 +3810,14 @@ mod tests {
                 match meta.protocol {
                     OPEN_SESSION_REQUEST => {
                         // Retransmitted open: re-send the response.
-                        let wire =
-                            Self::session_wire(&cipher, session_id, OPEN_SESSION_RESPONSE, 0, &socks_reply)
-                                .unwrap();
+                        let wire = Self::session_wire(
+                            &cipher,
+                            session_id,
+                            OPEN_SESSION_RESPONSE,
+                            0,
+                            &socks_reply,
+                        )
+                        .unwrap();
                         let _ = sock.send_to(&wire, peer).await;
                     }
                     DATA_CLIENT_TO_SERVER => {
@@ -3800,8 +3831,7 @@ mod tests {
                             // Parse every complete tunnel frame:
                             // 0x00 | be16 len | inner | 0xff.
                             while backlog.len() >= 4 && backlog[0] == 0x00 {
-                                let len =
-                                    u16::from_be_bytes([backlog[1], backlog[2]]) as usize;
+                                let len = u16::from_be_bytes([backlog[1], backlog[2]]) as usize;
                                 if backlog.len() < 3 + len + 1 {
                                     break;
                                 }
@@ -3813,8 +3843,7 @@ mod tests {
                                 assert_eq!(&frame[..3], &[0, 0, 0]);
                                 let (_, used) = decode_socks_addr(&frame[3..]).unwrap();
                                 let payload = frame[3 + used..].to_vec();
-                                let origin =
-                                    NetAddr::ip("127.0.0.1".parse().unwrap(), 5353);
+                                let origin = NetAddr::ip("127.0.0.1".parse().unwrap(), 5353);
                                 let mut inner = vec![0x00, 0x00, 0x00];
                                 encode_socks_addr(&mut inner, &origin.host, origin.port);
                                 inner.extend_from_slice(&payload);
@@ -3853,9 +3882,14 @@ mod tests {
                     }
                     ACK_CLIENT_TO_SERVER => {}
                     CLOSE_SESSION_REQUEST => {
-                        let wire =
-                            Self::session_wire(&cipher, session_id, CLOSE_SESSION_RESPONSE, next_send, &[])
-                                .unwrap();
+                        let wire = Self::session_wire(
+                            &cipher,
+                            session_id,
+                            CLOSE_SESSION_RESPONSE,
+                            next_send,
+                            &[],
+                        )
+                        .unwrap();
                         let _ = sock.send_to(&wire, peer).await;
                         return;
                     }
@@ -3965,13 +3999,10 @@ mod tests {
         let (port, mimic) = spawn_packet_mimic(&base, false, true).await;
         let cfg = MieruOut { port, ..base };
         let target = NetAddr::domain("dns.example", 53).unwrap();
-        let mut udp = tokio::time::timeout(
-            Duration::from_secs(20),
-            connect_udp(&cfg, &target),
-        )
-        .await
-        .expect("connect timed out")
-        .expect("connect_udp failed");
+        let mut udp = tokio::time::timeout(Duration::from_secs(20), connect_udp(&cfg, &target))
+            .await
+            .expect("connect timed out")
+            .expect("connect_udp failed");
 
         // Each datagram keeps its edges through the tunnel + associate
         // framing; the mimic relays with a fixed 127.0.0.1:5353 origin.
@@ -3982,7 +4013,10 @@ mod tests {
             .await
             .expect("recv timed out")
             .unwrap();
-        assert_eq!(addr.host, crate::addr::Host::Ip("127.0.0.1".parse().unwrap()));
+        assert_eq!(
+            addr.host,
+            crate::addr::Host::Ip("127.0.0.1".parse().unwrap())
+        );
         assert_eq!(addr.port, 5353);
         assert_eq!(&buf[..n], b"q-one");
         let (_, n) = tokio::time::timeout(Duration::from_secs(10), udp.recv_from(&mut buf))
@@ -4006,13 +4040,10 @@ mod tests {
         // header carries this IP as the origin (the wrapper refuses FQDN
         // downlink headers, like upstream).
         let target = NetAddr::ip("8.8.8.8".parse().unwrap(), 53);
-        let mut udp = tokio::time::timeout(
-            Duration::from_secs(20),
-            connect_udp(&cfg, &target),
-        )
-        .await
-        .expect("connect timed out")
-        .expect("connect_udp failed");
+        let mut udp = tokio::time::timeout(Duration::from_secs(20), connect_udp(&cfg, &target))
+            .await
+            .expect("connect timed out")
+            .expect("connect_udp failed");
 
         udp.send_to(&target, b"tcp-udp-assoc").await.unwrap();
         let mut buf = [0u8; 1500];
@@ -4111,7 +4142,9 @@ mod tests {
         // validateMieruOption's cross-checks (mihomo mieru.go:301-309).
         assert!(validate_ports(0, None).is_err());
         let err = validate_ports(0, None).unwrap_err();
-        assert!(err.to_string().contains("either port or port-range must be set"));
+        assert!(err
+            .to_string()
+            .contains("either port or port-range must be set"));
         let err = validate_ports(8080, Some((8080, 9080))).unwrap_err();
         assert!(err.to_string().contains("cannot be set at the same time"));
         assert!(validate_ports(8080, None).is_ok());
@@ -4144,8 +4177,14 @@ mod tests {
         assert_eq!(Multiplexing::parse("").unwrap(), Multiplexing::Low);
         assert_eq!(Multiplexing::parse("MULTIPLEXING_OFF").unwrap().factor(), 0);
         assert_eq!(Multiplexing::parse("MULTIPLEXING_LOW").unwrap().factor(), 1);
-        assert_eq!(Multiplexing::parse("MULTIPLEXING_MIDDLE").unwrap().factor(), 2);
-        assert_eq!(Multiplexing::parse("MULTIPLEXING_HIGH").unwrap().factor(), 3);
+        assert_eq!(
+            Multiplexing::parse("MULTIPLEXING_MIDDLE").unwrap().factor(),
+            2
+        );
+        assert_eq!(
+            Multiplexing::parse("MULTIPLEXING_HIGH").unwrap().factor(),
+            3
+        );
         let err = Multiplexing::parse("max").unwrap_err();
         assert!(err.to_string().contains("invalid multiplexing level: max"));
         assert!(Multiplexing::parse("low").is_err(), "case-sensitive");
@@ -4215,7 +4254,8 @@ mod tests {
                     None => {
                         // serverUsers.Discover over the three window keys.
                         let mut found = None;
-                        let hashed = hash_password(self.password.as_bytes(), self.username.as_bytes());
+                        let hashed =
+                            hash_password(self.password.as_bytes(), self.username.as_bytes());
                         for salt in salts_for_time(now) {
                             let key: [u8; KEY_LEN] =
                                 pbkdf2_hmac_sha256(&hashed, &salt, KEY_ITER, KEY_LEN)
@@ -4227,8 +4267,7 @@ mod tests {
                                 break;
                             }
                         }
-                        let (cipher, p) =
-                            found.ok_or_else(|| Error::crypto("discovery failed"))?;
+                        let (cipher, p) = found.ok_or_else(|| Error::crypto("discovery failed"))?;
                         recv = Some(cipher);
                         p
                     }
@@ -4249,9 +4288,10 @@ mod tests {
                     skip(&mut rd, meta.suffix_len as usize).await?;
                 }
 
-                let ctx = sessions
-                    .entry(meta.session_id)
-                    .or_insert_with(|| SessCtx { next_send: 0, socks_done: false });
+                let ctx = sessions.entry(meta.session_id).or_insert_with(|| SessCtx {
+                    next_send: 0,
+                    socks_done: false,
+                });
                 let seq = ctx.next_send;
                 ctx.next_send = ctx.next_send.wrapping_add(1);
                 match meta.protocol {
@@ -4330,7 +4370,11 @@ mod tests {
     /// carrying any number of sessions.
     async fn spawn_multi_tcp_mimic(
         cfg: &MieruOut,
-    ) -> (u16, std::sync::Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    ) -> (
+        u16,
+        std::sync::Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
         spawn_multi_tcp_mimic_on(cfg, 0).await
     }
 
@@ -4338,7 +4382,11 @@ mod tests {
     async fn spawn_multi_tcp_mimic_on(
         cfg: &MieruOut,
         port: u16,
-    ) -> (u16, std::sync::Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    ) -> (
+        u16,
+        std::sync::Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = MultiSessionMimicServer {
@@ -4392,7 +4440,11 @@ mod tests {
         .expect("dial 2 failed");
 
         assert_eq!(mux.underlay_count(), 1, "both sessions share the underlay");
-        assert_eq!(conns.load(Ordering::Relaxed), 1, "exactly one TCP connection");
+        assert_eq!(
+            conns.load(Ordering::Relaxed),
+            1,
+            "exactly one TCP connection"
+        );
 
         // Independent concurrent echoes over the shared underlay.
         s1.write_all(b"first-session-payload").await.unwrap();
@@ -4512,7 +4564,10 @@ mod tests {
                 };
                 let ctx = sessions
                     .entry(meta.session_id)
-                    .or_insert_with(|| UdpSessCtx { next_recv: 0, next_send: 0 });
+                    .or_insert_with(|| UdpSessCtx {
+                        next_recv: 0,
+                        next_send: 0,
+                    });
                 match meta.protocol {
                     OPEN_SESSION_REQUEST => {
                         assert_ne!(meta.session_id, 0);
@@ -4638,9 +4693,7 @@ mod tests {
             for _ in 0..1000 {
                 let a = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
                 let pa = a.local_addr().unwrap().port();
-                if pa != u16::MAX
-                    && TcpListener::bind(("127.0.0.1", pa + 1)).await.is_ok()
-                {
+                if pa != u16::MAX && TcpListener::bind(("127.0.0.1", pa + 1)).await.is_ok() {
                     found = Some((pa, pa + 1));
                     break;
                 }
@@ -4661,8 +4714,14 @@ mod tests {
                 .expect("dial timed out")
                 .expect("dial failed");
         }
-        assert!(conns1.load(Ordering::Relaxed) >= 1, "port {lo} never dialed");
-        assert!(conns2.load(Ordering::Relaxed) >= 1, "port {hi} never dialed");
+        assert!(
+            conns1.load(Ordering::Relaxed) >= 1,
+            "port {lo} never dialed"
+        );
+        assert!(
+            conns2.load(Ordering::Relaxed) >= 1,
+            "port {hi} never dialed"
+        );
         assert_eq!(
             conns1.load(Ordering::Relaxed) + conns2.load(Ordering::Relaxed),
             40

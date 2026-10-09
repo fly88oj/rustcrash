@@ -140,7 +140,10 @@ mod tests {
                         alpn: hello.alpn.clone(),
                         cipher_suites: hello.cipher_suites.clone(),
                     });
-                    Ok((der.clone(), rustls::crypto::ring::sign::any_supported_type(&key).unwrap()))
+                    Ok((
+                        der.clone(),
+                        rustls::crypto::ring::sign::any_supported_type(&key).unwrap(),
+                    ))
                 },
             )
             .await;
@@ -167,9 +170,16 @@ mod tests {
         assert_eq!(hello.sni.as_deref(), Some("www.example.com"));
         assert_eq!(hello.alpn, vec!["http/1.1".to_string()]);
         assert_eq!(hello.session_id.len(), 32);
-        assert_ne!(hello.session_id, vec![0u8; 32], "session id is freshly random");
+        assert_ne!(
+            hello.session_id,
+            vec![0u8; 32],
+            "session id is freshly random"
+        );
         assert!(!hello.x25519_share.iter().all(|b| *b == 0));
-        assert_eq!(hello.cipher_suites, UtslProfile::Firefox.cipher_suites().to_vec());
+        assert_eq!(
+            hello.cipher_suites,
+            UtslProfile::Firefox.cipher_suites().to_vec()
+        );
         let _ = server_task.await;
     }
 

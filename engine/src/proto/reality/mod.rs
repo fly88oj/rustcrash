@@ -25,9 +25,8 @@ pub mod reality;
 pub mod stream;
 pub mod tls13;
 
-pub use profiles::UtslProfile;
+pub use profiles::{is_client_fingerprint_name, UtslProfile};
 pub use reality::{
-    connect as reality_connect, connect_stream as reality_connect_stream, RealityCfg,
-    RealityStream,
+    connect as reality_connect, connect_stream as reality_connect_stream, RealityCfg, RealityStream,
 };
 pub use stream::{utls_connect, UtlsCfg};

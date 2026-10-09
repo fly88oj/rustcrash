@@ -92,7 +92,9 @@ use hkdf::Hkdf;
 use rand::{Rng, RngCore};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{ring as ring_provider, CryptoProvider};
-use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme};
+use rustls::{
+    ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme,
+};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tracing::debug;
@@ -448,19 +450,15 @@ fn derive_sequence_watermark(
         .map_err(|_| Error::crypto("tlsmirror: prk"))?;
     let mut key = [0u8; 32];
     hk.expand(
-        format!(
-            "v2ray-xv64FXUU-GxMn8UYz-bTy6UDeE:tlsmirror-sequence-watermark-encryption{tag}"
-        )
-        .as_bytes(),
+        format!("v2ray-xv64FXUU-GxMn8UYz-bTy6UDeE:tlsmirror-sequence-watermark-encryption{tag}")
+            .as_bytes(),
         &mut key,
     )
     .map_err(|_| Error::crypto("tlsmirror: hkdf expand watermark key"))?;
     let mut nonce = [0u8; 12];
     hk.expand(
-        format!(
-            "v2ray-xv64FXUU-GxMn8UYz-bTy6UDeE:tlsmirror-sequence-watermark-noncemask{tag}"
-        )
-        .as_bytes(),
+        format!("v2ray-xv64FXUU-GxMn8UYz-bTy6UDeE:tlsmirror-sequence-watermark-noncemask{tag}")
+            .as_bytes(),
         &mut nonce,
     )
     .map_err(|_| Error::crypto("tlsmirror: hkdf expand watermark nonce"))?;
@@ -508,7 +506,8 @@ fn unpack_padding(data: &[u8]) -> Option<&[u8]> {
         return None;
     }
     let n = data.len();
-    let payload_len = u32::from_be_bytes([data[n - 4], data[n - 3], data[n - 2], data[n - 1]]) as usize;
+    let payload_len =
+        u32::from_be_bytes([data[n - 4], data[n - 3], data[n - 2], data[n - 1]]) as usize;
     if payload_len > n - 4 {
         return None;
     }
@@ -599,8 +598,10 @@ impl Mirror {
             (Some(cr), Some(sr)) => (cr, sr),
             _ => return Err(Error::protocol("tlsmirror: handshake random is not ready")),
         };
-        let (enc_key, enc_mask) = derive_encryption_key(&self.primary_key, &cr, &sr, self.encrypt_tag())?;
-        let (dec_key, dec_mask) = derive_encryption_key(&self.primary_key, &cr, &sr, self.decrypt_tag())?;
+        let (enc_key, enc_mask) =
+            derive_encryption_key(&self.primary_key, &cr, &sr, self.encrypt_tag())?;
+        let (dec_key, dec_mask) =
+            derive_encryption_key(&self.primary_key, &cr, &sr, self.decrypt_tag())?;
         self.encryptor = Some(XorNonceAead::new(&enc_key, &enc_mask)?);
         self.decryptor = Some(XorNonceAead::new(&dec_key, &dec_mask)?);
         Ok(())
@@ -716,7 +717,11 @@ impl Mirror {
         let overhead = self.overhead();
         let max_plain = MAX_RECORD_PAYLOAD - overhead - 16 - if self.padding { 4 } else { 0 };
         let take = plain.len().min(max_plain);
-        let body_plain = if self.padding { pack_padding(&plain[..take]) } else { plain[..take].to_vec() };
+        let body_plain = if self.padding {
+            pack_padding(&plain[..take])
+        } else {
+            plain[..take].to_vec()
+        };
         let nonce8 = self.encryptor_nonce.next();
         let sealed = encryptor.seal(&nonce8, &body_plain)?;
         let mut fragment = Vec::with_capacity(overhead + sealed.len());
@@ -938,7 +943,9 @@ async fn pump(
                 let _ = randoms_tx.send(Some((cr, sr)));
             }
             mirror.apply_watermark_rx(&mut record[RECORD_HEADER_LEN..], rec_type);
-            if let Some(payload) = mirror.handle_inbound_record(&record[RECORD_HEADER_LEN..], rec_type) {
+            if let Some(payload) =
+                mirror.handle_inbound_record(&record[RECORD_HEADER_LEN..], rec_type)
+            {
                 if !payload.is_empty() {
                     let _ = hidden_tx.send(payload);
                 }
@@ -1092,18 +1099,26 @@ fn choose_next_traffic_step(step: &TrafficStep, current: usize) -> Result<(usize
 
 /// One HTTP/1.1 request/response over the carrier (traffic.go
 /// `runTrafficStep` for the non-h2 arm).
-async fn run_http1_step(
-    carrier: &mut tokio::io::DuplexStream,
-    step: &TrafficStep,
-) -> Result<()> {
+async fn run_http1_step(carrier: &mut tokio::io::DuplexStream, step: &TrafficStep) -> Result<()> {
     let host = if step.host.is_empty() {
         "localhost".to_string()
     } else {
         step.host.clone()
     };
-    let hostname = host.rsplit_once(':').map(|(h, _)| h.to_string()).unwrap_or(host.clone());
-    let path = if step.path.is_empty() { "/".to_string() } else { step.path.clone() };
-    let method = if step.method.is_empty() { "GET".to_string() } else { step.method.to_uppercase() };
+    let hostname = host
+        .rsplit_once(':')
+        .map(|(h, _)| h.to_string())
+        .unwrap_or(host.clone());
+    let path = if step.path.is_empty() {
+        "/".to_string()
+    } else {
+        step.path.clone()
+    };
+    let method = if step.method.is_empty() {
+        "GET".to_string()
+    } else {
+        step.method.to_uppercase()
+    };
     let mut req = Vec::with_capacity(256);
     req.extend_from_slice(format!("{method} {path} HTTP/1.1\r\n").as_bytes());
     req.extend_from_slice(format!("Host: {hostname}\r\n").as_bytes());
@@ -1137,7 +1152,9 @@ async fn run_http1_step(
             break;
         }
         if head.len() > 16 * 1024 {
-            return Err(Error::protocol("tlsmirror: carrier response head too large"));
+            return Err(Error::protocol(
+                "tlsmirror: carrier response head too large",
+            ));
         }
     }
     let head_str = String::from_utf8_lossy(&head).to_ascii_lowercase();
@@ -1145,7 +1162,9 @@ async fn run_http1_step(
         .lines()
         .find_map(|l| l.strip_prefix("content-length:"))
         .and_then(|v| v.trim().parse::<u64>().ok());
-    let chunked = head_str.lines().any(|l| l.starts_with("transfer-encoding:") && l.contains("chunked"));
+    let chunked = head_str
+        .lines()
+        .any(|l| l.starts_with("transfer-encoding:") && l.contains("chunked"));
     if let Some(len) = content_length {
         let mut body = vec![0u8; len as usize];
         carrier
@@ -1249,10 +1268,7 @@ impl CarrierH2 {
     async fn open_request(
         self: &Arc<Self>,
         block: &[u8],
-    ) -> Result<(
-        u32,
-        tokio::sync::mpsc::UnboundedReceiver<CarrierH2Event>,
-    )> {
+    ) -> Result<(u32, tokio::sync::mpsc::UnboundedReceiver<CarrierH2Event>)> {
         let id = self.next_stream.fetch_add(2, Ordering::SeqCst);
         if id == 0 || id > 0x7FFF_F000 {
             return Err(Error::network("tlsmirror: h2 stream ids exhausted"));
@@ -1290,15 +1306,13 @@ async fn carrier_h2_reader(
     let mut header_blocks: HashMap<u32, Vec<u8>> = HashMap::new();
     'conn: loop {
         while rbuf.len() >= 9 {
-            let len =
-                ((rbuf[0] as usize) << 16) | ((rbuf[1] as usize) << 8) | rbuf[2] as usize;
+            let len = ((rbuf[0] as usize) << 16) | ((rbuf[1] as usize) << 8) | rbuf[2] as usize;
             if rbuf.len() < 9 + len {
                 break;
             }
             let kind = rbuf[3];
             let flags = rbuf[4];
-            let stream_id =
-                u32::from_be_bytes([rbuf[5], rbuf[6], rbuf[7], rbuf[8]]) & 0x7FFF_FFFF;
+            let stream_id = u32::from_be_bytes([rbuf[5], rbuf[6], rbuf[7], rbuf[8]]) & 0x7FFF_FFFF;
             let payload = rbuf[9..9 + len].to_vec();
             rbuf.advance(9 + len);
             match kind {
@@ -1427,8 +1441,16 @@ async fn run_h2_step(
     } else {
         step.host.clone()
     };
-    let path = if step.path.is_empty() { "/".to_string() } else { step.path.clone() };
-    let method = if step.method.is_empty() { "GET".to_string() } else { step.method.to_uppercase() };
+    let path = if step.path.is_empty() {
+        "/".to_string()
+    } else {
+        step.path.clone()
+    };
+    let method = if step.method.is_empty() {
+        "GET".to_string()
+    } else {
+        step.method.to_uppercase()
+    };
     // Go's http2 client maps the URL onto the pseudo-headers and sends
     // `Host` as `:authority`; header names are lowercased on the wire.
     let mut block = Vec::with_capacity(128);
@@ -1606,7 +1628,12 @@ impl ServerCertVerifier for NoVerify {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -1615,7 +1642,12 @@ impl ServerCertVerifier for NoVerify {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -1727,8 +1759,7 @@ pub async fn connect_with(
     let pump_ready = ready.clone();
     let pump_ready_notify = ready_notify.clone();
     let defer = cfg.defer_instance_derived_write.duration();
-    let (randoms_tx, randoms_rx) =
-        tokio::sync::watch::channel(None::<([u8; 32], [u8; 32])>);
+    let (randoms_tx, randoms_rx) = tokio::sync::watch::channel(None::<([u8; 32], [u8; 32])>);
     tokio::spawn(async move {
         pump(
             transport,
@@ -1802,7 +1833,6 @@ pub async fn connect_with(
     }))
 }
 
-
 // ---------------------------------------------------------------------------
 // Connection enrolment (enrollment.go)
 // ---------------------------------------------------------------------------
@@ -1835,8 +1865,7 @@ fn enrollment_base32_encode(data: &[u8]) -> String {
 /// `deriveSecondaryKey` (enrollment.go:187): HKDF-SHA256 with the
 /// primary key as PRK under the v2ray secondary-key namespace.
 fn derive_secondary_key(primary_key: &[u8; 32], tag: &str) -> Result<[u8; 16]> {
-    let hk = Hkdf::<Sha256>::from_prk(primary_key)
-        .map_err(|_| Error::crypto("tlsmirror: prk"))?;
+    let hk = Hkdf::<Sha256>::from_prk(primary_key).map_err(|_| Error::crypto("tlsmirror: prk"))?;
     let mut key = [0u8; 16];
     hk.expand(
         format!("v2ray-sv77RCEY-e8AhYsbD-BmFC7XRK:tlsmirror-secondary{tag}").as_bytes(),
@@ -1897,16 +1926,19 @@ fn enrollment_add(
     client_random: &[u8; 32],
     server_random: &[u8; 32],
 ) -> Result<EnrollmentGuard> {
-    let request_key =
-        derive_enrollment_request_key(primary_key, client_random, server_random)?;
-    let mut active = enrollment_active().lock().unwrap_or_else(|e| e.into_inner());
+    let request_key = derive_enrollment_request_key(primary_key, client_random, server_random)?;
+    let mut active = enrollment_active()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if !active.insert(request_key.to_vec()) {
         return Err(Error::protocol(
             "tlsmirror: enrollment connection already exists",
         ));
     }
     drop(active);
-    Ok(EnrollmentGuard { request_key: Some(request_key.to_vec()) })
+    Ok(EnrollmentGuard {
+        request_key: Some(request_key.to_vec()),
+    })
 }
 
 /// Removes the entry on drop (`hidden.setEnrollmentRemove`, server.go:63).
@@ -2104,9 +2136,7 @@ fn skip_proto_value(data: &[u8], start_field: usize, wire_type: u64) -> Result<u
                 }
                 if nested_wire == 4 {
                     if nested_field != start_field {
-                        return Err(Error::protocol(
-                            "tlsmirror: mismatched protobuf end group",
-                        ));
+                        return Err(Error::protocol("tlsmirror: mismatched protobuf end group"));
                     }
                     return Ok(consumed);
                 }
@@ -2152,9 +2182,7 @@ fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-async fn h2_read_frame(
-    io: &mut BoxProxyStream,
-) -> Result<(u8, u8, u32, Vec<u8>)> {
+async fn h2_read_frame(io: &mut BoxProxyStream) -> Result<(u8, u8, u32, Vec<u8>)> {
     let mut head = [0u8; 9];
     io.read_exact(&mut head).await?;
     let len = (u32::from(head[0]) << 16 | u32::from(head[1]) << 8 | u32::from(head[2])) as usize;
@@ -2292,8 +2320,8 @@ fn hpack_string_read(block: &[u8], pos: usize) -> Result<(Vec<u8>, usize)> {
     };
     let huffman = first & 0x80 != 0;
     let (len, n) = hpack_integer_read(block, pos, 7)?;
-    let len = usize::try_from(len)
-        .map_err(|_| Error::protocol("tlsmirror: hpack length overflow"))?;
+    let len =
+        usize::try_from(len).map_err(|_| Error::protocol("tlsmirror: hpack length overflow"))?;
     let start = pos + n;
     let end = start + len;
     if block.len() < end {
@@ -2322,7 +2350,8 @@ pub(crate) async fn h2c_post(
     // SETTINGS_INITIAL_WINDOW_SIZE (0x4) = 1 MiB.
     settings.extend_from_slice(&0x4u16.to_be_bytes());
     settings.extend_from_slice(&(1u32 << 20).to_be_bytes());
-    io.write_all(&h2_frame(H2_SETTINGS, 0, 0, &settings)).await?;
+    io.write_all(&h2_frame(H2_SETTINGS, 0, 0, &settings))
+        .await?;
 
     // HEADERS on stream 1: literal-without-indexing, no Huffman.
     let mut block = Vec::new();
@@ -2469,8 +2498,10 @@ pub async fn serve_enrollment_control_connection(
     hpack_literal_header(&mut block, ":status", "200");
     hpack_literal_header(&mut block, "content-type", "application/octet-stream");
     hpack_literal_header(&mut block, "content-length", &resp_body.len().to_string());
-    io.write_all(&h2_frame(H2_HEADERS, 0x4, stream, &block)).await?;
-    io.write_all(&h2_frame(H2_DATA, 0x1, stream, &resp_body)).await?;
+    io.write_all(&h2_frame(H2_HEADERS, 0x4, stream, &block))
+        .await?;
+    io.write_all(&h2_frame(H2_DATA, 0x1, stream, &resp_body))
+        .await?;
     let _ = io.flush().await;
     Ok(())
 }
@@ -2484,17 +2515,15 @@ async fn verify_connection_enrollment(
     dialer: &EnrollmentDialer,
 ) -> Result<()> {
     let mut rx = randoms_rx.clone();
-    let (client_random, server_random) = match tokio::time::timeout(
-        Duration::from_secs(30),
-        rx.wait_for(|r| r.is_some()),
-    )
-    .await
-    {
-        Ok(Ok(value)) => value.ok_or_else(|| Error::network("tlsmirror: handshake randoms lost")),
-        _ => Err(Error::network(
-            "tlsmirror: carrier handshake randoms never became available",
-        )),
-    }?;
+    let (client_random, server_random) =
+        match tokio::time::timeout(Duration::from_secs(30), rx.wait_for(|r| r.is_some())).await {
+            Ok(Ok(value)) => {
+                value.ok_or_else(|| Error::network("tlsmirror: handshake randoms lost"))
+            }
+            _ => Err(Error::network(
+                "tlsmirror: carrier handshake randoms never became available",
+            )),
+        }?;
     let server_id = derive_enrollment_server_identifier(primary_key)?;
     let host = format!(
         "{}{ENROLLMENT_CONTROL_POSTFIX}",
@@ -2645,16 +2674,14 @@ pub async fn serve_conn_ready(
                 }
                 let mut m = c2s_mirror.lock().await;
                 m.apply_watermark_rx(&mut record[RECORD_HEADER_LEN..], rec_type);
-                let extracted =
-                    m.handle_inbound_record(&record[RECORD_HEADER_LEN..], rec_type);
+                let extracted = m.handle_inbound_record(&record[RECORD_HEADER_LEN..], rec_type);
                 drop(m);
                 match extracted {
                     Some(payload) => {
                         if !payload.is_empty() {
                             let _ = c2s_hidden.send(payload);
                         }
-                        if let (Some(tx), Some(stream)) = (ready_tx.take(), hidden_stream.take())
-                        {
+                        if let (Some(tx), Some(stream)) = (ready_tx.take(), hidden_stream.take()) {
                             let _ = tx.send(stream);
                         }
                     }
@@ -2795,7 +2822,6 @@ pub async fn serve_conn_ready(
     Ok(hidden)
 }
 
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2817,10 +2843,7 @@ mod tests {
         let nonce = [0u8, 0, 0, 0, 0, 0, 0, 0x4a, 0, 0, 0, 0];
         let block = chacha20_block(&key, 1, &nonce);
         assert_eq!(
-            block
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>(),
+            block.iter().map(|b| format!("{b:02x}")).collect::<String>(),
             "224f51f3401bd9e12fde276fb8631ded\
              8c131f823d2c06e27e4fcaec9ef3cf78\
              8a3b0aa372600a92b57974cded2b9334\
@@ -2874,15 +2897,23 @@ mod tests {
     fn xor_nonce_aead_roundtrip() {
         let a = XorNonceAead::new(&[1u8; 16], &[2u8; 12]).unwrap();
         let b = XorNonceAead::new(&[1u8; 16], &[2u8; 12]).unwrap();
-        let ct = a.seal(&[0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], b"hidden").unwrap();
+        let ct = a
+            .seal(&[0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], b"hidden")
+            .unwrap();
         assert_eq!(ct.len(), 6 + 16);
-        let pt = b.open(&[0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], &ct).unwrap();
+        let pt = b
+            .open(&[0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], &ct)
+            .unwrap();
         assert_eq!(pt, b"hidden");
         // Counter mismatch fails.
-        assert!(b.open(&[0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], &ct).is_err());
+        assert!(b
+            .open(&[0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], &ct)
+            .is_err());
         // Wrong mask fails.
         let c = XorNonceAead::new(&[1u8; 16], &[3u8; 12]).unwrap();
-        assert!(c.open(&[0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], &ct).is_err());
+        assert!(c
+            .open(&[0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], &ct)
+            .is_err());
     }
 
     #[test]
@@ -2943,16 +2974,18 @@ mod tests {
     #[test]
     fn next_step_weighted_choice() {
         let step = TrafficStep {
-            next_step: vec![
-                TrafficTransferCandidate { weight: 0, goto_location: 0 },
-            ],
+            next_step: vec![TrafficTransferCandidate {
+                weight: 0,
+                goto_location: 0,
+            }],
             ..http_step("s", "/")
         };
         assert!(choose_next_traffic_step(&step, 0).is_err());
         let step = TrafficStep {
-            next_step: vec![
-                TrafficTransferCandidate { weight: 1, goto_location: 4 },
-            ],
+            next_step: vec![TrafficTransferCandidate {
+                weight: 1,
+                goto_location: 4,
+            }],
             ..http_step("s", "/")
         };
         assert_eq!(choose_next_traffic_step(&step, 0).unwrap(), (4, true));
@@ -2962,9 +2995,15 @@ mod tests {
 
     #[test]
     fn time_spec_duration_bounds() {
-        let t = TimeSpec { base_nanoseconds: 10, uniform_random_multiplier_nanoseconds: 0 };
+        let t = TimeSpec {
+            base_nanoseconds: 10,
+            uniform_random_multiplier_nanoseconds: 0,
+        };
         assert_eq!(t.duration(), Duration::from_nanos(10));
-        let t = TimeSpec { base_nanoseconds: 5, uniform_random_multiplier_nanoseconds: 10 };
+        let t = TimeSpec {
+            base_nanoseconds: 5,
+            uniform_random_multiplier_nanoseconds: 10,
+        };
         for _ in 0..50 {
             let d = t.duration();
             assert!(d >= Duration::from_nanos(5) && d < Duration::from_nanos(15));
@@ -2975,7 +3014,10 @@ mod tests {
     fn primary_key_validation() {
         let key = generate_primary_key();
         assert_eq!(decode_primary_key(&key).unwrap().len(), 32);
-        assert!(decode_primary_key("").unwrap_err().to_string().contains("missing"));
+        assert!(decode_primary_key("")
+            .unwrap_err()
+            .to_string()
+            .contains("missing"));
         let err = decode_primary_key("not-base64!!").unwrap_err().to_string();
         assert!(err.contains("base64"), "{err}");
         use base64::Engine;
@@ -3005,7 +3047,8 @@ mod tests {
         let certified = rcgen::generate_simple_self_signed(vec!["carrier.example".to_string()])
             .expect("rcgen self-signed cert");
         let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
-        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let key =
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
         let provider = Arc::new(ring_provider::default_provider());
         let versions: &[&'static rustls::SupportedProtocolVersion] = if tls12_only {
             &[&rustls::version::TLS12]
@@ -3016,7 +3059,9 @@ mod tests {
             .with_protocol_versions(versions)
             .unwrap()
             .with_no_client_auth();
-        let mut config = builder.with_single_cert(vec![cert], key).expect("server config");
+        let mut config = builder
+            .with_single_cert(vec![cert], key)
+            .expect("server config");
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
         Arc::new(config)
     }
@@ -3077,8 +3122,7 @@ mod tests {
                             Ok(got) => got,
                         };
                         let mut cursor = &tmp[..got];
-                        if tls.read_tls(&mut cursor).is_err()
-                            || tls.process_new_packets().is_err()
+                        if tls.read_tls(&mut cursor).is_err() || tls.process_new_packets().is_err()
                         {
                             return;
                         }
@@ -3188,7 +3232,9 @@ mod tests {
                     let mut record = rbuf.split_to(RECORD_HEADER_LEN + rlen).to_vec();
                     let rec_type = record[0];
                     if first && rec_type == REC_HANDSHAKE {
-                        if let Some((random, suite)) = parse_server_hello(&record[RECORD_HEADER_LEN..]) {
+                        if let Some((random, suite)) =
+                            parse_server_hello(&record[RECORD_HEADER_LEN..])
+                        {
                             let mut m = s2c_mirror.lock().await;
                             m.server_random = Some(random);
                             m.tls12_explicit = m.explicit_suites.contains(&suite);
@@ -3199,10 +3245,11 @@ mod tests {
                     // carrier app/alert records are watermarked too once
                     // the tx stream is armed — the client strips every
                     // inbound record after its first hidden decrypt.
-                    s2c_mirror
-                        .lock()
-                        .await
-                        .apply_watermark_tx(&mut record[RECORD_HEADER_LEN..], rec_type, false);
+                    s2c_mirror.lock().await.apply_watermark_tx(
+                        &mut record[RECORD_HEADER_LEN..],
+                        rec_type,
+                        false,
+                    );
                     if client_wr.write_all(&record).await.is_err() {
                         return;
                     }
@@ -3270,14 +3317,24 @@ mod tests {
         }
     }
 
-    async fn run_client(cfg: &TlsMirrorOut, requests: Arc<StdMutex<Vec<String>>>) -> Result<BoxProxyStream> {
+    async fn run_client(
+        cfg: &TlsMirrorOut,
+        requests: Arc<StdMutex<Vec<String>>>,
+    ) -> Result<BoxProxyStream> {
         let primary_key = decode_primary_key(&cfg.primary_key)?;
         let (client_duplex, server_duplex) = tokio::io::duplex(256 * 1024);
         let forward = spawn_forward_server(false, requests);
         let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
         let cfg2 = cfg.clone();
         tokio::spawn(async move {
-            mirror_server_mimic(Box::new(server_duplex), forward, &cfg2, primary_key, close_rx).await;
+            mirror_server_mimic(
+                Box::new(server_duplex),
+                forward,
+                &cfg2,
+                primary_key,
+                close_rx,
+            )
+            .await;
         });
         // Keep the mimic alive for the test's lifetime.
         std::mem::forget(close_tx);
@@ -3356,7 +3413,14 @@ mod tests {
         let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
         let cfg2 = real.clone();
         tokio::spawn(async move {
-            mirror_server_mimic(Box::new(server_duplex), forward, &cfg2, primary_key, close_rx).await;
+            mirror_server_mimic(
+                Box::new(server_duplex),
+                forward,
+                &cfg2,
+                primary_key,
+                close_rx,
+            )
+            .await;
         });
         std::mem::forget(close_tx);
         let mut stream = connect(&bad, Box::new(client_duplex)).await.unwrap();
@@ -3365,9 +3429,10 @@ mod tests {
         // kills the carrier; the hidden channel never echoes.
         stream.write_all(b"secret").await.unwrap();
         let mut buf = [0u8; 6];
-        let result = tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf)).await;
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf)).await;
         match result {
-            Err(_) => {} // no data — fine
+            Err(_) => {}     // no data — fine
             Ok(Err(_)) => {} // carrier died — fine
             Ok(Ok(_)) => panic!("a wrong primary key must not echo hidden data"),
         }
@@ -3391,7 +3456,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&buf, b"deferred");
-        assert!(start.elapsed() >= Duration::from_millis(100), "{:?}", start.elapsed());
+        assert!(
+            start.elapsed() >= Duration::from_millis(100),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[tokio::test]
@@ -3410,7 +3479,10 @@ mod tests {
                 base_nanoseconds: 10_000_000,
                 uniform_random_multiplier_nanoseconds: 0,
             },
-            next_step: vec![TrafficTransferCandidate { weight: 1, goto_location: 0 }],
+            next_step: vec![TrafficTransferCandidate {
+                weight: 1,
+                goto_location: 0,
+            }],
             ..http_step("step", "/carrier")
         }];
         let mut stream = run_client(&cfg, requests.clone()).await.unwrap();
@@ -3418,7 +3490,8 @@ mod tests {
         let reqs = requests.lock().unwrap().clone();
         assert!(!reqs.is_empty(), "generator produced no carrier requests");
         assert!(
-            reqs.iter().any(|r| r.starts_with("GET /carrier HTTP/1.1\r\n")),
+            reqs.iter()
+                .any(|r| r.starts_with("GET /carrier HTTP/1.1\r\n")),
             "{reqs:?}"
         );
         assert!(
@@ -3426,7 +3499,8 @@ mod tests {
             "{reqs:?}"
         );
         assert!(
-            reqs.iter().any(|r| r.contains("User-Agent: tlsmirror-test\r\n")),
+            reqs.iter()
+                .any(|r| r.contains("User-Agent: tlsmirror-test\r\n")),
             "{reqs:?}"
         );
         // The hidden channel still works over the generating carrier.
@@ -3439,7 +3513,8 @@ mod tests {
         let certified = rcgen::generate_simple_self_signed(vec!["carrier.example".to_string()])
             .expect("rcgen self-signed cert");
         let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
-        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let key =
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
         let provider = Arc::new(ring_provider::default_provider());
         let mut config = rustls::ServerConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13])
@@ -3547,7 +3622,8 @@ mod tests {
                         }
                         H2_PING => {
                             if flags & 0x1 == 0 {
-                                let _ = tls.writer().write_all(&h2_frame(H2_PING, 0x1, 0, &payload));
+                                let _ =
+                                    tls.writer().write_all(&h2_frame(H2_PING, 0x1, 0, &payload));
                             }
                         }
                         H2_HEADERS | H2_CONTINUATION => {
@@ -3560,9 +3636,12 @@ mod tests {
                                 // leaves stream 1's BODY dangling (no
                                 // DATA/END_STREAM) — the download that
                                 // never finishes.
-                                let _ = tls
-                                    .writer()
-                                    .write_all(&h2_frame(H2_HEADERS, 0x4, stream, &[0x88]));
+                                let _ = tls.writer().write_all(&h2_frame(
+                                    H2_HEADERS,
+                                    0x4,
+                                    stream,
+                                    &[0x88],
+                                ));
                                 if !(hang_first && stream == 1) {
                                     let _ = tls
                                         .writer()
@@ -3612,7 +3691,14 @@ mod tests {
         let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
         let cfg2 = cfg.clone();
         tokio::spawn(async move {
-            mirror_server_mimic(Box::new(server_duplex), forward, &cfg2, primary_key, close_rx).await;
+            mirror_server_mimic(
+                Box::new(server_duplex),
+                forward,
+                &cfg2,
+                primary_key,
+                close_rx,
+            )
+            .await;
         });
         std::mem::forget(close_tx);
         connect(cfg, Box::new(client_duplex)).await
@@ -3634,7 +3720,10 @@ mod tests {
                 base_nanoseconds: 10_000_000,
                 uniform_random_multiplier_nanoseconds: 0,
             },
-            next_step: vec![TrafficTransferCandidate { weight: 1, goto_location: 0 }],
+            next_step: vec![TrafficTransferCandidate {
+                weight: 1,
+                goto_location: 0,
+            }],
             ..http_step("step", "/h2carrier")
         }];
         let mut stream = run_client_h2(&cfg, "h2", false, requests.clone())
@@ -3656,7 +3745,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         assert_eq!(reqs[0].0, 1, "{reqs:?}");
-        assert!(reqs.len() >= 2, "the goto-self loop produced one request only: {reqs:?}");
+        assert!(
+            reqs.len() >= 2,
+            "the goto-self loop produced one request only: {reqs:?}"
+        );
         assert!(reqs.iter().all(|(id, _)| id % 2 == 1), "{reqs:?}");
         // The request is h2-shaped: literal-encoded pseudo-headers plus
         // the step header, lowercased on the wire (run_h2_step).
@@ -3664,9 +3756,15 @@ mod tests {
         let contains = |needle: &[u8]| block.windows(needle.len()).any(|w| w == needle);
         assert!(contains(b":method") && contains(b"GET"), "{block:?}");
         assert!(contains(b":scheme") && contains(b"https"), "{block:?}");
-        assert!(contains(b":authority") && contains(b"carrier.example"), "{block:?}");
+        assert!(
+            contains(b":authority") && contains(b"carrier.example"),
+            "{block:?}"
+        );
         assert!(contains(b":path") && contains(b"/h2carrier"), "{block:?}");
-        assert!(contains(b"user-agent") && contains(b"tlsmirror-h2-test"), "{block:?}");
+        assert!(
+            contains(b"user-agent") && contains(b"tlsmirror-h2-test"),
+            "{block:?}"
+        );
         // The hidden channel still works over the h2-generating carrier.
         echo_roundtrip(&mut stream, b"over-h2-generator").await;
     }
@@ -3696,9 +3794,9 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let reqs = requests.lock().unwrap().clone();
-            let next_ran = reqs.iter().any(|(id, block)| {
-                *id == 3 && block.windows(5).any(|w| w == b"/next")
-            });
+            let next_ran = reqs
+                .iter()
+                .any(|(id, block)| *id == 3 && block.windows(5).any(|w| w == b"/next"));
             if next_ran {
                 break;
             }
@@ -3745,7 +3843,14 @@ mod tests {
         let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
         let cfg2 = cfg.clone();
         tokio::spawn(async move {
-            mirror_server_mimic(Box::new(server_duplex), forward, &cfg2, primary_key, close_rx).await;
+            mirror_server_mimic(
+                Box::new(server_duplex),
+                forward,
+                &cfg2,
+                primary_key,
+                close_rx,
+            )
+            .await;
         });
         std::mem::forget(close_tx);
         let mut stream = connect(&cfg, Box::new(client_duplex)).await.unwrap();
@@ -3756,14 +3861,24 @@ mod tests {
     async fn config_rejections() {
         let mut cfg = base_cfg();
         cfg.primary_key.clear();
-        let err = connect(&cfg, Box::new(tokio::io::duplex(16).0)).await.err().map(|e| e.to_string()).unwrap_or_default();
+        let err = connect(&cfg, Box::new(tokio::io::duplex(16).0))
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
         assert!(err.contains("primary key"), "{err}");
         let mut cfg = base_cfg();
         cfg.primary_key = "!!!".into();
-        assert!(connect(&cfg, Box::new(tokio::io::duplex(16).0)).await.is_err());
+        assert!(connect(&cfg, Box::new(tokio::io::duplex(16).0))
+            .await
+            .is_err());
         let mut cfg = base_cfg();
         cfg.connection_enrolment = Some(("ingress".into(), "egress".into()));
-        let err = connect(&cfg, Box::new(tokio::io::duplex(16).0)).await.err().map(|e| e.to_string()).unwrap_or_default();
+        let err = connect(&cfg, Box::new(tokio::io::duplex(16).0))
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
         assert!(err.contains("connection-enrolment"), "{err}");
         assert!(err.contains("enrollment.go"), "{err}");
         // (The h2-carrier generator is no longer rejected at config time:
@@ -3771,7 +3886,9 @@ mod tests {
         // traffic_generator_carries_h2_* tests.)
         let mut cfg = base_cfg();
         cfg.server_name.clear();
-        assert!(connect(&cfg, Box::new(tokio::io::duplex(16).0)).await.is_err());
+        assert!(connect(&cfg, Box::new(tokio::io::duplex(16).0))
+            .await
+            .is_err());
         // The recommended suite list is exposed verbatim.
         assert!(RECOMMENDED_EXPLICIT_NONCE_CIPHER_SUITES.contains(&49195));
         assert_eq!(RECOMMENDED_EXPLICIT_NONCE_CIPHER_SUITES.len(), 48);
@@ -3786,7 +3903,9 @@ mod tests {
             host.ends_with(".tlsmirror-controlconnection.v2fly.arpa"),
             "{host}"
         );
-        let label = host.strip_suffix(".tlsmirror-controlconnection.v2fly.arpa").unwrap();
+        let label = host
+            .strip_suffix(".tlsmirror-controlconnection.v2fly.arpa")
+            .unwrap();
         assert!(!label.is_empty());
         assert!(
             label
@@ -3796,7 +3915,10 @@ mod tests {
         );
         // Deterministic for the same key.
         assert_eq!(host, server_identifier_host(&key).unwrap());
-        assert_ne!(host, server_identifier_host(&generate_primary_key()).unwrap());
+        assert_ne!(
+            host,
+            server_identifier_host(&generate_primary_key()).unwrap()
+        );
         // The intercept predicate (listener/tlsmirror/tlsmirror.go:82).
         let target = crate::addr::NetAddr::domain(&host, 80).unwrap();
         assert!(is_enrollment_control_target(&target, &key));
@@ -3819,7 +3941,10 @@ mod tests {
         assert_eq!(enrollment_base32_encode(&[0xff]), "vs");
         assert_eq!(enrollment_base32_encode(&[0xAB, 0xCD]), "lf6g");
         let range: Vec<u8> = (0..16u8).collect();
-        assert_eq!(enrollment_base32_encode(&range), "000g40o40k30e209185go38e1s");
+        assert_eq!(
+            enrollment_base32_encode(&range),
+            "000g40o40k30e209185go38e1s"
+        );
         // 16-byte identifiers give 26 chars (80 bits), no padding.
         assert_eq!(enrollment_base32_encode(&[0u8; 16]).len(), 26);
     }
@@ -3861,7 +3986,10 @@ mod tests {
         assert_eq!(k1.len(), 16);
         assert_eq!(k1, derive_enrollment_request_key(&key, &cr, &sr).unwrap());
         assert_ne!(k1, derive_enrollment_request_key(&key, &sr, &cr).unwrap());
-        assert_ne!(k1, derive_enrollment_request_key(&[8u8; 32], &cr, &sr).unwrap());
+        assert_ne!(
+            k1,
+            derive_enrollment_request_key(&[8u8; 32], &cr, &sr).unwrap()
+        );
         // The server identifier derivation (secondary key namespace).
         let id = derive_enrollment_server_identifier(&key).unwrap();
         assert_eq!(id.len(), 16);
@@ -4103,9 +4231,9 @@ mod tests {
 
         let mut client_cfg = cfg.clone();
         client_cfg.connection_enrolment = Some(("ingress".to_string(), "egress".to_string()));
-        let mut stream =
-            connect_with(&client_cfg, Box::new(client_duplex), Some(dialer)).await
-                .expect("enrolled connect");
+        let mut stream = connect_with(&client_cfg, Box::new(client_duplex), Some(dialer))
+            .await
+            .expect("enrolled connect");
         echo_roundtrip(&mut stream, b"enrol-echo").await;
     }
 
@@ -4122,5 +4250,4 @@ mod tests {
         assert!(err.contains("connect_with"), "{err}");
         assert!(err.contains("enrollment.go"), "{err}");
     }
-
 }

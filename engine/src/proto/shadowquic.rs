@@ -370,7 +370,9 @@ async fn read_socks_addr<R: AsyncRead + Unpin>(r: &mut R) -> Result<NetAddr> {
                 .await
                 .map_err(|e| Error::network(format!("shadowquic: short domain len: {e}")))?;
             let mut domain = vec![0u8; len[0] as usize];
-            r.read_exact(&mut domain).await.map_err(size_err("domain"))?;
+            r.read_exact(&mut domain)
+                .await
+                .map_err(size_err("domain"))?;
             let s = String::from_utf8(domain)
                 .map_err(|_| Error::protocol("shadowquic: domain not utf-8"))?;
             Host::Domain(s.to_ascii_lowercase())
@@ -380,11 +382,7 @@ async fn read_socks_addr<R: AsyncRead + Unpin>(r: &mut R) -> Result<NetAddr> {
             r.read_exact(&mut octets).await.map_err(size_err("ipv6"))?;
             Host::Ip(std::net::IpAddr::V6(octets.into()))
         }
-        other => {
-            return Err(Error::protocol(format!(
-                "shadowquic: bad atyp {other:#x}"
-            )))
-        }
+        other => return Err(Error::protocol(format!("shadowquic: bad atyp {other:#x}"))),
     };
     let port = read_u16(r).await?;
     Ok(NetAddr::new(host, port))
@@ -581,11 +579,10 @@ impl ConnState {
             });
         }
     }
-
 }
 
 impl RecvRouter {
-        /// `feedDatagram` (`state.go:139-162`): deliver to a known target or
+    /// `feedDatagram` (`state.go:139-162`): deliver to a known target or
     /// buffer (capped at [`MAX_PENDING_PACKETS_PER_ID`]).
     async fn feed_datagram(&self, id: u16, payload: Bytes) {
         let target = {
@@ -743,7 +740,10 @@ pub async fn connect(option: &ShadowQuicOption) -> Result<Client> {
     // `adapter/outbound/jls.go:10-15 JLSOptions.Parse`: both fields
     // required when either is set.
     let jls_user = if option.jls_enabled() {
-        Some(crate::proto::jls::JlsUser::new(&option.username, &option.password)?)
+        Some(crate::proto::jls::JlsUser::new(
+            &option.username,
+            &option.password,
+        )?)
     } else {
         None
     };
@@ -754,13 +754,9 @@ pub async fn connect(option: &ShadowQuicOption) -> Result<Client> {
     let socket = std::net::UdpSocket::bind(quic::family_bind_addr(remote))
         .map_err(|e| Error::network(format!("shadowquic bind: {e}")))?;
     crate::mark::apply(&socket);
-    let mut endpoint = quinn::Endpoint::new(
-        endpoint_config,
-        None,
-        socket,
-        Arc::new(quinn::TokioRuntime),
-    )
-    .map_err(|e| Error::network(format!("shadowquic endpoint: {e}")))?;
+    let mut endpoint =
+        quinn::Endpoint::new(endpoint_config, None, socket, Arc::new(quinn::TokioRuntime))
+            .map_err(|e| Error::network(format!("shadowquic endpoint: {e}")))?;
     endpoint.set_default_client_config(client_config(option, &sni, &alpn, jls_user.as_ref())?);
     let conn = endpoint
         .connect(remote, &sni)
@@ -819,6 +815,7 @@ fn client_config(
             server_name: None,
             skip_cert_verify: option.skip_cert_verify,
             alpn: Vec::new(),
+            ..Default::default()
         };
         let mut tls = (*tls_client_config(&settings)?).clone();
         tls.alpn_protocols = alpn.iter().map(|a| a.as_bytes().to_vec()).collect();
@@ -1015,9 +1012,7 @@ impl Association {
                     let mut control_stream = self.control.lock().await;
                     if let Err(e) = control_stream.write_all(&control).await {
                         self.state.router.release_send_ids(&[id]).await;
-                        return Err(Error::network(format!(
-                            "shadowquic udp control: {e}"
-                        )));
+                        return Err(Error::network(format!("shadowquic udp control: {e}")));
                     }
                     inner.send_ids.insert(key.clone(), id);
                     inner.send_id_set.insert(id);
@@ -1034,12 +1029,10 @@ impl Association {
                 let stream = match inner.uni_streams.get_mut(&key) {
                     Some(stream) => stream,
                     None => {
-                        let mut stream = self
-                            .state
-                            .conn
-                            .open_uni()
-                            .await
-                            .map_err(|e| Error::network(format!("shadowquic udp stream: {e}")))?;
+                        let mut stream =
+                            self.state.conn.open_uni().await.map_err(|e| {
+                                Error::network(format!("shadowquic udp stream: {e}"))
+                            })?;
                         let mut header = Vec::with_capacity(2);
                         write_packet_stream_header(&mut header, id);
                         if let Err(e) = stream.write_all(&header).await {
@@ -1084,13 +1077,20 @@ impl Association {
         let (send_ids, recv_ids, uni_streams) = {
             let mut inner = self.inner.lock().await;
             (
-                std::mem::take(&mut inner.send_id_set).into_iter().collect::<Vec<_>>(),
-                std::mem::take(&mut inner.recv_id_set).into_iter().collect::<Vec<_>>(),
+                std::mem::take(&mut inner.send_id_set)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                std::mem::take(&mut inner.recv_id_set)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
                 std::mem::take(&mut inner.uni_streams),
             )
         };
         self.state.router.release_send_ids(&send_ids).await;
-        self.state.router.remove_recv_ids(self.assoc, &recv_ids).await;
+        self.state
+            .router
+            .remove_recv_ids(self.assoc, &recv_ids)
+            .await;
         for (_, mut stream) in uni_streams {
             let _ = stream.finish();
         }
@@ -1101,7 +1101,6 @@ impl Association {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1111,8 +1110,8 @@ mod tests {
     use std::sync::{Arc, OnceLock};
     use std::time::Duration;
 
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use rustls::crypto::ring as ring_provider;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // ------------------------------------------------------------ framing
@@ -1121,20 +1120,25 @@ mod tests {
     fn quic_version_parsing() {
         // quic_version.go:28-38 aliases, case/underscore normalization.
         for spelling in ["v1", "1", "RFC9000", "rfc-9000", "V1"] {
-            assert_eq!(parse_quic_version(spelling).unwrap(), QuicVersion::V1, "{spelling}");
+            assert_eq!(
+                parse_quic_version(spelling).unwrap(),
+                QuicVersion::V1,
+                "{spelling}"
+            );
         }
         for spelling in ["v2", "2", "RFC9369", "rfc_9369"] {
-            assert_eq!(parse_quic_version(spelling).unwrap(), QuicVersion::V2, "{spelling}");
+            assert_eq!(
+                parse_quic_version(spelling).unwrap(),
+                QuicVersion::V2,
+                "{spelling}"
+            );
         }
         assert_eq!(QuicVersion::V1.wire_code(), 0x1);
         assert!(parse_quic_version("v3").is_err());
         // ParseQUICVersions dedups in order.
-        let versions = parse_quic_versions(&[
-            "v1".to_string(),
-            "1".to_string(),
-            "rfc9000".to_string(),
-        ])
-        .unwrap();
+        let versions =
+            parse_quic_versions(&["v1".to_string(), "1".to_string(), "rfc9000".to_string()])
+                .unwrap();
         assert_eq!(versions, vec![QuicVersion::V1]);
         assert_eq!(
             parse_quic_versions(&["v2".to_string(), "v1".to_string()]).unwrap(),
@@ -1266,7 +1270,10 @@ mod tests {
             Ok(Err(e)) => e,
             Ok(Ok(_)) => panic!("wrong password must not authenticate"),
         };
-        assert!(err.to_string().contains(crate::proto::jls::ERR_AUTH_FAILED), "{err}");
+        assert!(
+            err.to_string().contains(crate::proto::jls::ERR_AUTH_FAILED),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -1279,14 +1286,20 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("incomplete credentials must be a config error"),
         };
-        assert!(err.to_string().contains("jls: password is required"), "{err}");
+        assert!(
+            err.to_string().contains("jls: password is required"),
+            "{err}"
+        );
         option.username.clear();
         option.password = "pass1".into();
         let err = match connect(&option).await {
             Err(e) => e,
             Ok(_) => panic!("incomplete credentials must be a config error"),
         };
-        assert!(err.to_string().contains("jls: username is required"), "{err}");
+        assert!(
+            err.to_string().contains("jls: username is required"),
+            "{err}"
+        );
     }
 
     // ------------------------------------------------------ loopback QUIC
@@ -1530,8 +1543,7 @@ mod tests {
                         let datagram_assoc = Arc::clone(&server_assoc);
                         tokio::spawn(async move {
                             loop {
-                                let Ok(message) = datagram_assoc.conn.read_datagram().await
-                                else {
+                                let Ok(message) = datagram_assoc.conn.read_datagram().await else {
                                     return;
                                 };
                                 if let Ok((id, payload)) = decode_datagram(&message) {
@@ -1557,18 +1569,19 @@ mod tests {
     }
 
     async fn start_server() -> (Arc<TestStats>, SocketAddr, quinn::Endpoint) {
-        serve_forever(quinn::Endpoint::server(
-            quinn_server_config(),
-            SocketAddr::from(([127, 0, 0, 1], 0)),
+        serve_forever(
+            quinn::Endpoint::server(quinn_server_config(), SocketAddr::from(([127, 0, 0, 1], 0)))
+                .expect("server endpoint"),
         )
-        .expect("server endpoint"))
         .await
     }
 
     /// A JLS-terminating QUIC server: the handshake runs on the engine's
     /// own TLS 1.3 stack (validating + stamping the JLS randoms), the
     /// framing layer above is the same mimic.
-    async fn start_jls_server(users: Vec<crate::proto::jls::JlsUser>) -> (Arc<TestStats>, SocketAddr, quinn::Endpoint) {
+    async fn start_jls_server(
+        users: Vec<crate::proto::jls::JlsUser>,
+    ) -> (Arc<TestStats>, SocketAddr, quinn::Endpoint) {
         serve_forever(
             crate::quic::tls13::test_server::start_quinn_server(
                 crate::quic::tls13::ServerMode::Jls { users },
@@ -1579,7 +1592,9 @@ mod tests {
         .await
     }
 
-    async fn serve_forever(endpoint: quinn::Endpoint) -> (Arc<TestStats>, SocketAddr, quinn::Endpoint) {
+    async fn serve_forever(
+        endpoint: quinn::Endpoint,
+    ) -> (Arc<TestStats>, SocketAddr, quinn::Endpoint) {
         let addr = endpoint.local_addr().expect("local addr");
         let stats = Arc::new(TestStats::default());
         let server_stats = Arc::clone(&stats);
@@ -1608,8 +1623,7 @@ mod tests {
         // TLS 1.3 stack under quinn's crypto trait), then the framing
         // layer relays as usual.
         let user = crate::proto::jls::JlsUser::new("jls-user", "jls-pass").unwrap();
-        let (stats, addr, _endpoint) =
-            start_jls_server(vec![user.clone()]).await;
+        let (stats, addr, _endpoint) = start_jls_server(vec![user.clone()]).await;
         let mut option = test_option(addr.port());
         option.username = user.username.clone();
         option.password = user.password.clone();
@@ -1630,8 +1644,7 @@ mod tests {
     #[tokio::test]
     async fn jls_udp_datagram_mode_roundtrip() {
         let user = crate::proto::jls::JlsUser::new("jls-user", "jls-pass").unwrap();
-        let (stats, addr, _endpoint) =
-            start_jls_server(vec![user.clone()]).await;
+        let (stats, addr, _endpoint) = start_jls_server(vec![user.clone()]).await;
         let mut option = test_option(addr.port());
         option.username = user.username.clone();
         option.password = user.password.clone();
@@ -1762,7 +1775,8 @@ mod tests {
         // Multiple early packets buffer up.
         state.feed_datagram(9, Bytes::from_static(b"early2")).await;
         // The registration flushes both, in order.
-        state.store_recv(
+        state
+            .store_recv(
                 9,
                 RecvTarget {
                     assoc: 1,
@@ -1802,7 +1816,10 @@ mod tests {
             }
         }
         let err = state.alloc_send_id().await.unwrap_err();
-        assert_eq!(err.to_string(), "network: shadowquic: too many udp contexts");
+        assert_eq!(
+            err.to_string(),
+            "network: shadowquic: too many udp contexts"
+        );
         {
             // Freeing `second` lets the wrap scan find it again.
             let mut inner = state.inner.lock().await;
@@ -1815,4 +1832,3 @@ mod tests {
         assert!(!inner.active_send.contains(&first));
     }
 }
-

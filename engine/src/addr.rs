@@ -165,7 +165,10 @@ pub fn decode_port_first_addr(data: &[u8]) -> Result<(NetAddr, usize)> {
             let Some(o) = data.get(3..7) else {
                 return Err(Error::protocol("port-first addr: short ipv4"));
             };
-            (Host::Ip(IpAddr::V4(Ipv4Addr::new(o[0], o[1], o[2], o[3]))), 5)
+            (
+                Host::Ip(IpAddr::V4(Ipv4Addr::new(o[0], o[1], o[2], o[3]))),
+                5,
+            )
         }
         0x02 => {
             let Some(&l) = data.get(3) else {
@@ -186,7 +189,11 @@ pub fn decode_port_first_addr(data: &[u8]) -> Result<(NetAddr, usize)> {
             b.copy_from_slice(o);
             (Host::Ip(IpAddr::V6(Ipv6Addr::from(b))), 17)
         }
-        other => return Err(Error::protocol(format!("port-first addr: bad atyp {other:#x}"))),
+        other => {
+            return Err(Error::protocol(format!(
+                "port-first addr: bad atyp {other:#x}"
+            )))
+        }
     };
     Ok((NetAddr::new(host, port), 2 + used))
 }
@@ -224,7 +231,8 @@ pub fn decode_socks_addr(data: &[u8]) -> Result<(NetAddr, usize)> {
     let Some(&atyp) = data.first() else {
         return Err(Error::protocol("socks addr: empty"));
     };
-    let atyp = Atyp::from_u8(atyp).ok_or_else(|| Error::protocol(format!("socks addr: bad atyp {atyp:#x}")))?;
+    let atyp = Atyp::from_u8(atyp)
+        .ok_or_else(|| Error::protocol(format!("socks addr: bad atyp {atyp:#x}")))?;
     let mut off = 1usize;
     let host = match atyp {
         Atyp::Ipv4 => {
@@ -273,7 +281,10 @@ mod tests {
 
     #[test]
     fn host_parse_classifies() {
-        assert_eq!(Host::parse("Example.COM").unwrap(), Host::Domain("example.com".into()));
+        assert_eq!(
+            Host::parse("Example.COM").unwrap(),
+            Host::Domain("example.com".into())
+        );
         assert_eq!(
             Host::parse("1.2.3.4").unwrap(),
             Host::Ip(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)))
@@ -317,11 +328,18 @@ mod tests {
         encode_socks_addr(&mut buf, &Host::Domain("example.com".into()), 443);
         assert_eq!(
             buf,
-            vec![0x03, 0x0b, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o', b'm', 0x01, 0xbb]
+            vec![
+                0x03, 0x0b, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o', b'm', 0x01,
+                0xbb
+            ]
         );
         // IPv4: 01 7f000001 1f90
         let mut buf = Vec::new();
-        encode_socks_addr(&mut buf, &Host::Ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))), 8080);
+        encode_socks_addr(
+            &mut buf,
+            &Host::Ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+            8080,
+        );
         assert_eq!(buf, vec![0x01, 127, 0, 0, 1, 0x1f, 0x90]);
     }
 
@@ -330,7 +348,10 @@ mod tests {
         let mut buf = Vec::new();
         encode_socks_addr(&mut buf, &Host::Domain("example.com".into()), 80);
         for cut in 0..buf.len() {
-            assert!(decode_socks_addr(&buf[..cut]).is_err(), "cut {cut} should fail");
+            assert!(
+                decode_socks_addr(&buf[..cut]).is_err(),
+                "cut {cut} should fail"
+            );
         }
     }
 

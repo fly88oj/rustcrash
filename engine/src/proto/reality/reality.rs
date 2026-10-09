@@ -122,7 +122,9 @@ pub fn parse_short_id(value: &str) -> Result<Vec<u8>> {
     let trimmed = value.trim();
     let trimmed = trimmed.strip_prefix("0x").unwrap_or(trimmed);
     if !trimmed.len().is_multiple_of(2) {
-        return Err(Error::config("reality: short-id has an odd number of hex digits"));
+        return Err(Error::config(
+            "reality: short-id has an odd number of hex digits",
+        ));
     }
     let mut out = Vec::with_capacity(trimmed.len() / 2);
     let bytes = trimmed.as_bytes();
@@ -205,8 +207,8 @@ pub fn verify_temp_auth(auth_key: &[u8; 32], cert_der: &[u8]) -> Result<bool> {
     if signature.len() != 64 {
         return Ok(false);
     }
-    let mut mac =
-        Hmac::<Sha512>::new_from_slice(auth_key).map_err(|_| Error::crypto("reality: bad auth key"))?;
+    let mut mac = Hmac::<Sha512>::new_from_slice(auth_key)
+        .map_err(|_| Error::crypto("reality: bad auth key"))?;
     mac.update(&key);
     // `verify_slice` is the constant-time comparison from the hmac crate.
     Ok(mac.verify_slice(&signature).is_ok())
@@ -436,7 +438,12 @@ mod tests {
         assert_eq!(parse_short_id("").unwrap(), Vec::<u8>::new());
         assert_eq!(parse_short_id("0a0b").unwrap(), vec![0x0a, 0x0b]);
         assert_eq!(parse_short_id("0x0A0B").unwrap(), vec![0x0a, 0x0b]);
-        assert_eq!(parse_short_id("00112233445566778899aabbccddeeff").unwrap().len(), 16);
+        assert_eq!(
+            parse_short_id("00112233445566778899aabbccddeeff")
+                .unwrap()
+                .len(),
+            16
+        );
         assert!(parse_short_id("abc").is_err());
         assert!(parse_short_id("zz").is_err());
         assert!(parse_short_id("00112233445566778899aabbccddeeff00").is_err());
@@ -460,8 +467,9 @@ mod tests {
             assert_eq!(parse_public_key(&encoded).unwrap(), raw);
         }
         assert!(parse_public_key("not base64!!").is_err());
-        assert!(parse_public_key(&base64::engine::general_purpose::STANDARD.encode([1u8; 31]))
-            .is_err());
+        assert!(
+            parse_public_key(&base64::engine::general_purpose::STANDARD.encode([1u8; 31])).is_err()
+        );
     }
 
     #[test]
@@ -505,7 +513,10 @@ mod tests {
         // The hello must carry the sealed value, not the plaintext.
         let mut sent = hello.clone();
         sent[SESSION_ID_OFFSET..SESSION_ID_OFFSET + 32].copy_from_slice(&sealed);
-        assert_eq!(&sent[SESSION_ID_OFFSET..SESSION_ID_OFFSET + 32], &sealed[..]);
+        assert_eq!(
+            &sent[SESSION_ID_OFFSET..SESSION_ID_OFFSET + 32],
+            &sealed[..]
+        );
         assert_ne!(&sealed[..16], &plain[..16]);
 
         // --- server side (XTLS/reality tls.go) ---
@@ -526,10 +537,17 @@ mod tests {
         assert_eq!(recovered.len(), 16);
         assert_eq!(&recovered[..3], &CLIENT_VERSION);
         assert_eq!(&recovered[4..8], &(now as u32).to_be_bytes());
-        assert_eq!(&recovered[8..16], &short_id[..], "server reads the short id");
+        assert_eq!(
+            &recovered[8..16],
+            &short_id[..],
+            "server reads the short id"
+        );
         // The server compares only 8 bytes (ClientShortId [8]byte), which is
         // all a <= 8-byte short id needs.
-        assert_eq!(u32::from_be_bytes(recovered[4..8].try_into().unwrap()), now as u32);
+        assert_eq!(
+            u32::from_be_bytes(recovered[4..8].try_into().unwrap()),
+            now as u32
+        );
     }
 
     #[test]
@@ -550,9 +568,13 @@ mod tests {
             &[0u8; 32],
             &eph_public,
         );
-        let sealed =
-            seal_session_id(&c_auth, &random, &session_id_plain(&[1, 2, 3, 4], 9, CLIENT_VERSION), &hello)
-                .unwrap();
+        let sealed = seal_session_id(
+            &c_auth,
+            &random,
+            &session_id_plain(&[1, 2, 3, 4], 9, CLIENT_VERSION),
+            &hello,
+        )
+        .unwrap();
 
         let other_shared = tls13::x25519(&other_secret, &eph_public).unwrap();
         let other_auth = auth_key(&other_shared, &random).unwrap();
@@ -578,7 +600,10 @@ mod tests {
             other => panic!("expected an Ed25519 key, got {other:?}"),
         };
         let (start, len) = tls13::der::signature_range(&der).unwrap();
-        assert_eq!(len, 64, "the template cert has a 64-byte Ed25519 signature slot");
+        assert_eq!(
+            len, 64,
+            "the template cert has a 64-byte Ed25519 signature slot"
+        );
         let mut mac = Hmac::<Sha512>::new_from_slice(auth_key).unwrap();
         mac.update(&pubkey);
         let tag = mac.finalize().into_bytes();
@@ -682,16 +707,14 @@ mod tests {
                     } else {
                         // Auth failed: real servers fall through to the target
                         // site, which presents an ordinary (non-REALITY) cert.
-                        let key_pair =
-                            rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
-                        let der = rcgen::CertificateParams::new(vec![
-                            "www.example.com".to_string()
-                        ])
-                        .unwrap()
-                        .self_signed(&key_pair)
-                        .unwrap()
-                        .der()
-                        .to_vec();
+                        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+                        let der =
+                            rcgen::CertificateParams::new(vec!["www.example.com".to_string()])
+                                .unwrap()
+                                .self_signed(&key_pair)
+                                .unwrap()
+                                .der()
+                                .to_vec();
                         let signing = rustls::crypto::ring::sign::any_supported_type(
                             &rustls::pki_types::PrivateKeyDer::Pkcs8(
                                 key_pair.serialize_der().into(),
@@ -713,7 +736,9 @@ mod tests {
             tls
         });
 
-        let mut stream = connect(&cfg, Box::new(client)).await.expect("REALITY connect");
+        let mut stream = connect(&cfg, Box::new(client))
+            .await
+            .expect("REALITY connect");
         stream.write_all(b"vless-ish payload").await.unwrap();
         let mut buf = [0u8; 17];
         stream.read_exact(&mut buf).await.unwrap();

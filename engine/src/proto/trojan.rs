@@ -57,7 +57,11 @@ impl TrojanStream {
 }
 
 impl AsyncWrite for TrojanStream {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         if let Some(hdr) = self.pending.take() {
             ready!(write_all_pin(&mut self.inner, cx, &hdr))?;
         }
@@ -74,13 +78,21 @@ impl AsyncWrite for TrojanStream {
 }
 
 impl AsyncRead for TrojanStream {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         // Trojan responses carry no header — data starts immediately.
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 
-fn write_all_pin(inner: &mut BoxProxyStream, cx: &mut Context<'_>, mut data: &[u8]) -> Poll<io::Result<()>> {
+fn write_all_pin(
+    inner: &mut BoxProxyStream,
+    cx: &mut Context<'_>,
+    mut data: &[u8],
+) -> Poll<io::Result<()>> {
     while !data.is_empty() {
         let n = ready!(Pin::new(&mut *inner).poll_write(cx, data))?;
         if n == 0 {
@@ -93,7 +105,6 @@ fn write_all_pin(inner: &mut BoxProxyStream, cx: &mut Context<'_>, mut data: &[u
     }
     Poll::Ready(Ok(()))
 }
-
 
 /// Encode a trojan UDP datagram: `socks-addr || len-be16 || CRLF ||
 /// payload` (upstream: mihomo transport/trojan writePacket, Xray
@@ -151,5 +162,4 @@ mod tests {
         assert_eq!(&seen[59 + used..59 + used + 2], b"\r\n");
         assert_eq!(&seen[59 + used + 2..], b"data");
     }
-
 }

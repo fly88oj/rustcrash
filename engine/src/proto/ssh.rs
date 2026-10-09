@@ -21,8 +21,8 @@ use std::task::{ready, Context, Poll};
 use rand::Rng;
 use russh::client::{self, Config, Handle, Msg};
 use russh::keys::{
-    decode_secret_key, parse_public_key_base64, PrivateKeyWithHashAlg, PublicKey,
-    PublicKeyBase64, PublicKeyOrCertificate,
+    decode_secret_key, parse_public_key_base64, PrivateKeyWithHashAlg, PublicKey, PublicKeyBase64,
+    PublicKeyOrCertificate,
 };
 use russh::{ChannelStream, SshId};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -69,11 +69,11 @@ fn parse_host_keys(entries: &[String]) -> Result<Vec<HostKeyPin>> {
         // `PublicKey::from_openssh` covers "algo base64 [comment]";
         // `parse_public_key_base64` also takes a bare base64 blob.
         let key = PublicKey::from_openssh(entry).or_else(|_| parse_public_key_base64(entry));
-        let key = key
-            .map_err(|e| Error::config(format!("ssh: unusable host-key entry {entry:?}: {e}")))?;
-        let blob = key
-            .to_bytes()
-            .map_err(|e| Error::config(format!("ssh: cannot encode host-key entry {entry:?}: {e}")))?;
+        let key =
+            key.map_err(|e| Error::config(format!("ssh: unusable host-key entry {entry:?}: {e}")))?;
+        let blob = key.to_bytes().map_err(|e| {
+            Error::config(format!("ssh: cannot encode host-key entry {entry:?}: {e}"))
+        })?;
         pins.push((key.algorithm().to_string(), blob));
     }
     Ok(pins)
@@ -175,7 +175,12 @@ async fn authenticate(session: &mut Handle<Handler>, cfg: &SshOut) -> Result<()>
         let res = session
             .authenticate_publickey(&cfg.user, key)
             .await
-            .map_err(|e| Error::network(format!("ssh: public-key auth against {}:{}: {e}", cfg.server, cfg.port)))?;
+            .map_err(|e| {
+                Error::network(format!(
+                    "ssh: public-key auth against {}:{}: {e}",
+                    cfg.server, cfg.port
+                ))
+            })?;
         if res.success() {
             return Ok(());
         }
@@ -185,7 +190,12 @@ async fn authenticate(session: &mut Handle<Handler>, cfg: &SshOut) -> Result<()>
         let res = session
             .authenticate_password(&cfg.user, password)
             .await
-            .map_err(|e| Error::network(format!("ssh: password auth against {}:{}: {e}", cfg.server, cfg.port)))?;
+            .map_err(|e| {
+                Error::network(format!(
+                    "ssh: password auth against {}:{}: {e}",
+                    cfg.server, cfg.port
+                ))
+            })?;
         if res.success() {
             return Ok(());
         }
@@ -212,9 +222,13 @@ pub async fn connect(cfg: &SshOut, target: &NetAddr) -> Result<BoxProxyStream> {
         pinned,
         warned_accept_any: false,
     };
-    let mut session = client::connect(Arc::new(client_config()), (cfg.server.as_str(), cfg.port), handler)
-        .await
-        .map_err(|e| Error::network(format!("ssh: connect {}:{}: {e}", cfg.server, cfg.port)))?;
+    let mut session = client::connect(
+        Arc::new(client_config()),
+        (cfg.server.as_str(), cfg.port),
+        handler,
+    )
+    .await
+    .map_err(|e| Error::network(format!("ssh: connect {}:{}: {e}", cfg.server, cfg.port)))?;
 
     authenticate(&mut session, cfg).await?;
 
@@ -338,7 +352,11 @@ mod tests {
             user: &str,
             _key: &PublicKey,
         ) -> std::result::Result<server::Auth, Self::Error> {
-            Ok(if user == "tester" { server::Auth::Accept } else { reject() })
+            Ok(if user == "tester" {
+                server::Auth::Accept
+            } else {
+                reject()
+            })
         }
 
         async fn channel_open_direct_tcpip(
@@ -422,8 +440,8 @@ mod tests {
 
     #[test]
     fn host_key_pins_accept_both_spellings() {
-        let key = PrivateKey::random(&mut russh::keys::key::safe_rng(), Algorithm::Ed25519)
-            .unwrap();
+        let key =
+            PrivateKey::random(&mut russh::keys::key::safe_rng(), Algorithm::Ed25519).unwrap();
         let public = key.public_key().clone();
         let bare = public.public_key_base64();
         let line = public.to_openssh().unwrap();
@@ -433,11 +451,14 @@ mod tests {
         assert!(host_key_matches(&pins, &public.clone().into()));
         assert_eq!(pins[0].1, public.to_bytes().unwrap());
 
-        let other = PrivateKey::random(&mut russh::keys::key::safe_rng(), Algorithm::Ed25519)
-            .unwrap();
+        let other =
+            PrivateKey::random(&mut russh::keys::key::safe_rng(), Algorithm::Ed25519).unwrap();
         assert!(!host_key_matches(&pins, &other.public_key().clone().into()));
         assert!(parse_host_keys(&["not a key".to_string()]).is_err());
-        assert!(!host_key_matches(&[], &public.into()), "no pins is a don't-care");
+        assert!(
+            !host_key_matches(&[], &public.into()),
+            "no pins is a don't-care"
+        );
     }
 
     #[tokio::test]
@@ -489,8 +510,8 @@ mod tests {
     async fn private_key_auth_with_passphrase() {
         let plan = plan("unused-password");
         let addr = spawn_server(plan.clone()).await;
-        let key = PrivateKey::random(&mut russh::keys::key::safe_rng(), Algorithm::Ed25519)
-            .unwrap();
+        let key =
+            PrivateKey::random(&mut russh::keys::key::safe_rng(), Algorithm::Ed25519).unwrap();
         let passphrase = "generated-passphrase-9f2c";
         let encrypted = key
             .encrypt(&mut russh::keys::key::safe_rng(), passphrase)
@@ -516,8 +537,8 @@ mod tests {
     async fn pinned_host_key_mismatch_is_refused() {
         let plan = plan("pw");
         let addr = spawn_server(plan.clone()).await;
-        let other = PrivateKey::random(&mut russh::keys::key::safe_rng(), Algorithm::Ed25519)
-            .unwrap();
+        let other =
+            PrivateKey::random(&mut russh::keys::key::safe_rng(), Algorithm::Ed25519).unwrap();
         let mut cfg = cfg_for(addr, &plan);
         cfg.host_key = vec![other.public_key().public_key_base64()];
 

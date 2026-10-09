@@ -109,7 +109,11 @@ impl ControlHttpDialer {
                 dialer.https_port = Some(p);
             }
             ("https", None) => {}
-            _ => return Err(Error::config(format!("control url {url:?}: unknown scheme"))),
+            _ => {
+                return Err(Error::config(format!(
+                    "control url {url:?}: unknown scheme"
+                )))
+            }
         }
         Ok(dialer)
     }
@@ -138,7 +142,9 @@ impl ControlHttpDialer {
         Err(Error::network(format!(
             "controlhttp: all connection attempts failed (HTTP: {}, HTTPS: {})",
             err80,
-            err443.map(|e: Error| e.to_string()).unwrap_or_else(|| "not tried".into()),
+            err443
+                .map(|e: Error| e.to_string())
+                .unwrap_or_else(|| "not tried".into()),
         )))
     }
 
@@ -150,11 +156,8 @@ impl ControlHttpDialer {
         } else {
             self.http_port
         };
-        let (init, cont) = client_deferred(
-            &self.machine_key,
-            &self.control_key,
-            self.protocol_version,
-        )?;
+        let (init, cont) =
+            client_deferred(&self.machine_key, &self.control_key, self.protocol_version)?;
         let tcp = TcpStream::connect((self.hostname.as_str(), port))
             .await
             .map_err(|e| {
@@ -169,6 +172,7 @@ impl ControlHttpDialer {
                 server_name: Some(self.hostname.clone()),
                 skip_cert_verify: self.skip_cert_verify,
                 alpn: Vec::new(),
+                ..Default::default()
             };
             tls_connect(Box::new(tcp), &self.hostname, &settings)
                 .await
@@ -232,7 +236,9 @@ where
     }
     let mut ok_upgrade = false;
     for line in lines {
-        let Some((k, v)) = line.split_once(':') else { continue };
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
         if k.eq_ignore_ascii_case("upgrade") && v.trim() == UPGRADE_HEADER_VALUE {
             ok_upgrade = true;
         }
@@ -307,9 +313,15 @@ mod tests {
     #[test]
     fn control_url_parsing() {
         let (s, h, p) = parse_control_url("https://controlplane.tailscale.com").unwrap();
-        assert_eq!((s.as_str(), h.as_str(), p), ("https", "controlplane.tailscale.com", None));
+        assert_eq!(
+            (s.as_str(), h.as_str(), p),
+            ("https", "controlplane.tailscale.com", None)
+        );
         let (s, h, p) = parse_control_url("http://127.0.0.1:8080/x").unwrap();
-        assert_eq!((s.as_str(), h.as_str(), p), ("http", "127.0.0.1", Some(8080)));
+        assert_eq!(
+            (s.as_str(), h.as_str(), p),
+            ("http", "127.0.0.1", Some(8080))
+        );
         let (s, h, p) = parse_control_url("https://[::1]:9443/").unwrap();
         // IPv6 literals keep their brackets-stripped host + port.
         assert_eq!((s.as_str(), p), ("https", Some(9443)));
@@ -425,11 +437,9 @@ mod tests {
         let (mut a, mut b) = tokio::io::duplex(1024);
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
-            a.write_all(
-                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n",
-            )
-            .await
-            .unwrap();
+            a.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n")
+                .await
+                .unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         });
         let err = upgrade_over(&mut b, "x", &[0u8; 101]).await.unwrap_err();

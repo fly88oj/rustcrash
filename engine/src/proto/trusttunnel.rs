@@ -91,12 +91,7 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// `TCPUserAgent` (protocol.go:38): `<platform> <app>/<version>`.
 fn tcp_user_agent() -> String {
-    format!(
-        "{} {}/{}",
-        std::env::consts::OS,
-        APP_NAME,
-        APP_VERSION
-    )
+    format!("{} {}/{}", std::env::consts::OS, APP_NAME, APP_VERSION)
 }
 
 /// `UDPUserAgent`: `<platform> _udp2`.
@@ -201,8 +196,8 @@ impl TrustTunnelOut {
 /// `parse16BytesIP` (protocol.go:75): the v4-mapped form, except ::1.
 fn parse_16_bytes_ip(buffer: &[u8; 16]) -> std::net::IpAddr {
     let zero_prefix = buffer[..12].iter().all(|b| *b == 0);
-    let is_ipv4 = zero_prefix
-        && !(buffer[12] == 0 && buffer[13] == 0 && buffer[14] == 0 && buffer[15] == 1);
+    let is_ipv4 =
+        zero_prefix && !(buffer[12] == 0 && buffer[13] == 0 && buffer[14] == 0 && buffer[15] == 1);
     if is_ipv4 {
         std::net::IpAddr::V4(std::net::Ipv4Addr::new(
             buffer[12], buffer[13], buffer[14], buffer[15],
@@ -282,9 +277,9 @@ pub async fn read_trusttunnel_udp(
     let mut header = [0u8; HEADER];
     stream.read_exact(&mut header).await?;
     let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
-    let payload_len = length.checked_sub(16 + 2 + 16 + 2).ok_or_else(|| {
-        Error::protocol(format!("trusttunnel: invalid udp length: {length}"))
-    })?;
+    let payload_len = length
+        .checked_sub(16 + 2 + 16 + 2)
+        .ok_or_else(|| Error::protocol(format!("trusttunnel: invalid udp length: {length}")))?;
     let mut source = [0u8; 16];
     source.copy_from_slice(&header[4..20]);
     let addr = parse_16_bytes_ip(&source);
@@ -533,7 +528,10 @@ fn read_hpack_string(data: &[u8], off: usize) -> Option<(Vec<u8>, usize)> {
 /// A minimal HPACK decoder: indexed fields, literal-with-name-index,
 /// literal-new-name (with and without indexing — entries land in the
 /// dynamic table), dynamic table size updates, Huffman strings.
-fn hpack_decode(block: &[u8], dynamic: &mut Vec<(String, String)>) -> Result<Vec<(String, String)>> {
+fn hpack_decode(
+    block: &[u8],
+    dynamic: &mut Vec<(String, String)>,
+) -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
     let mut off = 0usize;
     while off < block.len() {
@@ -551,15 +549,15 @@ fn hpack_decode(block: &[u8], dynamic: &mut Vec<(String, String)>) -> Result<Vec
                 .ok_or_else(|| Error::protocol("trusttunnel: hpack truncated name index"))?;
             off = n;
             let name = if name == 0 {
-                let (s, n) =
-                    read_hpack_string(block, off).ok_or_else(|| Error::protocol("trusttunnel: hpack truncated name"))?;
+                let (s, n) = read_hpack_string(block, off)
+                    .ok_or_else(|| Error::protocol("trusttunnel: hpack truncated name"))?;
                 off = n;
                 String::from_utf8_lossy(&s).into_owned()
             } else {
                 hpack_lookup(name as usize, dynamic)?.0
             };
-            let (value, n) =
-                read_hpack_string(block, off).ok_or_else(|| Error::protocol("trusttunnel: hpack truncated value"))?;
+            let (value, n) = read_hpack_string(block, off)
+                .ok_or_else(|| Error::protocol("trusttunnel: hpack truncated value"))?;
             off = n;
             let value = String::from_utf8_lossy(&value).into_owned();
             dynamic.insert(0, (name.clone(), value.clone()));
@@ -575,15 +573,15 @@ fn hpack_decode(block: &[u8], dynamic: &mut Vec<(String, String)>) -> Result<Vec
                 .ok_or_else(|| Error::protocol("trusttunnel: hpack truncated name index"))?;
             off = n;
             let name = if idx == 0 {
-                let (s, n) =
-                    read_hpack_string(block, off).ok_or_else(|| Error::protocol("trusttunnel: hpack truncated name"))?;
+                let (s, n) = read_hpack_string(block, off)
+                    .ok_or_else(|| Error::protocol("trusttunnel: hpack truncated name"))?;
                 off = n;
                 String::from_utf8_lossy(&s).into_owned()
             } else {
                 hpack_lookup(idx as usize, dynamic)?.0
             };
-            let (value, n) =
-                read_hpack_string(block, off).ok_or_else(|| Error::protocol("trusttunnel: hpack truncated value"))?;
+            let (value, n) = read_hpack_string(block, off)
+                .ok_or_else(|| Error::protocol("trusttunnel: hpack truncated value"))?;
             off = n;
             out.push((name, String::from_utf8_lossy(&value).into_owned()));
         }
@@ -701,7 +699,12 @@ impl H2Conn {
         host: &str,
         user_agent: &str,
         auth: &str,
-    ) -> Result<(u32, tokio::sync::mpsc::UnboundedReceiver<H2Event>, Arc<std::sync::Mutex<i64>>, Arc<tokio::sync::Notify>)> {
+    ) -> Result<(
+        u32,
+        tokio::sync::mpsc::UnboundedReceiver<H2Event>,
+        Arc<std::sync::Mutex<i64>>,
+        Arc<tokio::sync::Notify>,
+    )> {
         let id = self.next_stream_id.fetch_add(2, Ordering::SeqCst);
         if id == 0 || id > 0x7FFF_F000 {
             return Err(Error::network("trusttunnel: h2 stream ids exhausted"));
@@ -777,14 +780,20 @@ impl H2Conn {
                         "trusttunnel: h2 stream closed before response",
                     ))
                 }
-                H2Event::GoAway => {
-                    return Err(Error::network("trusttunnel: h2 connection gone"))
-                }
+                H2Event::GoAway => return Err(Error::network("trusttunnel: h2 connection gone")),
             }
         }
     }
 
-    async fn write_data(&self, id: u32, window: &Arc<std::sync::Mutex<i64>>, changed: &Arc<tokio::sync::Notify>, mut buf: &[u8], conn_window: &Arc<std::sync::Mutex<i64>>, conn_changed: &Arc<tokio::sync::Notify>) -> Result<usize> {
+    async fn write_data(
+        &self,
+        id: u32,
+        window: &Arc<std::sync::Mutex<i64>>,
+        changed: &Arc<tokio::sync::Notify>,
+        mut buf: &[u8],
+        conn_window: &Arc<std::sync::Mutex<i64>>,
+        conn_changed: &Arc<tokio::sync::Notify>,
+    ) -> Result<usize> {
         let total = buf.len();
         while !buf.is_empty() {
             // Wait for the smaller of the stream and connection windows.
@@ -809,7 +818,10 @@ impl H2Conn {
             let take = {
                 let sw = *window.lock().unwrap();
                 let cw = *conn_window.lock().unwrap();
-                buf.len().min(H2_MAX_FRAME).min(sw.max(0) as usize).min(cw.max(0) as usize)
+                buf.len()
+                    .min(H2_MAX_FRAME)
+                    .min(sw.max(0) as usize)
+                    .min(cw.max(0) as usize)
             };
             if take == 0 {
                 continue;
@@ -865,8 +877,7 @@ async fn h2_reader_task(
             }
             let frame_type = rbuf[3];
             let flags = rbuf[4];
-            let stream_id =
-                u32::from_be_bytes([rbuf[5], rbuf[6], rbuf[7], rbuf[8]]) & 0x7FFF_FFFF;
+            let stream_id = u32::from_be_bytes([rbuf[5], rbuf[6], rbuf[7], rbuf[8]]) & 0x7FFF_FFFF;
             let payload = rbuf[9..9 + len].to_vec();
             rbuf.advance(9 + len);
             match frame_type {
@@ -892,7 +903,9 @@ async fn h2_reader_task(
                 }
                 H2_WINDOW_UPDATE => {
                     if payload.len() == 4 {
-                        let inc = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) as i64;
+                        let inc =
+                            u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
+                                as i64;
                         if stream_id == 0 {
                             *conn_window.lock().unwrap() += inc;
                             conn_window_changed.notify_one();
@@ -1212,7 +1225,12 @@ fn h3_frame_at(data: &[u8]) -> Option<(u64, u64, usize)> {
 /// A QPACK string literal: length prefix `prefix_bits` wide starting at
 /// `off` (the pattern byte when the prefix is embedded), Huffman bit at
 /// `huff_mask`.
-fn read_qpack_string(data: &[u8], off: usize, prefix_bits: u32, huff_mask: u8) -> Option<(Vec<u8>, usize)> {
+fn read_qpack_string(
+    data: &[u8],
+    off: usize,
+    prefix_bits: u32,
+    huff_mask: u8,
+) -> Option<(Vec<u8>, usize)> {
     let first = *data.get(off)?;
     let huffman = first & huff_mask != 0;
     let (len, off) = read_int(data, off, prefix_bits)?;
@@ -1233,16 +1251,18 @@ fn qpack_decode_field_section(block: &[u8]) -> Result<Vec<(String, String)>> {
     let mut fields = Vec::new();
     // Field section prefix: required insert count (8-bit prefix) + sign
     // bit + base (7-bit prefix with S).
-    let (_, n) = read_int(block, 0, 8).ok_or_else(|| Error::protocol("trusttunnel: qpack prefix"))?;
-    let (_, n2) = read_int(block, n, 7).ok_or_else(|| Error::protocol("trusttunnel: qpack base"))?;
+    let (_, n) =
+        read_int(block, 0, 8).ok_or_else(|| Error::protocol("trusttunnel: qpack prefix"))?;
+    let (_, n2) =
+        read_int(block, n, 7).ok_or_else(|| Error::protocol("trusttunnel: qpack base"))?;
     let mut off = n2;
     while off < block.len() {
         let b = block[off];
         if b & 0x80 != 0 {
             // Indexed field line (static only).
             let is_static = b & 0x40 != 0;
-            let (idx, n) =
-                read_int(block, off, 6).ok_or_else(|| Error::protocol("trusttunnel: qpack index"))?;
+            let (idx, n) = read_int(block, off, 6)
+                .ok_or_else(|| Error::protocol("trusttunnel: qpack index"))?;
             off = n;
             if !is_static {
                 return Err(Error::protocol("trusttunnel: qpack dynamic reference"));
@@ -1252,8 +1272,8 @@ fn qpack_decode_field_section(block: &[u8]) -> Result<Vec<(String, String)>> {
         } else if b & 0xC0 == 0x40 {
             // Literal with name reference (static).
             let is_static = b & 0x08 != 0;
-            let (idx, n) =
-                read_int(block, off, 4).ok_or_else(|| Error::protocol("trusttunnel: qpack name index"))?;
+            let (idx, n) = read_int(block, off, 4)
+                .ok_or_else(|| Error::protocol("trusttunnel: qpack name index"))?;
             off = n;
             if !is_static {
                 return Err(Error::protocol("trusttunnel: qpack dynamic name reference"));
@@ -1290,7 +1310,11 @@ fn qpack_static(idx: usize) -> Result<(String, String)> {
     // RFC 9204 appendix A (subset covering the :status range).
     let entry = match idx {
         0 => return Err(Error::protocol("trusttunnel: qpack index 0")),
-        1..=21 => return Err(Error::protocol("trusttunnel: qpack unexpected static entry")),
+        1..=21 => {
+            return Err(Error::protocol(
+                "trusttunnel: qpack unexpected static entry",
+            ))
+        }
         25 => (":status", "200"),
         26 => (":status", "204"),
         27 => (":status", "206"),
@@ -1458,7 +1482,8 @@ impl TrustTunnelPool {
                     let create = if num == 0 {
                         false
                     } else if self.cfg.max_connections > 0 {
-                        !(conns.len() as i64 >= self.cfg.max_connections || num < self.cfg.min_streams)
+                        !(conns.len() as i64 >= self.cfg.max_connections
+                            || num < self.cfg.min_streams)
                     } else {
                         !(self.cfg.max_streams > 0 && num < self.cfg.max_streams)
                     };
@@ -1503,7 +1528,11 @@ impl TrustTunnelPool {
     }
 
     /// `Dial` (client.go:218): CONNECT with the TCP user agent.
-    pub async fn dial(&self, target: &NetAddr, transport: Option<BoxProxyStream>) -> Result<BoxProxyStream> {
+    pub async fn dial(
+        &self,
+        target: &NetAddr,
+        transport: Option<BoxProxyStream>,
+    ) -> Result<BoxProxyStream> {
         let host = format!("{}:{}", target.host.to_text(), target.port);
         let (_, stream) = self
             .open_tunnel(&host, &tcp_user_agent(), transport)
@@ -1523,7 +1552,11 @@ impl TrustTunnelPool {
     /// immediately once the 200 arrives.
     pub async fn health_check(&self, transport: Option<BoxProxyStream>) -> Result<()> {
         let (_, mut stream) = self
-            .open_tunnel(HEALTH_CHECK_MAGIC_ADDRESS, &health_check_user_agent(), transport)
+            .open_tunnel(
+                HEALTH_CHECK_MAGIC_ADDRESS,
+                &health_check_user_agent(),
+                transport,
+            )
             .await?;
         use tokio::io::AsyncWriteExt as _;
         let _ = stream.shutdown().await;
@@ -1550,7 +1583,12 @@ fn validate_cfg(cfg: &TrustTunnelOut) -> Result<()> {
         )));
     }
     if cfg.quic {
-        match cfg.congestion_controller.trim().to_ascii_lowercase().as_str() {
+        match cfg
+            .congestion_controller
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "" | "cubic" | "bbr" | "new_reno" => {}
             other => {
                 return Err(Error::config(format!(
@@ -1582,6 +1620,7 @@ async fn tls_wrap(cfg: &TrustTunnelOut, transport: BoxProxyStream) -> Result<Box
         server_name: Some(server_name.clone()),
         skip_cert_verify: cfg.skip_cert_verify,
         alpn,
+        ..Default::default()
     };
     tls_connect(transport, &server_name, &settings).await
 }
@@ -1679,7 +1718,10 @@ mod tests {
         let auth = build_auth("Aladdin", "open sesame");
         assert_eq!(
             auth,
-            format!("Basic {}", base64::engine::general_purpose::STANDARD.encode("Aladdin:open sesame"))
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode("Aladdin:open sesame")
+            )
         );
         assert!(tcp_user_agent().contains(APP_NAME));
         assert!(tcp_user_agent().contains(std::env::consts::OS));
@@ -1698,7 +1740,10 @@ mod tests {
         let app_len = APP_NAME.len();
         assert_eq!(&frame[..4], &((36 + 1 + app_len + 1) as u32).to_be_bytes());
         assert_eq!(&frame[4..22], &[0u8; 18]); // unknown source
-        assert_eq!(&frame[22..38], &build_padding_ip("8.8.8.8".parse().unwrap()));
+        assert_eq!(
+            &frame[22..38],
+            &build_padding_ip("8.8.8.8".parse().unwrap())
+        );
         assert_eq!(&frame[38..40], &53u16.to_be_bytes());
         assert_eq!(frame[40], app_len as u8);
         assert_eq!(&frame[41..41 + app_len], APP_NAME.as_bytes());
@@ -1723,7 +1768,16 @@ mod tests {
             std::net::IpAddr::V4("1.2.3.4".parse().unwrap())
         );
         assert_eq!(
-            parse_16_bytes_ip(&[0u8; 15][..].to_vec().iter().copied().chain([1u8]).collect::<Vec<u8>>().try_into().unwrap()),
+            parse_16_bytes_ip(
+                &[0u8; 15][..]
+                    .to_vec()
+                    .iter()
+                    .copied()
+                    .chain([1u8])
+                    .collect::<Vec<u8>>()
+                    .try_into()
+                    .unwrap()
+            ),
             std::net::IpAddr::V6("::1".parse().unwrap())
         );
         assert!(parse_trusttunnel_udp(&inbound[..30]).is_err());
@@ -1768,7 +1822,11 @@ mod tests {
         assert_eq!(huffman_decode(&coded).unwrap(), b"www.example.com");
         // Round-trip arbitrary strings through the table (bit-pack,
         // pad with the EOS prefix, decode back).
-        for s in [b"no-cache".to_vec(), b"custom-key".to_vec(), (0u8..=255).collect::<Vec<u8>>()] {
+        for s in [
+            b"no-cache".to_vec(),
+            b"custom-key".to_vec(),
+            (0u8..=255).collect::<Vec<u8>>(),
+        ] {
             let mut bits: Vec<bool> = Vec::new();
             for &sym in &s {
                 let (code, len) = HUFFMAN_CODES[sym as usize];
@@ -1820,7 +1878,10 @@ mod tests {
     fn h2_frame_header_layout() {
         let mut out = Vec::new();
         put_h2_frame(&mut out, H2_DATA, H2_FLAG_END_STREAM, 3, b"abcd");
-        assert_eq!(&out[..9], &[0, 0, 4, H2_DATA, H2_FLAG_END_STREAM, 0, 0, 0, 3]);
+        assert_eq!(
+            &out[..9],
+            &[0, 0, 4, H2_DATA, H2_FLAG_END_STREAM, 0, 0, 0, 3]
+        );
         assert_eq!(&out[9..], b"abcd");
     }
 
@@ -1830,13 +1891,11 @@ mod tests {
         cfg.port = 1;
         assert!(validate_cfg(&cfg).is_ok());
         cfg.server.clear();
-        assert!(
-            validate_cfg(&cfg)
-                .err()
-                .map(|e| e.to_string())
-                .unwrap_or_default()
-                .contains("server and port")
-        );
+        assert!(validate_cfg(&cfg)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default()
+            .contains("server and port"));
         let mut cfg = test_cfg();
         cfg.port = 1;
         cfg.quic = true;
@@ -1857,8 +1916,8 @@ mod tests {
     // ------------------------------------------------ h2 mimic (TCP + TLS)
 
     fn server_tls_config() -> Arc<rustls::ServerConfig> {
-        let certified = rcgen::generate_simple_self_signed(vec!["tt.example".to_string()])
-            .expect("rcgen cert");
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["tt.example".to_string()]).expect("rcgen cert");
         let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
         let key =
             rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
@@ -1897,7 +1956,9 @@ mod tests {
                 }
             }
             if !tls_out.is_empty() {
-                send.write_all(&tls_out).await.map_err(|er| er.to_string())?;
+                send.write_all(&tls_out)
+                    .await
+                    .map_err(|er| er.to_string())?;
                 send.flush().await.map_err(|er| er.to_string())?;
                 tls_out.clear();
             }
@@ -2040,7 +2101,9 @@ mod tests {
                 let mut block = Vec::new();
                 put_hpack_literal(&mut block, b":status", b"200");
                 put_h2_frame(&mut out, H2_HEADERS, H2_FLAG_END_HEADERS, stream_id, &block);
-                tls.writer().write_all(&out).map_err(|er| format!("response write: {er}"))?;
+                tls.writer()
+                    .write_all(&out)
+                    .map_err(|er| format!("response write: {er}"))?;
                 served.insert(stream_id);
                 plain_buf.drain(..off);
                 continue;
@@ -2070,7 +2133,13 @@ mod tests {
                             requests.lock().unwrap().push(fields.clone());
                             let mut block = Vec::new();
                             put_hpack_literal(&mut block, b":status", b"200");
-                            put_h2_frame(&mut responses, H2_HEADERS, H2_FLAG_END_HEADERS, sid, &block);
+                            put_h2_frame(
+                                &mut responses,
+                                H2_HEADERS,
+                                H2_FLAG_END_HEADERS,
+                                sid,
+                                &block,
+                            );
                             served.insert(sid);
                         }
                     } else if ftype == H2_DATA && !payload.is_empty() && served.contains(&sid) {
@@ -2080,14 +2149,18 @@ mod tests {
                 }
                 plain_buf.drain(..off);
                 if !responses.is_empty() {
-                    tls.writer().write_all(&responses).map_err(|er| er.to_string())?;
+                    tls.writer()
+                        .write_all(&responses)
+                        .map_err(|er| er.to_string())?;
                     while tls.wants_write() {
                         if tls.write_tls(&mut tls_out).unwrap_or(0) == 0 {
                             break;
                         }
                     }
                     if !tls_out.is_empty() {
-                        send.write_all(&tls_out).await.map_err(|er| er.to_string())?;
+                        send.write_all(&tls_out)
+                            .await
+                            .map_err(|er| er.to_string())?;
                         send.flush().await.map_err(|er| er.to_string())?;
                         tls_out.clear();
                     }
@@ -2131,7 +2204,9 @@ mod tests {
                         let inc = (payload.len() as u32).to_be_bytes();
                         put_h2_frame(&mut out, H2_WINDOW_UPDATE, 0, *sid, &inc);
                         put_h2_frame(&mut out, H2_WINDOW_UPDATE, 0, 0, &inc);
-                        tls.writer().write_all(&out).map_err(|er| format!("echo write: {er}"))?;
+                        tls.writer()
+                            .write_all(&out)
+                            .map_err(|er| format!("echo write: {er}"))?;
                         echoed = true;
                         // Flush to the socket before the next batch:
                         // rustls' plaintext buffer is record-sized.
@@ -2141,7 +2216,9 @@ mod tests {
                             }
                         }
                         if !tls_out.is_empty() {
-                            send.write_all(&tls_out).await.map_err(|er| er.to_string())?;
+                            send.write_all(&tls_out)
+                                .await
+                                .map_err(|er| er.to_string())?;
                             send.flush().await.map_err(|er| er.to_string())?;
                             tls_out.clear();
                         }
@@ -2209,7 +2286,9 @@ mod tests {
                             }
                         }
                         if !tls_out.is_empty() {
-                            send.write_all(&tls_out).await.map_err(|er| er.to_string())?;
+                            send.write_all(&tls_out)
+                                .await
+                                .map_err(|er| er.to_string())?;
                             send.flush().await.map_err(|er| er.to_string())?;
                             tls_out.clear();
                         }
@@ -2266,7 +2345,9 @@ mod tests {
                                 }
                             }
                             if !tls_out.is_empty() {
-                                send.write_all(&tls_out).await.map_err(|er| er.to_string())?;
+                                send.write_all(&tls_out)
+                                    .await
+                                    .map_err(|er| er.to_string())?;
                                 send.flush().await.map_err(|er| er.to_string())?;
                                 tls_out.clear();
                             }
@@ -2440,12 +2521,14 @@ mod tests {
         // The CONNECT carried the target as :authority + auth.
         let reqs = requests.lock().unwrap();
         assert!(reqs.iter().any(|f| {
-            f.iter().any(|(n, v)| n == ":authority" && v == "echo.example:443")
+            f.iter()
+                .any(|(n, v)| n == ":authority" && v == "echo.example:443")
                 && f.iter().any(|(n, v)| n == ":method" && v == "CONNECT")
                 && f.iter().any(|(n, v)| {
                     n == "proxy-authorization" && *v == build_auth(&cfg.username, &cfg.password)
                 })
-                && f.iter().any(|(n, v)| n == "user-agent" && *v == tcp_user_agent())
+                && f.iter()
+                    .any(|(n, v)| n == "user-agent" && *v == tcp_user_agent())
         }));
     }
 
@@ -2584,8 +2667,11 @@ mod tests {
             Err(e) => {
                 let msg = e.to_string();
                 assert!(
-                    msg.contains("auth") || msg.contains("status") || msg.contains("closed")
-                        || msg.contains("gone") || msg.contains("eof"),
+                    msg.contains("auth")
+                        || msg.contains("status")
+                        || msg.contains("closed")
+                        || msg.contains("gone")
+                        || msg.contains("eof"),
                     "{msg}"
                 );
             }
@@ -2595,8 +2681,8 @@ mod tests {
     // ------------------------------------------------------- quic (h3) arm
 
     fn quinn_server_config() -> quinn::ServerConfig {
-        let certified = rcgen::generate_simple_self_signed(vec!["tt.example".to_string()])
-            .expect("rcgen cert");
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["tt.example".to_string()]).expect("rcgen cert");
         let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
         let key =
             rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
@@ -2637,7 +2723,8 @@ mod tests {
                                     .find(|(n, _)| n == ":authority")
                                     .map(|(_, v)| v.clone())
                                     .unwrap_or_default();
-                                if authority != "echo.example:443" && authority != UDP_MAGIC_ADDRESS {
+                                if authority != "echo.example:443" && authority != UDP_MAGIC_ADDRESS
+                                {
                                     return;
                                 }
                                 let rest = buf[hdr + flen as usize..].to_vec();
@@ -2795,7 +2882,11 @@ mod tests {
         cfg.alpn = vec!["http/1.1".to_string()];
         cfg.port = 1;
         cfg.sni = "x".into();
-        let err = quic_dial(&cfg).await.err().map(|e| e.to_string()).unwrap_or_default();
+        let err = quic_dial(&cfg)
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
         assert!(err.contains("require alpn h3"), "{err}");
     }
 }

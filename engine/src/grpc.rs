@@ -117,9 +117,7 @@ pub async fn grpc_connect(
         (6u16, 10_485_760), // MAX_HEADER_LIST_SIZE = 10 MiB
     ]
     .into_iter()
-    .flat_map(|(id, val)| {
-        id.to_be_bytes().into_iter().chain(val.to_be_bytes())
-    })
+    .flat_map(|(id, val)| id.to_be_bytes().into_iter().chain(val.to_be_bytes()))
     .collect();
     put_frame(&mut conn.out, FT_SETTINGS, 0, 0, &settings);
     let conn_bump = (CONN_WINDOW - DEFAULT_WINDOW) as u32;
@@ -614,8 +612,7 @@ impl AsyncWrite for GrpcStream {
                 // `flag(0) | be32(1 + uvarint_len + n) | 0x0A | uvarint(n) | data`.
                 this.sendq.reserve(take + 11);
                 this.sendq.put_u8(0); // uncompressed-flag
-                this.sendq
-                    .put_u32((take + 1 + uvarint_len(take)) as u32); // big-endian length
+                this.sendq.put_u32((take + 1 + uvarint_len(take)) as u32); // big-endian length
                 this.sendq.put_u8(HUNK_TAG); // protobuf field 1, wire type 2
                 put_uvarint(&mut this.sendq, take);
                 this.sendq.put_slice(&buf[accepted..accepted + take]);
@@ -1902,7 +1899,6 @@ mod tests {
         assert_eq!(&buf, b"hello gun");
     }
 
-
     #[tokio::test]
     async fn grpc_connect_rejects_non_200() {
         let (client, server) = fake_gun_server_pipe(404).await;
@@ -2037,7 +2033,8 @@ mod tests {
                         let mut msg = Vec::new();
                         msg.push(0u8);
                         msg.extend_from_slice(
-                            &((1 + uvarint_len(request.len()) + request.len()) as u32).to_be_bytes(),
+                            &((1 + uvarint_len(request.len()) + request.len()) as u32)
+                                .to_be_bytes(),
                         );
                         msg.push(HUNK_TAG);
                         put_uvarint(&mut msg, request.len());

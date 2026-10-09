@@ -33,7 +33,7 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll, ready};
+use std::task::{ready, Context, Poll};
 
 use hkdf::Hkdf;
 use rand::RngCore;
@@ -3762,7 +3762,7 @@ pub(crate) mod test_server {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::reality::profiles::{UtslProfile, build_client_hello};
+    use crate::proto::reality::profiles::{build_client_hello, UtslProfile};
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::AsyncWriteExt;
 
@@ -3855,9 +3855,7 @@ mod tests {
         let mut p = RecordProtector::new(&keys).unwrap();
         assert_eq!(
             p.nonce(),
-            [
-                0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5
-            ]
+            [0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5]
         );
         p.seq = 1;
         assert_eq!(p.nonce()[11], 0xa4);
@@ -4450,7 +4448,7 @@ mod tests {
 
     use crate::proto::ech as ech_mod;
     use crate::proto::reality::tls13::test_server::{
-        EchServerMode, accept_ech, ech_server_key, find_ext_body,
+        accept_ech, ech_server_key, find_ext_body, EchServerMode,
     };
 
     fn ech_webpki_auth(cert_der: &[u8], name: &str) -> ServerAuth {
@@ -4999,11 +4997,10 @@ mod tests {
             );
         }
         // The outer hello in the clear must not leak the inner name.
-        assert!(
-            !set.outer_msg
-                .windows(b"secret.example".len())
-                .any(|w| w == b"secret.example")
-        );
+        assert!(!set
+            .outer_msg
+            .windows(b"secret.example".len())
+            .any(|w| w == b"secret.example"));
 
         // Round-trip: HPKE-open the outer payload and reconstruct — the
         // result must equal the client's transcript-form inner byte for

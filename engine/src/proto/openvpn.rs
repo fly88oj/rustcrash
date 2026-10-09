@@ -341,7 +341,9 @@ impl OpenVpnOut {
     /// (config.go:227-333), with mihomo's exact error strings.
     fn prepare(&self) -> Result<Settings> {
         if self.handshake_timeout < 0 {
-            return Err(Error::config("openvpn handshake timeout must be non-negative"));
+            return Err(Error::config(
+                "openvpn handshake timeout must be non-negative",
+            ));
         }
         let tran_window_set = self.tran_window.is_some();
         let transition_window = match self.tran_window {
@@ -373,7 +375,9 @@ impl OpenVpnOut {
         };
 
         if self.server.trim().is_empty() || self.port == 0 {
-            return Err(Error::config("openvpn config requires remote host and port"));
+            return Err(Error::config(
+                "openvpn config requires remote host and port",
+            ));
         }
         if dev != "tun" {
             return Err(Error::config(format!(
@@ -429,8 +433,12 @@ impl OpenVpnOut {
         }
         let cert = self.cert.as_deref().map(|c| c.as_bytes().to_vec());
         let key = self.key.as_deref().map(|k| k.as_bytes().to_vec());
-        let has_cert = cert.as_ref().is_some_and(|c| !c.iter().all(|b| b.is_ascii_whitespace()));
-        let has_key = key.as_ref().is_some_and(|k| !k.iter().all(|b| b.is_ascii_whitespace()));
+        let has_cert = cert
+            .as_ref()
+            .is_some_and(|c| !c.iter().all(|b| b.is_ascii_whitespace()));
+        let has_key = key
+            .as_ref()
+            .is_some_and(|k| !k.iter().all(|b| b.is_ascii_whitespace()));
         if has_cert || has_key {
             if !has_cert || !has_key {
                 return Err(Error::config(
@@ -450,16 +458,18 @@ impl OpenVpnOut {
         }
 
         let tls_auth_key = if !tls_auth.trim().is_empty() {
-            Some(decode_static_key(tls_auth.as_bytes()).map_err(|e| {
-                Error::config(format!("parse tls-auth key: {e}"))
-            })?)
+            Some(
+                decode_static_key(tls_auth.as_bytes())
+                    .map_err(|e| Error::config(format!("parse tls-auth key: {e}")))?,
+            )
         } else {
             None
         };
         let tls_crypt_key = if !tls_crypt.trim().is_empty() {
-            Some(decode_static_key(tls_crypt.as_bytes()).map_err(|e| {
-                Error::config(format!("parse tls-crypt key: {e}"))
-            })?)
+            Some(
+                decode_static_key(tls_crypt.as_bytes())
+                    .map_err(|e| Error::config(format!("parse tls-crypt key: {e}")))?,
+            )
         } else {
             None
         };
@@ -479,7 +489,10 @@ impl OpenVpnOut {
                         "openvpn dns URL {url:?} requires a scheme (e.g. udp://1.1.1.1)"
                     )));
                 };
-                if !matches!(scheme, "udp" | "tcp" | "tls" | "https" | "h3" | "quic" | "dhcp" | "system") {
+                if !matches!(
+                    scheme,
+                    "udp" | "tcp" | "tls" | "https" | "h3" | "quic" | "dhcp" | "system"
+                ) {
                     return Err(Error::config(format!(
                         "openvpn dns URL {url:?}: unsupported scheme {scheme:?}"
                     )));
@@ -492,7 +505,11 @@ impl OpenVpnOut {
             port: self.port,
             proto,
             cipher,
-            data_ciphers: self.data_ciphers.iter().map(|c| normalize_cipher(c)).collect(),
+            data_ciphers: self
+                .data_ciphers
+                .iter()
+                .map(|c| normalize_cipher(c))
+                .collect(),
             fallback_cipher: normalize_cipher(&self.data_cipher_fallback),
             auth,
             comp_lzo,
@@ -520,7 +537,11 @@ impl OpenVpnOut {
             } else {
                 Duration::from_secs(30) // renegotiateTimeout
             },
-            mtu: if self.mtu == 0 { 1500 } else { self.mtu as usize },
+            mtu: if self.mtu == 0 {
+                1500
+            } else {
+                self.mtu as usize
+            },
             remote_dns_resolve: self.remote_dns_resolve,
             dns: self.dns.clone(),
         })
@@ -781,9 +802,7 @@ impl AuthDigest {
             AUTH_SHA256 => Ok(AuthDigest::Sha256),
             AUTH_SHA384 => Ok(AuthDigest::Sha384),
             AUTH_SHA512 => Ok(AuthDigest::Sha512),
-            other => Err(Error::config(format!(
-                "unsupported openvpn auth {other:?}"
-            ))),
+            other => Err(Error::config(format!("unsupported openvpn auth {other:?}"))),
         }
     }
 
@@ -969,7 +988,9 @@ impl ControlCrypt {
                 Ok(out)
             }
             ControlCrypt::TlsCrypt { encrypt, .. } | ControlCrypt::TlsCryptV2 { encrypt, .. } => {
-                Ok(tls_crypt_wrap(encrypt, header, packet_id, unix_time, plaintext))
+                Ok(tls_crypt_wrap(
+                    encrypt, header, packet_id, unix_time, plaintext,
+                ))
             }
         }
     }
@@ -1360,7 +1381,11 @@ fn openvpn_prf(
     let s2 = &secret[secret.len() - split..];
     let md5_out = p_hash_md5(s1, &seed, size);
     let sha1_out = p_hash_sha1(s2, &seed, size);
-    md5_out.iter().zip(sha1_out.iter()).map(|(a, b)| a ^ b).collect()
+    md5_out
+        .iter()
+        .zip(sha1_out.iter())
+        .map(|(a, b)| a ^ b)
+        .collect()
 }
 
 /// pHash (keymethod.go:368-379): the TLS A(n) expansion, HMAC-MD5 half.
@@ -1414,7 +1439,11 @@ fn install_script_options_string(proto: &str, cipher: &str, auth: &str, comp_lzo
         CIPHER_AES256GCM | CIPHER_AES256CBC | CIPHER_CHACHA20POLY1305 => "256",
         _ => "128",
     };
-    let (mtu, comp) = if comp_lzo { ("1544", "comp-lzo,") } else { ("1550", "") };
+    let (mtu, comp) = if comp_lzo {
+        ("1544", "comp-lzo,")
+    } else {
+        ("1550", "")
+    };
     format!(
         "V4,dev-type tun,link-mtu {mtu},tun-mtu 1500,proto {proto_name},{comp}cipher {cipher},\
          auth {auth},keysize {keysize},key-method 2,tls-client"
@@ -1469,7 +1498,8 @@ const OPENVPN_PING_PACKET: [u8; 16] = [
     0x2a, 0x18, 0x7b, 0xf3, 0x64, 0x1e, 0xb4, 0xcb, 0x07, 0xed, 0x2d, 0x0a, 0x98, 0x1f, 0xc7, 0x48,
 ];
 
-type AesBlock16 = aes::cipher::generic_array::GenericArray<u8, aes::cipher::generic_array::typenum::U16>;
+type AesBlock16 =
+    aes::cipher::generic_array::GenericArray<u8, aes::cipher::generic_array::typenum::U16>;
 
 enum AesBlock {
     A128(Aes128),
@@ -1587,54 +1617,51 @@ impl DataChannel {
                 ))),
             }
         };
-        let (send, recv) =
-            match cipher_name {
-                CIPHER_AES128GCM | CIPHER_AES192GCM | CIPHER_AES256GCM
-                | CIPHER_CHACHA20POLY1305 => {
-                    // The AEAD implicit IV is the first 8 bytes of the
-                    // HMAC half (data.go:97-109).
-                    if keys.send_hmac_key.len() < 8 || keys.recv_hmac_key.len() < 8 {
-                        return Err(Error::crypto("openvpn implicit IV keys are too short"));
-                    }
-                    let mut s = DataDirection {
-                        cipher: DataCipher::Aead(mk_aead(&keys.send_cipher_key)?),
-                        hmac_key: keys.send_hmac_key.clone(),
-                        implicit_iv: [0; DATA_CHANNEL_IV_SIZE],
-                    };
-                    s.implicit_iv[4..].copy_from_slice(&keys.send_hmac_key[..8]);
-                    let mut r = DataDirection {
-                        cipher: DataCipher::Aead(mk_aead(&keys.recv_cipher_key)?),
-                        hmac_key: keys.recv_hmac_key.clone(),
-                        implicit_iv: [0; DATA_CHANNEL_IV_SIZE],
-                    };
-                    r.implicit_iv[4..].copy_from_slice(&keys.recv_hmac_key[..8]);
-                    (s, r)
+        let (send, recv) = match cipher_name {
+            CIPHER_AES128GCM | CIPHER_AES192GCM | CIPHER_AES256GCM | CIPHER_CHACHA20POLY1305 => {
+                // The AEAD implicit IV is the first 8 bytes of the
+                // HMAC half (data.go:97-109).
+                if keys.send_hmac_key.len() < 8 || keys.recv_hmac_key.len() < 8 {
+                    return Err(Error::crypto("openvpn implicit IV keys are too short"));
                 }
-                _ => {
-                    let auth_size = digest.size();
-                    if keys.send_hmac_key.len() < auth_size || keys.recv_hmac_key.len() < auth_size
-                    {
-                        return Err(Error::crypto("openvpn HMAC keys are too short"));
-                    }
-                    let s = DataDirection {
-                        cipher: DataCipher::Cbc {
-                            block: AesBlock::new(&keys.send_cipher_key)?,
-                            mac: digest,
-                        },
-                        hmac_key: keys.send_hmac_key[..auth_size].to_vec(),
-                        implicit_iv: [0; DATA_CHANNEL_IV_SIZE],
-                    };
-                    let r = DataDirection {
-                        cipher: DataCipher::Cbc {
-                            block: AesBlock::new(&keys.recv_cipher_key)?,
-                            mac: digest,
-                        },
-                        hmac_key: keys.recv_hmac_key[..auth_size].to_vec(),
-                        implicit_iv: [0; DATA_CHANNEL_IV_SIZE],
-                    };
-                    (s, r)
+                let mut s = DataDirection {
+                    cipher: DataCipher::Aead(mk_aead(&keys.send_cipher_key)?),
+                    hmac_key: keys.send_hmac_key.clone(),
+                    implicit_iv: [0; DATA_CHANNEL_IV_SIZE],
+                };
+                s.implicit_iv[4..].copy_from_slice(&keys.send_hmac_key[..8]);
+                let mut r = DataDirection {
+                    cipher: DataCipher::Aead(mk_aead(&keys.recv_cipher_key)?),
+                    hmac_key: keys.recv_hmac_key.clone(),
+                    implicit_iv: [0; DATA_CHANNEL_IV_SIZE],
+                };
+                r.implicit_iv[4..].copy_from_slice(&keys.recv_hmac_key[..8]);
+                (s, r)
+            }
+            _ => {
+                let auth_size = digest.size();
+                if keys.send_hmac_key.len() < auth_size || keys.recv_hmac_key.len() < auth_size {
+                    return Err(Error::crypto("openvpn HMAC keys are too short"));
                 }
-            };
+                let s = DataDirection {
+                    cipher: DataCipher::Cbc {
+                        block: AesBlock::new(&keys.send_cipher_key)?,
+                        mac: digest,
+                    },
+                    hmac_key: keys.send_hmac_key[..auth_size].to_vec(),
+                    implicit_iv: [0; DATA_CHANNEL_IV_SIZE],
+                };
+                let r = DataDirection {
+                    cipher: DataCipher::Cbc {
+                        block: AesBlock::new(&keys.recv_cipher_key)?,
+                        mac: digest,
+                    },
+                    hmac_key: keys.recv_hmac_key[..auth_size].to_vec(),
+                    implicit_iv: [0; DATA_CHANNEL_IV_SIZE],
+                };
+                (s, r)
+            }
+        };
         Ok(DataChannel {
             send,
             recv,
@@ -1765,7 +1792,10 @@ impl DataChannel {
                 if padding == 0 || padding > block_size || padding > buf.len() {
                     return Err(Error::protocol("invalid openvpn CBC padding"));
                 }
-                if buf[buf.len() - padding..].iter().any(|b| *b as usize != padding) {
+                if buf[buf.len() - padding..]
+                    .iter()
+                    .any(|b| *b as usize != padding)
+                {
                     return Err(Error::protocol("invalid openvpn CBC padding"));
                 }
                 let plain = &buf[..buf.len() - padding];
@@ -1827,7 +1857,10 @@ fn nonce_of(packet_id: u32, implicit: &[u8; DATA_CHANNEL_IV_SIZE]) -> [u8; DATA_
 /// data.go:432-440 aeadAdditionalData.
 fn aead_additional_data(header: &[u8], packet_id: &[u8]) -> Vec<u8> {
     let mut ad = Vec::with_capacity(header.len() + 4);
-    if header.first().is_some_and(|first| parse_opcode_key_id(*first).0 == P_DATA_V2) {
+    if header
+        .first()
+        .is_some_and(|first| parse_opcode_key_id(*first).0 == P_DATA_V2)
+    {
         ad.extend_from_slice(header);
     }
     ad.extend_from_slice(packet_id);
@@ -2152,7 +2185,9 @@ fn parse_auth_pending_timeout(msg: &str) -> Result<PushReply> {
 
 /// client.go:1629-1674 mergePushReply (dedup, wire order).
 fn merge_push_reply(prev: Option<PushReply>, next: PushReply) -> Option<PushReply> {
-    let Some(mut prev) = prev else { return Some(next) };
+    let Some(mut prev) = prev else {
+        return Some(next);
+    };
     let mut next = next;
     fn push_unique<T: PartialEq>(list: &mut Vec<T>, add: Vec<T>) {
         for v in add {
@@ -2302,13 +2337,11 @@ impl Link {
                     .map_err(|e| Error::network(e.to_string()))?;
                 Ok(())
             }
-            Link::Udp(socket) => {
-                socket
-                    .send(packet)
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| Error::network(e.to_string()))
-            }
+            Link::Udp(socket) => socket
+                .send(packet)
+                .await
+                .map(|_| ())
+                .map_err(|e| Error::network(e.to_string())),
         }
     }
 }
@@ -2618,45 +2651,48 @@ impl Reliable {
         crypt: Option<&ControlCrypt>,
         raw: &[u8],
     ) -> Result<(ControlPacket, u32, u32)> {
-        let (opcode, key_id, local, acks, ack_remote, message_id, payload, pid, time) =
-            match crypt {
-                None => {
-                    if raw.len() < TLS_CRYPT_HEADER_SIZE + 1 {
-                        return Err(Error::protocol("control packet too short"));
-                    }
-                    let (opcode, key_id) = parse_opcode_key_id(raw[0]);
-                    if !opcode_is_control(opcode) {
-                        return Err(Error::protocol(format!(
-                            "opcode {opcode} is not a control opcode"
-                        )));
-                    }
-                    let mut local = [0u8; SESSION_ID_SIZE];
-                    local.copy_from_slice(&raw[1..TLS_CRYPT_HEADER_SIZE]);
-                    let (acks, ack_remote, message_id, payload) =
-                        control_decode_plain(opcode, &raw[TLS_CRYPT_HEADER_SIZE..])?;
-                    (opcode, key_id, local, acks, ack_remote, message_id, payload, 0, 0)
+        let (opcode, key_id, local, acks, ack_remote, message_id, payload, pid, time) = match crypt
+        {
+            None => {
+                if raw.len() < TLS_CRYPT_HEADER_SIZE + 1 {
+                    return Err(Error::protocol("control packet too short"));
                 }
-                Some(crypt) => {
-                    let (header, pid, time, plain) = crypt.unwrap(raw)?;
-                    if header.len() != TLS_CRYPT_HEADER_SIZE {
-                        return Err(Error::protocol(format!(
-                            "invalid control header length {}",
-                            header.len()
-                        )));
-                    }
-                    let (opcode, key_id) = parse_opcode_key_id(header[0]);
-                    if !opcode_is_control(opcode) {
-                        return Err(Error::protocol(format!(
-                            "opcode {opcode} is not a control opcode"
-                        )));
-                    }
-                    let mut local = [0u8; SESSION_ID_SIZE];
-                    local.copy_from_slice(&header[1..]);
-                    let (acks, ack_remote, message_id, payload) =
-                        control_decode_plain(opcode, &plain)?;
-                    (opcode, key_id, local, acks, ack_remote, message_id, payload, pid, time)
+                let (opcode, key_id) = parse_opcode_key_id(raw[0]);
+                if !opcode_is_control(opcode) {
+                    return Err(Error::protocol(format!(
+                        "opcode {opcode} is not a control opcode"
+                    )));
                 }
-            };
+                let mut local = [0u8; SESSION_ID_SIZE];
+                local.copy_from_slice(&raw[1..TLS_CRYPT_HEADER_SIZE]);
+                let (acks, ack_remote, message_id, payload) =
+                    control_decode_plain(opcode, &raw[TLS_CRYPT_HEADER_SIZE..])?;
+                (
+                    opcode, key_id, local, acks, ack_remote, message_id, payload, 0, 0,
+                )
+            }
+            Some(crypt) => {
+                let (header, pid, time, plain) = crypt.unwrap(raw)?;
+                if header.len() != TLS_CRYPT_HEADER_SIZE {
+                    return Err(Error::protocol(format!(
+                        "invalid control header length {}",
+                        header.len()
+                    )));
+                }
+                let (opcode, key_id) = parse_opcode_key_id(header[0]);
+                if !opcode_is_control(opcode) {
+                    return Err(Error::protocol(format!(
+                        "opcode {opcode} is not a control opcode"
+                    )));
+                }
+                let mut local = [0u8; SESSION_ID_SIZE];
+                local.copy_from_slice(&header[1..]);
+                let (acks, ack_remote, message_id, payload) = control_decode_plain(opcode, &plain)?;
+                (
+                    opcode, key_id, local, acks, ack_remote, message_id, payload, pid, time,
+                )
+            }
+        };
         Ok((
             ControlPacket {
                 opcode,
@@ -2739,8 +2775,12 @@ struct UdpSock {
 enum Phase {
     Established,
     /// Fresh TLS epoch driving toward the KM2 record.
-    RekeyTls { sent_km2: bool },
-    RekeyKm2 { buf: Vec<u8> },
+    RekeyTls {
+        sent_km2: bool,
+    },
+    RekeyKm2 {
+        buf: Vec<u8>,
+    },
     Failed,
 }
 
@@ -3111,7 +3151,8 @@ impl Client {
                     // own control message stays pure TLS bytes.
                     self.send_ack(link).await?;
                 }
-                self.send_control(link, P_CONTROL_V1, piece.to_vec()).await?;
+                self.send_control(link, P_CONTROL_V1, piece.to_vec())
+                    .await?;
             }
         }
     }
@@ -3127,7 +3168,9 @@ impl Client {
     }
 
     fn tls_feed(&mut self, wire: &[u8]) -> std::result::Result<(), rustls::Error> {
-        let Some(tls) = self.tls.as_mut() else { return Ok(()) };
+        let Some(tls) = self.tls.as_mut() else {
+            return Ok(());
+        };
         let mut rest = wire;
         while !rest.is_empty() {
             let mut cursor = std::io::Cursor::new(rest);
@@ -3233,7 +3276,9 @@ impl Client {
 
     async fn tls_write_all(&mut self, link: &mut Link, bytes: &[u8]) -> Result<()> {
         {
-            let Some(tls) = self.tls.as_mut() else { return Ok(()) };
+            let Some(tls) = self.tls.as_mut() else {
+                return Ok(());
+            };
             use std::io::Write;
             tls.writer()
                 .write_all(bytes)
@@ -3279,7 +3324,13 @@ impl Client {
         let key_len = cipher_key_length(&negotiated);
         keys.send_cipher_key.truncate(key_len);
         keys.recv_cipher_key.truncate(key_len);
-        let channel = DataChannel::new(&keys, &negotiated, &self.settings.auth, push.peer_id, key_id)?;
+        let channel = DataChannel::new(
+            &keys,
+            &negotiated,
+            &self.settings.auth,
+            push.peer_id,
+            key_id,
+        )?;
         self.install_data_channel(channel);
         Ok(())
     }
@@ -3341,7 +3392,12 @@ impl Client {
 
     /// client.go:686-795 writeDataPacket: comp-lzo framing, epoch
     /// selection, encrypt, send.
-    async fn write_data_packet(&mut self, link: &mut Link, packet: &[u8], compress: bool) -> Result<()> {
+    async fn write_data_packet(
+        &mut self,
+        link: &mut Link,
+        packet: &[u8],
+        compress: bool,
+    ) -> Result<()> {
         let packet = if compress && self.settings.comp_lzo {
             lzo_frame(packet)
         } else {
@@ -3374,8 +3430,12 @@ impl Client {
     fn select_outbound(&self) -> (Option<u8>, Option<u8>, bool) {
         let current = self.current_key;
         let outbound = self.outbound_key.or(current);
-        let Some(cur) = current else { return (None, None, false) };
-        let Some(out) = outbound else { return (current, None, false) };
+        let Some(cur) = current else {
+            return (None, None, false);
+        };
+        let Some(out) = outbound else {
+            return (current, None, false);
+        };
         if out == cur {
             return (current, outbound, false);
         }
@@ -3384,7 +3444,11 @@ impl Client {
         let retiring_expired = self
             .retiring
             .is_some_and(|(k, expiry)| Some(k) == outbound && Instant::now() > expiry);
-        (current, outbound, peer_active || selection_expired || retiring_expired)
+        (
+            current,
+            outbound,
+            peer_active || selection_expired || retiring_expired,
+        )
     }
 
     async fn write_ping(&mut self, link: &mut Link) -> Result<()> {
@@ -3537,7 +3601,12 @@ impl Client {
 
     /// Source-address selection: the pushed address of the family.
     fn local_address_for(&self, dst: &SocketAddr) -> Result<IpAddress> {
-        for (addr, _) in self.push.as_ref().map(|p| p.prefixes.as_slice()).unwrap_or(&[]) {
+        for (addr, _) in self
+            .push
+            .as_ref()
+            .map(|p| p.prefixes.as_slice())
+            .unwrap_or(&[])
+        {
             match (addr, dst) {
                 (IpAddr::V4(a), SocketAddr::V4(_)) => return Ok(IpAddress::Ipv4(*a)),
                 (IpAddr::V6(a), SocketAddr::V6(_)) => return Ok(IpAddress::Ipv6(*a)),
@@ -3593,9 +3662,7 @@ impl Client {
                 );
                 let cx = self.iface.context();
                 if let Err(e) = sock.connect(cx, endpoint, local) {
-                    let _ = reply.send(Err(Error::network(format!(
-                        "openvpn: connect: {e:?}"
-                    ))));
+                    let _ = reply.send(Err(Error::network(format!("openvpn: connect: {e:?}"))));
                     return;
                 }
                 let handle = self.sockets.add(sock);
@@ -3642,7 +3709,14 @@ impl Client {
                 let id = self.next_udp_id;
                 self.next_udp_id += 1;
                 let (tx, rx) = mpsc::channel(64);
-                self.udp.insert(id, UdpSock { handle, port, down: tx });
+                self.udp.insert(
+                    id,
+                    UdpSock {
+                        handle,
+                        port,
+                        down: tx,
+                    },
+                );
                 let _ = reply.send(Ok((id, rx)));
             }
             Cmd::UdpSend { id, dst, data } => {
@@ -3921,7 +3995,9 @@ impl Client {
         //    newIPStack(push.Prefixes, mtu)). The default routes ride the
         //    local address of each family.
         if push.prefixes.is_empty() {
-            return Err(Error::protocol("openvpn push reply missing ifconfig address"));
+            return Err(Error::protocol(
+                "openvpn push reply missing ifconfig address",
+            ));
         }
         self.iface.update_ip_addrs(|addrs| {
             for (addr, bits) in &push.prefixes {
@@ -4041,7 +4117,9 @@ impl Client {
             }
             let got = self.read_tls_plaintext(link, Some(deadline)).await?;
             if got.is_empty() {
-                return Err(Error::network("openvpn tls stream closed before PUSH_REPLY"));
+                return Err(Error::network(
+                    "openvpn tls stream closed before PUSH_REPLY",
+                ));
             }
             buf.extend_from_slice(&got);
             if buf.len() > MAX_TLS_CONTROL_BUFFER {
@@ -4203,8 +4281,8 @@ fn cert_parts(cert: &[u8]) -> Option<CertParts<'_>> {
     rest = &rest[alg_total..];
     let (_, sig, _) = der_tlv(rest)?;
     let sig = sig.get(1..)?; // BIT STRING: skip the unused-bits byte.
-    // SPKI: the tbs SEQUENCE child that parses as
-    // SEQUENCE { AlgorithmIdentifier, BIT STRING }.
+                             // SPKI: the tbs SEQUENCE child that parses as
+                             // SEQUENCE { AlgorithmIdentifier, BIT STRING }.
     let mut t = tbs;
     while let Some((tag, val, consumed)) = der_tlv(t) {
         if tag == 0x30 {
@@ -4225,19 +4303,35 @@ fn cert_parts(cert: &[u8]) -> Option<CertParts<'_>> {
 
 /// Verify `cert` was signed by `signer`'s public key (ring, by family).
 fn cert_signed_by(cert: &[u8], signer: &[u8]) -> bool {
-    let Some((tbs, _oid, sig, _)) = cert_parts(cert) else { return false };
-    let Some((_, _, _, signer_spki)) = cert_parts(signer) else { return false };
-    let Some((_, spki_body, _)) = der_tlv(&signer_spki) else { return false };
-    let Some((_, _, alg_len)) = der_tlv(spki_body) else { return false };
-    let Some((_, alg_oid, _)) = der_tlv(spki_body) else { return false };
-    let Some((_, key_bits_raw, _)) = der_tlv(&spki_body[alg_len..]) else { return false };
+    let Some((tbs, _oid, sig, _)) = cert_parts(cert) else {
+        return false;
+    };
+    let Some((_, _, _, signer_spki)) = cert_parts(signer) else {
+        return false;
+    };
+    let Some((_, spki_body, _)) = der_tlv(&signer_spki) else {
+        return false;
+    };
+    let Some((_, _, alg_len)) = der_tlv(spki_body) else {
+        return false;
+    };
+    let Some((_, alg_oid, _)) = der_tlv(spki_body) else {
+        return false;
+    };
+    let Some((_, key_bits_raw, _)) = der_tlv(&spki_body[alg_len..]) else {
+        return false;
+    };
     let key_bits = key_bits_raw.get(1..).unwrap_or(key_bits_raw);
     match alg_oid {
         // rsaEncryption
         [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01] => {
-            let Some((_, n_body, n_len)) = der_tlv(key_bits) else { return false };
+            let Some((_, n_body, n_len)) = der_tlv(key_bits) else {
+                return false;
+            };
             let n = n_body.get(1..).unwrap_or(n_body); // skip leading zero
-            let Some((_, e_body, _)) = der_tlv(&key_bits[n_len..]) else { return false };
+            let Some((_, e_body, _)) = der_tlv(&key_bits[n_len..]) else {
+                return false;
+            };
             // Signature OID → algorithm selection.
             let alg = match _oid {
                 [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b] => {
@@ -4270,12 +4364,11 @@ fn cert_signed_by(cert: &[u8], signer: &[u8]) -> bool {
                 .is_ok()
         }
         // Ed25519
-        [0x2b, 0x65, 0x70] => ring::signature::UnparsedPublicKey::new(
-            &ring::signature::ED25519,
-            key_bits,
-        )
-        .verify(tbs, sig)
-        .is_ok(),
+        [0x2b, 0x65, 0x70] => {
+            ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key_bits)
+                .verify(tbs, sig)
+                .is_ok()
+        }
         _ => false,
     }
 }
@@ -4335,9 +4428,9 @@ impl rustls::client::danger::ServerCertVerifier for OpenVpnCaVerifier {
         chain.extend(intermediates.iter().map(|c| c.as_ref()));
         if self.rooted(&chain)
             || (!intermediates.is_empty()
-                && intermediates
-                    .iter()
-                    .any(|i| cert_signed_by(end_entity.as_ref(), i.as_ref()) && self.rooted(&[i.as_ref()])))
+                && intermediates.iter().any(|i| {
+                    cert_signed_by(end_entity.as_ref(), i.as_ref()) && self.rooted(&[i.as_ref()])
+                }))
         {
             return Ok(rustls::client::danger::ServerCertVerified::assertion());
         }
@@ -4715,7 +4808,11 @@ async fn dial_link(settings: &Settings) -> Result<Link> {
         .ok_or_else(|| Error::dns(format!("openvpn: no address for {}", settings.server)))?;
     match settings.proto.as_str() {
         PROTO_UDP => {
-            let bind = if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+            let bind = if addr.is_ipv4() {
+                "0.0.0.0:0"
+            } else {
+                "[::]:0"
+            };
             let socket = UdpSocket::bind(bind)
                 .await
                 .map_err(|e| Error::network(format!("openvpn: bind udp: {e}")))?;
@@ -4980,7 +5077,10 @@ mod tests {
 
     enum MimicLink {
         Tcp(TcpStream),
-        Udp { socket: UdpSocket, peer: Option<SocketAddr> },
+        Udp {
+            socket: UdpSocket,
+            peer: Option<SocketAddr>,
+        },
     }
 
     impl MimicLink {
@@ -4989,7 +5089,10 @@ mod tests {
                 MimicLink::Tcp(stream) => {
                     use tokio::io::AsyncReadExt;
                     let mut len = [0u8; 2];
-                    stream.read_exact(&mut len).await.map_err(|e| Error::network(e.to_string()))?;
+                    stream
+                        .read_exact(&mut len)
+                        .await
+                        .map_err(|e| Error::network(e.to_string()))?;
                     let size = usize::from(u16::from_be_bytes(len));
                     stream
                         .read_exact(&mut buf[..size])
@@ -5018,8 +5121,14 @@ mod tests {
                     let mut frame = Vec::with_capacity(2 + packet.len());
                     frame.extend_from_slice(&(packet.len() as u16).to_be_bytes());
                     frame.extend_from_slice(packet);
-                    stream.write_all(&frame).await.map_err(|e| Error::network(e.to_string()))?;
-                    stream.flush().await.map_err(|e| Error::network(e.to_string()))?;
+                    stream
+                        .write_all(&frame)
+                        .await
+                        .map_err(|e| Error::network(e.to_string()))?;
+                    stream
+                        .flush()
+                        .await
+                        .map_err(|e| Error::network(e.to_string()))?;
                     Ok(())
                 }
                 MimicLink::Udp { socket, peer } => {
@@ -5088,17 +5197,14 @@ mod tests {
             let listeners = vec![Self::add_listener(&mut sockets)];
 
             let mut udp_sock = udp::Socket::new(
-                udp::PacketBuffer::new(
-                    vec![udp::PacketMetadata::EMPTY; 64],
-                    vec![0; 32 * 1024],
-                ),
-                udp::PacketBuffer::new(
-                    vec![udp::PacketMetadata::EMPTY; 64],
-                    vec![0; 32 * 1024],
-                ),
+                udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 64], vec![0; 32 * 1024]),
+                udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 64], vec![0; 32 * 1024]),
             );
             udp_sock
-                .bind(IpListenEndpoint { addr: None, port: ECHO_UDP_PORT })
+                .bind(IpListenEndpoint {
+                    addr: None,
+                    port: ECHO_UDP_PORT,
+                })
                 .unwrap();
             let udp_sock = sockets.add(udp_sock);
 
@@ -5124,7 +5230,10 @@ mod tests {
                 tcp::SocketBuffer::new(vec![0; 64 * 1024]),
             );
             tcp_sock
-                .listen(IpListenEndpoint { addr: None, port: ECHO_TCP_PORT })
+                .listen(IpListenEndpoint {
+                    addr: None,
+                    port: ECHO_TCP_PORT,
+                })
                 .unwrap();
             sockets.add(tcp_sock)
         }
@@ -5137,9 +5246,10 @@ mod tests {
         /// endpoint fix — wireguard.rs:3164-3174 needs_listener — applied
         /// to this mimic's accept path).
         fn needs_listener(&self) -> bool {
-            !self.listeners.iter().any(|h| {
-                self.sockets.get::<tcp::Socket>(*h).state() == tcp::State::Listen
-            })
+            !self
+                .listeners
+                .iter()
+                .any(|h| self.sockets.get::<tcp::Socket>(*h).state() == tcp::State::Listen)
         }
 
         /// Stage one decrypted inner IP packet, arming a spare
@@ -5170,8 +5280,8 @@ mod tests {
             // listening socket, or smoltcp answers it with an RST — the
             // same race fixed in the endpoint's needs_listener (and in
             // wireguard.rs's own test harness, 4293-4309).
-            self.listeners.retain(|h| {
-                match self.sockets.get::<tcp::Socket>(*h).state() {
+            self.listeners
+                .retain(|h| match self.sockets.get::<tcp::Socket>(*h).state() {
                     tcp::State::Listen => true,
                     tcp::State::Closed => {
                         self.sockets.remove(*h);
@@ -5181,8 +5291,7 @@ mod tests {
                         self.conns.push(*h);
                         false
                     }
-                }
-            });
+                });
 
             // TCP echo: whatever arrived on any connection goes straight
             // back — unless the reset knob fires: abort (RST) mid-burst.
@@ -5195,7 +5304,10 @@ mod tests {
                         Err(_) => break,
                     };
                     self.seen_bytes += n;
-                    if self.reset_after_bytes.is_some_and(|limit| self.seen_bytes >= limit) {
+                    if self
+                        .reset_after_bytes
+                        .is_some_and(|limit| self.seen_bytes >= limit)
+                    {
                         // Mid-burst abort: the server resets the connection
                         // while the client writer is still pushing (the
                         // reset_mid_burst shape).
@@ -5294,8 +5406,7 @@ mod tests {
             if offset + 2 > packet.len() {
                 return false;
             }
-            let size =
-                u16::from_be_bytes(packet[offset..offset + 2].try_into().unwrap()) as usize;
+            let size = u16::from_be_bytes(packet[offset..offset + 2].try_into().unwrap()) as usize;
             if size != 0 && offset + 2 + size > packet.len() {
                 return false;
             }
@@ -5328,7 +5439,12 @@ mod tests {
             }
         }
 
-        async fn send_control(&mut self, link: &mut MimicLink, opcode: u8, payload: Vec<u8>) -> Result<()> {
+        async fn send_control(
+            &mut self,
+            link: &mut MimicLink,
+            opcode: u8,
+            payload: Vec<u8>,
+        ) -> Result<()> {
             let mut acks = std::mem::take(&mut self.acks);
             acks.truncate(CONTROL_SEND_ACK_MAX);
             let packet = ControlPacket {
@@ -5356,7 +5472,9 @@ mod tests {
             let plain = control_encode_plain(&packet)?;
             let encoded = match &self.crypt {
                 None => [header, plain].concat(),
-                Some(crypt) => crypt.wrap(&header, self.send_packet_id, self.send_packet_time, &plain)?,
+                Some(crypt) => {
+                    crypt.wrap(&header, self.send_packet_id, self.send_packet_time, &plain)?
+                }
             };
             link.write_packet(&encoded).await
         }
@@ -5399,22 +5517,31 @@ mod tests {
 
         async fn tls_flush(&mut self, link: &mut MimicLink) -> Result<()> {
             loop {
-                let Some(tls) = self.tls.as_mut() else { return Ok(()) };
+                let Some(tls) = self.tls.as_mut() else {
+                    return Ok(());
+                };
                 if !tls.wants_write() {
                     return Ok(());
                 }
                 let mut chunk = Vec::new();
-                if tls.write_tls(&mut chunk).map_err(|e| Error::network(e.to_string()))? == 0 {
+                if tls
+                    .write_tls(&mut chunk)
+                    .map_err(|e| Error::network(e.to_string()))?
+                    == 0
+                {
                     return Ok(());
                 }
                 for piece in chunk.chunks(MAX_TLS_CONTROL_PAYLOAD) {
-                    self.send_control(link, P_CONTROL_V1, piece.to_vec()).await?;
+                    self.send_control(link, P_CONTROL_V1, piece.to_vec())
+                        .await?;
                 }
             }
         }
 
         fn tls_feed(&mut self, wire: &[u8]) -> std::result::Result<(), rustls::Error> {
-            let Some(tls) = self.tls.as_mut() else { return Ok(()) };
+            let Some(tls) = self.tls.as_mut() else {
+                return Ok(());
+            };
             let mut rest = wire;
             while !rest.is_empty() {
                 let mut cursor = std::io::Cursor::new(rest);
@@ -5457,7 +5584,9 @@ mod tests {
 
         async fn tls_write_all(&mut self, link: &mut MimicLink, bytes: &[u8]) -> Result<()> {
             {
-                let Some(tls) = self.tls.as_mut() else { return Ok(()) };
+                let Some(tls) = self.tls.as_mut() else {
+                    return Ok(());
+                };
                 use std::io::Write;
                 tls.writer()
                     .write_all(bytes)
@@ -5486,13 +5615,13 @@ mod tests {
                 reset.opcode
             );
             if self.crypt.as_ref().is_some_and(|c| c.is_v2()) {
-                assert_eq!(reset.opcode, P_CONTROL_HARD_RESET_CLIENT_V3, "tls-crypt-v2 uses the V3 reset");
+                assert_eq!(
+                    reset.opcode, P_CONTROL_HARD_RESET_CLIENT_V3,
+                    "tls-crypt-v2 uses the V3 reset"
+                );
                 // Beyond the v1-wrapped reset there must be trailing
                 // bytes: the wrapped client key.
-                assert!(
-                    n > packet_end,
-                    "V3 reset must carry the wrapped client key"
-                );
+                assert!(n > packet_end, "V3 reset must carry the wrapped client key");
             }
             self.remote = Some(reset.local_session);
             // The reset consumed message id 0 of the client's stream.
@@ -5627,11 +5756,7 @@ mod tests {
                     } else {
                         pkt
                     };
-                    let encrypted = self
-                        .data
-                        .as_mut()
-                        .expect("data channel")
-                        .encrypt(&pkt)?;
+                    let encrypted = self.data.as_mut().expect("data channel").encrypt(&pkt)?;
                     link.write_packet(&encrypted).await?;
                 }
                 let mut buf = vec![0u8; 65_536];
@@ -5656,7 +5781,9 @@ mod tests {
                             }
                             continue;
                         }
-                        let Some(data) = self.data.as_mut() else { continue };
+                        let Some(data) = self.data.as_mut() else {
+                            continue;
+                        };
                         let plain = match data.decrypt(&buf[..n]) {
                             Ok(p) => p,
                             Err(e) => return Err(Error::network(format!("mimic decrypt: {e}"))),
@@ -5684,7 +5811,9 @@ mod tests {
         let ca = ca.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((stream, _)) = listener.accept().await else { continue };
+                let Ok((stream, _)) = listener.accept().await else {
+                    continue;
+                };
                 let mimic = Mimic::new(opts_plain_clone(&opts), ca.server_config.clone());
                 let link = MimicLink::Tcp(stream);
                 tokio::spawn(async move {
@@ -5815,8 +5944,7 @@ mod tests {
             payload: b"payload bytes".to_vec(),
         };
         let plain = control_encode_plain(&packet).unwrap();
-        let (acks, remote, mid, payload) =
-            control_decode_plain(P_CONTROL_V1, &plain).unwrap();
+        let (acks, remote, mid, payload) = control_decode_plain(P_CONTROL_V1, &plain).unwrap();
         assert_eq!(acks, vec![7, 8]);
         assert_eq!(remote, [1u8; 8]);
         assert_eq!(mid, 44);
@@ -5863,7 +5991,11 @@ mod tests {
         assert_eq!((pid, time, p2), (3, 77, plain));
         let mut bad = settings_for_crypt();
         bad.tls_crypt_key = Some(random_static_key());
-        assert!(ControlCrypt::new(&bad).unwrap().unwrap().unwrap(&wrapped).is_err());
+        assert!(ControlCrypt::new(&bad)
+            .unwrap()
+            .unwrap()
+            .unwrap(&wrapped)
+            .is_err());
 
         // tls-crypt-v2 PEM decode + selection.
         let material = random_static_key();
@@ -6036,7 +6168,8 @@ mod tests {
         let mut keys = test_keys();
         keys.send_cipher_key.truncate(16);
         keys.recv_cipher_key.truncate(16);
-        let mut client = DataChannel::new(&keys, CIPHER_AES128GCM, AUTH_SHA256, PEER_ID_UNSET, 2).unwrap();
+        let mut client =
+            DataChannel::new(&keys, CIPHER_AES128GCM, AUTH_SHA256, PEER_ID_UNSET, 2).unwrap();
         let pkt = client.encrypt(b"x").unwrap();
         assert_eq!(pkt[0], opcode_key_id(P_DATA_V1, 2));
     }
@@ -6047,6 +6180,150 @@ mod tests {
 
     fn client_header_vec(c: &DataChannel) -> Vec<u8> {
         c.header.clone()
+    }
+
+    // ---- P_DATA_V1 / P_DATA_V2 AEAD additional-data golden tests ----
+    // Ported from upstream transport/openvpn/data_v1_aead_test.go (fix
+    // 8d57a8c): the AD is the packet id ALONE for P_DATA_V1 and
+    // opcode|peer-id|packet-id for P_DATA_V2. Pinned against an
+    // independent reference AEAD so a consistently-wrong implementation
+    // on both ends cannot pass.
+
+    /// Keys truncated to the AES-256-GCM length the way DataChannel::new
+    /// truncates (cipher_key_length(CIPHER_AES256GCM) = 32).
+    fn v1_test_keys() -> (KeyMaterial, KeyMaterial) {
+        let mut client = KeyMaterial {
+            send_cipher_key: vec![0x11; MAX_CIPHER_KEY_LENGTH],
+            send_hmac_key: vec![0x22; MAX_HMAC_KEY_LENGTH],
+            recv_cipher_key: vec![0x33; MAX_CIPHER_KEY_LENGTH],
+            recv_hmac_key: vec![0x44; MAX_HMAC_KEY_LENGTH],
+        };
+        client.send_cipher_key.truncate(32);
+        client.recv_cipher_key.truncate(32);
+        let server = KeyMaterial {
+            send_cipher_key: client.recv_cipher_key.clone(),
+            send_hmac_key: client.recv_hmac_key.clone(),
+            recv_cipher_key: client.send_cipher_key.clone(),
+            recv_hmac_key: client.send_hmac_key.clone(),
+        };
+        let mut server = server;
+        server.send_cipher_key.truncate(32);
+        server.recv_cipher_key.truncate(32);
+        (client, server)
+    }
+
+    const TEST_IP_PACKET: &[u8] = &[
+        0x45, 0, 0, 20, 1, 2, 3, 4, 64, 6, 0, 0, 10, 8, 0, 2, 1, 1, 1, 1,
+    ];
+
+    /// Independent reference: AES-256-GCM with nonce = pid ‖ hmac_key[..8].
+    fn ref_open(
+        cipher_key: &[u8],
+        hmac_key: &[u8],
+        packet: &[u8],
+        header_size: usize,
+        ad: &[u8],
+    ) -> std::result::Result<Vec<u8>, aes_gcm::Error> {
+        use aes_gcm::aead::{Aead, KeyInit, Payload};
+        let pid = u32::from_be_bytes(
+            packet[header_size..header_size + 4]
+                .try_into()
+                .expect("pid"),
+        );
+        let mut nonce = [0u8; 12];
+        nonce[..4].copy_from_slice(&pid.to_be_bytes());
+        nonce[4..].copy_from_slice(&hmac_key[..8]);
+        let tag = &packet[header_size + 4..header_size + 4 + DATA_CHANNEL_TAG_SIZE];
+        let ct = &packet[header_size + 4 + DATA_CHANNEL_TAG_SIZE..];
+        let mut combined = ct.to_vec();
+        combined.extend_from_slice(tag);
+        let aead = aes_gcm::Aes256Gcm::new_from_slice(cipher_key).expect("key");
+        aead.decrypt(
+            (&nonce).into(),
+            Payload {
+                msg: &combined,
+                aad: ad,
+            },
+        )
+    }
+
+    #[test]
+    fn data_channel_aead_v1_ad_is_packet_id_only() {
+        let (client, _) = v1_test_keys();
+        let mut ch =
+            DataChannel::new(&client, CIPHER_AES256GCM, AUTH_SHA1, PEER_ID_UNSET, 4).unwrap();
+        let enc = ch.encrypt(TEST_IP_PACKET).unwrap();
+        // Wire header: P_DATA_V1 (opcode 6) with key-id 4 → 0x34, exactly
+        // as seen from an OpenVPN 2.6 client.
+        assert_eq!(enc[0], 0x34, "P_DATA_V1 opcode/key-id byte");
+        // A standard peer authenticates with AD = packet-id only…
+        let ad = enc[1..5].to_vec();
+        let plain = ref_open(&client.send_cipher_key, &client.send_hmac_key, &enc, 1, &ad)
+            .expect("standard peer rejects our P_DATA_V1 packet (AD must be packet-id only)");
+        assert_eq!(plain, TEST_IP_PACKET);
+        // …and must NOT authenticate with opcode|packet-id.
+        let wrong_ad = enc[..5].to_vec();
+        assert!(
+            ref_open(
+                &client.send_cipher_key,
+                &client.send_hmac_key,
+                &enc,
+                1,
+                &wrong_ad
+            )
+            .is_err(),
+            "P_DATA_V1 must not authenticate the opcode byte"
+        );
+    }
+
+    #[test]
+    fn data_channel_aead_v1_decrypts_standard_peer() {
+        // A standard OpenVPN/SoftEther peer seals a V1 packet with AD =
+        // packet-id only; it must decrypt. (Built with the reference AEAD
+        // sealing in wire order: header ‖ pid ‖ tag ‖ ciphertext.)
+        use aes_gcm::aead::{Aead, KeyInit, Payload};
+        let (client, server) = v1_test_keys();
+        let mut ch =
+            DataChannel::new(&client, CIPHER_AES256GCM, AUTH_SHA1, PEER_ID_UNSET, 4).unwrap();
+        let key = &server.send_cipher_key;
+        let hmac = &server.send_hmac_key;
+        let header = [opcode_key_id(P_DATA_V1, 4u8)];
+        let pid = 1u32;
+        let mut nonce = [0u8; 12];
+        nonce[..4].copy_from_slice(&pid.to_be_bytes());
+        nonce[4..].copy_from_slice(&hmac[..8]);
+        let aead = aes_gcm::Aes256Gcm::new_from_slice(key).unwrap();
+        let sealed = aead
+            .encrypt(
+                (&nonce).into(),
+                Payload {
+                    msg: TEST_IP_PACKET,
+                    aad: &pid.to_be_bytes(),
+                },
+            )
+            .unwrap();
+        let tag = &sealed[sealed.len() - DATA_CHANNEL_TAG_SIZE..];
+        let ct = &sealed[..sealed.len() - DATA_CHANNEL_TAG_SIZE];
+        let mut pkt = header.to_vec();
+        pkt.extend_from_slice(&pid.to_be_bytes());
+        pkt.extend_from_slice(tag);
+        pkt.extend_from_slice(ct);
+        assert_eq!(ch.decrypt(&pkt).unwrap(), TEST_IP_PACKET);
+    }
+
+    #[test]
+    fn data_channel_aead_v2_still_authenticates_header() {
+        // Regression guard: P_DATA_V2 keeps authenticating
+        // opcode|peer-id|packet-id.
+        let (client, _) = v1_test_keys();
+        let mut ch = DataChannel::new(&client, CIPHER_AES256GCM, AUTH_SHA1, 7, 0).unwrap();
+        let enc = ch.encrypt(TEST_IP_PACKET).unwrap();
+        // Wire header 4 bytes (opcode | peer-id 0x000007) + pid → AD is
+        // the first 8 bytes.
+        let ad = enc[..8].to_vec();
+        let plain = ref_open(&client.send_cipher_key, &client.send_hmac_key, &enc, 4, &ad)
+            .expect("standard peer rejects our P_DATA_V2 packet (AD must include the header)");
+        assert_eq!(plain, TEST_IP_PACKET);
     }
 
     #[test]
@@ -6060,8 +6337,12 @@ mod tests {
                 recv_cipher_key: keys.send_cipher_key.clone(),
                 recv_hmac_key: keys.send_hmac_key.clone(),
             };
-            server_keys.send_cipher_key.truncate(cipher_key_length(cipher));
-            server_keys.recv_cipher_key.truncate(cipher_key_length(cipher));
+            server_keys
+                .send_cipher_key
+                .truncate(cipher_key_length(cipher));
+            server_keys
+                .recv_cipher_key
+                .truncate(cipher_key_length(cipher));
             let mut server = DataChannel::new(&server_keys, cipher, AUTH_SHA256, 5, 0).unwrap();
             let pkt = client.encrypt(b"cbc payload").unwrap();
             assert_eq!(server.decrypt(&pkt).unwrap(), b"cbc payload".to_vec());
@@ -6091,8 +6372,12 @@ mod tests {
         // data-ciphers list: first common entry wins.
         s.data_ciphers = vec![CIPHER_AES256GCM.into(), CIPHER_AES128GCM.into()];
         assert_eq!(
-            negotiate_cipher(&s, &[CIPHER_AES128GCM.into(), CIPHER_CHACHA20POLY1305.into()], "")
-                .unwrap(),
+            negotiate_cipher(
+                &s,
+                &[CIPHER_AES128GCM.into(), CIPHER_CHACHA20POLY1305.into()],
+                ""
+            )
+            .unwrap(),
             CIPHER_AES128GCM
         );
         // No intersection + fallback.
@@ -6125,7 +6410,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(push.prefixes, vec![(IpAddr::V4(CLIENT_TUNNEL_IP), 24)]);
-        assert_eq!(push.routes, vec![(IpAddr::V4("192.168.0.0".parse().unwrap()), 16)]);
+        assert_eq!(
+            push.routes,
+            vec![(IpAddr::V4("192.168.0.0".parse().unwrap()), 16)]
+        );
         assert_eq!(push.dns, vec![IpAddr::V4(SERVER_TUNNEL_IP)]);
         assert_eq!(push.peer_id, 7);
         assert!(push.redirect && push.block_ipv6);
@@ -6136,7 +6424,10 @@ mod tests {
         assert_eq!(push.push_continuation, 1);
 
         // Continuation merge: intermediate 2 then final 1.
-        let first = parse_push_reply_inner("PUSH_REPLY,ifconfig 10.8.0.2 255.255.255.0,push-continuation 2").unwrap();
+        let first = parse_push_reply_inner(
+            "PUSH_REPLY,ifconfig 10.8.0.2 255.255.255.0,push-continuation 2",
+        )
+        .unwrap();
         let second = parse_push_reply_inner("PUSH_REPLY,peer-id 3,push-continuation 1").unwrap();
         let merged = merge_push_reply(Some(first), second).unwrap();
         assert_eq!(merged.prefixes.len(), 1);
@@ -6152,7 +6443,10 @@ mod tests {
 
     #[test]
     fn config_validation_errors() {
-        let mut cfg = test_cfg(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1)), "udp");
+        let mut cfg = test_cfg(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1)),
+            "udp",
+        );
         cfg.ca = "-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n".into();
 
         // Happy path.
@@ -6160,30 +6454,53 @@ mod tests {
 
         let mut bad = cfg.clone();
         bad.proto = Some("sctp".into());
-        assert!(bad.prepare().unwrap_err().to_string().contains("only udp and tcp"));
+        assert!(bad
+            .prepare()
+            .unwrap_err()
+            .to_string()
+            .contains("only udp and tcp"));
 
         let mut bad = cfg.clone();
         bad.dev = "tap".into();
-        assert!(bad.prepare().unwrap_err().to_string().contains("only dev tun"));
+        assert!(bad
+            .prepare()
+            .unwrap_err()
+            .to_string()
+            .contains("only dev tun"));
 
         let mut bad = cfg.clone();
         bad.cipher = "BF-CBC".into();
         let err = bad.prepare().unwrap_err().to_string();
-        assert!(err.contains("unsupported openvpn cipher \"BF-CBC\""), "{err}");
+        assert!(
+            err.contains("unsupported openvpn cipher \"BF-CBC\""),
+            "{err}"
+        );
 
         let mut bad = cfg.clone();
         bad.auth = "SHA3".into();
-        assert!(bad.prepare().unwrap_err().to_string().contains("unsupported openvpn auth"));
+        assert!(bad
+            .prepare()
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported openvpn auth"));
 
         let mut bad = cfg.clone();
         bad.key_direction = Some("2".into());
         bad.tls_auth = Some(static_key_pem(&random_static_key()));
-        assert!(bad.prepare().unwrap_err().to_string().contains("key-direction"));
+        assert!(bad
+            .prepare()
+            .unwrap_err()
+            .to_string()
+            .contains("key-direction"));
 
         let mut bad = cfg.clone();
         bad.tls_auth = Some(static_key_pem(&random_static_key()));
         bad.tls_crypt = Some(static_key_pem(&random_static_key()));
-        assert!(bad.prepare().unwrap_err().to_string().contains("mutually exclusive"));
+        assert!(bad
+            .prepare()
+            .unwrap_err()
+            .to_string()
+            .contains("mutually exclusive"));
 
         let mut bad = cfg.clone();
         bad.ca = String::new();
@@ -6192,7 +6509,11 @@ mod tests {
         let mut bad = cfg.clone();
         bad.username = None;
         bad.cert = None;
-        assert!(bad.prepare().unwrap_err().to_string().contains("cert+key or username"));
+        assert!(bad
+            .prepare()
+            .unwrap_err()
+            .to_string()
+            .contains("cert+key or username"));
 
         let mut bad = cfg.clone();
         bad.comp_lzo = "sometimes".into();
@@ -6200,25 +6521,45 @@ mod tests {
 
         let mut bad = cfg.clone();
         bad.ip_stack.mode = "gvisor".into();
-        assert!(bad.prepare().unwrap_err().to_string().contains("with_gvisor build tag"));
+        assert!(bad
+            .prepare()
+            .unwrap_err()
+            .to_string()
+            .contains("with_gvisor build tag"));
 
         let mut bad = cfg.clone();
         bad.ip_stack.mode = "bogus".into();
-        assert!(bad.prepare().unwrap_err().to_string().contains("invalid IP stack mode"));
+        assert!(bad
+            .prepare()
+            .unwrap_err()
+            .to_string()
+            .contains("invalid IP stack mode"));
 
         let mut bad = cfg.clone();
         bad.remote_dns_resolve = true;
         bad.dns = vec!["1.1.1.1".into()];
-        assert!(bad.prepare().unwrap_err().to_string().contains("requires a scheme"));
+        assert!(bad
+            .prepare()
+            .unwrap_err()
+            .to_string()
+            .contains("requires a scheme"));
 
         let mut bad = cfg;
         bad.handshake_timeout = -1;
-        assert!(bad.prepare().unwrap_err().to_string().contains("handshake timeout"));
+        assert!(bad
+            .prepare()
+            .unwrap_err()
+            .to_string()
+            .contains("handshake timeout"));
     }
 
     // ------------------------------------------------- full loopback tunnels
 
-    async fn tunnel_roundtrip(proto: &str, mut opts: MimicOpts, mut cfg_extra: impl FnMut(&mut OpenVpnOut)) {
+    async fn tunnel_roundtrip(
+        proto: &str,
+        mut opts: MimicOpts,
+        mut cfg_extra: impl FnMut(&mut OpenVpnOut),
+    ) {
         let ca = test_ca();
         let addr = if proto == "tcp" {
             spawn_mimic_tcp(opts_plain_clone(&opts), &ca).await
@@ -6237,20 +6578,21 @@ mod tests {
         if let Some((material, wrapped)) = opts.tls_crypt_v2.take() {
             cfg.tls_crypt_v2 = Some(tls_crypt_v2_client_pem(&material, &wrapped));
         }
-        cfg.comp_lzo = if opts.comp_lzo { "yes".into() } else { String::new() };
+        cfg.comp_lzo = if opts.comp_lzo {
+            "yes".into()
+        } else {
+            String::new()
+        };
         if !opts.cipher.is_empty() {
             cfg.cipher = opts.cipher.clone();
         }
         cfg_extra(&mut cfg);
 
         let target = NetAddr::ip(IpAddr::V4(SERVER_TUNNEL_IP), ECHO_TCP_PORT);
-        let mut stream = tokio::time::timeout(
-            Duration::from_secs(20),
-            connect(&cfg, &target),
-        )
-        .await
-        .expect("dial timeout")
-        .expect("dial through the tunnel");
+        let mut stream = tokio::time::timeout(Duration::from_secs(20), connect(&cfg, &target))
+            .await
+            .expect("dial timeout")
+            .expect("dial through the tunnel");
 
         let payload = b"hello over openvpn!".repeat(64);
         stream.write_all(&payload).await.unwrap();
@@ -6289,7 +6631,11 @@ mod tests {
             opts.tls_auth = Some(key);
             opts.key_direction = dir.into();
             tunnel_roundtrip("tcp", opts, |cfg| {
-                cfg.key_direction = if dir.is_empty() { None } else { Some(dir.into()) };
+                cfg.key_direction = if dir.is_empty() {
+                    None
+                } else {
+                    Some(dir.into())
+                };
             })
             .await;
         }
@@ -6421,8 +6767,9 @@ mod tests {
         // Every stream echoes multi-segment bursts, interleaved.
         for round in 0..4u32 {
             for (i, stream) in streams.iter_mut().enumerate() {
-                let chunk: Vec<u8> =
-                    (0..8 * 1024).map(|k| (k as u32 + round + i as u32) as u8).collect();
+                let chunk: Vec<u8> = (0..8 * 1024)
+                    .map(|k| (k as u32 + round + i as u32) as u8)
+                    .collect();
                 tokio::time::timeout(Duration::from_secs(30), stream.write_all(&chunk))
                     .await
                     .expect("concurrent stream write must not stall")
@@ -6551,7 +6898,10 @@ mod tests {
             .expect("echo timeout")
             .expect("echo datagram");
         assert_eq!(data, b"udp round trip");
-        assert_eq!(from.to_string(), format!("{SERVER_TUNNEL_IP}:{ECHO_UDP_PORT}"));
+        assert_eq!(
+            from.to_string(),
+            format!("{SERVER_TUNNEL_IP}:{ECHO_UDP_PORT}")
+        );
         udp.send(&target, b"again").await.unwrap();
         let (_, data2) = tokio::time::timeout(Duration::from_secs(20), udp.recv())
             .await
@@ -6596,7 +6946,10 @@ mod tests {
     async fn tls_auth_wrong_key_fails() {
         let mut opts = MimicOpts::plain("tcp");
         opts.tls_auth = Some(random_static_key());
-        let mut cfg = test_cfg(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1)), "tcp");
+        let mut cfg = test_cfg(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1)),
+            "tcp",
+        );
         cfg.ca = "-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n".into();
         cfg.tls_auth = Some(static_key_pem(&random_static_key()));
         cfg.handshake_timeout = 4;
@@ -6607,7 +6960,10 @@ mod tests {
     async fn tls_crypt_wrong_key_fails() {
         let mut opts = MimicOpts::plain("udp");
         opts.tls_crypt = Some(random_static_key());
-        let mut cfg = test_cfg(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1)), "udp");
+        let mut cfg = test_cfg(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1)),
+            "udp",
+        );
         cfg.ca = "-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n".into();
         cfg.tls_crypt = Some(static_key_pem(&random_static_key()));
         cfg.handshake_timeout = 4;
@@ -6620,7 +6976,10 @@ mod tests {
         rand::rngs::OsRng.fill_bytes(&mut wrapped);
         let mut opts = MimicOpts::plain("tcp");
         opts.tls_crypt_v2 = Some((random_static_key(), wrapped.clone()));
-        let mut cfg = test_cfg(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1)), "tcp");
+        let mut cfg = test_cfg(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1)),
+            "tcp",
+        );
         cfg.ca = "-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n".into();
         cfg.tls_crypt_v2 = Some(tls_crypt_v2_client_pem(&random_static_key(), &wrapped));
         cfg.handshake_timeout = 4;
@@ -6654,7 +7013,10 @@ mod tests {
 
     #[tokio::test]
     async fn domain_targets_are_refused() {
-        let mut cfg = test_cfg(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1)), "tcp");
+        let mut cfg = test_cfg(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1)),
+            "tcp",
+        );
         cfg.ca = "-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n".into();
         let err = match connect(&cfg, &NetAddr::domain("example.com", 443).unwrap()).await {
             Ok(_) => panic!("domain targets must be refused"),

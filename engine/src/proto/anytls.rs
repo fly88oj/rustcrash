@@ -417,9 +417,8 @@ impl WriterState {
         // swapped by the recv task mid-write (upstream reads the atomic
         // pointer per writeConn, session.go:460).
         let padding = self.padding.lock().unwrap().clone();
-        let segments =
-            padded_segments(&padding, &mut self.send_padding, &mut self.pkt_counter, b)
-                .map_err(io_invalid)?;
+        let segments = padded_segments(&padding, &mut self.send_padding, &mut self.pkt_counter, b)
+            .map_err(io_invalid)?;
         for seg in segments {
             self.conn.write_all(&seg).await?;
         }
@@ -689,7 +688,10 @@ impl AnyTlsSession {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.core
             .tx
-            .send(WriteCmd::Open { frames: wire, ack: ack_tx })
+            .send(WriteCmd::Open {
+                frames: wire,
+                ack: ack_tx,
+            })
             .map_err(|_| Error::network("anytls: session closed"))?;
         ack_rx
             .await
@@ -1008,9 +1010,7 @@ async fn open_session(cfg: &AnyTlsOut, transport: BoxProxyStream) -> Result<AnyT
                 Box::pin(async move {
                     let tcp = tokio::net::TcpStream::connect((server.as_str(), dial_port))
                         .await
-                        .map_err(|e| {
-                            Error::network(format!("dial {server}:{dial_port}: {e}"))
-                        })?;
+                        .map_err(|e| Error::network(format!("dial {server}:{dial_port}: {e}")))?;
                     Ok(Box::new(tcp) as BoxProxyStream)
                 })
             })
@@ -1038,6 +1038,7 @@ async fn open_session(cfg: &AnyTlsOut, transport: BoxProxyStream) -> Result<AnyT
                 server_name: Some(server_name.clone()),
                 skip_cert_verify: cfg.skip_verify,
                 alpn: Vec::new(),
+                ..Default::default()
             },
         )
         .await?
@@ -1053,10 +1054,7 @@ async fn open_session(cfg: &AnyTlsOut, transport: BoxProxyStream) -> Result<AnyT
 /// out of [`open_session`] so a caller that already owns the transport
 /// layer can join the same wire (tests use plain TCP; embedders can
 /// front their own TLS/JLS exactly like upstream's listener stacking).
-pub async fn start_session(
-    mut tls: BoxProxyStream,
-    password: &str,
-) -> Result<AnyTlsSession> {
+pub async fn start_session(mut tls: BoxProxyStream, password: &str) -> Result<AnyTlsSession> {
     if password.is_empty() {
         return Err(Error::config("anytls: password is required"));
     }
@@ -1103,10 +1101,7 @@ pub async fn open_session_plain(
 }
 
 /// [`udp_stream`] over a caller-owned transport (see [`connect_plain`]).
-pub async fn udp_stream_plain(
-    cfg: &AnyTlsOut,
-    transport: BoxProxyStream,
-) -> Result<AnyTlsUdp> {
+pub async fn udp_stream_plain(cfg: &AnyTlsOut, transport: BoxProxyStream) -> Result<AnyTlsUdp> {
     let session = open_session_plain(cfg, transport).await?;
     let target = NetAddr::domain(UOT_MAGIC_ADDRESS, 0)?;
     let stream = session.open_stream(&target).await?;
@@ -1188,12 +1183,9 @@ impl AnyTlsUdp {
             }
             _ => return Err(Error::protocol("anytls: bad uot address type")),
         };
-        let port = u16::from_be_bytes(
-            self.read_exact_n(2).await?.try_into().expect("two bytes"),
-        );
-        let len = u16::from_be_bytes(
-            self.read_exact_n(2).await?.try_into().expect("two bytes"),
-        ) as usize;
+        let port = u16::from_be_bytes(self.read_exact_n(2).await?.try_into().expect("two bytes"));
+        let len =
+            u16::from_be_bytes(self.read_exact_n(2).await?.try_into().expect("two bytes")) as usize;
         if buf.len() < len {
             return Err(Error::protocol("anytls: uot read: short buffer"));
         }
@@ -1650,8 +1642,7 @@ async fn server_writer_loop(
         match cmd {
             WriteCmd::Bytes(frames) => {
                 if conn.write_all(&frames).await.is_err() || conn.flush().await.is_err() {
-                    *die_reason.lock().unwrap() =
-                        "anytls: server session write error".to_string();
+                    *die_reason.lock().unwrap() = "anytls: server session write error".to_string();
                     let _ = dead.send(true);
                     return;
                 }
@@ -1724,8 +1715,7 @@ async fn server_recv_loop(
                         break 'session;
                     }
                     let mut streams = core.streams.lock().unwrap();
-                    if let std::collections::hash_map::Entry::Vacant(entry) = streams.entry(sid)
-                    {
+                    if let std::collections::hash_map::Entry::Vacant(entry) = streams.entry(sid) {
                         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
                         entry.insert(ev_tx);
                         drop(streams);
@@ -1867,9 +1857,7 @@ impl AnyTlsServerStream {
         buf.extend(self.read_n(rest).await?);
         let (target, consumed) = crate::addr::decode_socks_addr(&buf)?;
         if consumed != buf.len() {
-            return Err(Error::protocol(
-                "anytls: target address has trailing bytes",
-            ));
+            return Err(Error::protocol("anytls: target address has trailing bytes"));
         }
         Ok(target)
     }
@@ -1904,29 +1892,27 @@ impl AnyTlsServerStream {
     async fn read_n(&mut self, n: usize) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; n];
         let mut filled = 0usize;
-        std::future::poll_fn(|cx| {
-            loop {
-                while filled < n && !self.out.is_empty() {
-                    let take = self.out.len().min(n - filled);
-                    buf[filled..filled + take].copy_from_slice(&self.out[..take]);
-                    self.out.advance(take);
-                    filled += take;
+        std::future::poll_fn(|cx| loop {
+            while filled < n && !self.out.is_empty() {
+                let take = self.out.len().min(n - filled);
+                buf[filled..filled + take].copy_from_slice(&self.out[..take]);
+                self.out.advance(take);
+                filled += take;
+            }
+            if filled == n {
+                return Poll::Ready(Ok(()));
+            }
+            match Pin::new(&mut self.rx).poll_recv(cx) {
+                Poll::Ready(Some(ServerStreamEvent::Data(d))) => {
+                    self.out.extend_from_slice(&d);
                 }
-                if filled == n {
-                    return Poll::Ready(Ok(()));
+                Poll::Ready(Some(ServerStreamEvent::Fin)) | Poll::Ready(None) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "anytls: stream closed inside the target address",
+                    )));
                 }
-                match Pin::new(&mut self.rx).poll_recv(cx) {
-                    Poll::Ready(Some(ServerStreamEvent::Data(d))) => {
-                        self.out.extend_from_slice(&d);
-                    }
-                    Poll::Ready(Some(ServerStreamEvent::Fin)) | Poll::Ready(None) => {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "anytls: stream closed inside the target address",
-                        )));
-                    }
-                    Poll::Pending => return Poll::Pending,
-                }
+                Poll::Pending => return Poll::Pending,
             }
         })
         .await
@@ -2106,12 +2092,7 @@ pub async fn run_server_session(
         user,
         on_stream,
     });
-    tokio::spawn(server_writer_loop(
-        rx,
-        w,
-        dead,
-        core.die_reason.clone(),
-    ));
+    tokio::spawn(server_writer_loop(rx, w, dead, core.die_reason.clone()));
     server_recv_loop(r, core, dead_rx).await;
 }
 
@@ -2190,9 +2171,7 @@ pub fn parse_uot_packet(buf: &[u8]) -> Result<Option<(NetAddr, Vec<u8>, usize)>>
             o.copy_from_slice(&buf[1..17]);
             Host::Ip(std::net::IpAddr::V6(o.into()))
         }
-        _ => Host::Domain(
-            String::from_utf8_lossy(&buf[2..1 + addr_len]).into_owned(),
-        ),
+        _ => Host::Domain(String::from_utf8_lossy(&buf[2..1 + addr_len]).into_owned()),
     };
     let port_at = 1 + addr_len;
     let port = u16::from_be_bytes([buf[port_at], buf[port_at + 1]]);
@@ -2210,9 +2189,8 @@ pub fn parse_uot_packet(buf: &[u8]) -> Result<Option<(NetAddr, Vec<u8>, usize)>>
 /// Encode one uot datagram for the client — the mirror of
 /// [`AnyTlsUdp::recv_from`]'s wire (`uot-addr || be16 len || payload`).
 pub fn uot_packet_frame(from: &NetAddr, payload: &[u8]) -> Result<Vec<u8>> {
-    let len = u16::try_from(payload.len()).map_err(|_| {
-        Error::protocol("anytls: udp datagram exceeds 65535 bytes")
-    })?;
+    let len = u16::try_from(payload.len())
+        .map_err(|_| Error::protocol("anytls: udp datagram exceeds 65535 bytes"))?;
     let mut out = Vec::with_capacity(24 + payload.len());
     uot_addr_into(&mut out, &from.host, from.port);
     out.extend_from_slice(&len.to_be_bytes());
@@ -2303,18 +2281,21 @@ mod tests {
         // Session frame: cmd || sid be32 || len be16 || data (frame.go).
         let mut out = Vec::new();
         frame_into(&mut out, CMD_SETTINGS, 0, b"v=2");
-        assert_eq!(
-            out,
-            vec![CMD_SETTINGS, 0, 0, 0, 0, 0, 3, b'v', b'=', b'2']
-        );
+        assert_eq!(out, vec![CMD_SETTINGS, 0, 0, 0, 0, 0, 3, b'v', b'=', b'2']);
         // cmdWaste frame: zeroed payload (session.go:482-486).
-        assert_eq!(&waste_frame(3)[..HEADER_SIZE], &[CMD_WASTE, 0, 0, 0, 0, 0, 3]);
+        assert_eq!(
+            &waste_frame(3)[..HEADER_SIZE],
+            &[CMD_WASTE, 0, 0, 0, 0, 0, 3]
+        );
         assert_eq!(&waste_frame(3)[HEADER_SIZE..], &[0, 0, 0]);
         // PSH frames split at 0xFFFF.
         let mut out = Vec::new();
         psh_frames_into(&mut out, 1, &vec![7u8; MAX_FRAME_DATA + 5]);
         assert_eq!(out.len(), HEADER_SIZE * 2 + MAX_FRAME_DATA + 5);
-        assert_eq!(u16::from_be_bytes([out[5], out[6]]) as usize, MAX_FRAME_DATA);
+        assert_eq!(
+            u16::from_be_bytes([out[5], out[6]]) as usize,
+            MAX_FRAME_DATA
+        );
         let second = HEADER_SIZE + MAX_FRAME_DATA; // start of frame 2
         assert_eq!(out[second], CMD_PSH);
         assert_eq!(u16::from_be_bytes([out[second + 5], out[second + 6]]), 5);
@@ -2354,7 +2335,9 @@ mod tests {
     }
 
     /// One decrypted session frame off the TLS stream.
-    async fn read_frame(tls: &mut tokio_rustls::server::TlsStream<DuplexStream>) -> Result<(u8, u32, Vec<u8>)> {
+    async fn read_frame(
+        tls: &mut tokio_rustls::server::TlsStream<DuplexStream>,
+    ) -> Result<(u8, u32, Vec<u8>)> {
         let mut header = [0u8; HEADER_SIZE];
         tokio::time::timeout(Duration::from_secs(10), tls.read_exact(&mut header))
             .await
@@ -2451,10 +2434,7 @@ mod tests {
                 stream.extend_from_slice(&data);
                 if let Some(parsed) = parse_uot_stream(&stream) {
                     assert_eq!(parsed.is_connect, 0x00, "anytls uses non-connect uot");
-                    assert_eq!(
-                        parsed.target,
-                        NetAddr::domain("dns.example", 53).unwrap()
-                    );
+                    assert_eq!(parsed.target, NetAddr::domain("dns.example", 53).unwrap());
                     assert_eq!(parsed.payload, b"uot-query".to_vec());
                     // Echo one response packet from 8.8.4.4:53.
                     let mut resp = Vec::new();
@@ -2688,7 +2668,13 @@ mod tests {
             password: String::new(),
             ..test_cfg("x")
         };
-        let err = match connect(&cfg, Box::new(tokio::io::duplex(64).0), &NetAddr::domain("a.b", 80).unwrap()).await {
+        let err = match connect(
+            &cfg,
+            Box::new(tokio::io::duplex(64).0),
+            &NetAddr::domain("a.b", 80).unwrap(),
+        )
+        .await
+        {
             Ok(_) => panic!("an empty password must be rejected"),
             Err(e) => e,
         };
@@ -2987,7 +2973,10 @@ mod tests {
         }
     }
 
-    async fn read_timeout(stream: &mut (impl AsyncRead + Unpin), buf: &mut [u8]) -> io::Result<usize> {
+    async fn read_timeout(
+        stream: &mut (impl AsyncRead + Unpin),
+        buf: &mut [u8],
+    ) -> io::Result<usize> {
         tokio::time::timeout(Duration::from_secs(10), stream.read(buf))
             .await
             .expect("anytls read timed out")
@@ -3016,10 +3005,7 @@ mod tests {
         }
     }
 
-    async fn spawn_server_session(
-        password: &str,
-        padding_scheme: &[u8],
-    ) -> DuplexStream {
+    async fn spawn_server_session(password: &str, padding_scheme: &[u8]) -> DuplexStream {
         let (client, server) = tokio::io::duplex(256 * 1024);
         let users = AnyTlsUserMap::new(password, &[]);
         let padding_scheme = padding_scheme.to_vec();
@@ -3079,9 +3065,7 @@ mod tests {
         let scheme: &[u8] = b"stop=2\n0=10-10\n1=42-42";
         let transport = spawn_server_session(&password, scheme).await;
         let cfg = plain_cfg(&password);
-        let session = open_session_plain(&cfg, Box::new(transport))
-            .await
-            .unwrap();
+        let session = open_session_plain(&cfg, Box::new(transport)).await.unwrap();
         let target = NetAddr::domain("echo.example", 443).unwrap();
         let mut stream = session.open_stream(&target).await.unwrap();
         stream.write_all(b"hello").await.unwrap();
@@ -3199,9 +3183,7 @@ mod tests {
             run_server_session(server, DEFAULT_PADDING_SCHEME, user, on_stream).await;
         });
         let cfg = plain_cfg(&password);
-        let mut udp = udp_stream_plain(&cfg, Box::new(client))
-            .await
-            .unwrap();
+        let mut udp = udp_stream_plain(&cfg, Box::new(client)).await.unwrap();
         let target = NetAddr::domain("dns.example", 53).unwrap();
         udp.send_to(&target, b"q").await.unwrap();
         for _ in 0..100 {
@@ -3232,7 +3214,9 @@ mod tests {
         assert_eq!(parsed, target);
         assert_eq!(consumed, wire.len());
         // Incomplete prefix → NeedMore.
-        assert!(parse_uot_request(&wire[..wire.len() - 1]).unwrap().is_none());
+        assert!(parse_uot_request(&wire[..wire.len() - 1])
+            .unwrap()
+            .is_none());
         assert!(parse_uot_request(&[]).unwrap().is_none());
         // Bad atyp.
         assert!(parse_uot_request(&[0x00, 0x09]).is_err());
@@ -3247,8 +3231,9 @@ mod tests {
         assert_eq!(consumed, frame.len());
         let domain = NetAddr::domain("peer.example", 443).unwrap();
         let frame = uot_packet_frame(&domain, b"dd").unwrap();
-        let (origin, payload, _) =
-            parse_uot_packet(&frame).unwrap().expect("complete domain packet");
+        let (origin, payload, _) = parse_uot_packet(&frame)
+            .unwrap()
+            .expect("complete domain packet");
         assert_eq!(origin, domain);
         assert_eq!(payload, b"dd".to_vec());
         // Truncated at every boundary → NeedMore.

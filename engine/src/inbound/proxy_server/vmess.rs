@@ -146,15 +146,9 @@ impl VmessServer {
         let ct = read_exact_vec(&mut stream, hlen + TAG).await?;
         let hdr_aead = Aead::new(
             AeadKind::Aes128Gcm,
-            &kdf16(
-                &self.cmd_key,
-                &[KDF_HEADER_PAYLOAD_KEY, &auth_id, &nonce],
-            ),
+            &kdf16(&self.cmd_key, &[KDF_HEADER_PAYLOAD_KEY, &auth_id, &nonce]),
         )?;
-        let hdr_nonce = kdf12(
-            &self.cmd_key,
-            &[KDF_HEADER_PAYLOAD_NONCE, &auth_id, &nonce],
-        );
+        let hdr_nonce = kdf12(&self.cmd_key, &[KDF_HEADER_PAYLOAD_NONCE, &auth_id, &nonce]);
         let hdr = hdr_aead
             .open(&hdr_nonce, &auth_id, &ct)
             .map_err(|e| Error::protocol(format!("vmess header: {e}")))?;
@@ -245,10 +239,7 @@ impl VmessServer {
         // (sing-vmess writes its option byte back; the client checks
         // the first byte against its random response-V).
         let mut wire = Vec::with_capacity(64);
-        let len_aead = Aead::new(
-            AeadKind::Aes128Gcm,
-            &kdf16(&resp_key, &[KDF_RESP_LEN_KEY]),
-        )?;
+        let len_aead = Aead::new(AeadKind::Aes128Gcm, &kdf16(&resp_key, &[KDF_RESP_LEN_KEY]))?;
         let len_nonce = kdf12(&resp_iv, &[KDF_RESP_LEN_IV]);
         let resp_hdr = [response_v, opt, 0u8, 0u8];
         len_aead.seal(
@@ -315,11 +306,7 @@ fn spawn_vmess_udp(
                         tracing::debug!(target: "engine", "vmess udp {source}: bad datagram address");
                         continue;
                     };
-                    if up_tx
-                        .send((target, packet[used..].to_vec()))
-                        .await
-                        .is_err()
-                    {
+                    if up_tx.send((target, packet[used..].to_vec())).await.is_err() {
                         break;
                     }
                 }
@@ -389,7 +376,9 @@ where
 /// Serve a VMess listener; returns the bound address.
 pub async fn serve(cfg: &ServerConfig, relay: SharedRelay) -> Result<SocketAddr> {
     let ServerProtocol::Vmess { uuid, security } = &cfg.protocol else {
-        return Err(Error::config("vmess::serve called with a non-vmess protocol"));
+        return Err(Error::config(
+            "vmess::serve called with a non-vmess protocol",
+        ));
     };
     let server = VmessServer::new(uuid, security)?;
     let tag = cfg.tag.clone();
@@ -655,10 +644,7 @@ enum ChunkFraming {
 impl ChunkFraming {
     /// From the request option byte; the direction IV seeds the stream.
     fn from_opt(opt: u8, iv: [u8; 16]) -> Self {
-        match (
-            opt & OPT_CHUNK_MASKING != 0,
-            opt & OPT_GLOBAL_PADDING != 0,
-        ) {
+        match (opt & OPT_CHUNK_MASKING != 0, opt & OPT_GLOBAL_PADDING != 0) {
             (true, true) => ChunkFraming::MaskPad(Shake128::new(&iv)),
             (true, false) => ChunkFraming::Mask(Shake128::new(&iv)),
             (false, true) => ChunkFraming::Pad(Shake128::new(&iv)),
@@ -1125,19 +1111,11 @@ mod tests {
     /// chunk_length_stream.go: the padding length word is read BEFORE
     /// the mask word, from one shared SHAKE stream when both options
     /// are set (and no stream at all when neither is).
-    fn sing_framing_word(
-        shake: &mut Option<Shake128>,
-        mask: bool,
-        pad: bool,
-    ) -> (u16, usize) {
+    fn sing_framing_word(shake: &mut Option<Shake128>, mask: bool, pad: bool) -> (u16, usize) {
         let Some(s) = shake.as_mut() else {
             return (0, 0);
         };
-        let padding = if pad {
-            (s.next_u16() % 64) as usize
-        } else {
-            0
-        };
+        let padding = if pad { (s.next_u16() % 64) as usize } else { 0 };
         let mask = if mask { s.next_u16() } else { 0 };
         (mask, padding)
     }
@@ -1327,11 +1305,8 @@ mod tests {
             )?;
             let mut hdr_ct = vec![0u8; hlen + TAG];
             self.stream.read_exact(&mut hdr_ct).await?;
-            let hdr = payload_aead.open(
-                &kdf12(&self.resp_iv, &[KDF_RESP_PAYLOAD_IV]),
-                &[],
-                &hdr_ct,
-            )?;
+            let hdr =
+                payload_aead.open(&kdf12(&self.resp_iv, &[KDF_RESP_PAYLOAD_IV]), &[], &hdr_ct)?;
             assert_eq!(hdr[0], self.resp_v, "response header byte mismatch");
             assert_eq!(hdr[1], self.opt, "server must echo the request options");
             Ok(())
@@ -1432,8 +1407,7 @@ mod tests {
         let uuid = fresh_uuid();
         let (capture, addr) = spawn_server(&uuid, "auto").await;
         let target = NetAddr::domain("echo.test", 443).unwrap();
-        let placeholder =
-            NetAddr::ip(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+        let placeholder = NetAddr::ip(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
         let mut c = SingClient::connect(
             &uuid,
             addr,
@@ -1469,8 +1443,7 @@ mod tests {
         let target = NetAddr::domain("echo.test", 443).unwrap();
         let tcp = TcpStream::connect(addr).await.unwrap();
         // Like the outbound, the instruction header carries no real target.
-        let placeholder =
-            NetAddr::ip(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+        let placeholder = NetAddr::ip(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
         let mut stream = crate::proto::vmess::VmessStream::handshake(
             Box::new(tcp),
             &client(&uuid, "auto", addr.port()),

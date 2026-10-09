@@ -13,11 +13,31 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::ring as ring_provider;
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use sha1::{Digest, Sha1};
+use sha2::Sha256;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::addr::Host;
 use crate::error::{Error, Result};
 use crate::stream::BoxProxyStream;
+
+/// Which certificates a certificate pin may match.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PinScope {
+    /// The end-entity certificate only (sing-box semantics).
+    #[default]
+    Leaf,
+    /// Any certificate in the presented chain (mihomo fingerprint
+    /// semantics).
+    AnyChain,
+}
+
+/// An mTLS client identity: the PEM certificate chain plus its PEM
+/// private key.
+#[derive(Debug, Clone, Default)]
+pub struct ClientIdentity {
+    pub cert_pem: String,
+    pub key_pem: String,
+}
 
 /// TLS settings for one outbound.
 #[derive(Debug, Clone, Default)]
@@ -27,6 +47,27 @@ pub struct TlsSettings {
     pub skip_cert_verify: bool,
     /// ALPN protocol list (e.g. ["h2"] for the gRPC transport).
     pub alpn: Vec<String>,
+    /// SHA-256 pins over the whole DER-encoded leaf certificate. A
+    /// non-empty list replaces chain validation (sing-box
+    /// `certificate_sha256`, std_client.go VerifyPinnedCertificate; mihomo
+    /// http/socks5 `fingerprint` is the same pin in hex).
+    pub cert_sha256: Vec<[u8; 32]>,
+    /// Which presented certificates a cert pin may match: sing-box pins
+    /// the leaf only (std_client.go VerifyPinnedCertificate hashes
+    /// rawCerts[0]); mihomo's fingerprint matches any chain certificate
+    /// (component/ca/fingerprint.go loops PeerCertificates). Set by the
+    /// dialect the pins came from.
+    pub cert_pin_scope: PinScope,
+    /// SHA-256 pins over the leaf's SubjectPublicKeyInfo DER (sing-box
+    /// `certificate_public_key_sha256`). Either pin list matching passes.
+    pub spki_sha256: Vec<[u8; 32]>,
+    /// PEM trust anchors replacing the system store (sing-box
+    /// `certificate`/`certificate_path`).
+    pub ca_pem: Vec<String>,
+    /// Client certificate for mTLS outbounds (sing-box
+    /// `client_certificate`+`client_key`; mihomo http/socks5
+    /// `certificate`+`private-key`).
+    pub client_cert: Option<ClientIdentity>,
 }
 
 impl TlsSettings {
@@ -37,16 +78,18 @@ impl TlsSettings {
             server_name: Some(name.to_string()),
             skip_cert_verify: false,
             alpn: Vec::new(),
+            cert_sha256: Vec::new(),
+            cert_pin_scope: PinScope::Leaf,
+            spki_sha256: Vec::new(),
+            ca_pem: Vec::new(),
+            client_cert: None,
         }
     }
 }
 
 /// Read one HTTP head (through `\r\n\r\n`, capped at 16 KiB) from a
 /// boxed stream. Shared by the ws, httpupgrade and http-in paths.
-pub async fn read_head(
-    transport: &mut BoxProxyStream,
-    what: &str,
-) -> Result<String> {
+pub async fn read_head(transport: &mut BoxProxyStream, what: &str) -> Result<String> {
     use tokio::io::AsyncReadExt;
     let mut buf = Vec::with_capacity(512);
     let mut byte = [0u8; 1];
@@ -64,6 +107,28 @@ pub async fn read_head(
         }
     }
     Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Shared rustls dangerous-verifier plumbing: delegate handshake
+/// signature checks to the provider's standard algorithms.
+fn verify_sig(
+    algorithms: &rustls::crypto::WebPkiSupportedAlgorithms,
+    message: &[u8],
+    cert: &rustls::pki_types::CertificateDer<'_>,
+    dss: &DigitallySignedStruct,
+    version12: bool,
+) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+    if version12 {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, algorithms)
+    } else {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, algorithms)
+    }
+}
+
+fn supported_schemes(
+    algorithms: &rustls::crypto::WebPkiSupportedAlgorithms,
+) -> Vec<SignatureScheme> {
+    algorithms.supported_schemes()
 }
 
 /// Accept-anything verifier used when `skip-cert-verify` is set (mirrors
@@ -89,7 +154,13 @@ impl ServerCertVerifier for NoVerify {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        verify_sig(
+            &self.0.signature_verification_algorithms,
+            message,
+            cert,
+            dss,
+            true,
+        )
     }
 
     fn verify_tls13_signature(
@@ -98,11 +169,17 @@ impl ServerCertVerifier for NoVerify {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        verify_sig(
+            &self.0.signature_verification_algorithms,
+            message,
+            cert,
+            dss,
+            false,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
+        supported_schemes(&self.0.signature_verification_algorithms)
     }
 }
 
@@ -125,23 +202,230 @@ fn root_store() -> Result<RootCertStore> {
     Ok(roots)
 }
 
+/// Extract the SubjectPublicKeyInfo DER TLV from a DER certificate
+/// (X.509 Certificate SEQUENCE → tbsCertificate → 7th element, after the
+/// optional [0] version). Used for SPKI-sha256 pinning.
+fn cert_spki_der(cert: &[u8]) -> Option<&[u8]> {
+    /// Read one DER TLV at `off`; returns (tag, content, tlv_len).
+    fn tlv(buf: &[u8], off: usize) -> Option<(u8, &[u8], usize)> {
+        let tag = *buf.get(off)?;
+        let mut i = off + 1;
+        let mut len = *buf.get(i)? as usize;
+        if len & 0x80 != 0 {
+            let n = len & 0x7f;
+            if n == 0 || n > 4 {
+                return None;
+            }
+            i += 1;
+            len = 0;
+            for _ in 0..n {
+                len = (len << 8) | *buf.get(i)? as usize;
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+        let end = i.checked_add(len)?;
+        if end > buf.len() {
+            return None;
+        }
+        Some((tag, &buf[i..end], end - off))
+    }
+    let (_, cert_body, _) = tlv(cert, 0)?; // Certificate SEQUENCE
+    let (_, tbs, _) = tlv(cert_body, 0)?; // tbsCertificate SEQUENCE
+                                          // version [0] is EXPLICIT and optional — present in practice; skip it
+                                          // when the first element is context tag 0.
+    let mut off = 0usize;
+    if let Some((0xa0, _, len)) = tlv(tbs, 0).filter(|&(_, _, len)| len > 0) {
+        off = len;
+    }
+    // serialNumber, signature, issuer, validity, subject → SPKI is next.
+    for _ in 0..5 {
+        let (_, _, len) = tlv(tbs, off)?;
+        off += len;
+    }
+    let (_, _, spki_len) = tlv(tbs, off)?;
+    Some(&tbs[off..off + spki_len])
+}
+
+/// Pin-based verifier (sing-box std_client.go VerifyPinnedCertificate):
+/// any configured cert-SHA-256 or SPKI-SHA-256 match passes; otherwise
+/// the error names both computed hashes. A pin replaces chain validation
+/// entirely, exactly like upstream's InsecureSkipVerify swap.
+#[derive(Debug)]
+struct PinnedCertVerifier {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    cert_pins: Vec<[u8; 32]>,
+    spki_pins: Vec<[u8; 32]>,
+    pin_scope: PinScope,
+}
+
+impl ServerCertVerifier for PinnedCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        let b64 = |h: &[u8; 32]| base64::engine::general_purpose::STANDARD.encode(h);
+        let cert_hash: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
+        if self.cert_pins.iter().any(|p| p == &cert_hash) {
+            return Ok(ServerCertVerified::assertion());
+        }
+        if self.pin_scope == PinScope::AnyChain {
+            // mihomo's fingerprint verifier matches ANY presented chain
+            // certificate (component/ca/fingerprint.go loops
+            // PeerCertificates); sing-box pins the leaf only, so this arm
+            // runs only for mihomo-dialect pins.
+            for extra in _intermediates {
+                let h: [u8; 32] = Sha256::digest(extra.as_ref()).into();
+                if self.cert_pins.iter().any(|p| p == &h) {
+                    return Ok(ServerCertVerified::assertion());
+                }
+            }
+        }
+        if !self.spki_pins.is_empty() {
+            if let Some(spki) = cert_spki_der(end_entity.as_ref()) {
+                let key_hash: [u8; 32] = Sha256::digest(spki).into();
+                if self.spki_pins.iter().any(|p| p == &key_hash) {
+                    return Ok(ServerCertVerified::assertion());
+                }
+            }
+        }
+        Err(rustls::Error::General(format!(
+            "unrecognized peer certificate: sha256 {}, public key sha256 {}",
+            b64(&cert_hash),
+            b64(&{
+                let spki = cert_spki_der(end_entity.as_ref()).unwrap_or_default();
+                let key_hash: [u8; 32] = Sha256::digest(spki).into();
+                key_hash
+            })
+        )))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        verify_sig(
+            &self.provider.signature_verification_algorithms,
+            message,
+            cert,
+            dss,
+            true,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        verify_sig(
+            &self.provider.signature_verification_algorithms,
+            message,
+            cert,
+            dss,
+            false,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        supported_schemes(&self.provider.signature_verification_algorithms)
+    }
+}
+
+/// Always-present single client certificate (mTLS outbounds).
+struct SingleCertResolver(std::sync::Arc<rustls::sign::CertifiedKey>);
+
+impl std::fmt::Debug for SingleCertResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SingleCertResolver").finish_non_exhaustive()
+    }
+}
+
+impl rustls::client::ResolvesClientCert for SingleCertResolver {
+    fn resolve(
+        &self,
+        _acceptable_issuers: &[&[u8]],
+        _sigschemes: &[rustls::SignatureScheme],
+    ) -> Option<std::sync::Arc<rustls::sign::CertifiedKey>> {
+        Some(self.0.clone())
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
 /// Build a rustls ClientConfig honoring the settings.
 pub fn tls_client_config(settings: &TlsSettings) -> Result<Arc<ClientConfig>> {
     let provider = Arc::new(ring_provider::default_provider());
     let builder = ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .map_err(|e| Error::config(format!("tls: {e}")))?;
-    let mut config = if settings.skip_cert_verify {
+    let mut config = if !settings.cert_sha256.is_empty() || !settings.spki_sha256.is_empty() {
+        // Pinning replaces chain validation (upstream swaps
+        // InsecureSkipVerify on when a pin list is configured).
         builder
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
+            .with_custom_certificate_verifier(Arc::new(PinnedCertVerifier {
+                provider: provider.clone(),
+                cert_pins: settings.cert_sha256.clone(),
+                spki_pins: settings.spki_sha256.clone(),
+                pin_scope: settings.cert_pin_scope,
+            }))
             .with_no_client_auth()
+    } else if settings.skip_cert_verify {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify(provider.clone())))
+            .with_no_client_auth()
+    } else if !settings.ca_pem.is_empty() {
+        let mut roots = RootCertStore::empty();
+        for pem in &settings.ca_pem {
+            let mut cursor = std::io::Cursor::new(pem.as_bytes());
+            for cert in rustls_pemfile::certs(&mut cursor) {
+                let cert = cert.map_err(|e| Error::config(format!("tls certificate PEM: {e}")))?;
+                roots
+                    .add(cert)
+                    .map_err(|e| Error::config(format!("bad pinned CA cert: {e}")))?;
+            }
+        }
+        if roots.is_empty() {
+            return Err(Error::config(
+                "tls: certificate/certificate_path contained no PEM certificates",
+            ));
+        }
+        builder.with_root_certificates(roots).with_no_client_auth()
     } else {
         let roots = root_store()?;
-        builder
-            .with_root_certificates(roots)
-            .with_no_client_auth()
+        builder.with_root_certificates(roots).with_no_client_auth()
     };
+    if let Some(identity) = &settings.client_cert {
+        let cert_pem = identity.cert_pem.as_str();
+        let key_pem = identity.key_pem.as_str();
+        let mut cert_cursor = std::io::Cursor::new(cert_pem.as_bytes());
+        let certs: Vec<_> = rustls_pemfile::certs(&mut cert_cursor)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::config(format!("tls client certificate PEM: {e}")))?;
+        let mut key_cursor = std::io::Cursor::new(key_pem.as_bytes());
+        let key = rustls_pemfile::private_key(&mut key_cursor)
+            .map_err(|e| Error::config(format!("tls client private key PEM: {e}")))?
+            .ok_or_else(|| Error::config("tls: private-key PEM holds no key"))?;
+        let signing_key = provider
+            .key_provider
+            .load_private_key(key)
+            .map_err(|e| Error::config(format!("tls client private key: {e}")))?;
+        config.client_auth_cert_resolver = Arc::new(SingleCertResolver(std::sync::Arc::new(
+            rustls::sign::CertifiedKey::new(certs, signing_key),
+        )));
+    }
     if !settings.alpn.is_empty() {
         config.alpn_protocols = settings
             .alpn
@@ -223,12 +507,16 @@ pub async fn httpupgrade_connect(
     let mut lines = head.split("\r\n");
     let status = lines.next().unwrap_or_default();
     if !status.contains(" 101") {
-        return Err(Error::protocol(format!("httpupgrade: unexpected status {status:?}")));
+        return Err(Error::protocol(format!(
+            "httpupgrade: unexpected status {status:?}"
+        )));
     }
     let mut ok_connection = false;
     let mut ok_upgrade = false;
     for line in lines {
-        let Some((k, v)) = line.split_once(':') else { continue };
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
         let v = v.trim();
         if k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("upgrade") {
             ok_connection = true;
@@ -238,7 +526,9 @@ pub async fn httpupgrade_connect(
         }
     }
     if !ok_connection || !ok_upgrade {
-        return Err(Error::protocol("httpupgrade: missing Upgrade headers in 101"));
+        return Err(Error::protocol(
+            "httpupgrade: missing Upgrade headers in 101",
+        ));
     }
     // The byte-at-a-time head read never crosses into the body, so the
     // stream resumes exactly at the tunnel's first byte.
@@ -295,7 +585,10 @@ pub async fn ws_connect_early(
             "ws: early data exceeds {WS_MAX_EARLY_DATA} bytes"
         )));
     }
-    let host = settings.host.clone().unwrap_or_else(|| default_host.to_string());
+    let host = settings
+        .host
+        .clone()
+        .unwrap_or_else(|| default_host.to_string());
     let mut key_bytes = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut key_bytes);
     let key = base64::engine::general_purpose::STANDARD.encode(key_bytes);
@@ -454,7 +747,11 @@ impl WsStream {
 }
 
 impl AsyncWrite for WsStream {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
@@ -501,7 +798,11 @@ impl AsyncWrite for WsStream {
 }
 
 impl AsyncRead for WsStream {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         loop {
             // Drain queued control frames when the transport is writable.
@@ -582,10 +883,7 @@ pub fn effective_sni(settings: &TlsSettings, server: &str, target: Option<&Host>
     settings
         .server_name
         .clone()
-        .or_else(|| {
-            target
-                .and_then(|h| h.as_domain().map(|d| d.to_string()))
-        })
+        .or_else(|| target.and_then(|h| h.as_domain().map(|d| d.to_string())))
         .unwrap_or_else(|| server.to_string())
 }
 
@@ -653,7 +951,9 @@ mod tests {
             path: "/ws".into(),
             host: Some("ws.test".into()),
         };
-        let mut stream = ws_connect(Box::new(client), &settings, "fallback").await.unwrap();
+        let mut stream = ws_connect(Box::new(client), &settings, "fallback")
+            .await
+            .unwrap();
         stream.write_all(b"ping").await.unwrap();
         let mut buf = [0u8; 8];
         let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))
@@ -727,9 +1027,10 @@ mod tests {
                 }
             }
             let req = String::from_utf8_lossy(&buf).to_string();
-            let protocol = req
-                .lines()
-                .find(|l| l.to_ascii_lowercase().starts_with("sec-websocket-protocol:"));
+            let protocol = req.lines().find(|l| {
+                l.to_ascii_lowercase()
+                    .starts_with("sec-websocket-protocol:")
+            });
             assert_eq!(protocol, Some("Sec-WebSocket-Protocol: ----_wBCfw"));
             let key = req
                 .lines()
@@ -838,6 +1139,104 @@ mod tests {
         }
     }
 
+    /// PinnedCertVerifier (f2edd42 port): a pin over the full DER cert
+    /// passes, a pin over the SPKI passes, a wrong pin fails naming both
+    /// hashes — verified against a real rustls handshake with a
+    /// self-signed certificate.
+    #[tokio::test]
+    async fn pinned_cert_verifier_accepts_cert_or_spki_pins() {
+        let certified = rcgen::generate_simple_self_signed(vec!["pin.test".to_string()]).unwrap();
+        let leaf = certified.cert.der().clone();
+        let key_der = certified.key_pair.serialize_der();
+        let cert_hash: [u8; 32] = Sha256::digest(leaf.as_ref()).into();
+        let spki_hash: [u8; 32] =
+            Sha256::digest(cert_spki_der(leaf.as_ref()).expect("spki extract")).into();
+
+        async fn try_handshake(
+            settings: &crate::transport::TlsSettings,
+            der: &rustls::pki_types::CertificateDer<'static>,
+            key_der: Vec<u8>,
+        ) -> std::result::Result<(), String> {
+            let srv_cfg = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![der.clone()],
+                    rustls::pki_types::PrivateKeyDer::Pkcs8(key_der.into()),
+                )
+                .unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(srv_cfg));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let srv = tokio::spawn(async move {
+                if let Ok((sock, _)) = listener.accept().await {
+                    let _ = acceptor.accept(sock).await;
+                }
+            });
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let res = tls_connect(Box::new(tcp), "pin.test", settings)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+            srv.abort();
+            res
+        }
+
+        let ok = crate::transport::TlsSettings {
+            enabled: true,
+            server_name: Some("pin.test".into()),
+            cert_sha256: vec![cert_hash],
+            ..Default::default()
+        };
+        try_handshake(&ok, &leaf, key_der.clone())
+            .await
+            .expect("cert pin must pass");
+
+        let ok = crate::transport::TlsSettings {
+            enabled: true,
+            server_name: Some("pin.test".into()),
+            spki_sha256: vec![spki_hash],
+            ..Default::default()
+        };
+        try_handshake(&ok, &leaf, key_der.clone())
+            .await
+            .expect("spki pin must pass");
+
+        let bad = crate::transport::TlsSettings {
+            enabled: true,
+            server_name: Some("pin.test".into()),
+            cert_sha256: vec![[9u8; 32]],
+            ..Default::default()
+        };
+        let err = try_handshake(&bad, &leaf, key_der).await.unwrap_err();
+        assert!(err.contains("unrecognized peer certificate"), "{err}");
+    }
+
+    /// mihomo fingerprint semantics: a pin over ANY chain certificate
+    /// (intermediates included) authenticates (component/ca
+    /// fingerprint.go loops PeerCertificates).
+    #[tokio::test]
+    async fn pinned_cert_verifier_matches_intermediates() {
+        let leaf = rcgen::generate_simple_self_signed(vec!["a.test".to_string()]).unwrap();
+        let intermediate = rcgen::generate_simple_self_signed(vec!["b.test".to_string()]).unwrap();
+        let i_hash: [u8; 32] = Sha256::digest(intermediate.cert.der().as_ref()).into();
+        let verifier = PinnedCertVerifier {
+            provider: std::sync::Arc::new(ring_provider::default_provider()),
+            cert_pins: vec![i_hash],
+            spki_pins: Vec::new(),
+            pin_scope: PinScope::AnyChain, // mihomo fingerprint semantics under test
+        };
+        use rustls::client::danger::ServerCertVerifier as _;
+        verifier
+            .verify_server_cert(
+                leaf.cert.der(),
+                &[intermediate.cert.der().clone()],
+                &"a.test".try_into().unwrap(),
+                &[],
+                rustls::pki_types::UnixTime::now(),
+            )
+            .expect("intermediate pin must authenticate the chain");
+    }
+
     #[test]
     fn effective_sni_priority() {
         let tls = TlsSettings {
@@ -845,14 +1244,23 @@ mod tests {
             server_name: Some("sni.example".into()),
             skip_cert_verify: false,
             alpn: Vec::new(),
+            ..Default::default()
         };
         assert_eq!(
-            effective_sni(&tls, "1.2.3.4", Some(&Host::Domain("target.example".into()))),
+            effective_sni(
+                &tls,
+                "1.2.3.4",
+                Some(&Host::Domain("target.example".into()))
+            ),
             "sni.example"
         );
         let tls = TlsSettings::default();
         assert_eq!(
-            effective_sni(&tls, "1.2.3.4", Some(&Host::Domain("target.example".into()))),
+            effective_sni(
+                &tls,
+                "1.2.3.4",
+                Some(&Host::Domain("target.example".into()))
+            ),
             "target.example"
         );
         assert_eq!(effective_sni(&tls, "5.6.7.8", None), "5.6.7.8");

@@ -50,9 +50,9 @@ use crate::transport::{tls_connect, TlsSettings};
 
 use super::controlhttp::ControlHttpDialer;
 use super::noise::{MachinePublicKey, NoiseConn};
-use super::tailcfg::{FilterRule, 
-    DerpMap, DnsConfig, Hostinfo, MapRequest, MapResponse, Node, NodeKey, Prefix, RegisterRequest,
-    RegisterResponse, RegisterResponseAuth, UserProfile,
+use super::tailcfg::{
+    DerpMap, DnsConfig, FilterRule, Hostinfo, MapRequest, MapResponse, Node, NodeKey, Prefix,
+    RegisterRequest, RegisterResponse, RegisterResponseAuth, UserProfile,
 };
 
 /// The early-payload magic (control/ts2021/conn.go:90).
@@ -99,6 +99,7 @@ pub async fn fetch_control_key(control_url: &str) -> Result<MachinePublicKey> {
             server_name: Some(host.clone()),
             skip_cert_verify: false,
             alpn: Vec::new(),
+            ..Default::default()
         };
         tls_connect(Box::new(tcp), &host, &settings)
             .await
@@ -119,7 +120,10 @@ pub async fn fetch_control_key(control_url: &str) -> Result<MachinePublicKey> {
     let head = reader.read_head().await?;
     let status = head.split("\r\n").next().unwrap_or_default();
     if !status.contains(" 200") {
-        let body = reader.read_to_end(MAX_RESPONSE_BODY).await.unwrap_or_default();
+        let body = reader
+            .read_to_end(MAX_RESPONSE_BODY)
+            .await
+            .unwrap_or_default();
         return Err(Error::network(format!(
             "fetch control key: {status} (body: {})",
             String::from_utf8_lossy(&truncate(&body, 200))
@@ -130,8 +134,7 @@ pub async fn fetch_control_key(control_url: &str) -> Result<MachinePublicKey> {
     // JSON first; "some old control servers might not be updated to send
     // the new format. Accept the old pre-JSON format too" (direct.go:
     // 1559-1571) — a bare 32-byte machine key.
-    if let Ok(parsed) = serde_json::from_slice::<super::tailcfg::OverTlsPublicKeyResponse>(&body)
-    {
+    if let Ok(parsed) = serde_json::from_slice::<super::tailcfg::OverTlsPublicKeyResponse>(&body) {
         if let Some(pk) = parsed.public_key {
             return Ok(pk.to_machine_public_key());
         }
@@ -444,8 +447,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ControlSession<S> {
             if key.as_bytes() == &[0u8; 32] {
                 continue; // AddLBHeader skips zero keys (client.go:315)
             }
-            let node_hex: String =
-                key.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+            let node_hex: String = key.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
             req.push_str(&format!("{LB_HEADER}: nodekey:{node_hex}\r\n"));
         }
         req.push_str("Connection: close\r\n\r\n");
@@ -502,9 +504,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ControlSession<S> {
                 let mut done = 0;
                 while done < want {
                     if self.fill().await? == 0 && self.rbuf.is_empty() {
-                        return Err(Error::protocol(
-                            "control: EOF inside a fixed-length body",
-                        ));
+                        return Err(Error::protocol("control: EOF inside a fixed-length body"));
                     }
                     let take = (want - done).min(self.rbuf.len());
                     out[done..done + take].copy_from_slice(&self.rbuf[..take]);
@@ -585,8 +585,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ControlSession<S> {
         }
         let text = String::from_utf8_lossy(&line).into_owned();
         let size_str = text.split(';').next().unwrap_or("").trim();
-        u64::from_str_radix(size_str, 16)
-            .map_err(|_| Error::protocol("control: bad chunk size"))
+        u64::from_str_radix(size_str, 16).map_err(|_| Error::protocol("control: bad chunk size"))
     }
 
     /// Read the whole (small, non-streaming) body: register responses,
@@ -880,7 +879,11 @@ impl NetMap {
         // default route vs an advertised subnet behind accept-routes.
         let ungated = self.route_peer(ip);
         if let Some(peer) = ungated {
-            if peer.allowed_ips.iter().any(|p| is_exit_route(p) && p.contains(&ip)) {
+            if peer
+                .allowed_ips
+                .iter()
+                .any(|p| is_exit_route(p) && p.contains(&ip))
+            {
                 return Err(format!(
                     "{ip} would route through the exit node {} but no exit node is selected \
                      (exit-node)",
@@ -909,7 +912,12 @@ impl NetMap {
         if self.self_node.expired {
             return true;
         }
-        match self.self_node.key_expiry.as_deref().and_then(parse_rfc3339_unix) {
+        match self
+            .self_node
+            .key_expiry
+            .as_deref()
+            .and_then(parse_rfc3339_unix)
+        {
             Some(expiry) => expiry < now_unix,
             None => false,
         }
@@ -956,7 +964,9 @@ impl NetMap {
                 return false;
             }
             rule.dst.iter().any(|d| {
-                let Some(prefix) = d.prefix() else { return false };
+                let Some(prefix) = d.prefix() else {
+                    return false;
+                };
                 prefix.contains(&dst_ip) && port >= d.ports[0] && port <= d.ports[1]
             })
         })
@@ -1092,9 +1102,9 @@ impl NetMap {
             return Some(p);
         }
         let ip = self.resolve(value)?;
-        self.peers
-            .iter()
-            .find(|p| p.allowed_ips.iter().any(is_exit_route) && p.addresses.iter().any(|a| a.addr == ip))
+        self.peers.iter().find(|p| {
+            p.allowed_ips.iter().any(is_exit_route) && p.addresses.iter().any(|a| a.addr == ip)
+        })
     }
 }
 
@@ -1423,8 +1433,8 @@ pub async fn stream_map<F>(
 where
     F: FnMut(&NetMap),
 {
-    let body = serde_json::to_vec(request)
-        .map_err(|e| Error::config(format!("map request JSON: {e}")))?;
+    let body =
+        serde_json::to_vec(request).map_err(|e| Error::config(format!("map request JSON: {e}")))?;
     let status = session
         .post_json("/machine/map", authority, &[&request.node_key], &body)
         .await?;
@@ -1495,10 +1505,10 @@ async fn read_body_exact(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::derp::NodePrivateKey;
     use super::super::noise::{client_handshake, server_handshake, MachinePrivateKey};
     use super::super::tailcfg::Prefix;
+    use super::*;
     use base64::Engine;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1550,7 +1560,10 @@ mod tests {
         assert_eq!(ms.netmap().dns_config.domains.len(), 2);
         // A new DNSConfig replaces it (last-write-wins).
         ms.handle_response(&MapResponse {
-            dns_config: Some(DnsConfig { domains: vec![], proxied: false }),
+            dns_config: Some(DnsConfig {
+                domains: vec![],
+                proxied: false,
+            }),
             ..Default::default()
         })
         .unwrap();
@@ -1596,8 +1609,11 @@ mod tests {
         ms.handle_response(&resp).unwrap();
         let nm = ms.netmap();
         assert_eq!(nm.packet_filter.len(), 2);
-        ms.handle_response(&MapResponse { peers_removed: vec![9], ..Default::default() })
-            .unwrap();
+        ms.handle_response(&MapResponse {
+            peers_removed: vec![9],
+            ..Default::default()
+        })
+        .unwrap();
         assert_eq!(ms.netmap().packet_filter.len(), 2);
 
         // The matcher (filter/filter.go's walk): allowed tuples.
@@ -1606,14 +1622,35 @@ mod tests {
         let us2: std::net::IpAddr = "100.110.0.2".parse().unwrap();
         let us3: std::net::IpAddr = "100.110.0.3".parse().unwrap();
         let any_src: std::net::IpAddr = "203.0.113.9".parse().unwrap();
-        assert!(nm.packet_filter_allows(peer_v4, us, 6, 22), "tailnet src, TCP 22");
-        assert!(nm.packet_filter_allows(peer_v4, us2, 6, 65535), "any port in window");
-        assert!(nm.packet_filter_allows(any_src, us3, 17, 53), "any src, UDP 53");
+        assert!(
+            nm.packet_filter_allows(peer_v4, us, 6, 22),
+            "tailnet src, TCP 22"
+        );
+        assert!(
+            nm.packet_filter_allows(peer_v4, us2, 6, 65535),
+            "any port in window"
+        );
+        assert!(
+            nm.packet_filter_allows(any_src, us3, 17, 53),
+            "any src, UDP 53"
+        );
         // Denied: wrong proto, wrong port, wrong dst.
-        assert!(!nm.packet_filter_allows(peer_v4, us, 17, 22), "UDP not in TCP rule");
-        assert!(!nm.packet_filter_allows(peer_v4, us, 6, 23), "port outside window");
-        assert!(!nm.packet_filter_allows(peer_v4, us3, 6, 22), "dst not in TCP rule's ranges");
-        assert!(!nm.packet_filter_allows(any_src, us, 6, 22), "src outside any rule");
+        assert!(
+            !nm.packet_filter_allows(peer_v4, us, 17, 22),
+            "UDP not in TCP rule"
+        );
+        assert!(
+            !nm.packet_filter_allows(peer_v4, us, 6, 23),
+            "port outside window"
+        );
+        assert!(
+            !nm.packet_filter_allows(peer_v4, us3, 6, 22),
+            "dst not in TCP rule's ranges"
+        );
+        assert!(
+            !nm.packet_filter_allows(any_src, us, 6, 22),
+            "src outside any rule"
+        );
         // An empty filter denies everything (default-deny, exactly like
         // a nil Go filter).
         let empty = NetMap::default();
@@ -1671,10 +1708,16 @@ mod tests {
         );
         let v4 = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
         // FQDN forms.
-        assert_eq!(nm.resolve("peer.tail-scale.ts.net."), Some(v4("100.64.0.2")));
+        assert_eq!(
+            nm.resolve("peer.tail-scale.ts.net."),
+            Some(v4("100.64.0.2"))
+        );
         assert_eq!(nm.resolve("peer.tail-scale.ts.net"), Some(v4("100.64.0.2")));
         assert_eq!(nm.resolve("PEER.TAIL-SCALE.TS.NET"), Some(v4("100.64.0.2")));
-        assert_eq!(nm.resolve("self-node.tail-scale.ts.net"), Some(v4("100.64.0.1")));
+        assert_eq!(
+            nm.resolve("self-node.tail-scale.ts.net"),
+            Some(v4("100.64.0.1"))
+        );
         // Bare-name expansion through the search domains, in order:
         // "peer" hits the MagicDNS suffix, "db" only corp.example.
         assert_eq!(nm.resolve("peer"), Some(v4("100.64.0.2")));
@@ -1711,7 +1754,9 @@ mod tests {
             n
         };
         let mut exit_node = mk(4, "exit", exit.clone(), vec![("0.0.0.0", 0)]);
-        exit_node.allowed_ips.push(Prefix::new("::".parse().unwrap(), 0));
+        exit_node
+            .allowed_ips
+            .push(Prefix::new("::".parse().unwrap(), 0));
         exit_node.online = Some(true);
         let mut nm = NetMap {
             self_node: mk(1, "self", self_key.clone(), vec![]),
@@ -1726,13 +1771,16 @@ mod tests {
         };
         nm.self_node.name = "self.tail-scale.ts.net.".into();
 
-        let id_of = |r: std::result::Result<Option<&Node>, String>| {
-            r.unwrap().map(|n| n.id)
-        };
+        let id_of = |r: std::result::Result<Option<&Node>, String>| r.unwrap().map(|n| n.id);
         // Tailnet IPs always route, whatever the prefs.
-        assert_eq!(id_of(nm.route_peer_enforced(v4("100.64.0.2"), false, None, false)), Some(2));
+        assert_eq!(
+            id_of(nm.route_peer_enforced(v4("100.64.0.2"), false, None, false)),
+            Some(2)
+        );
         // Subnet routes: refused without accept-routes, routed with.
-        let refused = nm.route_peer_enforced(v4("10.0.0.7"), false, None, false).unwrap_err();
+        let refused = nm
+            .route_peer_enforced(v4("10.0.0.7"), false, None, false)
+            .unwrap_err();
         assert!(refused.contains("accept-routes"), "{refused}");
         assert_eq!(
             id_of(nm.route_peer_enforced(v4("10.0.0.7"), true, None, false)),
@@ -1743,7 +1791,10 @@ mod tests {
         let unselected = nm
             .route_peer_enforced(v4("8.8.8.8"), true, None, false)
             .unwrap_err();
-        assert!(unselected.contains("no exit node is selected"), "{unselected}");
+        assert!(
+            unselected.contains("no exit node is selected"),
+            "{unselected}"
+        );
         assert!(nm.route_peer(v4("8.8.8.8")).is_some(), "ungated /0 exists");
         // The selected exit node carries it.
         assert_eq!(
@@ -1775,11 +1826,15 @@ mod tests {
         // Exit-node selection itself.
         assert_eq!(nm.select_exit_node(Some("auto:any")).map(|n| n.id), Some(4));
         assert_eq!(
-            nm.select_exit_node(Some("exit.tail-scale.ts.net")).map(|n| n.id),
+            nm.select_exit_node(Some("exit.tail-scale.ts.net"))
+                .map(|n| n.id),
             Some(4)
         );
         assert_eq!(nm.select_exit_node(Some("exit")).map(|n| n.id), Some(4));
-        assert_eq!(nm.select_exit_node(Some("100.64.0.4")).map(|n| n.id), Some(4));
+        assert_eq!(
+            nm.select_exit_node(Some("100.64.0.4")).map(|n| n.id),
+            Some(4)
+        );
         assert_eq!(nm.select_exit_node(Some("auto:")).map(|n| n.id), None);
         assert_eq!(nm.select_exit_node(Some("plain")).map(|n| n.id), None);
         assert_eq!(nm.select_exit_node(None).map(|n| n.id), None);
@@ -1842,7 +1897,9 @@ mod tests {
             domain: "x.example".into(),
             ..Default::default()
         };
-        let nm = ms.handle_response(&full).expect("full map produces a netmap");
+        let nm = ms
+            .handle_response(&full)
+            .expect("full map produces a netmap");
         assert_eq!(nm.peers.len(), 2);
         assert_eq!(nm.domain, "x.example");
         // upgradeNode: the legacy DERP string became HomeDERP=2 and was
@@ -1853,7 +1910,10 @@ mod tests {
         assert_eq!(nm.peers[0].id, 10);
         assert_eq!(nm.user_profiles.get(&7).unwrap().login_name, "u@example");
         // Cryptokey routing through AllowedIPs.
-        assert_eq!(nm.route_peer("100.64.0.10".parse().unwrap()).unwrap().id, 10);
+        assert_eq!(
+            nm.route_peer("100.64.0.10".parse().unwrap()).unwrap().id,
+            10
+        );
         assert!(nm.route_peer("10.0.0.1".parse().unwrap()).is_none());
 
         // PeersRemoved (map.go:573-580).
@@ -1899,7 +1959,10 @@ mod tests {
             .unwrap();
         assert_eq!(nm.peers[0].home_derp, 5);
         assert_eq!(nm.peers[0].endpoints[0].0.port(), 5555);
-        assert_eq!(nm.peers[0].key_expiry.as_deref(), Some("2999-01-01T00:00:00Z"));
+        assert_eq!(
+            nm.peers[0].key_expiry.as_deref(),
+            Some("2999-01-01T00:00:00Z")
+        );
         // An unknown NodeID patch is ignored (map.go:3037-3039).
         let nm = ms
             .handle_response(&MapResponse {
@@ -1969,7 +2032,9 @@ mod tests {
             .lines()
             .find_map(|l| l.strip_prefix("X-Tailscale-Handshake: "))
             .expect("handshake header");
-        let init = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+        let init = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
         w.write_all(
             b"HTTP/1.1 101 Switching Protocols\r\n\
               Upgrade: tailscale-control-protocol\r\n\
@@ -2042,7 +2107,10 @@ mod tests {
             assert_eq!(method, "POST");
             assert_eq!(path, "/machine/register");
             let req: RegisterRequest = serde_json::from_slice(body).unwrap();
-            assert_eq!(req.version, super::super::tailcfg::CURRENT_CAPABILITY_VERSION);
+            assert_eq!(
+                req.version,
+                super::super::tailcfg::CURRENT_CAPABILITY_VERSION
+            );
             assert!(!req.hostinfo.as_ref().unwrap().backend_log_id.is_empty());
             assert!(!req.auth.as_ref().unwrap().auth_key.is_empty());
             assert_eq!(req.hostinfo.as_ref().unwrap().app, "rustcrash");
@@ -2171,7 +2239,9 @@ mod tests {
             .lines()
             .find_map(|l| l.strip_prefix("X-Tailscale-Handshake: "))
             .expect("handshake header");
-        let init = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+        let init = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
         w.write_all(
             b"HTTP/1.1 101 Switching Protocols\r\n\
               Upgrade: tailscale-control-protocol\r\n\
@@ -2190,7 +2260,10 @@ mod tests {
         let req: MapRequest = serde_json::from_slice(&body).unwrap();
         assert!(req.stream, "the long-poll sets Stream");
         assert!(req.keep_alive);
-        assert_eq!(req.version, super::super::tailcfg::CURRENT_CAPABILITY_VERSION);
+        assert_eq!(
+            req.version,
+            super::super::tailcfg::CURRENT_CAPABILITY_VERSION
+        );
         assert!(req.compress.is_empty());
 
         // 200 + chunked stream of length-prefixed messages (LE u32 +
@@ -2226,8 +2299,16 @@ mod tests {
         let node_key = NodeKey(*node.public().as_bytes());
         let peer_key = NodeKey(gen_pub());
 
-        let self_hex: String = node_key.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
-        let peer_hex: String = peer_key.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let self_hex: String = node_key
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let peer_hex: String = peer_key
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
 
         let first = format!(
             r#"{{"Node":{{"ID":1,"Key":"nodekey:{self_hex}",
@@ -2325,8 +2406,9 @@ mod tests {
         let machine_key = MachinePrivateKey::generate();
         let (client_stream, server_stream) = tokio::io::duplex(8192);
         let server = tokio::spawn(async move {
-            let mut conn =
-                server_handshake(server_stream, &control_key, None).await.unwrap();
+            let mut conn = server_handshake(server_stream, &control_key, None)
+                .await
+                .unwrap();
             let early = br#"{"nodeKeyChallenge":"chal1234"}"#;
             let mut payload = EARLY_PAYLOAD_MAGIC.to_vec();
             payload.extend_from_slice(&(early.len() as u32).to_be_bytes());
@@ -2343,7 +2425,10 @@ mod tests {
         // read_head runs the lazy sniff first; the challenge is captured
         // and the HTTP session bytes still parse.
         let head = session.read_head().await.unwrap();
-        assert_eq!(session.early_node_key_challenge.as_deref(), Some("chal1234"));
+        assert_eq!(
+            session.early_node_key_challenge.as_deref(),
+            Some("chal1234")
+        );
         assert!(head.starts_with("HTTP/1.1 200"));
         let mut body = [0u8; 2];
         session.read_exact(&mut body).await.unwrap();
@@ -2360,8 +2445,9 @@ mod tests {
         let machine_key = MachinePrivateKey::generate();
         let (client_stream, server_stream) = tokio::io::duplex(8192);
         let server = tokio::spawn(async move {
-            let mut conn =
-                server_handshake(server_stream, &control_key, None).await.unwrap();
+            let mut conn = server_handshake(server_stream, &control_key, None)
+                .await
+                .unwrap();
             conn.send(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
                 .await
                 .unwrap();
@@ -2443,8 +2529,7 @@ mod tests {
     fn expired_register_response_is_the_rotation_signal() {
         // direct.go:861-866: resp.NodeKeyExpired becomes regen=true, not
         // an error — decode the JSON shape straight off the wire parser.
-        let resp: RegisterResponse =
-            serde_json::from_str(r#"{"NodeKeyExpired":true}"#).unwrap();
+        let resp: RegisterResponse = serde_json::from_str(r#"{"NodeKeyExpired":true}"#).unwrap();
         assert!(resp.node_key_expired);
         assert!(!resp.machine_authorized);
         // The register outcome is driven in `super`'s e2e renewal test
@@ -2454,7 +2539,12 @@ mod tests {
     #[tokio::test]
     async fn key_fetch_against_a_plain_http_mimic() {
         let key = MachinePrivateKey::generate();
-        let hexs: String = key.public().as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let hexs: String = key
+            .public()
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let body = format!(r#"{{"publicKey":"mkey:{hexs}"}}"#);

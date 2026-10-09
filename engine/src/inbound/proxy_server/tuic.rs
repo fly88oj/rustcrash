@@ -412,7 +412,13 @@ async fn deliver_uni_packet(
     }
 }
 
-async fn deliver(shared: &TuicShared, session_id: u16, target: NetAddr, data: Vec<u8>, quic_mode: bool) {
+async fn deliver(
+    shared: &TuicShared,
+    session_id: u16,
+    target: NetAddr,
+    data: Vec<u8>,
+    quic_mode: bool,
+) {
     let up = udp_session(shared, session_id, quic_mode);
     let _ = up.send((target, data)).await;
 }
@@ -486,8 +492,7 @@ async fn downlink(
 ) {
     let mut packet_id: u16 = rand::random();
     loop {
-        let Ok(Some((target, data))) =
-            tokio::time::timeout(UDP_SESSION_TTL, down_rx.recv()).await
+        let Ok(Some((target, data))) = tokio::time::timeout(UDP_SESSION_TTL, down_rx.recv()).await
         else {
             break;
         };
@@ -568,7 +573,10 @@ impl Fragments {
         if self.parts.iter().all(|p| p.is_some()) {
             return Some((
                 self.addr.clone(),
-                self.parts.drain(..).flat_map(|p| p.unwrap_or_default()).collect(),
+                self.parts
+                    .drain(..)
+                    .flat_map(|p| p.unwrap_or_default())
+                    .collect(),
             ));
         }
         None
@@ -675,14 +683,7 @@ fn fragment_reply(
         .enumerate()
         .map(|(i, chunk)| {
             let addr = if i == 0 { Some(target) } else { None };
-            encode_packet_frame(
-                session_id,
-                packet_id,
-                i as u8,
-                total as u8,
-                addr,
-                chunk,
-            )
+            encode_packet_frame(session_id, packet_id, i as u8, total as u8, addr, chunk)
         })
         .collect()
 }

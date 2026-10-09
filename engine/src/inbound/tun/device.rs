@@ -368,7 +368,8 @@ pub mod abi {
     /// Ring capacity rule from wintun.h:170-172: a power of two within
     /// [WINTUN_MIN_RING_CAPACITY, WINTUN_MAX_RING_CAPACITY].
     pub fn wintun_ring_capacity_ok(cap: u32) -> bool {
-        cap.is_power_of_two() && (WINTUN_MIN_RING_CAPACITY..=WINTUN_MAX_RING_CAPACITY).contains(&cap)
+        cap.is_power_of_two()
+            && (WINTUN_MIN_RING_CAPACITY..=WINTUN_MAX_RING_CAPACITY).contains(&cap)
     }
 
     /// The capacity this backend starts sessions with: 4 MiB — the
@@ -505,7 +506,11 @@ pub mod abi {
             let v4 = [0x45, 0, 0, 1];
             let v6 = [0x60, 0, 0, 0];
             assert_eq!(utun_header(&v4), Some([0, 0, 0, 2]));
-            assert_eq!(utun_header(&v6), Some([0, 0, 0, 30]), "darwin AF_INET6 is 30");
+            assert_eq!(
+                utun_header(&v6),
+                Some([0, 0, 0, 30]),
+                "darwin AF_INET6 is 30"
+            );
             assert_eq!(utun_header(&[]), None);
             assert_eq!(utun_header(&[0x00, 1, 2]), None, "not an IP version");
         }
@@ -600,7 +605,9 @@ pub mod abi {
             assert_eq!(&req.name[..5], b"utun7");
             assert_eq!(req.mask.addr, [255, 255, 255, 252]);
             assert_eq!(req.dstaddr.addr, req.addr.addr);
-            assert!(IfAliasReq::new("an-interface-name-over-16", Ipv4Addr::LOCALHOST, 24).is_none());
+            assert!(
+                IfAliasReq::new("an-interface-name-over-16", Ipv4Addr::LOCALHOST, 24).is_none()
+            );
             assert!(IfAliasReq::new("utun7", Ipv4Addr::LOCALHOST, 33).is_none());
 
             // sing-tun tun_darwin.go:218-232: name[16] + three sockaddr_in6 +
@@ -616,9 +623,15 @@ pub mod abi {
             assert_eq!(req6.flags, DARWIN_IN6_IFF_NODAD | DARWIN_IN6_IFF_SECURED);
             assert_eq!(req6.lifetime.vltime, u32::MAX);
             // A /128 carries addr+1 as the point-to-point destination.
-            assert_eq!(req6.dstaddr.addr, Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 2).octets());
             assert_eq!(
-                IfAliasReq6::new("utun7", Ipv6Addr::LOCALHOST, 64).unwrap().dstaddr.addr,
+                req6.dstaddr.addr,
+                Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 2).octets()
+            );
+            assert_eq!(
+                IfAliasReq6::new("utun7", Ipv6Addr::LOCALHOST, 64)
+                    .unwrap()
+                    .dstaddr
+                    .addr,
                 Ipv6Addr::LOCALHOST.octets(),
                 "non-/128 keeps the address as destination"
             );
@@ -641,7 +654,10 @@ pub mod abi {
             assert_eq!(DARWIN_CTLIOCGINFO, 0xC064_4E03);
             // darwin AF values the packet codec depends on.
             assert_eq!(DARWIN_AF_SYSTEM, 32);
-            assert_ne!(DARWIN_AF_INET6, 10, "darwin AF_INET6 must not be the Linux value");
+            assert_ne!(
+                DARWIN_AF_INET6, 10,
+                "darwin AF_INET6 must not be the Linux value"
+            );
         }
 
         // -- wintun ring math + IP Helper layouts ------------------------------
@@ -669,7 +685,10 @@ pub mod abi {
             let v6 = sockaddr_inet_v6(Ipv6Addr::new(0xfd00, 1, 2, 3, 4, 5, 6, 7));
             assert_eq!(&v6[0..2], &23u16.to_le_bytes());
             assert_eq!(&v6[4..8], &[0; 4], "flowinfo zero");
-            assert_eq!(&v6[8..24], &Ipv6Addr::new(0xfd00, 1, 2, 3, 4, 5, 6, 7).octets());
+            assert_eq!(
+                &v6[8..24],
+                &Ipv6Addr::new(0xfd00, 1, 2, 3, 4, 5, 6, 7).octets()
+            );
             assert_eq!(&v6[24..], &[0; 4], "scope id zero");
         }
 
@@ -680,9 +699,18 @@ pub mod abi {
             // skip@61 + DadState@64 -> 72 with align 8.
             assert_eq!(std::mem::size_of::<MibUnicastIpAddressRow>(), 72);
             assert_eq!(std::mem::align_of::<MibUnicastIpAddressRow>(), 8);
-            assert_eq!(std::mem::offset_of!(MibUnicastIpAddressRow, interface_luid), 32);
-            assert_eq!(std::mem::offset_of!(MibUnicastIpAddressRow, interface_index), 40);
-            assert_eq!(std::mem::offset_of!(MibUnicastIpAddressRow, on_link_prefix_length), 60);
+            assert_eq!(
+                std::mem::offset_of!(MibUnicastIpAddressRow, interface_luid),
+                32
+            );
+            assert_eq!(
+                std::mem::offset_of!(MibUnicastIpAddressRow, interface_index),
+                40
+            );
+            assert_eq!(
+                std::mem::offset_of!(MibUnicastIpAddressRow, on_link_prefix_length),
+                60
+            );
             assert_eq!(std::mem::offset_of!(MibUnicastIpAddressRow, dad_state), 64);
         }
 

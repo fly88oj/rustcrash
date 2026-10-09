@@ -213,8 +213,7 @@ const MSG_TYPE_TRANSPORT: u8 = 4;
 // ---------------------------------------------------------------------------
 
 const BLAKE2S_IV: [u32; 8] = [
-    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-    0x5be0cd19,
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
 const SIGMA: [[usize; 16]; 10] = [
@@ -479,10 +478,7 @@ fn aead_seal(key: &[u8; 32], counter: u64, plain: &[u8], aad: &[u8]) -> Result<V
     let cipher = ChaCha20Poly1305::new_from_slice(key)
         .map_err(|_| Error::crypto("wg: bad AEAD key length"))?;
     cipher
-        .encrypt(
-            (&aead_nonce(counter)).into(),
-            Payload { msg: plain, aad },
-        )
+        .encrypt((&aead_nonce(counter)).into(), Payload { msg: plain, aad })
         .map_err(|_| Error::crypto("wg: AEAD seal failed"))
 }
 
@@ -490,10 +486,7 @@ fn aead_open(key: &[u8; 32], counter: u64, ct: &[u8], aad: &[u8]) -> Result<Vec<
     let cipher = ChaCha20Poly1305::new_from_slice(key)
         .map_err(|_| Error::crypto("wg: bad AEAD key length"))?;
     cipher
-        .decrypt(
-            (&aead_nonce(counter)).into(),
-            Payload { msg: ct, aad },
-        )
+        .decrypt((&aead_nonce(counter)).into(), Payload { msg: ct, aad })
         .map_err(|_| Error::crypto("wg: AEAD open failed"))
 }
 
@@ -918,7 +911,9 @@ impl Session {
     /// zero-padded to a multiple of 16, the AAD is empty.
     fn seal_transport(&mut self, inner: &[u8]) -> Result<Vec<u8>> {
         if self.send.next >= REJECT_AFTER_MESSAGES {
-            return Err(Error::protocol("wg: session counter exhausted (reject-after)"));
+            return Err(Error::protocol(
+                "wg: session counter exhausted (reject-after)",
+            ));
         }
         let counter = self.send.next;
         self.send.next += 1;
@@ -931,7 +926,10 @@ impl Session {
             .cipher
             .encrypt(
                 (&aead_nonce(counter)).into(),
-                Payload { msg: &plain, aad: &[] },
+                Payload {
+                    msg: &plain,
+                    aad: &[],
+                },
             )
             .map_err(|_| Error::crypto("wg: transport seal failed"))?;
         let mut msg = Vec::with_capacity(TRANSPORT_HEADER_LEN + ct.len());
@@ -952,7 +950,10 @@ impl Session {
             .cipher
             .decrypt(
                 (&aead_nonce(counter)).into(),
-                Payload { msg: data, aad: &[] },
+                Payload {
+                    msg: data,
+                    aad: &[],
+                },
             )
             .map_err(|_| Error::crypto("wg: transport open failed"))?;
         if !self.recv.replay.accept(counter) {
@@ -1402,9 +1403,7 @@ impl Stack {
             SocketAddr::V4(_) => IpAddress::Ipv4(self.local_ip),
             // target_addr already refused v6 targets when no v6 address is
             // configured; the mirror keeps the lookup total.
-            SocketAddr::V6(_) => {
-                IpAddress::Ipv6(self.local_ipv6.unwrap_or(Ipv6Addr::UNSPECIFIED))
-            }
+            SocketAddr::V6(_) => IpAddress::Ipv6(self.local_ipv6.unwrap_or(Ipv6Addr::UNSPECIFIED)),
         }
     }
 
@@ -1512,7 +1511,11 @@ impl Stack {
             return;
         };
         match msg {
-            WgMsg::Transport { receiver, counter, data } => {
+            WgMsg::Transport {
+                receiver,
+                counter,
+                data,
+            } => {
                 let Some(session) = self.session.as_mut() else {
                     return;
                 };
@@ -1991,7 +1994,11 @@ async fn tunnel_for(cfg: &WgOut) -> Result<mpsc::Sender<Cmd>> {
     let (tx, rx) = mpsc::channel::<Cmd>(64);
     let (statics, peer_pk, psk) = cfg.keys()?;
     let endpoint = resolve_endpoint(&cfg.server, cfg.port).await?;
-    let bind_addr = if endpoint.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let bind_addr = if endpoint.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
     let socket = Arc::new({
         let s = UdpSocket::bind(bind_addr)
             .await
@@ -2029,7 +2036,9 @@ async fn resolve_endpoint(server: &str, port: u16) -> Result<SocketAddr> {
 ///   hands the stack an IP (the netstack routes IPs only).
 fn target_addr(target: &NetAddr, what: &str, local_ipv6: Option<Ipv6Addr>) -> Result<SocketAddr> {
     match &target.host {
-        crate::addr::Host::Ip(IpAddr::V4(ip)) => Ok(SocketAddr::V4(SocketAddrV4::new(*ip, target.port))),
+        crate::addr::Host::Ip(IpAddr::V4(ip)) => {
+            Ok(SocketAddr::V4(SocketAddrV4::new(*ip, target.port)))
+        }
         crate::addr::Host::Ip(IpAddr::V6(ip)) => match local_ipv6 {
             Some(_) => Ok(SocketAddr::V6(SocketAddrV6::new(*ip, target.port, 0, 0))),
             None => Err(Error::network(format!(
@@ -2601,9 +2610,7 @@ impl Endpoint {
         };
         let now = Instant::now();
         match msg {
-            WgMsg::Initiation {
-                sender, mac1, ..
-            } => {
+            WgMsg::Initiation { sender, mac1, .. } => {
                 self.load.bump(now);
                 if self.load.under_load() {
                     // Too many handshakes: answer with a cookie instead of
@@ -2611,9 +2618,7 @@ impl Endpoint {
                     // ratelimiter). Legitimate initiators retry with MAC2.
                     let secret = self.cookie_for(now);
                     let cookie = make_cookie(&secret, from);
-                    if let Ok(reply) =
-                        build_cookie_reply(&self.statics.pk, sender, &mac1, cookie)
-                    {
+                    if let Ok(reply) = build_cookie_reply(&self.statics.pk, sender, &mac1, cookie) {
                         let _ = socket.send_to(&reply, from).await;
                     }
                     return;
@@ -2647,8 +2652,9 @@ impl Endpoint {
                 self.by_index.insert(index, pi);
                 let peer = &mut self.peers[pi];
                 peer.last_timestamp = Some(ts);
-                peer.session =
-                    Some(Session::from_responder(index, peer_index, k_send, k_recv, now));
+                peer.session = Some(Session::from_responder(
+                    index, peer_index, k_send, k_recv, now,
+                ));
                 peer.endpoint = Some(from);
                 peer.next_persistent = peer.persistent_keepalive.map(|iv| now + iv);
                 tracing::debug!(
@@ -2658,7 +2664,11 @@ impl Endpoint {
                 );
                 let _ = socket.send_to(&resp, from).await;
             }
-            WgMsg::Transport { receiver, counter, data } => {
+            WgMsg::Transport {
+                receiver,
+                counter,
+                data,
+            } => {
                 let Some(&pi) = self.by_index.get(&receiver) else {
                     return;
                 };
@@ -2692,8 +2702,7 @@ impl Endpoint {
                     // Cryptokey routing's source filter: the packet must
                     // come from an address this peer owns (whitepaper
                     // Allowed IPs; sing-box/wireguard-go drop the rest).
-                    let src_ok =
-                        src_ip_of(&inner).is_some_and(|src| source_allowed(peer, &src));
+                    let src_ok = src_ip_of(&inner).is_some_and(|src| source_allowed(peer, &src));
                     if !src_ok {
                         tracing::debug!(
                             target: "engine",
@@ -2733,9 +2742,7 @@ impl Endpoint {
                 .as_ref()
                 .is_some_and(|s| needs_keepalive(s.last_tx, now));
             // Configured persistent keepalive.
-            let due_persistent = self.peers[pi]
-                .next_persistent
-                .is_some_and(|at| now >= at);
+            let due_persistent = self.peers[pi].next_persistent.is_some_and(|at| now >= at);
             if want_keepalive || due_persistent {
                 let peer = &mut self.peers[pi];
                 let dst = peer.endpoint;
@@ -2902,11 +2909,7 @@ fn icmp_in(pkt: &[u8], src: IpAddr, dst: IpAddr, v6: bool) -> EpIn {
     let Some(off) = icmp_offset(pkt) else {
         return EpIn::Skip;
     };
-    let is_echo_request = if v6 {
-        pkt[off] == 128
-    } else {
-        pkt[off] == 8
-    };
+    let is_echo_request = if v6 { pkt[off] == 128 } else { pkt[off] == 8 };
     if is_echo_request {
         EpIn::IcmpEchoRequest { src, dst, v6 }
     } else {
@@ -3078,11 +3081,11 @@ impl EpStack {
         let mut iface_cfg = IfaceConfig::new(HardwareAddress::Ip);
         iface_cfg.random_seed = rand::random();
         let mut iface = Interface::new(iface_cfg, &mut shim, SmolInstant::ZERO);
-        let (v4, p4) = cfg
-            .address
-            .unwrap_or((Ipv4Addr::new(172, 16, 0, 1), 30));
+        let (v4, p4) = cfg.address.unwrap_or((Ipv4Addr::new(172, 16, 0, 1), 30));
         if p4 > 32 {
-            return Err(Error::config(format!("wg endpoint: /{p4} is not a valid IPv4 prefix")));
+            return Err(Error::config(format!(
+                "wg endpoint: /{p4} is not a valid IPv4 prefix"
+            )));
         }
         iface.update_ip_addrs(|addrs| {
             let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(v4), p4));
@@ -3328,6 +3331,7 @@ impl EpStack {
                                     inbound: self.tag.clone(),
                                     inbound_port: None,
                                     inbound_kind: "tun",
+                                    in_user: None,
                                 },
                                 Box::new(WgStream {
                                     shared: shared.clone(),
@@ -3361,10 +3365,8 @@ impl EpStack {
                 continue;
             };
             let sock = self.sockets.get_mut::<udp::Socket>(handle);
-            let mut meta = udp::UdpMetadata::from(IpEndpoint::new(
-                smol_ip(r.client.ip()),
-                r.client.port(),
-            ));
+            let mut meta =
+                udp::UdpMetadata::from(IpEndpoint::new(smol_ip(r.client.ip()), r.client.port()));
             meta.local_address = Some(smol_ip(r.local.ip()));
             if let Err(e) = sock.send_slice(&r.data, meta) {
                 tracing::debug!(target: "engine", "wg endpoint: udp reply to {}: {e:?}", r.client);
@@ -3484,16 +3486,19 @@ fn smol_ip(ip: IpAddr) -> IpAddress {
 }
 
 /// Drive the endpoint until the socket dies.
-async fn run_endpoint(socket: Arc<UdpSocket>, mut ep: Endpoint, mut stack: EpStack, wake: Arc<Notify>) {
+async fn run_endpoint(
+    socket: Arc<UdpSocket>,
+    mut ep: Endpoint,
+    mut stack: EpStack,
+    wake: Arc<Notify>,
+) {
     let mut rx = vec![0u8; 65_536];
     loop {
         let egress = stack.step();
         for pkt in egress {
             ep.send_inner(&socket, &pkt).await;
         }
-        let offset = stack
-            .poll_delay()
-            .clamp(MIN_TICK, MAX_TICK);
+        let offset = stack.poll_delay().clamp(MIN_TICK, MAX_TICK);
         let deadline = Instant::now() + offset;
         let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
         tokio::select! {
@@ -3533,9 +3538,9 @@ async fn spawn_endpoint(
             .await
             .map_err(|e| Error::network(format!("wg endpoint: bind udp {port}: {e}")))?,
     };
-    let local = socket.local_addr().map_err(|e| {
-        Error::network(format!("wg endpoint: bound socket has no address: {e}"))
-    })?;
+    let local = socket
+        .local_addr()
+        .map_err(|e| Error::network(format!("wg endpoint: bound socket has no address: {e}")))?;
     let socket = Arc::new(socket);
     let wake = Arc::new(Notify::new());
     let stack = EpStack::new(cfg, relay, wake.clone())?;
@@ -3900,7 +3905,11 @@ mod tests {
         t.extend_from_slice(&9u64.to_le_bytes());
         t.extend_from_slice(&[0u8; 16]);
         match parse_wg_msg(&t).unwrap() {
-            WgMsg::Transport { receiver, counter, data } => {
+            WgMsg::Transport {
+                receiver,
+                counter,
+                data,
+            } => {
                 assert_eq!((receiver, counter), (7, 9));
                 assert_eq!(data.len(), 16);
             }
@@ -3949,7 +3958,11 @@ mod tests {
         let payload = b"hello tunnel";
         let msg = client.seal_transport(payload).unwrap();
         match parse_wg_msg(&msg).unwrap() {
-            WgMsg::Transport { receiver, counter, data } => {
+            WgMsg::Transport {
+                receiver,
+                counter,
+                data,
+            } => {
                 assert_eq!(receiver, 1000, "receiver must be the server's index");
                 assert_eq!(counter, 0);
                 let plain = server.open_transport(counter, &data).unwrap();
@@ -4091,9 +4104,7 @@ mod tests {
         assert!(server.open_transport(c, &d).is_err());
         // Counters keep advancing past the exchanges above.
         let keepalive = client.seal_transport(&[]).unwrap();
-        let WgMsg::Transport { counter, data, .. } =
-            parse_wg_msg(&keepalive).unwrap()
-        else {
+        let WgMsg::Transport { counter, data, .. } = parse_wg_msg(&keepalive).unwrap() else {
             panic!()
         };
         assert_eq!(counter, 3);
@@ -4143,17 +4154,27 @@ mod tests {
     fn rekey_and_keepalive_boundaries() {
         let t0 = Instant::now();
         // Fresh session: no rekey, no keepalive.
-        assert!(!should_rekey(t0, 0, t0 + REKEY_AFTER_TIME - Duration::from_millis(1)));
+        assert!(!should_rekey(
+            t0,
+            0,
+            t0 + REKEY_AFTER_TIME - Duration::from_millis(1)
+        ));
         assert!(should_rekey(t0, 0, t0 + REKEY_AFTER_TIME));
         // Message-count trigger (2^60) independent of time.
         assert!(should_rekey(t0, REKEY_AFTER_MESSAGES, t0));
         assert!(!should_rekey(t0, REKEY_AFTER_MESSAGES - 1, t0));
         // Reject-after is strictly later than rekey-after.
-        assert!(!session_expired(t0, t0 + REJECT_AFTER_TIME - Duration::from_millis(1)));
+        assert!(!session_expired(
+            t0,
+            t0 + REJECT_AFTER_TIME - Duration::from_millis(1)
+        ));
         assert!(session_expired(t0, t0 + REJECT_AFTER_TIME));
         assert!(REJECT_AFTER_TIME > REKEY_AFTER_TIME);
         // Keepalive after 10s of transmit silence.
-        assert!(!needs_keepalive(t0, t0 + KEEPALIVE_TIMEOUT - Duration::from_millis(1)));
+        assert!(!needs_keepalive(
+            t0,
+            t0 + KEEPALIVE_TIMEOUT - Duration::from_millis(1)
+        ));
         assert!(needs_keepalive(t0, t0 + KEEPALIVE_TIMEOUT));
         // The whitepaper's counter constants, pinned.
         assert_eq!(REKEY_AFTER_MESSAGES, 1 << 60);
@@ -4269,7 +4290,10 @@ mod tests {
                     .send_cipher
                     .encrypt(
                         (&aead_nonce(counter)).into(),
-                        Payload { msg: &plain, aad: &[] },
+                        Payload {
+                            msg: &plain,
+                            aad: &[],
+                        },
                     )
                     .unwrap();
                 let mut msg = Vec::with_capacity(TRANSPORT_HEADER_LEN + ct.len());
@@ -4285,7 +4309,10 @@ mod tests {
                     .recv_cipher
                     .decrypt(
                         (&aead_nonce(counter)).into(),
-                        Payload { msg: data, aad: &[] },
+                        Payload {
+                            msg: data,
+                            aad: &[],
+                        },
                     )
                     .map_err(|_| Error::crypto("server: transport open failed"))?;
                 if !self.replay.accept(counter) {
@@ -4347,9 +4374,7 @@ mod tests {
         let statics = x25519_keypair();
         let mut psk = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut psk);
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let endpoint = socket.local_addr().unwrap();
         let socket = Arc::new(socket);
 
@@ -4415,16 +4440,10 @@ mod tests {
             cfg.random_seed = rand::random();
             let mut iface = Interface::new(cfg, &mut shim, SmolInstant::ZERO);
             iface.update_ip_addrs(|addrs| {
-                let _ = addrs.push(IpCidr::new(
-                    IpAddress::Ipv4(SERVER_TUNNEL_IP),
-                    24,
-                ));
+                let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(SERVER_TUNNEL_IP), 24));
                 // Dual-stack listener side: the v6 prefix mirrors the /24 so
                 // same-subnet replies need no route, plus a default v6 route.
-                let _ = addrs.push(IpCidr::new(
-                    IpAddress::Ipv6(SERVER_TUNNEL_IP_V6),
-                    64,
-                ));
+                let _ = addrs.push(IpCidr::new(IpAddress::Ipv6(SERVER_TUNNEL_IP_V6), 64));
             });
             iface
                 .routes_mut()
@@ -4440,14 +4459,8 @@ mod tests {
             let listener = Self::add_listener(&mut sockets);
 
             let mut udp_sock = udp::Socket::new(
-                udp::PacketBuffer::new(
-                    vec![udp::PacketMetadata::EMPTY; 64],
-                    vec![0; 32 * 1024],
-                ),
-                udp::PacketBuffer::new(
-                    vec![udp::PacketMetadata::EMPTY; 64],
-                    vec![0; 32 * 1024],
-                ),
+                udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 64], vec![0; 32 * 1024]),
+                udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 64], vec![0; 32 * 1024]),
             );
             udp_sock
                 .bind(IpListenEndpoint {
@@ -4650,7 +4663,9 @@ mod tests {
         let cfg = server.cfg_for(&client_keys);
         let target = NetAddr::ip(IpAddr::V4(SERVER_TUNNEL_IP), ECHO_TCP_PORT);
 
-        let mut stream = connect(&cfg, &target).await.expect("dial through the tunnel");
+        let mut stream = connect(&cfg, &target)
+            .await
+            .expect("dial through the tunnel");
         let payload = b"hello over wireguard!".repeat(64);
         stream.write_all(&payload).await.unwrap();
         let mut echoed = vec![0u8; payload.len()];
@@ -4677,7 +4692,9 @@ mod tests {
         let cfg = server.cfg_for(&client_keys);
         let target = NetAddr::ip(IpAddr::V4(SERVER_TUNNEL_IP), ECHO_TCP_PORT);
 
-        let mut stream = connect(&cfg, &target).await.expect("dial through the tunnel");
+        let mut stream = connect(&cfg, &target)
+            .await
+            .expect("dial through the tunnel");
         let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
         tokio::time::timeout(Duration::from_secs(30), stream.write_all(&payload))
             .await
@@ -4701,7 +4718,9 @@ mod tests {
         let cfg = server.cfg_for(&client_keys);
         let target = NetAddr::ip(IpAddr::V4(SERVER_TUNNEL_IP), ECHO_TCP_PORT);
 
-        let mut stream = connect(&cfg, &target).await.expect("dial through the tunnel");
+        let mut stream = connect(&cfg, &target)
+            .await
+            .expect("dial through the tunnel");
         for round in 0..8u32 {
             let chunk: Vec<u8> = (0..8 * 1024).map(|i| (i as u32 + round) as u8).collect();
             tokio::time::timeout(Duration::from_secs(30), stream.write_all(&chunk))
@@ -4728,7 +4747,9 @@ mod tests {
         let cfg = server.cfg_for(&client_keys);
         let target = NetAddr::ip(IpAddr::V4(SERVER_TUNNEL_IP), ECHO_TCP_PORT);
 
-        let stream = connect(&cfg, &target).await.expect("dial through the tunnel");
+        let stream = connect(&cfg, &target)
+            .await
+            .expect("dial through the tunnel");
         const TOTAL: usize = 512 * 1024;
         let payload: Vec<u8> = (0..TOTAL).map(|i| (i % 253) as u8).collect();
         let mut echoed = vec![0u8; TOTAL];
@@ -4761,7 +4782,9 @@ mod tests {
         let cfg = server.cfg_for(&client_keys);
         let target = NetAddr::ip(IpAddr::V4(SERVER_TUNNEL_IP), ECHO_TCP_PORT);
 
-        let stream = connect(&cfg, &target).await.expect("dial through the tunnel");
+        let stream = connect(&cfg, &target)
+            .await
+            .expect("dial through the tunnel");
         const TOTAL: usize = 256 * 1024;
         let payload: Vec<u8> = (0..TOTAL).map(|i| (i % 249) as u8).collect();
 
@@ -4804,8 +4827,7 @@ mod tests {
             let cfg = cfg.clone();
             handles.push(tokio::spawn(async move {
                 let target = NetAddr::ip(IpAddr::V4(SERVER_TUNNEL_IP), ECHO_TCP_PORT);
-                let mut stream =
-                    connect(&cfg, &target).await.expect("concurrent dial");
+                let mut stream = connect(&cfg, &target).await.expect("concurrent dial");
                 for round in 0..8u32 {
                     let chunk: Vec<u8> = (0..TOTAL / 8)
                         .map(|i| (i as u32 + round + s as u32) as u8)
@@ -4839,7 +4861,10 @@ mod tests {
         udp.send(&target, b"udp round trip").await.unwrap();
         let (from, data) = udp.recv().await.expect("echo datagram");
         assert_eq!(data, b"udp round trip");
-        assert_eq!(from.to_string(), format!("{SERVER_TUNNEL_IP}:{ECHO_UDP_PORT}"));
+        assert_eq!(
+            from.to_string(),
+            format!("{SERVER_TUNNEL_IP}:{ECHO_UDP_PORT}")
+        );
         // And a second exchange on the same socket.
         udp.send(&target, b"again").await.unwrap();
         let (_, data2) = udp.recv().await.unwrap();
@@ -4863,7 +4888,9 @@ mod tests {
         let cfg = server.cfg_for_dual(&client_keys);
         let target = NetAddr::ip(IpAddr::V6(SERVER_TUNNEL_IP_V6), ECHO_TCP_PORT);
 
-        let mut stream = connect(&cfg, &target).await.expect("v6 dial through the tunnel");
+        let mut stream = connect(&cfg, &target)
+            .await
+            .expect("v6 dial through the tunnel");
         let payload = b"hello over wireguard v6!".repeat(64);
         stream.write_all(&payload).await.unwrap();
         let mut echoed = vec![0u8; payload.len()];
@@ -4986,7 +5013,9 @@ mod tests {
         let client_keys = x25519_keypair();
         let cfg = server.cfg_for(&client_keys);
         let target = NetAddr::ip(IpAddr::V4(SERVER_TUNNEL_IP), ECHO_TCP_PORT);
-        let mut stream = connect(&cfg, &target).await.expect("dial with reserved bytes");
+        let mut stream = connect(&cfg, &target)
+            .await
+            .expect("dial with reserved bytes");
         stream.write_all(b"reserved smoke").await.unwrap();
         let mut echoed = vec![0u8; 14];
         stream.read_exact(&mut echoed).await.unwrap();
@@ -5062,7 +5091,11 @@ mod tests {
     const EP_TCP_PORT: u16 = 9021;
     const EP_UDP_PORT: u16 = 9022;
 
-    fn endpoint_cfg(server_statics: &StaticKeys, client_pk: [u8; 32], psk: [u8; 32]) -> WgEndpointCfg {
+    fn endpoint_cfg(
+        server_statics: &StaticKeys,
+        client_pk: [u8; 32],
+        psk: [u8; 32],
+    ) -> WgEndpointCfg {
         WgEndpointCfg {
             tag: "wg-ep".into(),
             private_key: b64(&server_statics.sk),
@@ -5147,7 +5180,11 @@ mod tests {
                 return None;
             };
             match parse_wg_msg(&buf[..n]) {
-                Some(WgMsg::Transport { receiver, counter, data }) => {
+                Some(WgMsg::Transport {
+                    receiver,
+                    counter,
+                    data,
+                }) => {
                     if receiver != sess.local_index {
                         continue; // stale
                     }
@@ -5178,20 +5215,25 @@ mod tests {
     }
 
     async fn manual_recv_inner(sock: &tokio::net::UdpSocket, sess: &mut Session) -> Vec<u8> {
-        recv_transport(sock, sess, Duration::from_secs(10)).await.expect("a relayed reply")
+        recv_transport(sock, sess, Duration::from_secs(10))
+            .await
+            .expect("a relayed reply")
     }
 
     /// A UDP/IPv4 packet with valid header + UDP checksums (smoltcp verifies
     /// both on input).
     fn udp4_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Vec<u8> {
         let (sport, dport) = (src.port(), dst.port());
-        let (src, dst) = (match src.ip() {
-            IpAddr::V4(v4) => v4,
-            _ => panic!("v4 builder"),
-        }, match dst.ip() {
-            IpAddr::V4(v4) => v4,
-            _ => panic!("v4 builder"),
-        });
+        let (src, dst) = (
+            match src.ip() {
+                IpAddr::V4(v4) => v4,
+                _ => panic!("v4 builder"),
+            },
+            match dst.ip() {
+                IpAddr::V4(v4) => v4,
+                _ => panic!("v4 builder"),
+            },
+        );
         let total = 20 + 8 + payload.len();
         let mut p = vec![0u8; total];
         p[0] = 0x45;
@@ -5242,7 +5284,9 @@ mod tests {
 
     async fn spawn_test_endpoint(cfg: &WgEndpointCfg) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let relay = EpEchoRelay(std::sync::Mutex::new(Vec::new()));
-        spawn_endpoint(cfg, Arc::new(relay)).await.expect("endpoint starts")
+        spawn_endpoint(cfg, Arc::new(relay))
+            .await
+            .expect("endpoint starts")
     }
 
     /// TCP relayed through the endpoint into the engine, driven by the
@@ -5351,8 +5395,9 @@ mod tests {
         // Every stream echoes multi-segment bursts, interleaved.
         for round in 0..4u32 {
             for (i, stream) in streams.iter_mut().enumerate() {
-                let chunk: Vec<u8> =
-                    (0..8 * 1024).map(|k| (k as u32 + round + i as u32) as u8).collect();
+                let chunk: Vec<u8> = (0..8 * 1024)
+                    .map(|k| (k as u32 + round + i as u32) as u8)
+                    .collect();
                 stream.write_all(&chunk).await.unwrap();
                 let mut back = vec![0u8; chunk.len()];
                 stream.read_exact(&mut back).await.unwrap();
@@ -5404,7 +5449,8 @@ mod tests {
             .await
             .expect("dial through the endpoint");
         let payload = vec![7u8; 512 * 1024];
-        let outcome = tokio::time::timeout(Duration::from_secs(15), stream.write_all(&payload)).await;
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(15), stream.write_all(&payload)).await;
         match outcome {
             Err(_elapsed) => panic!("writer hung on a reset connection (stall)"),
             // The write may complete into local queues before the RST lands;
@@ -5442,7 +5488,9 @@ mod tests {
         let cfg = server.cfg_for(&client_keys);
         let target = NetAddr::ip(IpAddr::V4(SERVER_TUNNEL_IP), ECHO_TCP_PORT);
 
-        let stream = connect(&cfg, &target).await.expect("dial through the tunnel");
+        let stream = connect(&cfg, &target)
+            .await
+            .expect("dial through the tunnel");
         const TOTAL: usize = 256 * 1024;
         let payload: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
 
@@ -5491,7 +5539,10 @@ mod tests {
             .expect("echo datagram")
             .expect("udp echo");
         assert_eq!(data, b"ep-udp");
-        assert_eq!(from.to_string(), format!("{SERVER_TUNNEL_IP}:{EP_UDP_PORT}"));
+        assert_eq!(
+            from.to_string(),
+            format!("{SERVER_TUNNEL_IP}:{EP_UDP_PORT}")
+        );
         udp.send(&target, b"ep-udp-2").await.unwrap();
         let (_, data2) = tokio::time::timeout(Duration::from_secs(30), udp.recv())
             .await
@@ -5709,12 +5760,7 @@ mod tests {
 
         let (sock, mut sess, _init, _pending) =
             manual_handshake(&client_keys, &server_statics.pk, &psk, ep).await;
-        let req = icmp4_echo_request(
-            Ipv4Addr::new(172, 16, 200, 2),
-            SERVER_TUNNEL_IP,
-            0xBEEF,
-            7,
-        );
+        let req = icmp4_echo_request(Ipv4Addr::new(172, 16, 200, 2), SERVER_TUNNEL_IP, 0xBEEF, 7);
         let reply = manual_roundtrip(&sock, &mut sess, ep, &req).await;
         assert_eq!(reply[20], 0, "echo reply type");
         assert_eq!(&reply[24..26], &0xBEEFu16.to_be_bytes(), "id preserved");
@@ -5765,8 +5811,8 @@ mod tests {
         }
         // The production client-side consumer opens it with the pending
         // initiation's MAC1 as AAD.
-        let cookie = consume_cookie_reply(&server_statics.pk, &pending, &parsed)
-            .expect("cookie decrypts");
+        let cookie =
+            consume_cookie_reply(&server_statics.pk, &pending, &parsed).expect("cookie decrypts");
         assert_ne!(cookie, [0u8; 16]);
         task.abort();
     }
@@ -5793,7 +5839,11 @@ mod tests {
             .expect("the keepalive fires within the interval")
             .unwrap();
         match parse_wg_msg(&buf[..n]).unwrap() {
-            WgMsg::Transport { receiver, counter, data } => {
+            WgMsg::Transport {
+                receiver,
+                counter,
+                data,
+            } => {
                 assert_eq!(receiver, sess.local_index);
                 let plain = sess.open_transport(counter, &data).unwrap();
                 assert!(plain.is_empty(), "keepalive carries no payload");
@@ -5830,14 +5880,31 @@ mod tests {
         assert!(route_peer(&peers, &IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))).is_none());
         assert!(route_peer(&peers, &IpAddr::V6(Ipv6Addr::LOCALHOST)).is_none());
 
-        let v6peers = vec![peer(vec![(IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0)), 64)])];
-        assert!(
-            route_peer(&v6peers, &IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 1, 2, 3, 4))).is_some()
-        );
-        assert!(route_peer(&v6peers, &IpAddr::V6(Ipv6Addr::new(0xfd00, 1, 0, 0, 0, 0, 0, 0))).is_none());
+        let v6peers = vec![peer(vec![(
+            IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0)),
+            64,
+        )])];
+        assert!(route_peer(
+            &v6peers,
+            &IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 1, 2, 3, 4))
+        )
+        .is_some());
+        assert!(route_peer(
+            &v6peers,
+            &IpAddr::V6(Ipv6Addr::new(0xfd00, 1, 0, 0, 0, 0, 0, 0))
+        )
+        .is_none());
         // Edge prefixes.
-        assert!(prefix_contains(&IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0, &IpAddr::V4(Ipv4Addr::LOCALHOST)));
-        assert!(!prefix_contains(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 33, &IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(prefix_contains(
+            &IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+            0,
+            &IpAddr::V4(Ipv4Addr::LOCALHOST)
+        ));
+        assert!(!prefix_contains(
+            &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)),
+            33,
+            &IpAddr::V4(Ipv4Addr::LOCALHOST)
+        ));
     }
 
     #[test]
@@ -5848,9 +5915,16 @@ mod tests {
             p.extend_from_slice(&SERVER_TUNNEL_IP.octets());
             p.extend_from_slice(&5150u16.to_be_bytes());
             p.extend_from_slice(&9021u16.to_be_bytes());
-            p.push(0); p.push(0); p.push(0); p.push(0); // seq
-            p.push(0); p.push(0); p.push(0); p.push(0); // ack
-            p.push(0x50); p.push(0x02); // data offset + SYN
+            p.push(0);
+            p.push(0);
+            p.push(0);
+            p.push(0); // seq
+            p.push(0);
+            p.push(0);
+            p.push(0);
+            p.push(0); // ack
+            p.push(0x50);
+            p.push(0x02); // data offset + SYN
             p.extend_from_slice(&[0x10, 0x00, 0, 0, 0, 0]); // window, checksum, urgent
             p
         };
@@ -5872,7 +5946,10 @@ mod tests {
             other => panic!("udp: {other:?}"),
         }
         let icmp = icmp4_echo_request(Ipv4Addr::new(172, 16, 200, 2), SERVER_TUNNEL_IP, 1, 1);
-        assert!(matches!(ep_classify(&icmp), EpIn::IcmpEchoRequest { v6: false, .. }));
+        assert!(matches!(
+            ep_classify(&icmp),
+            EpIn::IcmpEchoRequest { v6: false, .. }
+        ));
         // v6 UDP.
         let mut v6 = vec![0x60u8, 0, 0, 0, 0, 11, 17, 64];
         v6.extend_from_slice(&CLIENT_TUNNEL_IP_V6.octets());
@@ -5931,7 +6008,10 @@ mod tests {
         let mac1: [u8; 16] = msg[116..132].try_into().unwrap();
         let full = blake2s256(b"secret");
         let secret: [u8; 16] = full[..16].try_into().unwrap();
-        let cookie = make_cookie(&secret, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234));
+        let cookie = make_cookie(
+            &secret,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234),
+        );
         let reply = build_cookie_reply(&server.pk, 5, &mac1, cookie).unwrap();
         assert_eq!(reply.len(), MSG_COOKIE_LEN);
         let learned =
@@ -5969,7 +6049,13 @@ mod tests {
             }],
         };
         assert!(Endpoint::new(&base()).is_ok());
-        let err = match Endpoint::new(&WgEndpointCfg { peers: vec![], ..base() }) { Err(e) => e.to_string(), Ok(_) => panic!("config must be rejected") };
+        let err = match Endpoint::new(&WgEndpointCfg {
+            peers: vec![],
+            ..base()
+        }) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("config must be rejected"),
+        };
         assert!(err.contains("at least one peer"), "{err}");
         let err = match Endpoint::new(&WgEndpointCfg {
             peers: vec![WgEndpointPeer {

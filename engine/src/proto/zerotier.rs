@@ -270,12 +270,14 @@ pub const TRACE_LEVEL_INSANE: u64 = 4;
 /// Marker for the milestone: the sections between here and
 /// [`NOT_PORTED`] are the Rust-native ZeroTier wire layer (identity,
 /// armor, HELLO, controller netconf), all pinned to public vectors.
-pub const MILESTONE_1: &str = "zerotier wire core: identity + armor + HELLO + netconf (rust-native)";
+pub const MILESTONE_1: &str =
+    "zerotier wire core: identity + armor + HELLO + netconf (rust-native)";
 
 /// Marker for the milestone: the node runtime (world/planet,
 /// the UDP loop with WHOIS + relay, fragmentation, the netconf→smoltcp
 /// link and the dial).
-pub const MILESTONE_2: &str = "zerotier node runtime: planet + UDP loop + WHOIS + fragments + netconf link (rust-native)";
+pub const MILESTONE_2: &str =
+    "zerotier node runtime: planet + UDP loop + WHOIS + fragments + netconf link (rust-native)";
 
 // Milestone-2 wire constants (node/Packet.hpp:138-208, Constants.hpp).
 
@@ -415,7 +417,12 @@ fn salsa20_state(key: &[u8], iv: &[u8; 8], counter: u64) -> [u32; 16] {
     let (c, hi): (&[u32; 4], [u32; 4]) = if key.len() == 32 {
         (
             &SALSA_SIGMA,
-            [word(&key[16..20]), word(&key[20..24]), word(&key[24..28]), word(&key[28..32])],
+            [
+                word(&key[16..20]),
+                word(&key[20..24]),
+                word(&key[24..28]),
+                word(&key[28..32]),
+            ],
         )
     } else {
         (&SALSA_TAU, k)
@@ -458,7 +465,12 @@ impl SalsaStream {
     fn new(key: &[u8], iv: &[u8], rounds: usize) -> Self {
         let mut n = [0u8; 8];
         n.copy_from_slice(&iv[..8]);
-        SalsaStream { key: key.to_vec(), iv: n, counter: 0, rounds }
+        SalsaStream {
+            key: key.to_vec(),
+            iv: n,
+            counter: 0,
+            rounds,
+        }
     }
 
     /// XOR `data` with the next keystream bytes (block-discarding).
@@ -505,7 +517,12 @@ fn poly1305(key: &[u8; 32], msg: &[u8]) -> [u8; 16] {
         ((r_full >> 78) & 0x03ff_ffff) as u32,
         ((r_full >> 104) & 0x03ff_ffff) as u32,
     ];
-    let pad = [le(&key[16..20]), le(&key[20..24]), le(&key[24..28]), le(&key[28..32])];
+    let pad = [
+        le(&key[16..20]),
+        le(&key[20..24]),
+        le(&key[24..28]),
+        le(&key[28..32]),
+    ];
     let mut h = [0u32; 5];
 
     let mut blocks = |m: &[u8], hibit: u32| {
@@ -665,10 +682,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// that buffer. `digest[0] < 17` and `digest[59..64]` = the address.
 fn memory_hard_hash(public: &[u8; PUBLIC_KEY_SIZE]) -> [u8; 64] {
     use sha2::Digest;
-    let mut digest: [u8; 64] = sha2::Sha512::digest(public)
-        .as_slice()
-        .try_into()
-        .unwrap();
+    let mut digest: [u8; 64] = sha2::Sha512::digest(public).as_slice().try_into().unwrap();
     let mut stream = SalsaStream::new(&digest[0..32], &digest[32..40], 20);
 
     let mut genmem = vec![0u8; IDENTITY_GEN_MEMORY];
@@ -728,7 +742,11 @@ impl NodeIdentity {
         public: [u8; PUBLIC_KEY_SIZE],
         secret: Option<[u8; PRIVATE_KEY_SIZE]>,
     ) -> Self {
-        NodeIdentity { address, public, secret }
+        NodeIdentity {
+            address,
+            public,
+            secret,
+        }
     }
 
     /// `Identity::generate()` (node/Identity.cpp:69-87 +
@@ -750,7 +768,11 @@ impl NodeIdentity {
             let digest = memory_hard_hash(&public);
             let address = be40(&digest[59..64]);
             if digest[0] < IDENTITY_HASHCASH_THRESHOLD && !address_is_reserved(address) {
-                return Ok(NodeIdentity { address, public, secret: Some(secret) });
+                return Ok(NodeIdentity {
+                    address,
+                    public,
+                    secret: Some(secret),
+                });
             }
             let lo = u64::from_le_bytes(secret[8..16].try_into().unwrap()).wrapping_add(1);
             secret[8..16].copy_from_slice(&lo.to_le_bytes());
@@ -776,7 +798,12 @@ impl NodeIdentity {
 
     pub fn to_secret_str(&self) -> Result<String> {
         match &self.secret {
-            Some(s) => Ok(format!("{:010x}:0:{}:{}", self.address, hex(&self.public), hex(s))),
+            Some(s) => Ok(format!(
+                "{:010x}:0:{}:{}",
+                self.address,
+                hex(&self.public),
+                hex(s)
+            )),
             None => Err(Error::crypto("zerotier: identity has no secret half")),
         }
     }
@@ -788,7 +815,9 @@ impl NodeIdentity {
     pub fn from_str_form(raw: &str) -> Result<Self> {
         let fields: Vec<&str> = raw.trim().split(':').collect();
         if fields.len() != 3 && fields.len() != 4 {
-            return Err(Error::config("zerotier: identity must have 3 or 4 colon fields"));
+            return Err(Error::config(
+                "zerotier: identity must have 3 or 4 colon fields",
+            ));
         }
         let address = parse_node_address(fields[0])?;
         if fields[1] != "0" {
@@ -802,21 +831,30 @@ impl NodeIdentity {
                 unhex_into(s, &mut sec)?;
                 if sec[..32] != [0u8; 32] {
                     let dh: [u8; 32] = sec[..32].try_into().unwrap();
-                    let want = curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(dh).0;
+                    let want =
+                        curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(dh).0;
                     if want != public[..32] {
-                        return Err(Error::config("zerotier: identity X25519 halves do not match"));
+                        return Err(Error::config(
+                            "zerotier: identity X25519 halves do not match",
+                        ));
                     }
                 }
                 if sec[32..] != [0u8; 32]
                     && ed25519_public_from_seed(&sec[32..64])? != public[32..64]
                 {
-                    return Err(Error::config("zerotier: identity Ed25519 halves do not match"));
+                    return Err(Error::config(
+                        "zerotier: identity Ed25519 halves do not match",
+                    ));
                 }
                 Some(sec)
             }
             None => None,
         };
-        Ok(NodeIdentity { address, public, secret })
+        Ok(NodeIdentity {
+            address,
+            public,
+            secret,
+        })
     }
 
     /// Binary serialize (`Identity::serialize`, node/Identity.hpp:218-232):
@@ -870,7 +908,14 @@ impl NodeIdentity {
                 )))
             }
         };
-        Ok((NodeIdentity { address, public, secret }, used))
+        Ok((
+            NodeIdentity {
+                address,
+                public,
+                secret,
+            },
+            used,
+        ))
     }
 
     /// `Identity::locallyValidate` (node/Identity.cpp:113-124): re-run
@@ -894,7 +939,9 @@ impl NodeIdentity {
             .ok_or_else(|| Error::crypto("zerotier: agreement needs a secret identity"))?;
         let sk: [u8; 32] = secret[..32].try_into().unwrap();
         let pk: [u8; 32] = peer.public[..32].try_into().unwrap();
-        let raw = curve25519_dalek::montgomery::MontgomeryPoint(pk).mul_clamped(sk).0;
+        let raw = curve25519_dalek::montgomery::MontgomeryPoint(pk)
+            .mul_clamped(sk)
+            .0;
         let digest = sha2::Sha512::digest(raw);
         let mut key = [0u8; SYMMETRIC_KEY_SIZE];
         key.copy_from_slice(&digest[..SYMMETRIC_KEY_SIZE]);
@@ -932,12 +979,9 @@ impl NodeIdentity {
         if !ct_eq(&signature[64..], &digest[..32]) {
             return false;
         }
-        ring::signature::UnparsedPublicKey::new(
-            &ring::signature::ED25519,
-            &self.public[32..64],
-        )
-        .verify(&digest[..32], &signature[..64])
-        .is_ok()
+        ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &self.public[32..64])
+            .verify(&digest[..32], &signature[..64])
+            .is_ok()
     }
 }
 
@@ -1089,7 +1133,9 @@ impl Verb {
             0x0b => Ok(Verb::NetworkConfigRequest),
             0x0c => Ok(Verb::NetworkConfig),
             0x10 => Ok(Verb::PushDirectPaths),
-            other => Err(Error::crypto(format!("zerotier: unknown verb 0x{other:02x}"))),
+            other => Err(Error::crypto(format!(
+                "zerotier: unknown verb 0x{other:02x}"
+            ))),
         }
     }
 }
@@ -1130,7 +1176,9 @@ impl WirePacket {
         if bytes.len() < PACKET_HEADER_LEN || bytes.len() > MAX_PACKET_LENGTH {
             return Err(Error::crypto("zerotier: bad packet length"));
         }
-        Ok(WirePacket { buf: bytes.to_vec() })
+        Ok(WirePacket {
+            buf: bytes.to_vec(),
+        })
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -1508,9 +1556,12 @@ impl PhysAddr {
             PhysAddr::V4(ip, port) => {
                 Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip), port)))
             }
-            PhysAddr::V6(ip, port) => {
-                Some(SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(ip), port, 0, 0)))
-            }
+            PhysAddr::V6(ip, port) => Some(SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::from(ip),
+                port,
+                0,
+                0,
+            ))),
         }
     }
 
@@ -1651,7 +1702,15 @@ pub fn build_ok_hello(
     physical: PhysAddr,
     key: &[u8; SYMMETRIC_KEY_SIZE],
 ) -> Result<WirePacket> {
-    build_ok_hello_with_worlds(from, to_hello, hello_packet_id, to_address, physical, &[], key)
+    build_ok_hello_with_worlds(
+        from,
+        to_hello,
+        hello_packet_id,
+        to_address,
+        physical,
+        &[],
+        key,
+    )
 }
 
 /// [`build_ok_hello`] with a world-update block — the responder side
@@ -1694,12 +1753,12 @@ pub fn build_ok_hello_with_worlds(
 
 /// Parse a (dearmored) OK(HELLO). `in_re_packet_id` must be checked by
 /// the caller against the HELLO it sent.
-    pub fn parse_ok_hello(pkt: &WirePacket) -> Result<OkHello> {
-        let p = pkt.payload();
-        // in-re-verb + packet id + timestamp + versions = 22 bytes minimum.
-        if p.len() < 22 || !matches!(Verb::from_byte(p[0]), Ok(Verb::Hello)) {
-            return Err(Error::crypto("zerotier: not an OK(HELLO)"));
-        }
+pub fn parse_ok_hello(pkt: &WirePacket) -> Result<OkHello> {
+    let p = pkt.payload();
+    // in-re-verb + packet id + timestamp + versions = 22 bytes minimum.
+    if p.len() < 22 || !matches!(Verb::from_byte(p[0]), Ok(Verb::Hello)) {
+        return Err(Error::crypto("zerotier: not an OK(HELLO)"));
+    }
     let in_re_packet_id = u64::from_be_bytes(p[1..9].try_into().unwrap());
     let timestamp = i64_from_be(&p[9..17]);
     let proto_version = p[17];
@@ -1746,12 +1805,12 @@ pub fn netconf_request_meta_dict() -> String {
         format!("majv={maj}"),
         format!("minv={min}"),
         format!("revv={rev}"),
-        "mr=1024".to_string(),  // ZT_MAX_NETWORK_RULES
-        "mc=128".to_string(),   // ZT_MAX_NETWORK_CAPABILITIES
-        "mcr=64".to_string(),   // ZT_MAX_CAPABILITY_RULES
-        "mt=128".to_string(),   // ZT_MAX_NETWORK_TAGS
-        "f=0".to_string(),      // flags
-        "revr=1".to_string(),   // ZT_RULES_ENGINE_REVISION
+        "mr=1024".to_string(), // ZT_MAX_NETWORK_RULES
+        "mc=128".to_string(),  // ZT_MAX_NETWORK_CAPABILITIES
+        "mcr=64".to_string(),  // ZT_MAX_CAPABILITY_RULES
+        "mt=128".to_string(),  // ZT_MAX_NETWORK_TAGS
+        "f=0".to_string(),     // flags
+        "revr=1".to_string(),  // ZT_RULES_ENGINE_REVISION
         "o=rustcrash-engine".to_string(),
     ]
     .join("\n")
@@ -1771,7 +1830,11 @@ pub fn build_network_config_request(
     key: &[u8; SYMMETRIC_KEY_SIZE],
 ) -> Result<WirePacket> {
     let meta = netconf_request_meta_dict();
-    let mut pkt = WirePacket::new(controller_address, from.address(), Verb::NetworkConfigRequest);
+    let mut pkt = WirePacket::new(
+        controller_address,
+        from.address(),
+        Verb::NetworkConfigRequest,
+    );
     pkt.push_u64(network_id)
         .push_u16(meta.len() as u16)
         .push_bytes(meta.as_bytes());
@@ -1856,9 +1919,12 @@ pub fn parse_netconf_response(
             "zerotier: multi-chunk netconf reassembly is staged with the transport loop",
         ));
     }
-    if p[at] != 1 || u16::from_be_bytes(p[at + 1..at + 3].try_into().unwrap()) != SIGNATURE_SIZE as u16
+    if p[at] != 1
+        || u16::from_be_bytes(p[at + 1..at + 3].try_into().unwrap()) != SIGNATURE_SIZE as u16
     {
-        return Err(Error::crypto("zerotier: netconf chunk is unsigned (legacy controller)"));
+        return Err(Error::crypto(
+            "zerotier: netconf chunk is unsigned (legacy controller)",
+        ));
     }
     at += 3;
     if p.len() < at + SIGNATURE_SIZE {
@@ -1866,9 +1932,15 @@ pub fn parse_netconf_response(
     }
     let sig = &p[at..at + SIGNATURE_SIZE];
     if !controller.verify(&p[signed_start..signed_end], sig) {
-        return Err(Error::crypto("zerotier: netconf chunk signature check failed"));
+        return Err(Error::crypto(
+            "zerotier: netconf chunk signature check failed",
+        ));
     }
-    Ok(NetconfResponse { network_id, update_id, dict: chunk.to_vec() })
+    Ok(NetconfResponse {
+        network_id,
+        update_id,
+        dict: chunk.to_vec(),
+    })
 }
 
 /// Build a signed, optionally LZ4-compressed netconf chunk the way a
@@ -2010,7 +2082,10 @@ impl World {
                 Ok(b)
             }
             fn take(&mut self, n: usize) -> Result<&[u8]> {
-                let s = self.buf.get(self.at..self.at + n).ok_or_else(|| bad("truncated"))?;
+                let s = self
+                    .buf
+                    .get(self.at..self.at + n)
+                    .ok_or_else(|| bad("truncated"))?;
                 self.at += n;
                 Ok(s)
             }
@@ -2050,17 +2125,26 @@ impl World {
                 c.at += used;
                 endpoints.push(ep);
             }
-            roots.push(WorldRoot { identity, endpoints });
+            roots.push(WorldRoot {
+                identity,
+                endpoints,
+            });
         }
         if world_type == WORLD_TYPE_MOON {
             let dlen = c.u16()? as usize;
-            c.at = c
-                .at
-                .checked_add(dlen)
-                .ok_or_else(|| bad("moon dictionary"))?;
+            c.at =
+                c.at.checked_add(dlen)
+                    .ok_or_else(|| bad("moon dictionary"))?;
         }
         Ok((
-            World { world_type, id, timestamp, must_be_signed_by, signature, roots },
+            World {
+                world_type,
+                id,
+                timestamp,
+                must_be_signed_by,
+                signature,
+                roots,
+            },
             c.at,
         ))
     }
@@ -2168,42 +2252,44 @@ impl World {
 /// file bootstraps against, like `Topology`'s constructor.
 pub fn default_planet() -> &'static [u8] {
     const ZT_DEFAULT_WORLD: [u8; 570] = [
-        0x01, 0x00, 0x00, 0x00, 0x00, 0x08, 0xea, 0xc9, 0x0a, 0x00, 0x00, 0x01, 0x7e, 0xe9, 0x57, 0x60,
-        0xcd, 0xb8, 0xb3, 0x88, 0xa4, 0x69, 0x22, 0x14, 0x91, 0xaa, 0x9a, 0xcd, 0x66, 0xcc, 0x76, 0x4c,
-        0xde, 0xfd, 0x56, 0x03, 0x9f, 0x10, 0x67, 0xae, 0x15, 0xe6, 0x9c, 0x6f, 0xb4, 0x2d, 0x7b, 0x55,
-        0x33, 0x0e, 0x3f, 0xda, 0xac, 0x52, 0x9c, 0x07, 0x92, 0xfd, 0x73, 0x40, 0xa6, 0xaa, 0x21, 0xab,
-        0xa8, 0xa4, 0x89, 0xfd, 0xae, 0xa4, 0x4a, 0x39, 0xbf, 0x2d, 0x00, 0x65, 0x9a, 0xc9, 0xc8, 0x18,
-        0xeb, 0x36, 0x00, 0x92, 0x76, 0x37, 0xef, 0x4d, 0x14, 0x04, 0xa4, 0x4d, 0x54, 0x46, 0x84, 0x85,
-        0x13, 0x79, 0x75, 0x1f, 0xaa, 0x79, 0xb4, 0xc4, 0xea, 0x85, 0x04, 0x01, 0x75, 0xea, 0x06, 0x58,
-        0x60, 0x48, 0x24, 0x02, 0xe1, 0xeb, 0x34, 0x20, 0x52, 0x00, 0x0e, 0x62, 0x90, 0x06, 0x1a, 0x9b,
-        0xe0, 0xcd, 0x29, 0x3c, 0x8b, 0x55, 0xf1, 0xc3, 0xd2, 0x52, 0x48, 0x08, 0xaf, 0xc5, 0x49, 0x22,
-        0x08, 0x0e, 0x35, 0x39, 0xa7, 0x5a, 0xdd, 0xc3, 0xce, 0xf0, 0xf6, 0xad, 0x26, 0x0d, 0x58, 0x82,
-        0x93, 0xbb, 0x77, 0x86, 0xe7, 0x1e, 0xfa, 0x4b, 0x90, 0x57, 0xda, 0xd9, 0x86, 0x7a, 0xfe, 0x12,
-        0xdd, 0x04, 0xca, 0xfe, 0x9e, 0xfe, 0xb9, 0x00, 0xcc, 0xde, 0xf7, 0x6b, 0xc7, 0xb9, 0x7d, 0xed,
-        0x90, 0x4e, 0xab, 0xc5, 0xdf, 0x09, 0x88, 0x6d, 0x9c, 0x15, 0x14, 0xa6, 0x10, 0x03, 0x6c, 0xb9,
-        0x13, 0x9c, 0xc2, 0x14, 0x00, 0x1a, 0x29, 0x58, 0x97, 0x8e, 0xfc, 0xec, 0x15, 0x71, 0x2d, 0xd3,
-        0x94, 0x8c, 0x6e, 0x6b, 0x3a, 0x8e, 0x89, 0x3d, 0xf0, 0x1f, 0xf4, 0x93, 0xd1, 0xf8, 0xd9, 0x80,
-        0x6a, 0x86, 0x0c, 0x54, 0x20, 0x57, 0x1b, 0xf0, 0x00, 0x02, 0x04, 0x68, 0xc2, 0x08, 0x86, 0x27,
-        0x09, 0x06, 0x26, 0x05, 0x98, 0x80, 0x02, 0x00, 0x12, 0x00, 0x00, 0x30, 0x05, 0x71, 0x0e, 0x34,
-        0x00, 0x51, 0x27, 0x09, 0x77, 0x8c, 0xde, 0x71, 0x90, 0x00, 0x3f, 0x66, 0x81, 0xa9, 0x9e, 0x5a,
-        0xd1, 0x89, 0x5e, 0x9f, 0xba, 0x33, 0xe6, 0x21, 0x2d, 0x44, 0x54, 0xe1, 0x68, 0xbc, 0xec, 0x71,
-        0x12, 0x10, 0x1b, 0xf0, 0x00, 0x95, 0x6e, 0xd8, 0xe9, 0x2e, 0x42, 0x89, 0x2c, 0xb6, 0xf2, 0xec,
-        0x41, 0x08, 0x81, 0xa8, 0x4a, 0xb1, 0x9d, 0xa5, 0x0e, 0x12, 0x87, 0xba, 0x3d, 0x92, 0x6c, 0x3a,
-        0x1f, 0x75, 0x5c, 0xcc, 0xf2, 0x99, 0xa1, 0x20, 0x70, 0x55, 0x00, 0x02, 0x04, 0x67, 0xc3, 0x67,
-        0x42, 0x27, 0x09, 0x06, 0x26, 0x05, 0x98, 0x80, 0x04, 0x00, 0x00, 0xc3, 0x02, 0x54, 0xf2, 0xbc,
-        0xa1, 0xf7, 0x00, 0x19, 0x27, 0x09, 0x62, 0xf8, 0x65, 0xae, 0x71, 0x00, 0xe2, 0x07, 0x6c, 0x57,
-        0xde, 0x87, 0x0e, 0x62, 0x88, 0xd7, 0xd5, 0xe7, 0x40, 0x44, 0x08, 0xb1, 0x54, 0x5e, 0xfc, 0xa3,
-        0x7d, 0x67, 0xf7, 0x7b, 0x87, 0xe9, 0xe5, 0x41, 0x68, 0xc2, 0x5d, 0x3e, 0xf1, 0xa9, 0xab, 0xf2,
-        0x90, 0x5e, 0xa5, 0xe7, 0x85, 0xc0, 0x1d, 0xff, 0x23, 0x88, 0x7a, 0xd4, 0x23, 0x2d, 0x95, 0xc7,
-        0xa8, 0xfd, 0x2c, 0x27, 0x11, 0x1a, 0x72, 0xbd, 0x15, 0x93, 0x22, 0xdc, 0x00, 0x02, 0x04, 0x32,
-        0x07, 0xfc, 0x8a, 0x27, 0x09, 0x06, 0x20, 0x01, 0x49, 0xf0, 0xd0, 0xdb, 0x00, 0x02, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x27, 0x09, 0xca, 0xfe, 0x04, 0xeb, 0xa9, 0x00, 0x6c, 0x6a,
-        0x9d, 0x1d, 0xea, 0x55, 0xc1, 0x61, 0x6b, 0xfe, 0x2a, 0x2b, 0x8f, 0x0f, 0xf9, 0xa8, 0xca, 0xca,
-        0xf7, 0x03, 0x74, 0xfb, 0x1f, 0x39, 0xe3, 0xbe, 0xf8, 0x1c, 0xbf, 0xeb, 0xef, 0x17, 0xb7, 0x22,
-        0x82, 0x68, 0xa0, 0xa2, 0xa2, 0x9d, 0x34, 0x88, 0xc7, 0x52, 0x56, 0x5c, 0x6c, 0x96, 0x5c, 0xbd,
-        0x65, 0x06, 0xec, 0x24, 0x39, 0x7c, 0xc8, 0xa5, 0xd9, 0xd1, 0x52, 0x85, 0xa8, 0x7f, 0x00, 0x02,
-        0x04, 0x54, 0x11, 0x35, 0x9b, 0x27, 0x09, 0x06, 0x2a, 0x02, 0x6e, 0xa0, 0xd4, 0x05, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x99, 0x93, 0x27, 0x09,
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x08, 0xea, 0xc9, 0x0a, 0x00, 0x00, 0x01, 0x7e, 0xe9, 0x57,
+        0x60, 0xcd, 0xb8, 0xb3, 0x88, 0xa4, 0x69, 0x22, 0x14, 0x91, 0xaa, 0x9a, 0xcd, 0x66, 0xcc,
+        0x76, 0x4c, 0xde, 0xfd, 0x56, 0x03, 0x9f, 0x10, 0x67, 0xae, 0x15, 0xe6, 0x9c, 0x6f, 0xb4,
+        0x2d, 0x7b, 0x55, 0x33, 0x0e, 0x3f, 0xda, 0xac, 0x52, 0x9c, 0x07, 0x92, 0xfd, 0x73, 0x40,
+        0xa6, 0xaa, 0x21, 0xab, 0xa8, 0xa4, 0x89, 0xfd, 0xae, 0xa4, 0x4a, 0x39, 0xbf, 0x2d, 0x00,
+        0x65, 0x9a, 0xc9, 0xc8, 0x18, 0xeb, 0x36, 0x00, 0x92, 0x76, 0x37, 0xef, 0x4d, 0x14, 0x04,
+        0xa4, 0x4d, 0x54, 0x46, 0x84, 0x85, 0x13, 0x79, 0x75, 0x1f, 0xaa, 0x79, 0xb4, 0xc4, 0xea,
+        0x85, 0x04, 0x01, 0x75, 0xea, 0x06, 0x58, 0x60, 0x48, 0x24, 0x02, 0xe1, 0xeb, 0x34, 0x20,
+        0x52, 0x00, 0x0e, 0x62, 0x90, 0x06, 0x1a, 0x9b, 0xe0, 0xcd, 0x29, 0x3c, 0x8b, 0x55, 0xf1,
+        0xc3, 0xd2, 0x52, 0x48, 0x08, 0xaf, 0xc5, 0x49, 0x22, 0x08, 0x0e, 0x35, 0x39, 0xa7, 0x5a,
+        0xdd, 0xc3, 0xce, 0xf0, 0xf6, 0xad, 0x26, 0x0d, 0x58, 0x82, 0x93, 0xbb, 0x77, 0x86, 0xe7,
+        0x1e, 0xfa, 0x4b, 0x90, 0x57, 0xda, 0xd9, 0x86, 0x7a, 0xfe, 0x12, 0xdd, 0x04, 0xca, 0xfe,
+        0x9e, 0xfe, 0xb9, 0x00, 0xcc, 0xde, 0xf7, 0x6b, 0xc7, 0xb9, 0x7d, 0xed, 0x90, 0x4e, 0xab,
+        0xc5, 0xdf, 0x09, 0x88, 0x6d, 0x9c, 0x15, 0x14, 0xa6, 0x10, 0x03, 0x6c, 0xb9, 0x13, 0x9c,
+        0xc2, 0x14, 0x00, 0x1a, 0x29, 0x58, 0x97, 0x8e, 0xfc, 0xec, 0x15, 0x71, 0x2d, 0xd3, 0x94,
+        0x8c, 0x6e, 0x6b, 0x3a, 0x8e, 0x89, 0x3d, 0xf0, 0x1f, 0xf4, 0x93, 0xd1, 0xf8, 0xd9, 0x80,
+        0x6a, 0x86, 0x0c, 0x54, 0x20, 0x57, 0x1b, 0xf0, 0x00, 0x02, 0x04, 0x68, 0xc2, 0x08, 0x86,
+        0x27, 0x09, 0x06, 0x26, 0x05, 0x98, 0x80, 0x02, 0x00, 0x12, 0x00, 0x00, 0x30, 0x05, 0x71,
+        0x0e, 0x34, 0x00, 0x51, 0x27, 0x09, 0x77, 0x8c, 0xde, 0x71, 0x90, 0x00, 0x3f, 0x66, 0x81,
+        0xa9, 0x9e, 0x5a, 0xd1, 0x89, 0x5e, 0x9f, 0xba, 0x33, 0xe6, 0x21, 0x2d, 0x44, 0x54, 0xe1,
+        0x68, 0xbc, 0xec, 0x71, 0x12, 0x10, 0x1b, 0xf0, 0x00, 0x95, 0x6e, 0xd8, 0xe9, 0x2e, 0x42,
+        0x89, 0x2c, 0xb6, 0xf2, 0xec, 0x41, 0x08, 0x81, 0xa8, 0x4a, 0xb1, 0x9d, 0xa5, 0x0e, 0x12,
+        0x87, 0xba, 0x3d, 0x92, 0x6c, 0x3a, 0x1f, 0x75, 0x5c, 0xcc, 0xf2, 0x99, 0xa1, 0x20, 0x70,
+        0x55, 0x00, 0x02, 0x04, 0x67, 0xc3, 0x67, 0x42, 0x27, 0x09, 0x06, 0x26, 0x05, 0x98, 0x80,
+        0x04, 0x00, 0x00, 0xc3, 0x02, 0x54, 0xf2, 0xbc, 0xa1, 0xf7, 0x00, 0x19, 0x27, 0x09, 0x62,
+        0xf8, 0x65, 0xae, 0x71, 0x00, 0xe2, 0x07, 0x6c, 0x57, 0xde, 0x87, 0x0e, 0x62, 0x88, 0xd7,
+        0xd5, 0xe7, 0x40, 0x44, 0x08, 0xb1, 0x54, 0x5e, 0xfc, 0xa3, 0x7d, 0x67, 0xf7, 0x7b, 0x87,
+        0xe9, 0xe5, 0x41, 0x68, 0xc2, 0x5d, 0x3e, 0xf1, 0xa9, 0xab, 0xf2, 0x90, 0x5e, 0xa5, 0xe7,
+        0x85, 0xc0, 0x1d, 0xff, 0x23, 0x88, 0x7a, 0xd4, 0x23, 0x2d, 0x95, 0xc7, 0xa8, 0xfd, 0x2c,
+        0x27, 0x11, 0x1a, 0x72, 0xbd, 0x15, 0x93, 0x22, 0xdc, 0x00, 0x02, 0x04, 0x32, 0x07, 0xfc,
+        0x8a, 0x27, 0x09, 0x06, 0x20, 0x01, 0x49, 0xf0, 0xd0, 0xdb, 0x00, 0x02, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x02, 0x27, 0x09, 0xca, 0xfe, 0x04, 0xeb, 0xa9, 0x00, 0x6c, 0x6a,
+        0x9d, 0x1d, 0xea, 0x55, 0xc1, 0x61, 0x6b, 0xfe, 0x2a, 0x2b, 0x8f, 0x0f, 0xf9, 0xa8, 0xca,
+        0xca, 0xf7, 0x03, 0x74, 0xfb, 0x1f, 0x39, 0xe3, 0xbe, 0xf8, 0x1c, 0xbf, 0xeb, 0xef, 0x17,
+        0xb7, 0x22, 0x82, 0x68, 0xa0, 0xa2, 0xa2, 0x9d, 0x34, 0x88, 0xc7, 0x52, 0x56, 0x5c, 0x6c,
+        0x96, 0x5c, 0xbd, 0x65, 0x06, 0xec, 0x24, 0x39, 0x7c, 0xc8, 0xa5, 0xd9, 0xd1, 0x52, 0x85,
+        0xa8, 0x7f, 0x00, 0x02, 0x04, 0x54, 0x11, 0x35, 0x9b, 0x27, 0x09, 0x06, 0x2a, 0x02, 0x6e,
+        0xa0, 0xd4, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x99, 0x93, 0x27, 0x09,
     ];
     &ZT_DEFAULT_WORLD
 }
@@ -2239,10 +2325,13 @@ pub struct WireFragment {
 
 impl WireFragment {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < FRAGMENT_HEADER_LEN || bytes[FRAGMENT_IDX_INDICATOR] != FRAGMENT_INDICATOR {
+        if bytes.len() < FRAGMENT_HEADER_LEN || bytes[FRAGMENT_IDX_INDICATOR] != FRAGMENT_INDICATOR
+        {
             return Err(Error::crypto("zerotier: not a valid fragment"));
         }
-        Ok(WireFragment { bytes: bytes.to_vec() })
+        Ok(WireFragment {
+            bytes: bytes.to_vec(),
+        })
     }
 
     /// The destination address (bytes 8..13).
@@ -2277,7 +2366,9 @@ impl WireFragment {
 /// [`MAX_PACKET_FRAGMENTS`] fragments.
 pub fn fragment_packet(armored: &[u8], path_mtu: usize) -> Result<Vec<Vec<u8>>> {
     if path_mtu <= FRAGMENT_HEADER_LEN {
-        return Err(Error::network("zerotier: path MTU too small to carry fragments"));
+        return Err(Error::network(
+            "zerotier: path MTU too small to carry fragments",
+        ));
     }
     let chunk = armored.len().min(path_mtu);
     if chunk == armored.len() {
@@ -2355,13 +2446,16 @@ impl FragmentAssembler {
                 return None;
             }
             let packet_id = frag.packet_id();
-            let entry = self.entries.entry(packet_id).or_insert_with(|| FragAssembly {
-                total: 0,
-                have: 0,
-                head: None,
-                frags: vec![None; 15],
-                at: Instant::now(),
-            });
+            let entry = self
+                .entries
+                .entry(packet_id)
+                .or_insert_with(|| FragAssembly {
+                    total: 0,
+                    have: 0,
+                    head: None,
+                    frags: vec![None; 15],
+                    at: Instant::now(),
+                });
             if entry.have & (1 << number) != 0 {
                 return None; // duplicate fragment
             }
@@ -2388,20 +2482,22 @@ impl FragmentAssembler {
             // Unfragmented: process directly.
             return Some(datagram.to_vec());
         }
-        let entry = self.entries.entry(packet_id).or_insert_with(|| FragAssembly {
-            total: 0,
-            have: 0,
-            head: None,
-            frags: vec![None; 15],
-            at: Instant::now(),
-        });
+        let entry = self
+            .entries
+            .entry(packet_id)
+            .or_insert_with(|| FragAssembly {
+                total: 0,
+                have: 0,
+                head: None,
+                frags: vec![None; 15],
+                at: Instant::now(),
+            });
         if entry.have & 1 != 0 {
             return None; // duplicate head
         }
         entry.have |= 1;
         entry.head = Some(datagram.to_vec());
-        let complete =
-            entry.total > 1 && entry.have.count_ones() as usize == entry.total;
+        let complete = entry.total > 1 && entry.have.count_ones() as usize == entry.total;
         if !complete {
             return None;
         }
@@ -2416,7 +2512,8 @@ impl FragmentAssembler {
     /// Drop expired entries (the RX queue recycle).
     pub fn expire(&mut self) {
         let now = Instant::now();
-        self.entries.retain(|_, e| now.duration_since(e.at) < FRAGMENT_TTL);
+        self.entries
+            .retain(|_, e| now.duration_since(e.at) < FRAGMENT_TTL);
     }
 }
 
@@ -2523,7 +2620,11 @@ pub fn parse_rendezvous(pkt: &WirePacket) -> Result<Rendezvous> {
             SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(octets), port, 0, 0))
         }
     };
-    Ok(Rendezvous { flags, zt_address, sock })
+    Ok(Rendezvous {
+        flags,
+        zt_address,
+        sock,
+    })
 }
 
 /// One `VERB_PUSH_DIRECT_PATHS` (0x10) record. Wire (the writer,
@@ -2584,14 +2685,18 @@ pub fn parse_push_direct_paths(pkt: &WirePacket) -> Result<Vec<DirectPath>> {
     let mut out = Vec::with_capacity(count.min(16));
     for _ in 0..count {
         if at + 3 > p.len() {
-            return Err(Error::crypto("zerotier: truncated PUSH_DIRECT_PATHS record"));
+            return Err(Error::crypto(
+                "zerotier: truncated PUSH_DIRECT_PATHS record",
+            ));
         }
         let flags = p[at];
         at += 1;
         let ext = u16::from_be_bytes([p[at], p[at + 1]]) as usize;
         at += 2;
         if at + ext + 2 > p.len() {
-            return Err(Error::crypto("zerotier: truncated PUSH_DIRECT_PATHS extension"));
+            return Err(Error::crypto(
+                "zerotier: truncated PUSH_DIRECT_PATHS extension",
+            ));
         }
         at += ext;
         let ty = p[at];
@@ -2602,7 +2707,10 @@ pub fn parse_push_direct_paths(pkt: &WirePacket) -> Result<Vec<DirectPath>> {
             4 if at + 6 <= p.len() && alen >= 6 => {
                 let ip = Ipv4Addr::new(p[at], p[at + 1], p[at + 2], p[at + 3]);
                 let port = u16::from_be_bytes([p[at + 4], p[at + 5]]);
-                out.push(DirectPath { flags, sock: SocketAddr::V4(SocketAddrV4::new(ip, port)) });
+                out.push(DirectPath {
+                    flags,
+                    sock: SocketAddr::V4(SocketAddrV4::new(ip, port)),
+                });
                 at += alen;
             }
             6 if at + 18 <= p.len() && alen >= 18 => {
@@ -2641,7 +2749,9 @@ pub fn parse_ok_whois(pkt: &WirePacket) -> Result<Vec<NodeIdentity>> {
         let (id, used) = NodeIdentity::deserialize_bin(&p[at..])?;
         at += used;
         if id.secret.is_some() {
-            return Err(Error::crypto("zerotier: WHOIS reply carried a secret identity"));
+            return Err(Error::crypto(
+                "zerotier: WHOIS reply carried a secret identity",
+            ));
         }
         ids.push(id);
     }
@@ -2661,9 +2771,17 @@ pub fn ok_in_re_packet_id(pkt: &WirePacket) -> Result<u64> {
 /// and the ethernet *payload* — MACs are derived from the packet's
 /// source/destination ZeroTier addresses (`_doFRAME`), never carried.
 /// Unarmored — see [`build_whois`].
-pub fn build_frame(from: &NodeIdentity, to: u64, network_id: u64, ethertype: u16, frame: &[u8]) -> WirePacket {
+pub fn build_frame(
+    from: &NodeIdentity,
+    to: u64,
+    network_id: u64,
+    ethertype: u16,
+    frame: &[u8],
+) -> WirePacket {
     let mut pkt = WirePacket::new(to, from.address(), Verb::Frame);
-    pkt.push_u64(network_id).push_u16(ethertype).push_bytes(frame);
+    pkt.push_u64(network_id)
+        .push_u16(ethertype)
+        .push_bytes(frame);
     pkt
 }
 
@@ -2738,7 +2856,10 @@ impl NetconfDict {
     }
 
     pub fn get(&self, key: &str) -> Option<&[u8]> {
-        self.pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_slice())
+        self.pairs
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_slice())
     }
 
     /// `Dictionary::getUI`: integers are stored as hex.
@@ -2886,7 +3007,12 @@ pub fn parse_applied_netconf(resp: &NetconfResponse) -> Result<AppliedNetconf> {
                         .ok_or_else(|| Error::protocol("zerotier: bad route gateway"))?,
                 ),
             };
-            routes.push(ManagedRoute { target, via, flags, metric });
+            routes.push(ManagedRoute {
+                target,
+                via,
+                flags,
+                metric,
+            });
         }
     }
 
@@ -3058,7 +3184,12 @@ struct Shim {
 
 impl Shim {
     fn new(mtu: usize) -> Self {
-        Shim { ingress: VecDeque::new(), egress: VecDeque::new(), scratch: Vec::new(), mtu }
+        Shim {
+            ingress: VecDeque::new(),
+            egress: VecDeque::new(),
+            scratch: Vec::new(),
+            mtu,
+        }
     }
 
     fn stage(&mut self, pkt: &[u8]) {
@@ -3076,12 +3207,18 @@ impl Device for Shim {
         let pkt = self.ingress.pop_front()?;
         Some((
             RxTok { pkt },
-            TxTok { egress: &mut self.egress, scratch: &mut self.scratch },
+            TxTok {
+                egress: &mut self.egress,
+                scratch: &mut self.scratch,
+            },
         ))
     }
 
     fn transmit(&mut self, _ts: SmolInstant) -> Option<TxTok<'_>> {
-        Some(TxTok { egress: &mut self.egress, scratch: &mut self.scratch })
+        Some(TxTok {
+            egress: &mut self.egress,
+            scratch: &mut self.scratch,
+        })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -3211,7 +3348,10 @@ impl AsyncWrite for ZtStream {
     ) -> Poll<io::Result<usize>> {
         let mut g = self.shared.lock();
         if g.aborted {
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, "zt: aborted")));
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "zt: aborted",
+            )));
         }
         if g.write_closed || g.to_stack.len() >= ZT_STREAM_QUEUE_MAX {
             g.write_waker = Some(cx.waker().clone());
@@ -3228,7 +3368,10 @@ impl AsyncWrite for ZtStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         self.shared.lock().write_closed = true;
         self.shared.wake.notify_one();
         Poll::Ready(Ok(()))
@@ -3413,7 +3556,10 @@ impl ZtStack {
     }
 
     fn learn_peer(&mut self, identity: NodeIdentity, endpoint: Option<SocketAddr>) {
-        let key = self.identity.agree(&identity).unwrap_or([0u8; SYMMETRIC_KEY_SIZE]);
+        let key = self
+            .identity
+            .agree(&identity)
+            .unwrap_or([0u8; SYMMETRIC_KEY_SIZE]);
         match self.peers.entry(identity.address()) {
             std::collections::hash_map::Entry::Vacant(slot) => {
                 // New identity: persist it (`Topology::_savePeer` —
@@ -3446,7 +3592,9 @@ impl ZtStack {
     /// OK(HELLO) reply, armored under the pairwise key and echoing a
     /// packet id we await, confirms the path.
     async fn attempt_contact(&mut self, socket: &UdpSocket, dest: u64, at: SocketAddr) {
-        let Some(peer) = self.peers.get(&dest) else { return };
+        let Some(peer) = self.peers.get(&dest) else {
+            return;
+        };
         let key = peer.key;
         // `_doRENDEZVOUS`'s junk packet (IncomingPacket.cpp:757-758).
         // Delta: upstream sends it with TTL 2; the port has no
@@ -3457,7 +3605,8 @@ impl ZtStack {
         // Bounded probe bookkeeping (see `probing`).
         if self.probing.len() > 128 {
             let now = Instant::now();
-            self.probing.retain(|_, at_instant| now.duration_since(*at_instant) < PROBE_TTL);
+            self.probing
+                .retain(|_, at_instant| now.duration_since(*at_instant) < PROBE_TTL);
         }
         self.probing.insert((dest, at), Instant::now());
         let moons = self.moon_tail();
@@ -3537,7 +3686,10 @@ impl ZtStack {
         let dst_ip = dst_ip_of(pkt);
         let dest = match dst_ip.and_then(|ip| self.ip_peers.get(&ip).copied()) {
             Some(addr) => Some(addr),
-            None => self.netconf.as_ref().and_then(|n| n.specialists.first().copied()),
+            None => self
+                .netconf
+                .as_ref()
+                .and_then(|n| n.specialists.first().copied()),
         };
         let Some(dest) = dest else {
             tracing::debug!(target: "engine", "zt: no route to {dst_ip:?}, dropping frame");
@@ -3575,7 +3727,10 @@ impl ZtStack {
         match &self.join {
             Join::Start => {
                 self.send_root_hello(socket).await;
-                self.join = Join::HelloRoot { at: now, attempts: 1 };
+                self.join = Join::HelloRoot {
+                    at: now,
+                    attempts: 1,
+                };
             }
             Join::HelloRoot { at, attempts } => {
                 if now.duration_since(*at) >= ZT_HELLO_RETRY {
@@ -3585,7 +3740,10 @@ impl ZtStack {
                     }
                     let next = attempts + 1;
                     self.send_root_hello(socket).await;
-                    self.join = Join::HelloRoot { at: now, attempts: next };
+                    self.join = Join::HelloRoot {
+                        at: now,
+                        attempts: next,
+                    };
                 }
             }
             Join::Netconf { at, attempts } => {
@@ -3596,7 +3754,10 @@ impl ZtStack {
                     }
                     let next = attempts + 1;
                     self.send_netconf_request(socket).await;
-                    self.join = Join::Netconf { at: now, attempts: next };
+                    self.join = Join::Netconf {
+                        at: now,
+                        attempts: next,
+                    };
                 }
             }
             Join::Applied | Join::Failed(_) => {}
@@ -3644,8 +3805,11 @@ impl ZtStack {
         };
         let previous = self.netconf.as_ref().map(|n| (n.revision, n.update_id));
         let meta = netconf_request_meta_dict();
-        let mut req =
-            WirePacket::new(self.controller, self.identity.address(), Verb::NetworkConfigRequest);
+        let mut req = WirePacket::new(
+            self.controller,
+            self.identity.address(),
+            Verb::NetworkConfigRequest,
+        );
         req.push_u64(self.network_id)
             .push_u16(meta.len() as u16)
             .push_bytes(meta.as_bytes());
@@ -3709,7 +3873,11 @@ impl ZtStack {
         self.join = Join::Applied;
         self.netconf = Some(applied);
         // WHOIS the specialists now so data frames have keys ready.
-        if let Some(spec) = self.netconf.as_ref().and_then(|n| n.specialists.first().copied()) {
+        if let Some(spec) = self
+            .netconf
+            .as_ref()
+            .and_then(|n| n.specialists.first().copied())
+        {
             if !self.peers.contains_key(&spec) {
                 self.request_whois(socket, spec).await;
             }
@@ -3835,7 +4003,11 @@ impl ZtStack {
                     self.wake.notify_one();
                 }
             }
-            Verb::Error | Verb::Hello | Verb::NetworkConfig | Verb::NetworkConfigRequest | Verb::Nop => {}
+            Verb::Error
+            | Verb::Hello
+            | Verb::NetworkConfig
+            | Verb::NetworkConfigRequest
+            | Verb::Nop => {}
         }
     }
 
@@ -3873,7 +4045,9 @@ impl ZtStack {
         let source = pkt.source();
         let now = Instant::now();
         {
-            let Some(peer) = self.peers.get_mut(&source) else { return };
+            let Some(peer) = self.peers.get_mut(&source) else {
+                return;
+            };
             let streak = match peer.last_push_recv {
                 Some(at) if now.duration_since(at) < PUSH_DIRECT_PATHS_CUTOFF => {
                     peer.push_recv_streak + 1
@@ -3886,7 +4060,9 @@ impl ZtStack {
                 return; // rateGatePushDirectPaths: drop the push
             }
         }
-        let Ok(paths) = parse_push_direct_paths(&pkt) else { return };
+        let Ok(paths) = parse_push_direct_paths(&pkt) else {
+            return;
+        };
         let current = self.peers.get(&source).and_then(|p| p.endpoint);
         let mut probed = 0usize;
         for p in paths {
@@ -3915,7 +4091,9 @@ impl ZtStack {
     async fn push_direct_paths_to(&mut self, socket: &UdpSocket, dest: u64) {
         let now = Instant::now();
         let key = {
-            let Some(peer) = self.peers.get_mut(&dest) else { return };
+            let Some(peer) = self.peers.get_mut(&dest) else {
+                return;
+            };
             let interval = if peer.endpoint.is_some() {
                 DIRECT_PATH_PUSH_INTERVAL_HAVEPATH
             } else {
@@ -3931,9 +4109,14 @@ impl ZtStack {
         };
         let mut paths: Vec<DirectPath> = Vec::new();
         for cand in [self.local_addr, self.my_surface].into_iter().flatten() {
-            if cand.port() != 0 && !cand.ip().is_unspecified() && !paths.iter().any(|p| p.sock == cand)
+            if cand.port() != 0
+                && !cand.ip().is_unspecified()
+                && !paths.iter().any(|p| p.sock == cand)
             {
-                paths.push(DirectPath { flags: 0, sock: cand });
+                paths.push(DirectPath {
+                    flags: 0,
+                    sock: cand,
+                });
             }
         }
         if paths.is_empty() {
@@ -3959,7 +4142,11 @@ impl ZtStack {
     /// verifies, the id matches a pending seed, and the roots contain
     /// that seed. The seed is consumed on adoption.
     fn adopt_worlds(&mut self, from: u64, block: &[u8]) {
-        let is_planet_root = self.world.roots.iter().any(|r| r.identity.address() == from);
+        let is_planet_root = self
+            .world
+            .roots
+            .iter()
+            .any(|r| r.identity.address() == from);
         let mut at = 0usize;
         while at < block.len() {
             match World::from_bytes(&block[at..]) {
@@ -4044,9 +4231,13 @@ impl ZtStack {
             Ok(p) => p,
             Err(_) => return,
         };
-        let claimed = parse_hello(&probe).ok().filter(|h| h.identity.address() == source);
+        let claimed = parse_hello(&probe)
+            .ok()
+            .filter(|h| h.identity.address() == source);
         let Some(claimed) = claimed else { return };
-        let Ok(key) = self.identity.agree(&claimed.identity) else { return };
+        let Ok(key) = self.identity.agree(&claimed.identity) else {
+            return;
+        };
         if pkt.dearmor(&key).is_err() {
             tracing::debug!(target: "engine", "zt: HELLO MAC check failed");
             return;
@@ -4147,7 +4338,10 @@ impl ZtStack {
                 }
                 // The root path is proven; move the join along.
                 if matches!(self.join, Join::HelloRoot { .. }) {
-                    self.join = Join::Netconf { at: self.std_now(), attempts: 0 };
+                    self.join = Join::Netconf {
+                        at: self.std_now(),
+                        attempts: 0,
+                    };
                     self.send_netconf_request(socket).await;
                 }
                 // Trust established → tell this peer where we are
@@ -4155,12 +4349,17 @@ impl ZtStack {
                 self.push_direct_paths_to(socket, source).await;
             }
             Ok(Verb::Whois) => {
-                let Ok(ids) = parse_ok_whois(&pkt) else { return };
+                let Ok(ids) = parse_ok_whois(&pkt) else {
+                    return;
+                };
                 for id in ids {
                     // Roots are trusted anchors; other identities
                     // must carry their hashcash proof.
-                    let is_root =
-                        self.world.roots.iter().any(|r| r.identity.address() == id.address());
+                    let is_root = self
+                        .world
+                        .roots
+                        .iter()
+                        .any(|r| r.identity.address() == id.address());
                     if !is_root && !id.locally_validate() {
                         tracing::debug!(target: "engine", "zt: WHOIS identity failed hashcash");
                         continue;
@@ -4237,7 +4436,10 @@ impl ZtStack {
             tcp::SocketBuffer::new(vec![0; ZT_TCP_TX_BYTES]),
         );
         let port = self.ephemeral_port();
-        let local = IpListenEndpoint { addr: Some(local_ip), port };
+        let local = IpListenEndpoint {
+            addr: Some(local_ip),
+            port,
+        };
         let cx = self.iface.context();
         let endpoint = match remote {
             SocketAddr::V4(v4) => IpEndpoint::new(IpAddress::Ipv4(*v4.ip()), v4.port()),
@@ -4286,11 +4488,13 @@ impl ZtStack {
     }
 
     async fn step(&mut self, socket: &UdpSocket) {
-        self.iface.poll(self.now(), &mut self.shim, &mut self.sockets);
+        self.iface
+            .poll(self.now(), &mut self.shim, &mut self.sockets);
         self.promote_dials();
         self.service_conns();
         self.drain_udp_rx();
-        self.iface.poll(self.now(), &mut self.shim, &mut self.sockets);
+        self.iface
+            .poll(self.now(), &mut self.shim, &mut self.sockets);
         self.drain_egress(socket).await;
     }
 
@@ -4457,7 +4661,14 @@ impl ZtStack {
                 let id = self.next_udp_id;
                 self.next_udp_id += 1;
                 let (tx, rx) = mpsc::channel::<(NetAddr, Vec<u8>)>(64);
-                self.udp.insert(id, ZtUdpSock { handle, port, down: tx });
+                self.udp.insert(
+                    id,
+                    ZtUdpSock {
+                        handle,
+                        port,
+                        down: tx,
+                    },
+                );
                 let _ = reply.send(Ok((id, rx)));
             }
             ZtCmd::UdpSend { id, dst, data } => {
@@ -4490,13 +4701,12 @@ impl ZtStack {
         // Expire unanswered probes.
         if !self.probing.is_empty() {
             let now = Instant::now();
-            self.probing.retain(|_, at| now.duration_since(*at) < PROBE_TTL);
+            self.probing
+                .retain(|_, at| now.duration_since(*at) < PROBE_TTL);
         }
         // `ZT_PATH_HEARTBEAT_PERIOD`: keep the root path alive with a
         // periodic HELLO once joined (the reply doubles as the ack).
-        if matches!(self.join, Join::Applied)
-            && self.last_root_hello.elapsed() >= PATH_HEARTBEAT
-        {
+        if matches!(self.join, Join::Applied) && self.last_root_hello.elapsed() >= PATH_HEARTBEAT {
             self.send_root_hello(socket).await;
         }
     }
@@ -4505,9 +4715,9 @@ impl ZtStack {
 /// The destination IP of an IPv4/IPv6 packet, if parseable.
 fn dst_ip_of(pkt: &[u8]) -> Option<IpAddr> {
     match pkt.first()? >> 4 {
-        4 if pkt.len() >= 20 => {
-            Some(IpAddr::V4(Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19])))
-        }
+        4 if pkt.len() >= 20 => Some(IpAddr::V4(Ipv4Addr::new(
+            pkt[16], pkt[17], pkt[18], pkt[19],
+        ))),
         6 if pkt.len() >= 40 => {
             let mut o = [0u8; 16];
             o.copy_from_slice(&pkt[24..40]);
@@ -4520,9 +4730,9 @@ fn dst_ip_of(pkt: &[u8]) -> Option<IpAddr> {
 /// The source IP of an IPv4/IPv6 packet, if parseable.
 fn src_ip_of(pkt: &[u8]) -> Option<IpAddr> {
     match pkt.first()? >> 4 {
-        4 if pkt.len() >= 20 => {
-            Some(IpAddr::V4(Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15])))
-        }
+        4 if pkt.len() >= 20 => Some(IpAddr::V4(Ipv4Addr::new(
+            pkt[12], pkt[13], pkt[14], pkt[15],
+        ))),
         6 if pkt.len() >= 40 => {
             let mut o = [0u8; 16];
             o.copy_from_slice(&pkt[8..24]);
@@ -4548,7 +4758,11 @@ fn local_address_for(netconf: &Option<AppliedNetconf>, dst: &SocketAddr) -> Opti
 
 /// The node task: one loop, biased select over commands, socket reads,
 /// wakeups and the join/timer tick (the wireguard run_stack shape).
-async fn run_zt_stack(mut stack: ZtStack, socket: Arc<UdpSocket>, mut cmd_rx: mpsc::Receiver<ZtCmd>) {
+async fn run_zt_stack(
+    mut stack: ZtStack,
+    socket: Arc<UdpSocket>,
+    mut cmd_rx: mpsc::Receiver<ZtCmd>,
+) {
     let wake = stack.wake.clone();
     let mut rx = vec![0u8; 65_536];
     loop {
@@ -4719,8 +4933,13 @@ async fn zt_tunnel_for(cfg: &ZeroTierConfig) -> Result<mpsc::Sender<ZtCmd>> {
 /// precedent), and a family with no managed address is refused.
 fn zt_target_addr(target: &NetAddr, netconf: &Option<AppliedNetconf>) -> Result<SocketAddr> {
     match &target.host {
-        crate::addr::Host::Ip(IpAddr::V4(ip)) => Ok(SocketAddr::V4(SocketAddrV4::new(*ip, target.port))),
-        crate::addr::Host::Ip(IpAddr::V6(ip)) => match netconf.as_ref().map(|n| n.managed_ips.iter().any(|(a, _)| a.is_ipv6())) {
+        crate::addr::Host::Ip(IpAddr::V4(ip)) => {
+            Ok(SocketAddr::V4(SocketAddrV4::new(*ip, target.port)))
+        }
+        crate::addr::Host::Ip(IpAddr::V6(ip)) => match netconf
+            .as_ref()
+            .map(|n| n.managed_ips.iter().any(|(a, _)| a.is_ipv6()))
+        {
             Some(true) => Ok(SocketAddr::V6(SocketAddrV6::new(*ip, target.port, 0, 0))),
             _ => Err(Error::network(
                 "zt: dial to an IPv6 target with no managed IPv6 address",
@@ -4749,7 +4968,10 @@ pub async fn connect(cfg: &ZeroTierConfig, target: &NetAddr) -> Result<BoxProxyS
     let tunnel = zt_tunnel_for(cfg).await?;
     let (tx, rx) = oneshot::channel();
     tunnel
-        .send(ZtCmd::Connect { target: target.clone(), reply: tx })
+        .send(ZtCmd::Connect {
+            target: target.clone(),
+            reply: tx,
+        })
         .await
         .map_err(|_| Error::network("zt: node task is gone"))?;
     // The join (HELLO → WHOIS → netconf) plus the TCP connect itself.
@@ -4781,7 +5003,11 @@ impl ZtUdp {
             .await
             .map_err(|_| Error::network("zt: udp open timed out"))?
             .map_err(|_| Error::network("zt: node task dropped the open"))??;
-        Ok(ZtUdp { cmd: tunnel, id, down: tokio::sync::Mutex::new(down) })
+        Ok(ZtUdp {
+            cmd: tunnel,
+            id,
+            down: tokio::sync::Mutex::new(down),
+        })
     }
 
     /// Send one datagram to `target` (a managed IP address).
@@ -4800,7 +5026,11 @@ impl ZtUdp {
             }
         };
         self.cmd
-            .send(ZtCmd::UdpSend { id: self.id, dst, data: data.to_vec() })
+            .send(ZtCmd::UdpSend {
+                id: self.id,
+                dst,
+                data: data.to_vec(),
+            })
             .await
             .map_err(|_| Error::network("zt: node task is gone"))
     }
@@ -4925,7 +5155,10 @@ impl std::fmt::Debug for ZeroTierConfig {
             .field("name", &self.name)
             .field("network", &self.network)
             .field("state_dir", &self.state_dir)
-            .field("identity_secret", &self.identity_secret.as_ref().map(|_| "[redacted]"))
+            .field(
+                "identity_secret",
+                &self.identity_secret.as_ref().map(|_| "[redacted]"),
+            )
             .field("planet", &self.planet)
             .field("mtu", &self.mtu)
             .field("ip_stack", &self.ip_stack)
@@ -5180,7 +5413,9 @@ impl NodeStateStore {
     /// store's atomic precedent).
     pub fn save_identity(&self, id: &NodeIdentity) -> Result<()> {
         let secret = id.to_secret_str()?;
-        let tmp = self.dir.join(format!(".identity.secret.{}", std::process::id()));
+        let tmp = self
+            .dir
+            .join(format!(".identity.secret.{}", std::process::id()));
         std::fs::write(&tmp, secret.as_bytes())
             .map_err(|e| Error::config(format!("zerotier: write identity: {e}")))?;
         std::fs::rename(&tmp, self.identity_path())
@@ -5196,13 +5431,19 @@ impl NodeStateStore {
         };
         let mut out = Vec::new();
         for entry in entries.flatten() {
-            let Ok(raw) = std::fs::read(entry.path()) else { continue };
-            let Ok((identity, used)) = NodeIdentity::deserialize_bin(&raw) else { continue };
+            let Ok(raw) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            let Ok((identity, used)) = NodeIdentity::deserialize_bin(&raw) else {
+                continue;
+            };
             if !identity.locally_validate() || used != 71 {
                 continue; // cache poison / non-public form: drop the entry
             }
             let endpoint = if raw.len() > used {
-                PhysAddr::deserialize_from(&raw, used).ok().and_then(|(a, _)| a.to_socket_addr())
+                PhysAddr::deserialize_from(&raw, used)
+                    .ok()
+                    .and_then(|(a, _)| a.to_socket_addr())
             } else {
                 None
             };
@@ -5224,7 +5465,11 @@ impl NodeStateStore {
             PhysAddr::from_socket_addr(ep).serialize_into(&mut buf);
         }
         let path = dir.join(format!("{:010x}", identity.address()));
-        let tmp = dir.join(format!(".{:010x}.{}", identity.address(), std::process::id()));
+        let tmp = dir.join(format!(
+            ".{:010x}.{}",
+            identity.address(),
+            std::process::id()
+        ));
         if std::fs::write(&tmp, &buf).is_ok() {
             let _ = std::fs::rename(&tmp, path);
         }
@@ -5269,7 +5514,8 @@ pub const NOT_PORTED: &str = concat!(
 /// (`identity.secret` + `peers.d`), and moon orbit gossip (the
 /// OK(HELLO) world-update block adopting signed moons whose roots
 /// contain a configured seed).
-pub const MILESTONE_3: &str = "zerotier direct paths + NAT-t + state persistence + moon gossip (rust-native)";
+pub const MILESTONE_3: &str =
+    "zerotier direct paths + NAT-t + state persistence + moon gossip (rust-native)";
 
 #[cfg(test)]
 mod tests {
@@ -5279,7 +5525,9 @@ mod tests {
     /// the environment only, never a source literal. Absent means "not
     /// exercised" (the shape check covers it either way).
     fn test_identity() -> Option<String> {
-        std::env::var("RUSTCRASH_TEST_ZT_IDENTITY").ok().filter(|s| !s.is_empty())
+        std::env::var("RUSTCRASH_TEST_ZT_IDENTITY")
+            .ok()
+            .filter(|s| !s.is_empty())
     }
 
     fn wellformed(network: &str) -> ZeroTierConfig {
@@ -5301,11 +5549,10 @@ mod tests {
     /// vectors BouncyCastle and RustCrypto test against).
     #[test]
     fn salsa20_ecostream_20_rounds_256bit() {
-        let key: [u8; 32] = unhex(
-            "8000000000000000000000000000000000000000000000000000000000000000",
-        )
-        .try_into()
-        .unwrap();
+        let key: [u8; 32] =
+            unhex("8000000000000000000000000000000000000000000000000000000000000000")
+                .try_into()
+                .unwrap();
         let iv = [0u8; 8];
         let mut stream = vec![0u8; 512];
         salsa20_xor(&key, &iv, &mut stream, 20);
@@ -5386,11 +5633,10 @@ mod tests {
     /// RFC 8439 §2.5.2 — the Poly1305 MAC vector.
     #[test]
     fn poly1305_rfc8439() {
-        let key: [u8; 32] = unhex(
-            "85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b",
-        )
-        .try_into()
-        .unwrap();
+        let key: [u8; 32] =
+            unhex("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b")
+                .try_into()
+                .unwrap();
         let msg = b"Cryptographic Forum Research Group";
         let tag = poly1305(&key, msg);
         assert_eq!(hex(&tag), "a8061dc1305136c6c22b8baf0c0127a9");
@@ -5421,11 +5667,7 @@ mod tests {
         // A tampered public key breaks the address binding.
         let mut tampered_pub = *id.public();
         tampered_pub[63] ^= 1;
-        let bad = NodeIdentity::from_parts(
-            id.address(),
-            tampered_pub,
-            id.secret,
-        );
+        let bad = NodeIdentity::from_parts(id.address(), tampered_pub, id.secret);
         assert!(!bad.locally_validate());
         assert_eq!(id.to_secret_str().unwrap(), known_good);
         assert!(id.to_public_str().starts_with("8e4df28b72:0:"));
@@ -5530,7 +5772,7 @@ mod tests {
         pkt.armor(&key, true);
         assert_eq!(pkt.cipher().unwrap(), CipherSuite::C25519Poly1305Salsa2012);
         assert_ne!(pkt.as_bytes(), wire); // MAC + ciphertext differ
-        // The peer derives the same key and opens it.
+                                          // The peer derives the same key and opens it.
         let mut inbound = WirePacket::from_bytes(pkt.as_bytes()).unwrap();
         assert_eq!(inbound.source(), a.address());
         inbound.dearmor(&b.agree(&a).unwrap()).unwrap();
@@ -5665,8 +5907,8 @@ mod tests {
         let key_c = controller.agree(&node).unwrap();
 
         // The node's request (uncompressed, suite 1).
-        let req = build_network_config_request(&node, controller.address(), nwid, None, &key_n)
-            .unwrap();
+        let req =
+            build_network_config_request(&node, controller.address(), nwid, None, &key_n).unwrap();
         let mut req_in = WirePacket::from_bytes(req.as_bytes()).unwrap();
         req_in.dearmor(&key_c).unwrap();
         req_in.uncompress().unwrap();
@@ -5675,8 +5917,17 @@ mod tests {
         assert_eq!(u64::from_be_bytes(p[0..8].try_into().unwrap()), nwid);
         let dlen = u16::from_be_bytes(p[8..10].try_into().unwrap()) as usize;
         let meta = String::from_utf8(p[10..10 + dlen].to_vec()).unwrap();
-        for needed in ["v=7\n", "pv=11\n", "vend=1\n", "mr=1024\n", "o=rustcrash-engine\n"] {
-            assert!(meta.contains(needed), "meta dict missing {needed:?}: {meta}");
+        for needed in [
+            "v=7\n",
+            "pv=11\n",
+            "vend=1\n",
+            "mr=1024\n",
+            "o=rustcrash-engine\n",
+        ] {
+            assert!(
+                meta.contains(needed),
+                "meta dict missing {needed:?}: {meta}"
+            );
         }
         assert_eq!(&p[10 + dlen..], &[0u8; 16]);
 
@@ -5800,10 +6051,19 @@ mod tests {
     #[test]
     fn network_id_parsing() {
         // 16 hex digits parse; ad-hoc (0xff top byte) recognized.
-        assert_eq!(parse_network_id("8056c2e21c000001").unwrap(), 0x8056c2e21c000001);
-        assert!(is_adhoc_network_id(parse_network_id("ffffc2e21c000001").unwrap()));
-        assert!(!is_adhoc_network_id(parse_network_id("8056c2e21c000001").unwrap()));
-        assert!(!is_adhoc_network_id(parse_network_id("00ffc2e21c000001").unwrap()));
+        assert_eq!(
+            parse_network_id("8056c2e21c000001").unwrap(),
+            0x8056c2e21c000001
+        );
+        assert!(is_adhoc_network_id(
+            parse_network_id("ffffc2e21c000001").unwrap()
+        ));
+        assert!(!is_adhoc_network_id(
+            parse_network_id("8056c2e21c000001").unwrap()
+        ));
+        assert!(!is_adhoc_network_id(
+            parse_network_id("00ffc2e21c000001").unwrap()
+        ));
         // Wrong length / non-hex / zero / reserved-controller inputs fail.
         for bad in [
             "8056c2e21c0000",
@@ -5827,11 +6087,11 @@ mod tests {
         assert_eq!(parse_node_address("1234567890").unwrap(), 0x1234567890);
         assert_eq!(parse_node_address("abcdef0123").unwrap(), 0xabcdef0123);
         for bad in [
-            "123456789",     // 9 digits
-            "12345678901",   // 11 digits
-            "0000000000",    // reserved: zero
-            "ffffffffff",    // reserved: 0xff prefix
-            "00ffffffffff",  // wrong length
+            "123456789",    // 9 digits
+            "12345678901",  // 11 digits
+            "0000000000",   // reserved: zero
+            "ffffffffff",   // reserved: 0xff prefix
+            "00ffffffffff", // wrong length
         ] {
             assert!(parse_node_address(bad).is_err(), "{bad:?}");
         }
@@ -5904,15 +6164,30 @@ mod tests {
         assert!(cfg.validate().is_ok());
         // Duplicate orbit worlds (cached lines 248-250).
         cfg.orbit = vec![
-            ZeroTierOrbit { world: 7, seed: "0123456789".into() },
-            ZeroTierOrbit { world: 7, seed: "0123456789".into() },
+            ZeroTierOrbit {
+                world: 7,
+                seed: "0123456789".into(),
+            },
+            ZeroTierOrbit {
+                world: 7,
+                seed: "0123456789".into(),
+            },
         ];
         let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("duplicate ZeroTier orbit world 0000000000000007"), "{err}");
+        assert!(
+            err.contains("duplicate ZeroTier orbit world 0000000000000007"),
+            "{err}"
+        );
         // Bad seed (non-hex10 or reserved).
-        cfg.orbit = vec![ZeroTierOrbit { world: 7, seed: "nope".into() }];
+        cfg.orbit = vec![ZeroTierOrbit {
+            world: 7,
+            seed: "nope".into(),
+        }];
         assert!(cfg.validate().is_err());
-        cfg.orbit = vec![ZeroTierOrbit { world: 7, seed: "ffffffffff".into() }];
+        cfg.orbit = vec![ZeroTierOrbit {
+            world: 7,
+            seed: "ffffffffff".into(),
+        }];
         assert!(cfg.validate().is_err());
         // Trace target must be a hex10 node id (cached lines 267-271).
         cfg.orbit.clear();
@@ -5962,10 +6237,19 @@ mod tests {
         let pkt = WirePacket::new(0x123456789a, 0x00beefcafe, Verb::NetworkConfigRequest);
         let b = pkt.as_bytes();
         assert_eq!(b.len(), PACKET_HEADER_LEN);
-        assert_eq!(&b[PACKET_IDX_DEST..PACKET_IDX_SOURCE], &[0x12, 0x34, 0x56, 0x78, 0x9a]);
-        assert_eq!(&b[PACKET_IDX_SOURCE..PACKET_IDX_FLAGS], &[0x00, 0xbe, 0xef, 0xca, 0xfe]);
+        assert_eq!(
+            &b[PACKET_IDX_DEST..PACKET_IDX_SOURCE],
+            &[0x12, 0x34, 0x56, 0x78, 0x9a]
+        );
+        assert_eq!(
+            &b[PACKET_IDX_SOURCE..PACKET_IDX_FLAGS],
+            &[0x00, 0xbe, 0xef, 0xca, 0xfe]
+        );
         assert_eq!(b[PACKET_IDX_VERB], 0x0b);
-        assert_eq!(pkt.packet_id(), u64::from_be_bytes(b[0..8].try_into().unwrap()));
+        assert_eq!(
+            pkt.packet_id(),
+            u64::from_be_bytes(b[0..8].try_into().unwrap())
+        );
         assert!(WirePacket::from_bytes(&b[..27]).is_err());
         let oversized = vec![0u8; MAX_PACKET_LENGTH + 1];
         assert!(WirePacket::from_bytes(&oversized).is_err());
@@ -6027,14 +6311,8 @@ mod tests {
         // Root 0's stable endpoints: 104.194.8.134:9993 + the v6 twin
         // (transcribed from the binary above).
         let root0 = &world.roots[0];
-        assert_eq!(
-            root0.endpoints[0],
-            PhysAddr::V4([104, 194, 8, 134], 9993)
-        );
-        assert_eq!(
-            root0.endpoints[1].to_socket_addr().unwrap().port(),
-            9993
-        );
+        assert_eq!(root0.endpoints[0], PhysAddr::V4([104, 194, 8, 134], 9993));
+        assert_eq!(root0.endpoints[1].to_socket_addr().unwrap().port(), 9993);
         // Round-trip: re-serializing the parsed world is byte-exact.
         assert_eq!(world.to_bytes(), bytes);
         // Tampering with any byte breaks the signature (checked where
@@ -6074,7 +6352,10 @@ mod tests {
                     identity: r1.clone(),
                     endpoints: vec![PhysAddr::V4([10, 1, 1, 1], 9993)],
                 },
-                WorldRoot { identity: r2, endpoints: vec![] },
+                WorldRoot {
+                    identity: r2,
+                    endpoints: vec![],
+                },
             ],
         )
         .unwrap();
@@ -6106,19 +6387,26 @@ mod tests {
 
         // A newer revision signed by the same key replaces; one signed
         // by a different key does not (the next-update key must match).
-        let newer = World::make(WORLD_TYPE_PLANET, 0xfeedface, 2000, &signer, vec![
-            WorldRoot { identity: r1, endpoints: vec![] },
-        ])
+        let newer = World::make(
+            WORLD_TYPE_PLANET,
+            0xfeedface,
+            2000,
+            &signer,
+            vec![WorldRoot {
+                identity: r1,
+                endpoints: vec![],
+            }],
+        )
         .unwrap();
         assert!(newer.signature_is_valid());
         assert!(newer.timestamp > parsed.timestamp);
         let other_signer = synth_identity(0x66, 0x00000000aa);
-        let forged = World::make(WORLD_TYPE_PLANET, 0xfeedface, 3000, &other_signer, vec![])
-            .unwrap();
+        let forged =
+            World::make(WORLD_TYPE_PLANET, 0xfeedface, 3000, &other_signer, vec![]).unwrap();
         assert!(forged.signature_is_valid()); // self-consistent...
-        // ...but parse_planet anchors on its own key; the *replacement*
-        // check upstream performs (verify with the OLD world's key) is
-        // what rejects it:
+                                              // ...but parse_planet anchors on its own key; the *replacement*
+                                              // check upstream performs (verify with the OLD world's key) is
+                                              // what rejects it:
         let old_key = NodeIdentity::from_parts(0, parsed.must_be_signed_by, None);
         let mut body = Vec::new();
         forged.serialize(true, &mut body);
@@ -6165,7 +6453,10 @@ mod tests {
             let frag = WireFragment::from_bytes(dg).unwrap();
             assert_eq!(frag.total_fragments(), 4);
             assert_eq!(frag.fragment_number(), i);
-            assert_eq!(frag.packet_id(), u64::from_be_bytes(armored[0..8].try_into().unwrap()));
+            assert_eq!(
+                frag.packet_id(),
+                u64::from_be_bytes(armored[0..8].try_into().unwrap())
+            );
             assert_eq!(frag.destination(), be40(&armored[8..13]));
             assert_eq!(dg.len(), 16 + 1384.min(5000 - 1400 - (i - 1) * 1384));
         }
@@ -6213,9 +6504,9 @@ mod tests {
         asm.ingest(&dgs[1]);
         asm.ingest(&dgs[3]); // fragment 2 lost
         assert!(asm.ingest(&dgs[1]).is_none()); // dup still ignored
-        assert!(asm.entries.contains_key(&u64::from_be_bytes(
-            dgs[0][0..8].try_into().unwrap()
-        )));
+        assert!(asm
+            .entries
+            .contains_key(&u64::from_be_bytes(dgs[0][0..8].try_into().unwrap())));
 
         // Unfragmented head passes through directly.
         let mut asm = FragmentAssembler::default();
@@ -6241,7 +6532,11 @@ mod tests {
         let payload: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
         let mut pkt = build_frame(&a, b.address(), 0x1234_0000_0000, ETHERTYPE_IPV4, &payload);
         let dgs = armor_and_fragment(&mut pkt, &key, 700).unwrap();
-        assert!(dgs.len() >= 6, "small MTU must force many fragments: {}", dgs.len());
+        assert!(
+            dgs.len() >= 6,
+            "small MTU must force many fragments: {}",
+            dgs.len()
+        );
         assert!(dgs.iter().skip(1).all(|d| d.len() <= 700));
         // Feed in order; the last datagram completes.
         let mut asm = FragmentAssembler::default();
@@ -6260,7 +6555,11 @@ mod tests {
         evil[idx] ^= 0x80;
         let mut asm = FragmentAssembler::default();
         let mut assembled = None;
-        for dg in dgs.iter().enumerate().map(|(i, d)| if i == 2 { &evil } else { d }) {
+        for dg in dgs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| if i == 2 { &evil } else { d })
+        {
             if let Some(full) = asm.ingest(dg) {
                 assembled = Some(full);
             }
@@ -6289,9 +6588,7 @@ mod tests {
         let sp = 0x0a0b0c0d11u64.to_be_bytes().to_vec();
         let mut dict = format!(
             "v=7\nnwid={:x}\nts={:x}\nr=2\nid={:010x}\nmtu=af0\n",
-            0x0a0b0c0d11000001u64,
-            1_700_000_000_000u64,
-            0x0a0b0c0d11u64,
+            0x0a0b0c0d11000001u64, 1_700_000_000_000u64, 0x0a0b0c0d11u64,
         )
         .into_bytes();
         dict.extend_from_slice(b"I=");
@@ -6342,18 +6639,40 @@ mod tests {
         let mut dict = format!("v=7\nnwid={:x}\nRT=", 0x0a0b0c0d11000001u64).into_bytes();
         dict.extend_from_slice(&escape_dict_value(&rt2));
         dict.push(b'\n');
-        let resp = NetconfResponse { network_id: 0x0a0b0c0d11000001, update_id: 1, dict };
+        let resp = NetconfResponse {
+            network_id: 0x0a0b0c0d11000001,
+            update_id: 1,
+            dict,
+        };
         let applied = parse_applied_netconf(&resp).unwrap();
-        assert_eq!(applied.routes[0].via, Some(IpAddr::V4(Ipv4Addr::new(10, 144, 0, 1))));
+        assert_eq!(
+            applied.routes[0].via,
+            Some(IpAddr::V4(Ipv4Addr::new(10, 144, 0, 1)))
+        );
         // mtu clamping: 100 → 1280 floor; absent → 2800 default.
         let dict = format!("v=7\nnwid={:x}\nmtu=64\n", 0x0a0b0c0d11000001u64).into_bytes();
-        let resp = NetconfResponse { network_id: 0x0a0b0c0d11000001, update_id: 1, dict };
+        let resp = NetconfResponse {
+            network_id: 0x0a0b0c0d11000001,
+            update_id: 1,
+            dict,
+        };
         assert_eq!(parse_applied_netconf(&resp).unwrap().mtu, 1280);
         let dict = format!("v=7\nnwid={:x}\n", 0x0a0b0c0d11000001u64).into_bytes();
-        let resp = NetconfResponse { network_id: 0x0a0b0c0d11000001, update_id: 1, dict };
-        assert_eq!(parse_applied_netconf(&resp).unwrap().mtu, DEFAULT_NETWORK_MTU);
+        let resp = NetconfResponse {
+            network_id: 0x0a0b0c0d11000001,
+            update_id: 1,
+            dict,
+        };
+        assert_eq!(
+            parse_applied_netconf(&resp).unwrap().mtu,
+            DEFAULT_NETWORK_MTU
+        );
         // Missing nwid, or a mismatched one, is fatal.
-        let resp = NetconfResponse { network_id: 1, dict: b"v=7\n".to_vec(), update_id: 1 };
+        let resp = NetconfResponse {
+            network_id: 1,
+            dict: b"v=7\n".to_vec(),
+            update_id: 1,
+        };
         assert!(parse_applied_netconf(&resp).is_err());
         // escape/unescape round-trip over every byte.
         for b in 0u16..256 {
@@ -6443,7 +6762,13 @@ mod tests {
     }
 
     impl Mimic {
-        async fn send_to(&self, dest: u64, key: &[u8; SYMMETRIC_KEY_SIZE], pkt: &mut WirePacket, mtu: usize) {
+        async fn send_to(
+            &self,
+            dest: u64,
+            key: &[u8; SYMMETRIC_KEY_SIZE],
+            pkt: &mut WirePacket,
+            mtu: usize,
+        ) {
             let endpoint = self.known.lock().unwrap().get(&dest).map(|(_, e)| *e);
             let dgs = armor_and_fragment(pkt, key, mtu).unwrap();
             let via = endpoint
@@ -6487,8 +6812,8 @@ mod tests {
                 if fwd[FRAGMENT_IDX_INDICATOR] == FRAGMENT_INDICATOR {
                     fwd[15] = fwd[15].wrapping_add(1) & 0x3f;
                 } else {
-                    fwd[PACKET_IDX_FLAGS] = (fwd[PACKET_IDX_FLAGS] & 0xf8)
-                        | ((fwd[PACKET_IDX_FLAGS] + 1) & 0x07);
+                    fwd[PACKET_IDX_FLAGS] =
+                        (fwd[PACKET_IDX_FLAGS] & 0xf8) | ((fwd[PACKET_IDX_FLAGS] + 1) & 0x07);
                 }
                 let _ = self.socket.send_to(&fwd, ep).await;
                 // Switch.cpp:205-208: after a successful direct relay,
@@ -6503,14 +6828,22 @@ mod tests {
                         let to_dst = build_rendezvous(
                             &self.identity,
                             dest,
-                            &Rendezvous { flags: 0, zt_address: source, sock: src_ep },
+                            &Rendezvous {
+                                flags: 0,
+                                zt_address: source,
+                                sock: src_ep,
+                            },
                             &self.identity.agree(&dst_id).unwrap(),
                         );
                         let _ = self.socket.send_to(to_dst.as_bytes(), ep).await;
                         let to_src = build_rendezvous(
                             &self.identity,
                             source,
-                            &Rendezvous { flags: 0, zt_address: dest, sock: dst_ep },
+                            &Rendezvous {
+                                flags: 0,
+                                zt_address: dest,
+                                sock: dst_ep,
+                            },
                             &self.identity.agree(&src_id).unwrap(),
                         );
                         let _ = self.socket.send_to(to_src.as_bytes(), src_ep).await;
@@ -6591,9 +6924,13 @@ mod tests {
                     // root relay).
                     if let Ok(ids) = parse_ok_whois(&pkt) {
                         for id in ids {
-                            self.known.lock().unwrap().entry(id.address()).or_insert_with(|| {
-                                (id, self.root.as_ref().map(|(_, _, ep)| *ep).unwrap())
-                            });
+                            self.known
+                                .lock()
+                                .unwrap()
+                                .entry(id.address())
+                                .or_insert_with(|| {
+                                    (id, self.root.as_ref().map(|(_, _, ep)| *ep).unwrap())
+                                });
                         }
                     }
                 }
@@ -6607,11 +6944,14 @@ mod tests {
                         }
                     }
                     if ok.len() > PACKET_HEADER_LEN + 9 {
-                        self.send_to(source, &key, &mut ok, DEFAULT_PHYSICAL_MTU).await;
+                        self.send_to(source, &key, &mut ok, DEFAULT_PHYSICAL_MTU)
+                            .await;
                     }
                 }
                 Verb::NetworkConfigRequest => {
-                    let Some((nwid, specialist, mtu)) = netconf else { return };
+                    let Some((nwid, specialist, mtu)) = netconf else {
+                        return;
+                    };
                     let mtu = *mtu as usize;
                     // Node.cpp:800-840 — the signed single-chunk dict:
                     // a managed /24 for the requester, the on-link
@@ -6627,8 +6967,7 @@ mod tests {
                     let sp = specialist.to_be_bytes().to_vec();
                     let mut dict = format!(
                         "v=7\nnwid={nwid:x}\nts={:x}\nr=1\nid={:010x}\nmtu={mtu:x}\n",
-                        1_700_000_000_000u64,
-                        source,
+                        1_700_000_000_000u64, source,
                     )
                     .into_bytes();
                     dict.extend_from_slice(b"I=");
@@ -6663,7 +7002,9 @@ mod tests {
                 Verb::PushDirectPaths => {
                     // `_doPUSH_DIRECT_PATHS`'s probe: HELLO every
                     // advertised address we do not already have.
-                    let Ok(paths) = parse_push_direct_paths(&pkt) else { return };
+                    let Ok(paths) = parse_push_direct_paths(&pkt) else {
+                        return;
+                    };
                     let known_ep = self.known.lock().unwrap().get(&source).map(|(_, e)| *e);
                     let Some((peer_id, _)) = self.known.lock().unwrap().get(&source).cloned()
                     else {
@@ -6691,8 +7032,11 @@ mod tests {
                     // `_doRENDEZVOUS` on a leaf: probe the introduced
                     // peer at the given address (junk omitted — the
                     // mimic needs no NAT opening on loopback).
-                    let Ok(rd) = parse_rendezvous(&pkt) else { return };
-                    let Some((peer_id, _)) = self.known.lock().unwrap().get(&rd.zt_address).cloned()
+                    let Ok(rd) = parse_rendezvous(&pkt) else {
+                        return;
+                    };
+                    let Some((peer_id, _)) =
+                        self.known.lock().unwrap().get(&rd.zt_address).cloned()
                     else {
                         return;
                     };
@@ -6715,7 +7059,9 @@ mod tests {
 
         /// HELLO the root at startup so it learns us.
         async fn hello_root(&self) {
-            let Some((root_addr, root_id, root_ep)) = &self.root else { return };
+            let Some((root_addr, root_id, root_ep)) = &self.root else {
+                return;
+            };
             let key = self.identity.agree(root_id).unwrap();
             let hello = build_hello(
                 &self.identity,
@@ -6760,14 +7106,22 @@ mod tests {
                 tcp::SocketBuffer::new(vec![0; 16 * 1024]),
             );
             listener
-                .listen(IpListenEndpoint { addr: None, port: E2E_TCP_ECHO })
+                .listen(IpListenEndpoint {
+                    addr: None,
+                    port: E2E_TCP_ECHO,
+                })
                 .unwrap();
             let tcp = sockets.add(listener);
             let mut usock = udp::Socket::new(
                 udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; 16 * 1024]),
                 udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; 16 * 1024]),
             );
-            usock.bind(IpListenEndpoint { addr: None, port: E2E_UDP_ECHO }).unwrap();
+            usock
+                .bind(IpListenEndpoint {
+                    addr: None,
+                    port: E2E_UDP_ECHO,
+                })
+                .unwrap();
             let udp = sockets.add(usock);
             BridgeStack {
                 iface,
@@ -6798,7 +7152,8 @@ mod tests {
         /// Poll + echo service; returns (dest, ethertype, frame) pairs
         /// to send back.
         fn step(&mut self) -> Vec<(u64, u16, Vec<u8>)> {
-            self.iface.poll(self.now(), &mut self.shim, &mut self.sockets);
+            self.iface
+                .poll(self.now(), &mut self.shim, &mut self.sockets);
             // TCP echo: whatever arrived goes straight back.
             {
                 let sock = self.sockets.get_mut::<tcp::Socket>(self.tcp);
@@ -6821,7 +7176,9 @@ mod tests {
             {
                 let sock = self.sockets.get_mut::<udp::Socket>(self.udp);
                 while sock.can_recv() {
-                    let Ok((n, meta)) = sock.recv_slice(&mut self.pump_buf) else { break };
+                    let Ok((n, meta)) = sock.recv_slice(&mut self.pump_buf) else {
+                        break;
+                    };
                     let _ = sock.send_slice(&self.pump_buf[..n], meta);
                 }
             }
@@ -6836,14 +7193,21 @@ mod tests {
                     sock.close();
                 }
                 if sock.state() == tcp::State::Closed {
-                    sock.listen(IpListenEndpoint { addr: None, port: E2E_TCP_ECHO }).unwrap();
+                    sock.listen(IpListenEndpoint {
+                        addr: None,
+                        port: E2E_TCP_ECHO,
+                    })
+                    .unwrap();
                 }
             }
-            self.iface.poll(self.now(), &mut self.shim, &mut self.sockets);
+            self.iface
+                .poll(self.now(), &mut self.shim, &mut self.sockets);
             let egress: Vec<Vec<u8>> = self.shim.egress.drain(..).collect();
             let mut out = Vec::new();
             for pkt in egress {
-                let Some(et) = ip_ethertype(&pkt) else { continue };
+                let Some(et) = ip_ethertype(&pkt) else {
+                    continue;
+                };
                 if let Some(dest) = dst_ip_of(&pkt).and_then(|ip| self.ip_peers.get(&ip).copied()) {
                     out.push((dest, et, pkt));
                 }
@@ -6907,7 +7271,9 @@ mod tests {
         let root_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 65_536];
             loop {
-                let Ok((n, from)) = root_sock.recv_from(&mut buf).await else { break };
+                let Ok((n, from)) = root_sock.recv_from(&mut buf).await else {
+                    break;
+                };
                 root_mimic.on_datagram(&buf[..n], from, None, None).await;
             }
         });
@@ -6935,7 +7301,9 @@ mod tests {
             ctrl_mimic.hello_root().await;
             let mut buf = vec![0u8; 65_536];
             loop {
-                let Ok((n, from)) = ctrl_sock.recv_from(&mut buf).await else { break };
+                let Ok((n, from)) = ctrl_sock.recv_from(&mut buf).await else {
+                    break;
+                };
                 ctrl_mimic
                     .on_datagram(&buf[..n], from, Some(&netconf_info), None)
                     .await;
@@ -6982,7 +7350,9 @@ mod tests {
                         .map(|(id, _)| bridge_id.agree(id).unwrap())
                         .unwrap_or([0u8; SYMMETRIC_KEY_SIZE]);
                     let mut pkt = build_frame(&bridge_id, dest, nwid, et, &frame);
-                    bridge_mimic.send_to(dest, &key, &mut pkt, DEFAULT_PHYSICAL_MTU).await;
+                    bridge_mimic
+                        .send_to(dest, &key, &mut pkt, DEFAULT_PHYSICAL_MTU)
+                        .await;
                 }
             }
         });
@@ -7036,10 +7406,7 @@ mod tests {
             .unwrap();
         assert_eq!(data, b"zt overlay udp echo");
         assert_eq!(from.port, E2E_UDP_ECHO);
-        assert_eq!(
-            from.host,
-            crate::addr::Host::Ip(IpAddr::V4(E2E_BRIDGE_IP))
-        );
+        assert_eq!(from.host, crate::addr::Host::Ip(IpAddr::V4(E2E_BRIDGE_IP)));
 
         drop(stream);
         drop(udp);
@@ -7053,7 +7420,10 @@ mod tests {
         let identity_file = state_dir.join(STATE_FILE_IDENTITY);
         let persisted = std::fs::read_to_string(&identity_file).unwrap();
         assert_eq!(persisted.trim(), node_id.to_secret_str().unwrap().trim());
-        let peers = std::fs::read_dir(state_dir.join(STATE_DIR_PEERS)).unwrap().flatten().count();
+        let peers = std::fs::read_dir(state_dir.join(STATE_DIR_PEERS))
+            .unwrap()
+            .flatten()
+            .count();
         assert!(peers >= 2, "root + bridge should be persisted, got {peers}");
         std::fs::remove_dir_all(&state_dir).ok();
     }
@@ -7183,7 +7553,10 @@ mod tests {
         let first = store.load_or_create_identity().unwrap();
         assert!(first.locally_validate());
         let second = store.load_or_create_identity().unwrap();
-        assert_eq!(first.to_secret_str().unwrap(), second.to_secret_str().unwrap());
+        assert_eq!(
+            first.to_secret_str().unwrap(),
+            second.to_secret_str().unwrap()
+        );
 
         // Peers: save + load round-trip (real identities — the loader
         // validates hashcash, so synthesized keys are cache poison).
@@ -7199,7 +7572,9 @@ mod tests {
         store.save_peer(&peer2, None);
         let loaded = store.load_peers();
         assert_eq!(loaded.len(), 2);
-        assert!(loaded.iter().any(|(id, e)| id.address() == peer2.address() && e.is_none()));
+        assert!(loaded
+            .iter()
+            .any(|(id, e)| id.address() == peer2.address() && e.is_none()));
 
         // A corrupt identity.secret is a loud config error, never a
         // silent identity rotation.
@@ -7260,7 +7635,10 @@ mod tests {
             0xbadbadbad1,
             1,
             &moon_authority,
-            vec![WorldRoot { identity: moon_root.clone(), endpoints: vec![] }],
+            vec![WorldRoot {
+                identity: moon_root.clone(),
+                endpoints: vec![],
+            }],
         )
         .unwrap();
         let mut other_bytes = Vec::new();
@@ -7275,12 +7653,16 @@ mod tests {
         assert_eq!(stack.moons.len(), 1);
         assert_eq!(stack.moons[0].id, 0xfeedface01);
         assert!(stack.is_upstream(moon_root.address()));
-        assert!(stack.root_endpoints().iter().any(|(a, _, ep)| {
-            *a == moon_root.address() && *ep == moon_ep
-        }));
+        assert!(stack
+            .root_endpoints()
+            .iter()
+            .any(|(a, _, ep)| { *a == moon_root.address() && *ep == moon_ep }));
         // The moon root entered the peer table with its endpoint.
         assert_eq!(
-            stack.peers.get(&moon_root.address()).and_then(|p| p.endpoint),
+            stack
+                .peers
+                .get(&moon_root.address())
+                .and_then(|p| p.endpoint),
             Some(moon_ep)
         );
 
@@ -7290,7 +7672,10 @@ mod tests {
             0xfeedface01,
             7,
             &moon_authority,
-            vec![WorldRoot { identity: moon_root.clone(), endpoints: vec![] }],
+            vec![WorldRoot {
+                identity: moon_root.clone(),
+                endpoints: vec![],
+            }],
         )
         .unwrap();
         let mut older_bytes = Vec::new();
@@ -7352,7 +7737,9 @@ mod tests {
         let root_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 65_536];
             loop {
-                let Ok((n, from)) = root_sock.recv_from(&mut buf).await else { break };
+                let Ok((n, from)) = root_sock.recv_from(&mut buf).await else {
+                    break;
+                };
                 root_mimic.on_datagram(&buf[..n], from, None, None).await;
             }
         });
@@ -7377,7 +7764,9 @@ mod tests {
             ctrl_mimic.hello_root().await;
             let mut buf = vec![0u8; 65_536];
             loop {
-                let Ok((n, from)) = ctrl_sock.recv_from(&mut buf).await else { break };
+                let Ok((n, from)) = ctrl_sock.recv_from(&mut buf).await else {
+                    break;
+                };
                 ctrl_mimic
                     .on_datagram(&buf[..n], from, Some(&netconf_info), None)
                     .await;
@@ -7421,7 +7810,9 @@ mod tests {
                         .map(|(id, _)| bridge_id.agree(id).unwrap())
                         .unwrap_or([0u8; SYMMETRIC_KEY_SIZE]);
                     let mut pkt = build_frame(&bridge_id, dest, nwid, et, &frame);
-                    bridge_mimic.send_to(dest, &key, &mut pkt, DEFAULT_PHYSICAL_MTU).await;
+                    bridge_mimic
+                        .send_to(dest, &key, &mut pkt, DEFAULT_PHYSICAL_MTU)
+                        .await;
                 }
             }
         });

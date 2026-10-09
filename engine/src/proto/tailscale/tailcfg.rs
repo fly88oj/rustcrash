@@ -235,7 +235,9 @@ impl<'de> Deserialize<'de> for Prefix {
             .map_err(|_| serde::de::Error::custom(format!("bad prefix bits: {s:?}")))?;
         let max = if addr.is_ipv4() { 32 } else { 128 };
         if bits > max {
-            return Err(serde::de::Error::custom(format!("prefix bits too large: {s:?}")));
+            return Err(serde::de::Error::custom(format!(
+                "prefix bits too large: {s:?}"
+            )));
         }
         Ok(Prefix { addr, bits })
     }
@@ -270,13 +272,25 @@ impl<'de> Deserialize<'de> for AddrPort {
 /// (direct.go:755-757 "hostinfo: BackendLogID missing").
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Hostinfo {
-    #[serde(rename = "IPNVersion", default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        rename = "IPNVersion",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
     pub ipn_version: String,
-    #[serde(rename = "BackendLogID", default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        rename = "BackendLogID",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
     pub backend_log_id: String,
     #[serde(rename = "OS", default, skip_serializing_if = "String::is_empty")]
     pub os: String,
-    #[serde(rename = "OSVersion", default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        rename = "OSVersion",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
     pub os_version: String,
     /// "App is used to disambiguate Tailscale clients that run using
     /// tsnet" (tailcfg.go:925) — exactly this port's case.
@@ -287,7 +301,11 @@ pub struct Hostinfo {
     /// Userspace (netstack) mode — always true for this port.
     #[serde(rename = "Userspace", default, skip_serializing_if = "Option::is_none")]
     pub userspace: Option<bool>,
-    #[serde(rename = "UserspaceRouter", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "UserspaceRouter",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub userspace_router: Option<bool>,
 }
 
@@ -299,7 +317,11 @@ pub struct Hostinfo {
 /// branch of the register request.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RegisterResponseAuth {
-    #[serde(rename = "Oauth2Token", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "Oauth2Token",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub oauth2_token: Option<serde_json::Value>,
     #[serde(rename = "AuthKey", default, skip_serializing_if = "String::is_empty")]
     pub auth_key: String,
@@ -332,7 +354,11 @@ pub struct RegisterRequest {
     pub followup: String,
     #[serde(rename = "Hostinfo", default, skip_serializing_if = "Option::is_none")]
     pub hostinfo: Option<Hostinfo>,
-    #[serde(rename = "Ephemeral", default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(
+        rename = "Ephemeral",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
     pub ephemeral: bool,
     #[serde(rename = "Tailnet", default, skip_serializing_if = "String::is_empty")]
     pub tailnet: String,
@@ -391,7 +417,11 @@ pub struct UserProfile {
     pub login_name: String,
     #[serde(rename = "DisplayName", default)]
     pub display_name: String,
-    #[serde(rename = "ProfilePicURL", default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        rename = "ProfilePicURL",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
     pub profile_pic_url: String,
 }
 
@@ -529,7 +559,11 @@ impl DerpMap {
             } else {
                 node.host_name.clone()
             };
-            let scheme = if node.insecure_for_tests { "http" } else { "https" };
+            let scheme = if node.insecure_for_tests {
+                "http"
+            } else {
+                "https"
+            };
             return Some(match node.derp_port {
                 0 | 443 => format!("{scheme}://{host}"),
                 port => format!("{scheme}://{host}:{port}"),
@@ -700,7 +734,11 @@ pub struct MapResponse {
     #[serde(rename = "KeepAlive", default)]
     pub keep_alive: bool,
     /// "a URL for the client to open to complete an action".
-    #[serde(rename = "PopBrowserURL", default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        rename = "PopBrowserURL",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
     pub pop_browser_url: String,
     /// "describes the node making the map request" (self).
     #[serde(rename = "Node", default, skip_serializing_if = "Option::is_none")]
@@ -714,23 +752,47 @@ pub struct MapResponse {
     pub peers: Vec<Node>,
     /// "the Nodes ... that have changed or been added since the past
     /// update" (map.go:584-591).
-    #[serde(rename = "PeersChanged", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        rename = "PeersChanged",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub peers_changed: Vec<Node>,
     /// "the NodeIDs that are no longer in the peer list".
-    #[serde(rename = "PeersRemoved", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        rename = "PeersRemoved",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub peers_removed: Vec<i64>,
     /// "a lighter version of the older PeersChanged support" (patches).
-    #[serde(rename = "PeersChangedPatch", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        rename = "PeersChangedPatch",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub peers_changed_patch: Vec<PeerChange>,
     /// "how to update peers' LastSeen times ... If the value is false,
     /// the peer is gone".
-    #[serde(rename = "PeerSeenChange", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "PeerSeenChange",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub peer_seen_change: Option<BTreeMap<i64, bool>>,
     /// "changes the value of a Peer Node.Online value".
-    #[serde(rename = "OnlineChange", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "OnlineChange",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub online_change: Option<BTreeMap<i64, bool>>,
     /// "the user profiles of nodes in the network".
-    #[serde(rename = "UserProfiles", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        rename = "UserProfiles",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub user_profiles: Vec<UserProfile>,
     /// "the name of the network that this node is in".
     #[serde(rename = "Domain", default, skip_serializing_if = "String::is_empty")]
@@ -748,25 +810,38 @@ pub struct MapResponse {
     /// an outbound-only proxy never receives unsolicited traffic, so
     /// the engine carries and exposes the rules and leaves host-side
     /// enforcement to a listener/TUN surface.
-    #[serde(rename = "PacketFilter", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "PacketFilter",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub packet_filter: Option<Vec<FilterRule>>,
     /// "if non-zero, is the current timestamp according to the control
     /// server" (RFC3339 pass-through).
-    #[serde(rename = "ControlTime", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "ControlTime",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub control_time: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::noise::MachinePrivateKey;
+    use super::*;
 
     /// Keys are generated in-test, never literals (repo rule); the hex
     /// strings below are derived at runtime from random keys.
     #[test]
     fn node_key_json_is_the_nodekey_prefix_form() {
         let key = NodePrivateKey::generate();
-        let pub_hex: String = key.public().as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let pub_hex: String = key
+            .public()
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let wire = format!("\"nodekey:{pub_hex}\"");
         let parsed: NodeKey = serde_json::from_str(&wire).unwrap();
         assert_eq!(parsed.as_bytes(), key.public().as_bytes());
@@ -836,8 +911,12 @@ mod tests {
         // NodeKey, NLKey, Hostinfo, Followup, Timestamp..., Ephemeral,
         // and Auth.AuthKey when an auth key is in play (786-789).
         let node = NodePrivateKey::generate();
-        let node_hex: String =
-            node.public().as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let node_hex: String = node
+            .public()
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let req = RegisterRequest {
             version: CURRENT_CAPABILITY_VERSION,
             node_key: NodeKey(*node.public().as_bytes()),
@@ -881,10 +960,18 @@ mod tests {
         // runtime — no literal key material).
         let self_key = NodePrivateKey::generate();
         let peer_key = NodePrivateKey::generate();
-        let self_hex: String =
-            self_key.public().as_bytes().iter().map(|b| format!("{b:02x}")).collect();
-        let peer_hex: String =
-            peer_key.public().as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let self_hex: String = self_key
+            .public()
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let peer_hex: String = peer_key
+            .public()
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let raw = format!(
             r#"{{
               "Node": {{
@@ -920,7 +1007,10 @@ mod tests {
         let resp: MapResponse = serde_json::from_str(&raw).unwrap();
         let node = resp.node.as_ref().unwrap();
         assert_eq!(node.id, 1);
-        assert_eq!(node.addresses, vec![Prefix::new("100.64.0.1".parse().unwrap(), 32)]);
+        assert_eq!(
+            node.addresses,
+            vec![Prefix::new("100.64.0.1".parse().unwrap(), 32)]
+        );
         assert_eq!(node.legacy_derp_string, "127.3.3.40:1");
         assert_eq!(resp.peers.len(), 1);
         let peer = &resp.peers[0];
@@ -942,8 +1032,12 @@ mod tests {
     #[test]
     fn peer_change_patch_json_shape() {
         let peer_key = NodePrivateKey::generate();
-        let peer_hex: String =
-            peer_key.public().as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let peer_hex: String = peer_key
+            .public()
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let raw = format!(
             r#"{{"NodeID": 7, "DERPRegion": 2, "Endpoints": ["127.0.0.1:1234"],
                  "Online": false, "Key": "nodekey:{peer_hex}"}}"#
@@ -953,13 +1047,21 @@ mod tests {
         assert_eq!(pc.derp_region, 2);
         assert_eq!(pc.endpoints.len(), 1);
         assert_eq!(pc.online, Some(false));
-        assert_eq!(pc.key.as_ref().unwrap().as_bytes(), peer_key.public().as_bytes());
+        assert_eq!(
+            pc.key.as_ref().unwrap().as_bytes(),
+            peer_key.public().as_bytes()
+        );
     }
 
     #[test]
     fn over_tls_key_response_shape() {
         let k = MachinePrivateKey::generate();
-        let hexs: String = k.public().as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let hexs: String = k
+            .public()
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let resp: OverTlsPublicKeyResponse =
             serde_json::from_str(&format!(r#"{{"publicKey":"mkey:{hexs}"}}"#)).unwrap();
         assert_eq!(resp.public_key.unwrap().0, *k.public().as_bytes());

@@ -43,6 +43,7 @@ blake3 = "1"
 md-5 = "0.10"
 sha1 = "0.10"
 sha2 = { workspace = true }
+psl = "2"
 hmac = "0.12"
 crc32fast = "1"
 uuid = { version = "1", features = ["v4"] }

@@ -23,7 +23,9 @@ pub async fn serve(
         .map_err(|e| {
             crate::inbound::bind_failure("socks", format!("{}:{}", cfg.bind, cfg.port), e)
         })?;
-    let addr = listener.local_addr().map_err(|e| Error::network(e.to_string()))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| Error::network(e.to_string()))?;
     let tag = cfg.tag.clone();
     let authentication = authentication.to_vec();
     tokio::spawn(async move {
@@ -40,8 +42,17 @@ pub async fn serve(
             let server_ip = addr.ip();
             tokio::spawn(async move {
                 let port = stream.local_addr().map(|a| a.port()).ok();
-                handle(stream, peer, tag, port, "socks", authentication, relay, Some(server_ip))
-                    .await;
+                handle(
+                    stream,
+                    peer,
+                    tag,
+                    port,
+                    "socks",
+                    authentication,
+                    relay,
+                    Some(server_ip),
+                )
+                .await;
             });
         }
     });
@@ -127,6 +138,7 @@ async fn handle_inner(
     // A client that did not offer it gets "no acceptable methods"
     // (0xFF) and the connection closes; one that did runs the
     // sub-negotiation and a failed pair fails it (0x01 status).
+    let mut auth_user: Option<String> = None;
     if !authentication.is_empty() {
         if !methods.contains(&0x02) {
             stream.write_all(&[0x05, 0xFF]).await?;
@@ -147,6 +159,9 @@ async fn handle_inner(
         stream.read_exact(&mut pass).await?;
         if auth_accepted(&authentication, &user, &pass) {
             stream.write_all(&[0x01, 0x00]).await?;
+            // mihomo metadata.InUser (inbound.WithInUser): the username
+            // rides the connection for IN-USER rules / hash-key pinning.
+            auth_user = Some(String::from_utf8_lossy(&user).into_owned());
         } else {
             stream.write_all(&[0x01, 0x01]).await?;
             return Err(Error::protocol("socks5: authentication failed"));
@@ -175,6 +190,7 @@ async fn handle_inner(
                     inbound: tag.to_string(),
                     inbound_port,
                     inbound_kind,
+                    in_user: auth_user,
                 },
                 Box::new(stream),
             );
@@ -202,8 +218,8 @@ async fn read_socks_target(stream: &mut BoxProxyStream, atyp: u8) -> Result<NetA
             stream.read_exact(&mut l).await?;
             let mut name = vec![0u8; l[0] as usize];
             stream.read_exact(&mut name).await?;
-            let s = String::from_utf8(name)
-                .map_err(|_| Error::protocol("socks5: domain not utf-8"))?;
+            let s =
+                String::from_utf8(name).map_err(|_| Error::protocol("socks5: domain not utf-8"))?;
             Host::parse(&s)?
         }
         0x04 => {
@@ -392,9 +408,12 @@ mod tests {
         let mut r = [0u8; 2];
         c.read_exact(&mut r).await.unwrap();
         assert_eq!(&r, &[0x05, 0x00]);
-        c.write_all(&[0x05, 0x01, 0x00, 0x03, 9, b'e', b'c', b'h', b'o', b'.', b't', b'e', b's', b't', 0x01, 0xbb])
-            .await
-            .unwrap();
+        c.write_all(&[
+            0x05, 0x01, 0x00, 0x03, 9, b'e', b'c', b'h', b'o', b'.', b't', b'e', b's', b't', 0x01,
+            0xbb,
+        ])
+        .await
+        .unwrap();
         let mut reply = [0u8; 10];
         c.read_exact(&mut reply).await.unwrap();
         assert_eq!(reply[1], 0x00);
@@ -456,7 +475,9 @@ mod tests {
         let mut r = [0u8; 2];
         c.read_exact(&mut r).await.unwrap();
         assert_eq!(&r, &[0x05, 0x02]);
-        let sub = vec![0x01, 5, b'w', b'r', b'o', b'n', b'g', 4, b'p', b'a', b's', b's'];
+        let sub = vec![
+            0x01, 5, b'w', b'r', b'o', b'n', b'g', 4, b'p', b'a', b's', b's',
+        ];
         c.write_all(&sub).await.unwrap();
         let mut r = [0u8; 2];
         c.read_exact(&mut r).await.unwrap();

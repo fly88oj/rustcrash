@@ -135,9 +135,7 @@ pub use noise::{
     client_deferred, client_handshake, server_handshake, MachinePrivateKey, MachinePublicKey,
     NoiseConn, CURRENT_PROTOCOL_VERSION,
 };
-pub use state::{
-    persist_rotated_node_key, FileStore, NodeIdentity, Persist, STATE_FILE_NAME,
-};
+pub use state::{persist_rotated_node_key, FileStore, NodeIdentity, Persist, STATE_FILE_NAME};
 pub use tailcfg::{
     AddrPort, DerpMap, DerpNode, DerpRegion, DiscoKeyText, DnsConfig, FilterRule, Hostinfo,
     MachineKeyText, MapRequest, MapResponse, NetPortRange, Node, NodeKey, OverTlsPublicKeyResponse,
@@ -203,7 +201,10 @@ impl std::fmt::Debug for TailscaleConfig {
             .field("udp", &self.udp)
             .field("accept_routes", &self.accept_routes)
             .field("exit_node", &self.exit_node)
-            .field("exit_node_allow_lan_access", &self.exit_node_allow_lan_access)
+            .field(
+                "exit_node_allow_lan_access",
+                &self.exit_node_allow_lan_access,
+            )
             .finish()
     }
 }
@@ -439,7 +440,10 @@ impl TailscaleOverlay {
     }
     /// The latest netmap (the last one the poll delivered).
     pub fn netmap(&self) -> Option<NetMap> {
-        self.netmap.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.netmap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The prefs this overlay enforces (from the config it started
@@ -491,7 +495,9 @@ impl TailscaleOverlay {
     /// The search domains of the live netmap (the MagicDNS suffix plus
     /// `DNSConfig.Domains`).
     pub fn search_domains(&self) -> Vec<String> {
-        self.netmap().map(|nm| nm.search_domains()).unwrap_or_default()
+        self.netmap()
+            .map(|nm| nm.search_domains())
+            .unwrap_or_default()
     }
 
     /// The peer currently selected as exit node (the config's
@@ -502,11 +508,8 @@ impl TailscaleOverlay {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()?;
-        self.netmap().and_then(|nm| {
-            nm.peers
-                .into_iter()
-                .find(|p| p.key == key)
-        })
+        self.netmap()
+            .and_then(|nm| nm.peers.into_iter().find(|p| p.key == key))
     }
 
     /// The peer `ip` routes to under this overlay's prefs — the
@@ -528,7 +531,9 @@ impl TailscaleOverlay {
             Ok(None) => Err(Error::network(format!(
                 "tailscale: no peer routes {ip} (cryptokey routing found no match)"
             ))),
-            Err(reason) => Err(Error::network(format!("tailscale: {ip} not routed: {reason}"))),
+            Err(reason) => Err(Error::network(format!(
+                "tailscale: {ip} not routed: {reason}"
+            ))),
         }
     }
 
@@ -589,7 +594,12 @@ impl TailscaleOverlay {
     /// The peer's tunnel, spawned or reused (one per peer, keyed by
     /// node key hex — the same cache `dial_relay` rides).
     async fn tunnel_for_peer(&self, nm: &NetMap, peer: &Node) -> Result<TsTunnel> {
-        let peer_hex: String = peer.key.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let peer_hex: String = peer
+            .key
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let mut tunnels = self.tunnels.lock().await;
         // Reuse the peer's tunnel when it exists and lives.
         if let Some(t) = tunnels.get(&peer_hex) {
@@ -602,12 +612,10 @@ impl TailscaleOverlay {
             .or_else(|| peer.endpoints.first())
             .map(|ep| ep.0);
         let derp = if peer.home_derp != 0 {
-            nm.derp_map
-                .region_url(peer.home_derp)
-                .map(|url| DerpRoute {
-                    url,
-                    peer_key: *peer.key.as_bytes(),
-                })
+            nm.derp_map.region_url(peer.home_derp).map(|url| DerpRoute {
+                url,
+                peer_key: *peer.key.as_bytes(),
+            })
         } else {
             None
         };
@@ -755,15 +763,21 @@ impl TsUdpSocket {
             Error::network("tailscale: no netmap yet (the map poll has not delivered one)")
         })?;
         let peer = self.overlay.routed_peer(&nm, ip)?;
-        let peer_hex: String =
-            peer.key.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let peer_hex: String = peer
+            .key
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let mut sessions = self.sessions.lock().await;
         if !sessions.contains_key(&peer_hex) {
             let tunnel = self.overlay.tunnel_for_peer(&nm, peer).await?;
-            let udp = tunnel.udp_socket(nm.self_node.addresses.iter().find_map(|p| match p.addr {
-                std::net::IpAddr::V6(v6) => Some(v6),
-                _ => None,
-            })).await?;
+            let udp = tunnel
+                .udp_socket(nm.self_node.addresses.iter().find_map(|p| match p.addr {
+                    std::net::IpAddr::V6(v6) => Some(v6),
+                    _ => None,
+                }))
+                .await?;
             // Funnel this peer's replies into the shared channel.
             let forward = udp.clone();
             let down = self.down_tx.clone();
@@ -802,7 +816,8 @@ async fn register_round(
     authority: &str,
     request: &RegisterRequest,
 ) -> Result<RegisterOutcome> {
-    let dialer = ControlHttpDialer::from_url(control_url, machine_key.clone(), control_key.clone())?;
+    let dialer =
+        ControlHttpDialer::from_url(control_url, machine_key.clone(), control_key.clone())?;
     let mut session = ControlSession::dial(&dialer).await?;
     register(&mut session, authority, request).await
 }
@@ -1076,9 +1091,7 @@ pub async fn start_overlay_with(
                             }
                             tracing::info!(target: "engine",
                                 "tailscale: node key renewed (OldNodeKey rotation accepted)");
-                            *renewal_error
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner()) = None;
+                            *renewal_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
                             node_key = new_key.clone();
                             *shared_node_key.lock().unwrap_or_else(|e| e.into_inner()) = new_key;
                             // Fresh map session under the new identity
@@ -1093,9 +1106,8 @@ pub async fn start_overlay_with(
                             continue;
                         }
                         Ok(RegisterOutcome::NodeKeyExpired) => {
-                            *renewal_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(
-                                "weird: regen=true but server says NodeKeyExpired".into(),
-                            );
+                            *renewal_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some("weird: regen=true but server says NodeKeyExpired".into());
                         }
                         Ok(RegisterOutcome::NeedsBrowserAuth(url)) => {
                             *renewal_error.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -1257,7 +1269,9 @@ pub async fn dial_tcp_addr(
         crate::addr::Host::Domain(name) => {
             let overlay = overlay_for(config).await?;
             let ip = overlay.resolve(name).ok_or_else(|| {
-                Error::dns(format!("tailscale: {name} is not a MagicDNS name in the tailnet"))
+                Error::dns(format!(
+                    "tailscale: {name} is not a MagicDNS name in the tailnet"
+                ))
             })?;
             return overlay.dial(SocketAddr::new(ip, target.port)).await;
         }
@@ -1279,7 +1293,9 @@ fn host_of(url: &str) -> String {
         Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => h,
         _ => authority,
     };
-    host.trim_start_matches('[').trim_end_matches(']').to_string()
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string()
 }
 
 fn port_of(url: &str) -> u16 {
@@ -1321,9 +1337,9 @@ fn backend_log_id() -> String {
 pub async fn connect(config: &TailscaleConfig) -> Result<()> {
     // Everything that can be brought up, is (and fails loudly).
     let overlay = start_overlay(config).await?;
-    let nm = overlay.netmap().ok_or_else(|| {
-        Error::network("tailscale: start_overlay returned without a netmap")
-    })?;
+    let nm = overlay
+        .netmap()
+        .ok_or_else(|| Error::network("tailscale: start_overlay returned without a netmap"))?;
     if nm.peers.is_empty() {
         return Err(Error::config(
             "tailscale: logged in and netmap present, but the tailnet has no peers to dial",
@@ -1442,7 +1458,9 @@ mod tests {
         // SECURITY: the repo's standing rule — fake credentials come from
         // the environment only, never a source literal. Absent means "not
         // exercised".
-        std::env::var("RUSTCRASH_TEST_TS_AUTH_KEY").ok().filter(|k| !k.is_empty())
+        std::env::var("RUSTCRASH_TEST_TS_AUTH_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())
     }
 
     /// A generated-in-test fake auth key (never a literal; the mimic
@@ -1450,7 +1468,10 @@ mod tests {
     fn generated_auth_key() -> String {
         let mut b = [0u8; 12];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);
-        format!("tskey-auth-{}", b.iter().map(|x| format!("{x:02x}")).collect::<String>())
+        format!(
+            "tskey-auth-{}",
+            b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+        )
     }
 
     #[test]
@@ -1782,239 +1803,239 @@ mod tests {
     ) {
         use base64::Engine;
         let mut head = Vec::new();
-            let mut b = [0u8; 1];
-            loop {
-                if sock.read_exact(&mut b).await.is_err() {
-                    break;
-                }
-                head.push(b[0]);
-                if head.ends_with(b"\r\n\r\n") {
-                    break;
-                }
+        let mut b = [0u8; 1];
+        loop {
+            if sock.read_exact(&mut b).await.is_err() {
+                break;
             }
-            let text = String::from_utf8_lossy(&head).into_owned();
-            if text.starts_with("GET /key") {
-                // loadServerPubKeys' endpoint (over TLS in production).
-                assert!(text.contains("GET /key?v=148"), "{text}");
-                let hexs: String = fx
-                    .control_key
-                    .public()
-                    .as_bytes()
-                    .iter()
-                    .map(|x| format!("{x:02x}"))
-                    .collect();
-                let body = format!(r#"{{"publicKey":"mkey:{hexs}"}}"#);
-                sock.write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    )
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
-                return;
+            head.push(b[0]);
+            if head.ends_with(b"\r\n\r\n") {
+                break;
             }
-            if !text.starts_with("POST /ts2021") {
-                panic!("unexpected request: {text}");
-            }
-            let b64 = text
-                .lines()
-                .find_map(|l| l.strip_prefix("X-Tailscale-Handshake: "))
-                .expect("handshake header");
-            let init = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+        }
+        let text = String::from_utf8_lossy(&head).into_owned();
+        if text.starts_with("GET /key") {
+            // loadServerPubKeys' endpoint (over TLS in production).
+            assert!(text.contains("GET /key?v=148"), "{text}");
+            let hexs: String = fx
+                .control_key
+                .public()
+                .as_bytes()
+                .iter()
+                .map(|x| format!("{x:02x}"))
+                .collect();
+            let body = format!(r#"{{"publicKey":"mkey:{hexs}"}}"#);
             sock.write_all(
-                b"HTTP/1.1 101 Switching Protocols\r\n\
-                  Upgrade: tailscale-control-protocol\r\n\
-                  Connection: upgrade\r\n\r\n",
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
             )
             .await
             .unwrap();
-            let mut conn = server_handshake(sock, &fx.control_key, Some(init))
-                .await
-                .unwrap();
+            return;
+        }
+        if !text.starts_with("POST /ts2021") {
+            panic!("unexpected request: {text}");
+        }
+        let b64 = text
+            .lines()
+            .find_map(|l| l.strip_prefix("X-Tailscale-Handshake: "))
+            .expect("handshake header");
+        let init = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        sock.write_all(
+            b"HTTP/1.1 101 Switching Protocols\r\n\
+                  Upgrade: tailscale-control-protocol\r\n\
+                  Connection: upgrade\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut conn = server_handshake(sock, &fx.control_key, Some(init))
+            .await
+            .unwrap();
 
-            // One HTTP/1.1 request inside the noise records.
-            let mut buf = Vec::new();
-            let (path, body) = loop {
-                let rec = conn.recv().await.unwrap();
-                buf.extend_from_slice(&rec);
-                let t = String::from_utf8_lossy(&buf).into_owned();
-                if let Some(pos) = t.find("\r\n\r\n") {
-                    if let Some(cl) = t
-                        .lines()
-                        .find_map(|l| l.strip_prefix("Content-Length: "))
-                        .and_then(|v| v.trim().parse::<usize>().ok())
-                    {
-                        if buf.len() >= pos + 4 + cl {
-                            let path = t
-                                .lines()
-                                .next()
-                                .unwrap()
-                                .split_ascii_whitespace()
-                                .nth(1)
-                                .unwrap()
-                                .to_string();
-                            break (path, buf[pos + 4..pos + 4 + cl].to_vec());
-                        }
+        // One HTTP/1.1 request inside the noise records.
+        let mut buf = Vec::new();
+        let (path, body) = loop {
+            let rec = conn.recv().await.unwrap();
+            buf.extend_from_slice(&rec);
+            let t = String::from_utf8_lossy(&buf).into_owned();
+            if let Some(pos) = t.find("\r\n\r\n") {
+                if let Some(cl) = t
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Content-Length: "))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                {
+                    if buf.len() >= pos + 4 + cl {
+                        let path = t
+                            .lines()
+                            .next()
+                            .unwrap()
+                            .split_ascii_whitespace()
+                            .nth(1)
+                            .unwrap()
+                            .to_string();
+                        break (path, buf[pos + 4..pos + 4 + cl].to_vec());
                     }
                 }
-            };
+            }
+        };
 
-            match path.as_str() {
-                "/machine/register" => {
-                    let req: RegisterRequest = serde_json::from_slice(&body).unwrap();
-                    assert_eq!(req.version, CURRENT_CAPABILITY_VERSION);
-                    assert_eq!(req.auth.as_ref().unwrap().auth_key, fx.auth_key);
-                    assert_eq!(
-                        req.ephemeral, fx.ephemeral,
-                        "the ephemeral login flag (direct.go:766) round-trips"
-                    );
-                    // The register ledger: the first round's key, and the
-                    // OldNodeKey renewal round (direct.go:761).
-                    if let Some(cap) = &fx.register_capture {
-                        let nk = *req.node_key.as_bytes();
-                        let old = *req.old_node_key.as_bytes();
-                        let mut first = cap.first.lock().unwrap_or_else(|e| e.into_inner());
-                        if first.is_none() {
-                            *first = Some(nk);
-                        } else if old != [0u8; 32] {
-                            *cap.renewal.lock().unwrap_or_else(|e| e.into_inner()) = Some((old, nk));
-                        }
+        match path.as_str() {
+            "/machine/register" => {
+                let req: RegisterRequest = serde_json::from_slice(&body).unwrap();
+                assert_eq!(req.version, CURRENT_CAPABILITY_VERSION);
+                assert_eq!(req.auth.as_ref().unwrap().auth_key, fx.auth_key);
+                assert_eq!(
+                    req.ephemeral, fx.ephemeral,
+                    "the ephemeral login flag (direct.go:766) round-trips"
+                );
+                // The register ledger: the first round's key, and the
+                // OldNodeKey renewal round (direct.go:761).
+                if let Some(cap) = &fx.register_capture {
+                    let nk = *req.node_key.as_bytes();
+                    let old = *req.old_node_key.as_bytes();
+                    let mut first = cap.first.lock().unwrap_or_else(|e| e.into_inner());
+                    if first.is_none() {
+                        *first = Some(nk);
+                    } else if old != [0u8; 32] {
+                        *cap.renewal.lock().unwrap_or_else(|e| e.into_inner()) = Some((old, nk));
                     }
-                    let resp = br#"{"MachineAuthorized":true}"#.to_vec();
-                    let head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        resp.len()
-                    );
-                    let mut wire = head.into_bytes();
-                    wire.extend_from_slice(&resp);
-                    conn.send(&wire).await.unwrap();
                 }
-                "/machine/map" => {
-                    let req: MapRequest = serde_json::from_slice(&body).unwrap();
-                    assert!(req.stream);
-                    assert!(req.keep_alive);
-                    if let Some(slot) = &fx.disco_capture {
-                        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(req.disco_key.0);
-                    }
-                    let round = map_round
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                        + 1;
-                    if let Some(from) = fx.map_fail_from_round {
-                        if round >= from {
-                            let resp = br#"{"Error":"map rejected"}"#.to_vec();
-                            let head = format!(
-                                "HTTP/1.1 500 nope\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                                resp.len()
-                            );
-                            let mut wire = head.into_bytes();
-                            wire.extend_from_slice(&resp);
-                            conn.send(&wire).await.unwrap();
-                            return;
-                        }
-                    }
-                    // The netmap: self + one peer (+ DERPMap when the
-                    // peer has a home relay). Built with serde_json so
-                    // the Go field names are asserted by construction.
-                    let self_hex: String = req
-                        .node_key
-                        .as_bytes()
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect();
-                    let mut peer = serde_json::json!({
-                        "ID": 2,
-                        "Name": "peer.tail-scale.ts.net.",
-                        "User": 10,
-                        "Key": format!("nodekey:{}", fx.peer_key_hex),
-                        "Addresses": ["100.64.0.2/32"],
-                        "AllowedIPs": ["100.64.0.2/32"],
-                        "HomeDERP": 1,
-                        "Online": true,
-                        "MachineAuthorized": true,
-                    });
-                    if let Some(ep) = fx.peer_endpoint {
-                        peer["Endpoints"] = serde_json::json!([ep.to_string()]);
-                    }
-                    if let Some(dk) = &fx.peer_disco_hex {
-                        peer["DiscoKey"] = serde_json::json!(format!("discokey:{dk}"));
-                    }
-                    let mut msg = serde_json::json!({
-                        "Node": {
-                            "ID": 1,
-                            "Name": "self-node.tail-scale.ts.net.",
-                            "Key": format!("nodekey:{self_hex}"),
-                            "Addresses": ["100.64.0.1/32"],
-                            "AllowedIPs": ["100.64.0.1/32"],
-                        },
-                        "Peers": [peer],
-                        "Domain": "tail-scale.ts.net",
-                    });
-                    if !fx.dns_domains.is_empty() {
-                        msg["DNSConfig"] = serde_json::json!({
-                            "Domains": fx.dns_domains,
-                            "Proxied": true,
-                        });
-                    }
-                    if let Some(tweak) = &fx.map_tweak {
-                        tweak(round, &mut msg);
-                    }
-                    if let Some(url) = &fx.derp_url {
-                        let authority = url
-                            .trim_start_matches("http://")
-                            .trim_start_matches("https://");
-                        let port: u16 = authority
-                            .rsplit_once(':')
-                            .and_then(|(_, p)| p.parse().ok())
-                            .unwrap_or(80);
-                        let host = authority
-                            .rsplit_once(':')
-                            .map(|(h, _)| h)
-                            .unwrap_or(authority);
-                        msg["DERPMap"] = serde_json::json!({
-                            "Regions": {
-                                "1": {
-                                    "RegionID": 1,
-                                    "RegionCode": "tst",
-                                    "RegionName": "Test",
-                                    "Nodes": [{
-                                        "Name": "1a",
-                                        "RegionID": 1,
-                                        "HostName": host,
-                                        "IPv4": host,
-                                        "DERPPort": port,
-                                        "InsecureForTests": true,
-                                    }],
-                                }
-                            }
-                        });
-                    }
-                    let msg = serde_json::to_vec(&msg).unwrap();
-                    conn.send(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
-                        .await
-                        .unwrap();
-                    let mut framed = Vec::with_capacity(4 + msg.len());
-                    framed.extend_from_slice(&(msg.len() as u32).to_le_bytes());
-                    framed.extend_from_slice(&msg);
-                    let mut chunk = format!("{:x}\r\n", framed.len()).into_bytes();
-                    chunk.extend_from_slice(&framed);
-                    chunk.extend_from_slice(b"\r\n");
-                    conn.send(&chunk).await.unwrap();
-                    if fx.map_close_after_deliver {
-                        // Drop the connection: the poll's read sees EOF,
-                        // reconnects per the backoff loop.
+                let resp = br#"{"MachineAuthorized":true}"#.to_vec();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    resp.len()
+                );
+                let mut wire = head.into_bytes();
+                wire.extend_from_slice(&resp);
+                conn.send(&wire).await.unwrap();
+            }
+            "/machine/map" => {
+                let req: MapRequest = serde_json::from_slice(&body).unwrap();
+                assert!(req.stream);
+                assert!(req.keep_alive);
+                if let Some(slot) = &fx.disco_capture {
+                    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(req.disco_key.0);
+                }
+                let round = map_round.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if let Some(from) = fx.map_fail_from_round {
+                    if round >= from {
+                        let resp = br#"{"Error":"map rejected"}"#.to_vec();
+                        let head = format!(
+                            "HTTP/1.1 500 nope\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            resp.len()
+                        );
+                        let mut wire = head.into_bytes();
+                        wire.extend_from_slice(&resp);
+                        conn.send(&wire).await.unwrap();
                         return;
                     }
-                    // Hold the long-poll open.
-                    loop {
-                        if conn.recv().await.is_err() {
-                            break;
+                }
+                // The netmap: self + one peer (+ DERPMap when the
+                // peer has a home relay). Built with serde_json so
+                // the Go field names are asserted by construction.
+                let self_hex: String = req
+                    .node_key
+                    .as_bytes()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                let mut peer = serde_json::json!({
+                    "ID": 2,
+                    "Name": "peer.tail-scale.ts.net.",
+                    "User": 10,
+                    "Key": format!("nodekey:{}", fx.peer_key_hex),
+                    "Addresses": ["100.64.0.2/32"],
+                    "AllowedIPs": ["100.64.0.2/32"],
+                    "HomeDERP": 1,
+                    "Online": true,
+                    "MachineAuthorized": true,
+                });
+                if let Some(ep) = fx.peer_endpoint {
+                    peer["Endpoints"] = serde_json::json!([ep.to_string()]);
+                }
+                if let Some(dk) = &fx.peer_disco_hex {
+                    peer["DiscoKey"] = serde_json::json!(format!("discokey:{dk}"));
+                }
+                let mut msg = serde_json::json!({
+                    "Node": {
+                        "ID": 1,
+                        "Name": "self-node.tail-scale.ts.net.",
+                        "Key": format!("nodekey:{self_hex}"),
+                        "Addresses": ["100.64.0.1/32"],
+                        "AllowedIPs": ["100.64.0.1/32"],
+                    },
+                    "Peers": [peer],
+                    "Domain": "tail-scale.ts.net",
+                });
+                if !fx.dns_domains.is_empty() {
+                    msg["DNSConfig"] = serde_json::json!({
+                        "Domains": fx.dns_domains,
+                        "Proxied": true,
+                    });
+                }
+                if let Some(tweak) = &fx.map_tweak {
+                    tweak(round, &mut msg);
+                }
+                if let Some(url) = &fx.derp_url {
+                    let authority = url
+                        .trim_start_matches("http://")
+                        .trim_start_matches("https://");
+                    let port: u16 = authority
+                        .rsplit_once(':')
+                        .and_then(|(_, p)| p.parse().ok())
+                        .unwrap_or(80);
+                    let host = authority
+                        .rsplit_once(':')
+                        .map(|(h, _)| h)
+                        .unwrap_or(authority);
+                    msg["DERPMap"] = serde_json::json!({
+                        "Regions": {
+                            "1": {
+                                "RegionID": 1,
+                                "RegionCode": "tst",
+                                "RegionName": "Test",
+                                "Nodes": [{
+                                    "Name": "1a",
+                                    "RegionID": 1,
+                                    "HostName": host,
+                                    "IPv4": host,
+                                    "DERPPort": port,
+                                    "InsecureForTests": true,
+                                }],
+                            }
                         }
+                    });
+                }
+                let msg = serde_json::to_vec(&msg).unwrap();
+                conn.send(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut framed = Vec::with_capacity(4 + msg.len());
+                framed.extend_from_slice(&(msg.len() as u32).to_le_bytes());
+                framed.extend_from_slice(&msg);
+                let mut chunk = format!("{:x}\r\n", framed.len()).into_bytes();
+                chunk.extend_from_slice(&framed);
+                chunk.extend_from_slice(b"\r\n");
+                conn.send(&chunk).await.unwrap();
+                if fx.map_close_after_deliver {
+                    // Drop the connection: the poll's read sees EOF,
+                    // reconnects per the backoff loop.
+                    return;
+                }
+                // Hold the long-poll open.
+                loop {
+                    if conn.recv().await.is_err() {
+                        break;
                     }
                 }
-                other => panic!("unexpected control path: {other}"),
             }
+            other => panic!("unexpected control path: {other}"),
+        }
     }
 
     /// A DERP mimic that relays frames between the overlay client and
@@ -2024,8 +2045,8 @@ mod tests {
     async fn derp_bridge(listener: tokio::net::TcpListener, peer_endpoint: SocketAddr) {
         use super::derp::{
             box_open, box_seal, read_frame, write_frame, NodePrivateKey as _NodePriv,
-            FRAME_CLIENT_INFO, FRAME_RECV_PACKET,
-            FRAME_SEND_PACKET, FRAME_SERVER_INFO, FRAME_SERVER_KEY, KEY_LEN, MAGIC,
+            FRAME_CLIENT_INFO, FRAME_RECV_PACKET, FRAME_SEND_PACKET, FRAME_SERVER_INFO,
+            FRAME_SERVER_KEY, KEY_LEN, MAGIC,
         };
         let (mut sock, _) = listener.accept().await.expect("derp accept");
         let mut head = Vec::new();
@@ -2047,13 +2068,17 @@ mod tests {
         let server_key = _NodePriv::generate();
         let mut greeting = MAGIC.to_vec();
         greeting.extend_from_slice(server_key.public().as_bytes());
-        write_frame(&mut sock, FRAME_SERVER_KEY, &greeting).await.unwrap();
+        write_frame(&mut sock, FRAME_SERVER_KEY, &greeting)
+            .await
+            .unwrap();
         let (t, payload) = read_frame(&mut sock).await.unwrap();
         assert_eq!(t, FRAME_CLIENT_INFO);
         let mut peer = [0u8; 32];
         peer.copy_from_slice(&payload[..KEY_LEN]);
         let boxed = box_seal(server_key.secret(), &peer, br#"{"version":2}"#).unwrap();
-        write_frame(&mut sock, FRAME_SERVER_INFO, &boxed).await.unwrap();
+        write_frame(&mut sock, FRAME_SERVER_INFO, &boxed)
+            .await
+            .unwrap();
         let _ = box_open(server_key.secret(), &peer, &payload[KEY_LEN..]).unwrap();
 
         // The bridge socket the peer's replies come back on.
@@ -2141,9 +2166,7 @@ mod tests {
                     let Some(our_pub) = captured else {
                         continue;
                     };
-                    let Ok((_sender, msg)) =
-                        super::disco::open(&disco, pkt)
-                    else {
+                    let Ok((_sender, msg)) = super::disco::open(&disco, pkt) else {
                         continue;
                     };
                     if let super::disco::DiscoMessage::Ping(ping) = msg {
@@ -2199,20 +2222,26 @@ mod tests {
             }
         }
         assert!(head.starts_with(b"GET /derp HTTP/1.1"));
-        sock.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\r\n")
-            .await
-            .unwrap();
+        sock.write_all(
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\r\n",
+        )
+        .await
+        .unwrap();
 
         let server_key = _NodePriv::generate();
         let mut greeting = MAGIC.to_vec();
         greeting.extend_from_slice(server_key.public().as_bytes());
-        write_frame(&mut sock, FRAME_SERVER_KEY, &greeting).await.unwrap();
+        write_frame(&mut sock, FRAME_SERVER_KEY, &greeting)
+            .await
+            .unwrap();
         let (t, payload) = read_frame(&mut sock).await.unwrap();
         assert_eq!(t, FRAME_CLIENT_INFO);
         let mut peer = [0u8; 32];
         peer.copy_from_slice(&payload[..KEY_LEN]);
         let boxed = box_seal(server_key.secret(), &peer, br#"{"version":2}"#).unwrap();
-        write_frame(&mut sock, FRAME_SERVER_INFO, &boxed).await.unwrap();
+        write_frame(&mut sock, FRAME_SERVER_INFO, &boxed)
+            .await
+            .unwrap();
         let _ = box_open(server_key.secret(), &peer, &payload[KEY_LEN..]).unwrap();
 
         let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -2284,20 +2313,29 @@ mod tests {
             }
         }
         assert!(head.starts_with(b"GET /derp HTTP/1.1"));
-        sock.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\r\n")
-            .await
-            .unwrap();
+        sock.write_all(
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\r\n",
+        )
+        .await
+        .unwrap();
         let server_key = _NodePriv::generate();
         let mut greeting = MAGIC.to_vec();
         greeting.extend_from_slice(server_key.public().as_bytes());
-        write_frame(&mut sock, FRAME_SERVER_KEY, &greeting).await.unwrap();
+        write_frame(&mut sock, FRAME_SERVER_KEY, &greeting)
+            .await
+            .unwrap();
         let (t, payload) = read_frame(&mut sock).await.unwrap();
         assert_eq!(t, FRAME_CLIENT_INFO);
         let mut client = [0u8; 32];
         client.copy_from_slice(&payload[..KEY_LEN]);
-        assert_eq!(client, our_node_pub, "the DERP registration is our node key");
+        assert_eq!(
+            client, our_node_pub,
+            "the DERP registration is our node key"
+        );
         let boxed = box_seal(server_key.secret(), &client, br#"{"version":2}"#).unwrap();
-        write_frame(&mut sock, FRAME_SERVER_INFO, &boxed).await.unwrap();
+        write_frame(&mut sock, FRAME_SERVER_INFO, &boxed)
+            .await
+            .unwrap();
         let _ = box_open(server_key.secret(), &client, &payload[KEY_LEN..]).unwrap();
 
         loop {
@@ -2315,10 +2353,8 @@ mod tests {
                         // CallMeMaybe (upstream: a peer receiving
                         // DERP-relayed traffic answers with one when it
                         // wants the direct path, endpoint.go:2138+).
-                        let our_pub = (*our_disco_pub
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner()))
-                        .expect("the client's disco key was captured");
+                        let our_pub = (*our_disco_pub.lock().unwrap_or_else(|e| e.into_inner()))
+                            .expect("the client's disco key was captured");
                         let cmm = super::disco::CallMeMaybe {
                             my_number: vec![my_number],
                         };
@@ -2345,7 +2381,6 @@ mod tests {
         }
     }
 
-
     fn b64(bytes: &[u8]) -> String {
         base64::engine::general_purpose::STANDARD.encode(bytes)
     }
@@ -2359,10 +2394,7 @@ mod tests {
 
     /// [`spawn_peer_wg_endpoint`] at a chosen inner address (an exit
     /// node peer owns a different tailnet IP than the plain peer).
-    async fn spawn_peer_wg_endpoint_at(
-        our_node_pub: [u8; 32],
-        addr: &str,
-    ) -> (SocketAddr, String) {
+    async fn spawn_peer_wg_endpoint_at(our_node_pub: [u8; 32], addr: &str) -> (SocketAddr, String) {
         // SECURITY: the peer's static key is generated in-test.
         let peer_static = NodePrivateKey::generate();
         let cfg = crate::proto::wireguard::WgEndpointCfg {
@@ -2434,7 +2466,9 @@ mod tests {
             ephemeral: false,
             ..TailscaleConfig::new("ts-e2e")
         };
-        let overlay = start_overlay(&cfg).await.unwrap_or_else(|e| panic!("login + netmap: {e}"));
+        let overlay = start_overlay(&cfg)
+            .await
+            .unwrap_or_else(|e| panic!("login + netmap: {e}"));
 
         // The netmap: self address + one peer with the endpoint's real
         // UDP address.
@@ -2510,7 +2544,9 @@ mod tests {
             ephemeral: false,
             ..TailscaleConfig::new("ts-derp")
         };
-        let overlay = start_overlay(&cfg).await.unwrap_or_else(|e| panic!("login + netmap: {e}"));
+        let overlay = start_overlay(&cfg)
+            .await
+            .unwrap_or_else(|e| panic!("login + netmap: {e}"));
         let nm = overlay.netmap().unwrap();
         assert!(nm.peers[0].endpoints.is_empty(), "peer is DERP-only");
         assert_eq!(nm.peers[0].home_derp, 1);
@@ -2855,16 +2891,18 @@ mod tests {
             state_dir: Some(dir.path().to_string_lossy().into_owned()),
             ..TailscaleConfig::new("ts-renew")
         };
-        let overlay = Arc::new(start_overlay_with(
-            &cfg,
-            PollRetry {
-                initial: std::time::Duration::from_millis(20),
-                max: std::time::Duration::from_millis(50),
-                max_attempts: 500,
-            },
-        )
-        .await
-        .unwrap());
+        let overlay = Arc::new(
+            start_overlay_with(
+                &cfg,
+                PollRetry {
+                    initial: std::time::Duration::from_millis(20),
+                    max: std::time::Duration::from_millis(50),
+                    max_attempts: 500,
+                },
+            )
+            .await
+            .unwrap(),
+        );
 
         // The rotation lands: our node public changes...
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -2882,11 +2920,12 @@ mod tests {
 
         // ...the mimic saw the OldNodeKey register round exactly
         // (direct.go:761: OldNodeKey = the current key, NodeKey = fresh).
-        let renewal = *capture
-            .renewal
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        assert_eq!(renewal, Some((initial_pub, rotated_pub)), "the OldNodeKey flow");
+        let renewal = *capture.renewal.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            renewal,
+            Some((initial_pub, rotated_pub)),
+            "the OldNodeKey flow"
+        );
 
         // ...and the next netmap carries the rotated self key with the
         // expiry gone.
@@ -3023,7 +3062,9 @@ mod tests {
         .unwrap();
         w.flush().await.unwrap();
         let socket = r.unsplit(w);
-        let mut conn = server_handshake(socket, &control_key, Some(init)).await.unwrap();
+        let mut conn = server_handshake(socket, &control_key, Some(init))
+            .await
+            .unwrap();
         let got = conn.recv().await.unwrap();
         conn.send(&got).await.unwrap();
     }
@@ -3072,7 +3113,9 @@ mod tests {
             let server_key = NodePrivateKey::generate();
             let mut greeting = MAGIC.to_vec();
             greeting.extend_from_slice(server_key.public().as_bytes());
-            write_frame(&mut sock, FRAME_SERVER_KEY, &greeting).await.unwrap();
+            write_frame(&mut sock, FRAME_SERVER_KEY, &greeting)
+                .await
+                .unwrap();
             let (t, payload) = read_frame(&mut sock).await.unwrap();
             assert_eq!(t, FRAME_CLIENT_INFO);
             let mut peer = [0u8; 32];
@@ -3085,7 +3128,9 @@ mod tests {
                 String::from_utf8_lossy(&json)
             );
             let boxed = box_seal(server_key.secret(), &peer, br#"{"version":2}"#).unwrap();
-            write_frame(&mut sock, FRAME_SERVER_INFO, &boxed).await.unwrap();
+            write_frame(&mut sock, FRAME_SERVER_INFO, &boxed)
+                .await
+                .unwrap();
         });
 
         // SECURITY: machine key generated in-test, never a literal.
@@ -3096,9 +3141,14 @@ mod tests {
             derp_url: Some(format!("http://{derp_addr}")),
         };
 
-        let report = connect_with_bootstrap(&config, &bootstrap).await.expect("wires up");
+        let report = connect_with_bootstrap(&config, &bootstrap)
+            .await
+            .expect("wires up");
         assert!(report.control_reachable);
-        assert_eq!(report.control_protocol_version, Some(CURRENT_PROTOCOL_VERSION));
+        assert_eq!(
+            report.control_protocol_version,
+            Some(CURRENT_PROTOCOL_VERSION)
+        );
         assert!(report.derp_registered);
     }
 
@@ -3136,7 +3186,11 @@ mod tests {
         assert_eq!(fast.delay(0), std::time::Duration::from_millis(10));
         assert_eq!(fast.delay(1), std::time::Duration::from_millis(20));
         assert_eq!(fast.delay(2), std::time::Duration::from_millis(40));
-        assert_eq!(fast.delay(9), std::time::Duration::from_millis(40), "capped");
+        assert_eq!(
+            fast.delay(9),
+            std::time::Duration::from_millis(40),
+            "capped"
+        );
         assert_eq!(POLL_RETRY.delay(0), std::time::Duration::from_millis(100));
         assert_eq!(POLL_RETRY.delay(9), std::time::Duration::from_secs(30));
         // No overflow even at absurd attempt counts.
@@ -3151,7 +3205,10 @@ mod tests {
         let same_but_other_key = TailscaleConfig::new("ts")
             .with_control_url("http://127.0.0.1:1".into())
             .with_auth_key(Some("tskey-env-sourced-2".into()));
-        assert_eq!(overlay_cache_key(&base), overlay_cache_key(&same_but_other_key));
+        assert_eq!(
+            overlay_cache_key(&base),
+            overlay_cache_key(&same_but_other_key)
+        );
         assert!(!overlay_cache_key(&base).contains("tskey-"));
         // Every routing-relevant field changes the key.
         for changed in [
@@ -3226,7 +3283,10 @@ mod tests {
         // whole point (the openvpn TUNNELS registry shape).
         let a = overlay_for(&lt.cfg).await.unwrap();
         let b = overlay_for(&lt.cfg).await.unwrap();
-        assert!(Arc::ptr_eq(&a, &b), "the overlay is reused, not re-registered");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "the overlay is reused, not re-registered"
+        );
         // A different config identity is a different overlay.
         let mut other = lt.cfg.clone();
         other.name = "ts-cache-2".into();
@@ -3242,10 +3302,13 @@ mod tests {
         let mut got = vec![0u8; payload.len()];
         let mut off = 0;
         while off < payload.len() {
-            let n = tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut got[off..]))
-                .await
-                .unwrap_or_else(|_| panic!("echo stalled at {off}"))
-                .unwrap();
+            let n = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                stream.read(&mut got[off..]),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("echo stalled at {off}"))
+            .unwrap();
             assert!(n > 0);
             off += n;
         }
@@ -3284,11 +3347,11 @@ mod tests {
     async fn udp_through_the_overlay_echoes() {
         let lt = live_tailnet("ts-udp", true).await;
         let overlay = Arc::new(start_overlay(&lt.cfg).await.unwrap());
-        let udp = overlay.udp_socket().await.unwrap_or_else(|e| panic!("udp: {e}"));
-        let target = crate::addr::NetAddr::ip(
-            "100.64.0.2".parse().unwrap(),
-            7700,
-        );
+        let udp = overlay
+            .udp_socket()
+            .await
+            .unwrap_or_else(|e| panic!("udp: {e}"));
+        let target = crate::addr::NetAddr::ip("100.64.0.2".parse().unwrap(), 7700);
         let payload: Vec<u8> = (0..512u32).map(|i| (i % 251) as u8).collect();
         udp.send(&target, &payload).await.unwrap();
         let (from, data) = tokio::time::timeout(std::time::Duration::from_secs(10), udp.recv())
@@ -3331,7 +3394,11 @@ mod tests {
         // in-test; it is never dialed, only present in the map).
         let extra_hex: String = {
             let k = NodePrivateKey::generate();
-            k.public().as_bytes().iter().map(|b| format!("{b:02x}")).collect()
+            k.public()
+                .as_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
         };
         let tweak = std::sync::Arc::new(move |round: usize, msg: &mut serde_json::Value| {
             if round >= 2 {
@@ -3386,7 +3453,10 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert!(overlay.poll_error().is_none(), "still polling");
-        assert_eq!(overlay.netmap().unwrap().peers[1].name, "late.tail-scale.ts.net.");
+        assert_eq!(
+            overlay.netmap().unwrap().peers[1].name,
+            "late.tail-scale.ts.net."
+        );
     }
 
     #[tokio::test]
@@ -3440,7 +3510,9 @@ mod tests {
         // The last netmap stays: the routing decision still answers.
         assert_eq!(overlay.netmap().unwrap().peers.len(), 1);
         let nm = overlay.netmap().unwrap();
-        let peer = overlay.routed_peer(&nm, "100.64.0.2".parse().unwrap()).unwrap();
+        let peer = overlay
+            .routed_peer(&nm, "100.64.0.2".parse().unwrap())
+            .unwrap();
         assert_eq!(peer.name, "peer.tail-scale.ts.net.");
     }
 
@@ -3459,16 +3531,19 @@ mod tests {
         let control_addr = control_listener.local_addr().unwrap();
         let auth_key = generated_auth_key();
         let tweak = std::sync::Arc::new(move |_round: usize, msg: &mut serde_json::Value| {
-            msg["Peers"].as_array_mut().unwrap().push(serde_json::json!({
-                "ID": 3,
-                "Name": "exit.tail-scale.ts.net.",
-                "User": 10,
-                "Key": format!("nodekey:{exit_hex}"),
-                "Addresses": ["100.64.0.3/32"],
-                "AllowedIPs": ["100.64.0.3/32", "0.0.0.0/0"],
-                "Endpoints": [exit_addr.to_string()],
-                "Online": true,
-            }));
+            msg["Peers"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "ID": 3,
+                    "Name": "exit.tail-scale.ts.net.",
+                    "User": 10,
+                    "Key": format!("nodekey:{exit_hex}"),
+                    "Addresses": ["100.64.0.3/32"],
+                    "AllowedIPs": ["100.64.0.3/32", "0.0.0.0/0"],
+                    "Endpoints": [exit_addr.to_string()],
+                    "Online": true,
+                }));
         });
         let mut fx = ControlFixture::new(
             MachinePrivateKey::generate(),
@@ -3490,7 +3565,10 @@ mod tests {
         let overlay = Arc::new(start_overlay(&cfg).await.unwrap());
         // The auto pick resolved the exit peer from the map.
         assert_eq!(
-            overlay.selected_exit_node().as_ref().map(|n| n.name.as_str()),
+            overlay
+                .selected_exit_node()
+                .as_ref()
+                .map(|n| n.name.as_str()),
             Some("exit.tail-scale.ts.net.")
         );
         // Internet destinations now route to the exit peer...
@@ -3503,7 +3581,10 @@ mod tests {
         let err = overlay
             .routed_peer(&nm, "192.168.0.10".parse().unwrap())
             .unwrap_err();
-        assert!(err.to_string().contains("exit-node-allow-lan-access"), "{err}");
+        assert!(
+            err.to_string().contains("exit-node-allow-lan-access"),
+            "{err}"
+        );
         // ...and tailnet addresses still route to their owning peer.
         let routed = overlay
             .routed_peer(&nm, "100.64.0.2".parse().unwrap())

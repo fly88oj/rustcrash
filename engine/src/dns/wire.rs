@@ -185,10 +185,7 @@ pub(crate) fn read_name(raw: &[u8], offset: usize) -> Result<(String, usize)> {
                 if pos + len > raw.len() {
                     return Err(Error::dns("label runs past end"));
                 }
-                labels.push(
-                    String::from_utf8_lossy(&raw[pos..pos + len])
-                        .to_ascii_lowercase(),
-                );
+                labels.push(String::from_utf8_lossy(&raw[pos..pos + len]).to_ascii_lowercase());
                 pos += len;
                 if !followed_pointer {
                     consumed += len;
@@ -241,7 +238,11 @@ fn write_name(out: &mut Vec<u8>, name: &str) {
 
 /// Build a response for `query` carrying `answers` (A/AAAA rdata).
 /// TTL is small: fake-ip mappings are volatile.
-pub fn build_response(query: &DnsMessage, rcode: u8, answers: &[(std::net::IpAddr, u32)]) -> Vec<u8> {
+pub fn build_response(
+    query: &DnsMessage,
+    rcode: u8,
+    answers: &[(std::net::IpAddr, u32)],
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(64 + answers.len() * 16);
     let id = query.id;
     out.extend_from_slice(&id.to_be_bytes());

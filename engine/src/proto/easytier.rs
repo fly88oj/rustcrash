@@ -505,7 +505,10 @@ impl std::fmt::Debug for EasyTierConfig {
         f.debug_struct("EasyTierConfig")
             .field("name", &self.name)
             .field("network_name", &self.network_name)
-            .field("network_secret", &(!self.network_secret.is_empty()).then_some("[redacted]"))
+            .field(
+                "network_secret",
+                &(!self.network_secret.is_empty()).then_some("[redacted]"),
+            )
             .field("hostname", &self.hostname)
             .field("ipv4", &self.ipv4)
             .field("dhcp", &self.dhcp)
@@ -532,8 +535,14 @@ impl std::fmt::Debug for EasyTierConfig {
             .field("mtu", &self.mtu)
             .field("tld_dns_zone", &self.tld_dns_zone)
             .field("secure_mode", &self.secure_mode)
-            .field("local_private_key", &self.local_private_key.as_ref().map(|_| "[redacted]"))
-            .field("local_public_key", &self.local_public_key.as_ref().map(|_| "[redacted]"))
+            .field(
+                "local_private_key",
+                &self.local_private_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field(
+                "local_public_key",
+                &self.local_public_key.as_ref().map(|_| "[redacted]"),
+            )
             .finish()
     }
 }
@@ -677,8 +686,7 @@ impl EasyTierTomlConfig {
             .iter()
             .enumerate()
             .map(|(i, raw)| {
-                parse_peer_uri(raw)
-                    .map_err(|e| Error::config(format!("easytier: peers[{i}]: {e}")))
+                parse_peer_uri(raw).map_err(|e| Error::config(format!("easytier: peers[{i}]: {e}")))
             })
             .collect()
     }
@@ -694,7 +702,8 @@ impl EasyTierTomlConfig {
 
     /// `secureModeEnabled()` (toml.go:162-167).
     fn secure_mode_enabled(&self) -> bool {
-        self.secure_mode.unwrap_or_else(|| self.has_secure_mode_material())
+        self.secure_mode
+            .unwrap_or_else(|| self.has_secure_mode_material())
     }
 
     /// `ValidateStructured()` (toml.go:68-89) — the exact upstream
@@ -916,12 +925,7 @@ pub fn apply_required_flags(config_toml: &str) -> String {
     let mut seen: Vec<String> = Vec::new();
     let mut wrote_flags = false;
 
-    fn flush(
-        out: &mut Vec<String>,
-        seen: &mut Vec<String>,
-        section: &str,
-        wrote_flags: &mut bool,
-    ) {
+    fn flush(out: &mut Vec<String>, seen: &mut Vec<String>, section: &str, wrote_flags: &mut bool) {
         if section != "flags" {
             return;
         }
@@ -945,9 +949,7 @@ pub fn apply_required_flags(config_toml: &str) -> String {
         }
         if section == "flags" {
             let key = flag_key(trimmed);
-            if let Some((required_key, required_value)) =
-                FLAGS.iter().find(|(k, _)| *k == key)
-            {
+            if let Some((required_key, required_value)) = FLAGS.iter().find(|(k, _)| *k == key) {
                 out.push(format!("{key} = {required_value}"));
                 seen.push(required_key.to_string());
                 continue;
@@ -1213,10 +1215,14 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<P
     }
     let body_len = u32::from_le_bytes(len_buf) as usize;
     if body_len > TCP_MTU_BYTES {
-        return Err(Error::protocol("easytier: invalid packet. msg: body too long"));
+        return Err(Error::protocol(
+            "easytier: invalid packet. msg: body too long",
+        ));
     }
     if body_len < PEER_MANAGER_HEADER_SIZE {
-        return Err(Error::protocol("easytier: invalid packet. msg: body too short"));
+        return Err(Error::protocol(
+            "easytier: invalid packet. msg: body too short",
+        ));
     }
     let mut body = vec![0u8; body_len];
     reader.read_exact(&mut body).await?;
@@ -1427,7 +1433,8 @@ impl UdpVtHalf {
                 return true;
             }
             self.tx_queue.push_back(datagram.to_vec());
-            self.tx_stage.drain(..TCP_TUNNEL_HEADER_SIZE + datagram.len());
+            self.tx_stage
+                .drain(..TCP_TUNNEL_HEADER_SIZE + datagram.len());
         }
     }
 }
@@ -1640,8 +1647,17 @@ pub async fn connect_udp_tunnel(dst: SocketAddr) -> Result<UdpVtStream> {
             }
         }
     });
-    tokio::spawn(run_udp_sender(socket, dst, conn_id, half.clone(), wake.clone()));
-    Ok(UdpVtStream { half, send_wake: wake })
+    tokio::spawn(run_udp_sender(
+        socket,
+        dst,
+        conn_id,
+        half.clone(),
+        wake.clone(),
+    ));
+    Ok(UdpVtStream {
+        half,
+        send_wake: wake,
+    })
 }
 
 /// One accepted server-side circuit (`UdpConnection` keyed by remote
@@ -1734,8 +1750,7 @@ async fn run_udp_listener(
                 if body.len() != 8 {
                     continue;
                 }
-                let sack =
-                    UdpTunnelHeader::datagram(udp_packet_type::SACK, header.conn_id, body);
+                let sack = UdpTunnelHeader::datagram(udp_packet_type::SACK, header.conn_id, body);
                 if socket.send_to(&sack, addr).await.is_err() {
                     continue;
                 }
@@ -1756,10 +1771,7 @@ async fn run_udp_listener(
                     half.clone(),
                     send_wake.clone(),
                 ));
-                let stream = UdpVtStream {
-                    half,
-                    send_wake,
-                };
+                let stream = UdpVtStream { half, send_wake };
                 if accept_tx.send(stream).await.is_err() {
                     return;
                 }
@@ -1858,11 +1870,11 @@ mod quic_plaintext {
 
     use bytes::BytesMut;
 
+    use quinn_proto::congestion::BbrConfig;
     use quinn_proto::crypto::{
         ClientConfig as QuinnClientConfig, CryptoError, ExportKeyingMaterialError, HeaderKey,
         KeyPair, Keys, PacketKey, ServerConfig as QuinnServerConfig, Session,
     };
-    use quinn_proto::congestion::BbrConfig;
     use quinn_proto::transport_parameters::TransportParameters;
     use quinn_proto::{ConnectError, Side, TransportError};
 
@@ -1946,7 +1958,12 @@ mod quic_plaintext {
             } else {
                 self.state[0]
             };
-            diffuse(a ^ self.state[1] ^ self.state[2] ^ self.state[3] ^ (self.written + self.ntail as u64))
+            diffuse(
+                a ^ self.state[1]
+                    ^ self.state[2]
+                    ^ self.state[3]
+                    ^ (self.written + self.ntail as u64),
+            )
         }
     }
 
@@ -1982,7 +1999,8 @@ mod quic_plaintext {
     impl PacketKey for PlaintextPacketKey {
         fn encrypt(&self, _packet: u64, buf: &mut [u8], header_len: usize) {
             let (header, payload_tag) = buf.split_at_mut(header_len);
-            let (payload, tag_storage) = payload_tag.split_at_mut(payload_tag.len() - self.tag_len());
+            let (payload, tag_storage) =
+                payload_tag.split_at_mut(payload_tag.len() - self.tag_len());
             let checksum = packet_tag(header, payload);
             tag_storage.copy_from_slice(&checksum.to_be_bytes());
         }
@@ -2198,7 +2216,12 @@ mod quic_plaintext {
             Ok(crypto_keys())
         }
 
-        fn retry_tag(&self, _version: u32, _orig_dst_cid: &quinn_proto::ConnectionId, _packet: &[u8]) -> [u8; 16] {
+        fn retry_tag(
+            &self,
+            _version: u32,
+            _orig_dst_cid: &quinn_proto::ConnectionId,
+            _packet: &[u8],
+        ) -> [u8; 16] {
             [0u8; 16]
         }
 
@@ -2308,10 +2331,7 @@ impl AsyncWrite for EtQuicStream {
 /// The quinn endpoint boot shared by both roles: a bound UDP socket
 /// wrapped by the tokio runtime's UDP stack (upstream:
 /// `QuicEndpointManager::try_create`, quic.rs:233-249).
-fn quic_endpoint(
-    bind: SocketAddr,
-    server: Option<quinn::ServerConfig>,
-) -> Result<quinn::Endpoint> {
+fn quic_endpoint(bind: SocketAddr, server: Option<quinn::ServerConfig>) -> Result<quinn::Endpoint> {
     let socket = std::net::UdpSocket::bind(bind)
         .map_err(|e| Error::network(format!("easytier: quic bind {bind}: {e}")))?;
     let runtime = quinn::default_runtime()
@@ -2504,9 +2524,7 @@ where
 fn ws_header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
     head.split("\r\n").find_map(|line| {
         let (k, v) = line.split_once(':')?;
-        k.trim()
-            .eq_ignore_ascii_case(name)
-            .then(|| v.trim())
+        k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
     })
 }
 
@@ -2771,8 +2789,11 @@ impl AsyncRead for WsPeerStream {
                             }
                         }
                         WS_OP_PING => {
-                            this.ctrl
-                                .extend_from_slice(&ws_frame(WS_OP_PONG, &frame.payload, this.client));
+                            this.ctrl.extend_from_slice(&ws_frame(
+                                WS_OP_PONG,
+                                &frame.payload,
+                                this.client,
+                            ));
                         }
                         WS_OP_PONG => {}
                         WS_OP_CLOSE => {
@@ -2780,8 +2801,11 @@ impl AsyncRead for WsPeerStream {
                             // stream (websocket.rs:49-52).
                             if !this.closed {
                                 this.closed = true;
-                                this.ctrl
-                                    .extend_from_slice(&ws_frame(WS_OP_CLOSE, &frame.payload, this.client));
+                                this.ctrl.extend_from_slice(&ws_frame(
+                                    WS_OP_CLOSE,
+                                    &frame.payload,
+                                    this.client,
+                                ));
                             }
                             this.eof = true;
                         }
@@ -2930,6 +2954,7 @@ pub async fn connect_ws_tunnel(endpoint: &PeerEndpoint) -> Result<WsPeerStream> 
             server_name: None,
             skip_cert_verify: true,
             alpn: Vec::new(),
+            ..Default::default()
         };
         io = crate::transport::tls_connect(io, &sni, &settings).await?;
     }
@@ -2958,7 +2983,9 @@ pub async fn connect_ws_tunnel(endpoint: &PeerEndpoint) -> Result<WsPeerStream> 
     }
     let accept = ws_header(&head, "sec-websocket-accept").unwrap_or_default();
     if accept != ws_accept_key(&key) {
-        return Err(Error::protocol("easytier: ws Sec-WebSocket-Accept mismatch"));
+        return Err(Error::protocol(
+            "easytier: ws Sec-WebSocket-Accept mismatch",
+        ));
     }
     Ok(WsPeerStream::new(io, true))
 }
@@ -3009,8 +3036,7 @@ fn ws_der_utctime(unix_secs: i64) -> Vec<u8> {
 }
 
 /// Build the (cert, key) pair rustls serves for `wss`.
-fn ws_self_signed_pair(
-) -> Result<(
+fn ws_self_signed_pair() -> Result<(
     rustls::pki_types::CertificateDer<'static>,
     rustls::pki_types::PrivateKeyDer<'static>,
 )> {
@@ -3030,7 +3056,11 @@ fn ws_self_signed_pair(
     // SubjectPublicKeyInfo: ecPublicKey + prime256v1, uncompressed point.
     let mut alg = Vec::new();
     ws_der_put(&mut alg, 0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]);
-    ws_der_put(&mut alg, 0x06, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]);
+    ws_der_put(
+        &mut alg,
+        0x06,
+        &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07],
+    );
     let mut alg_id = Vec::new();
     ws_der_put(&mut alg_id, 0x30, &alg);
     let mut spki_bitstring = Vec::new();
@@ -3113,15 +3143,16 @@ fn ws_self_signed_pair(
 }
 
 fn wss_insecure_server() -> Option<&'static Arc<rustls::ServerConfig>> {
-    WSS_INSECURE_SERVER.get_or_init(|| {
-        let (cert, key) = ws_self_signed_pair().ok()?;
-        rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert], key)
-            .ok()
-            .map(Arc::new)
-    })
-    .as_ref()
+    WSS_INSECURE_SERVER
+        .get_or_init(|| {
+            let (cert, key) = ws_self_signed_pair().ok()?;
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)
+                .ok()
+                .map(Arc::new)
+        })
+        .as_ref()
 }
 
 /// `WsTunnelListener` (websocket.rs:81-196): a TCP listener whose accept
@@ -3144,11 +3175,9 @@ impl WsVtListener {
             .local_addr()
             .map_err(|e| Error::network(format!("easytier: ws local addr: {e}")))?;
         let tls = if endpoint.transport == PeerTransport::Wss {
-            Some(
-                wss_insecure_server().cloned().ok_or_else(|| {
-                    Error::crypto("easytier: wss listener: self-signed cert generation failed")
-                })?,
-            )
+            Some(wss_insecure_server().cloned().ok_or_else(|| {
+                Error::crypto("easytier: wss listener: self-signed cert generation failed")
+            })?)
         } else {
             None
         };
@@ -3175,12 +3204,7 @@ impl WsVtListener {
                 .await
                 .map_err(|e| Error::network(format!("easytier: ws accept: {e}")))?;
             let _ = stream.set_nodelay(true);
-            match tokio::time::timeout(
-                Duration::from_secs(3),
-                self.try_accept(stream),
-            )
-            .await
-            {
+            match tokio::time::timeout(Duration::from_secs(3), self.try_accept(stream)).await {
                 Ok(Ok(stream)) => return Ok(stream),
                 Ok(Err(e)) => {
                     tracing::debug!(target: "engine", "easytier: ws accept: {e}");
@@ -3211,7 +3235,9 @@ impl WsVtListener {
             return Err(Error::protocol("easytier: ws: not a websocket upgrade"));
         }
         if ws_header(&head, "sec-websocket-version").map(|v| v.trim()) != Some("13") {
-            return Err(Error::protocol("easytier: ws: unsupported Sec-WebSocket-Version"));
+            return Err(Error::protocol(
+                "easytier: ws: unsupported Sec-WebSocket-Version",
+            ));
         }
         let key = ws_header(&head, "sec-websocket-key")
             .ok_or_else(|| Error::protocol("easytier: ws: missing Sec-WebSocket-Key"))?
@@ -3599,8 +3625,7 @@ impl WgEtPump {
                 // initiation with MAC2 right away (the engine wg client's
                 // `initiate(socket, true)` mirror).
                 if let Some(pending) = &self.pending {
-                    if let Ok(cookie) =
-                        et_pump::consume_cookie_reply(&self.peer_pk, pending, &msg)
+                    if let Ok(cookie) = et_pump::consume_cookie_reply(&self.peer_pk, pending, &msg)
                     {
                         self.cookie = Some((cookie, Instant::now()));
                         self.pending = None;
@@ -3608,7 +3633,11 @@ impl WgEtPump {
                     }
                 }
             }
-            WgMsg::Transport { receiver, counter, data } => {
+            WgMsg::Transport {
+                receiver,
+                counter,
+                data,
+            } => {
                 // Find the session by receiver index (boringtun's
                 // N_SESSIONS ring); tag first, replay window after.
                 let now = Instant::now();
@@ -3694,8 +3723,7 @@ impl WgEtPump {
         }
         // KEEPALIVE(KEEPALIVE_TIMEOUT): we received since our last send
         // but have been transmit-silent.
-        if self.last_rx > self.last_tx && now.duration_since(self.last_tx) >= WG_KEEPALIVE_TIMEOUT
-        {
+        if self.last_rx > self.last_tx && now.duration_since(self.last_tx) >= WG_KEEPALIVE_TIMEOUT {
             if let Some(sess) = self.sessions.back_mut() {
                 if let Ok(keepalive) = sess.session.seal(&[]) {
                     self.last_tx = Instant::now();
@@ -3790,7 +3818,10 @@ async fn run_wg_receiver(
                 if addr != dst {
                     continue;
                 }
-                let out = pump.lock().unwrap_or_else(|e| e.into_inner()).decapsulate(&buf[..n]);
+                let out = pump
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .decapsulate(&buf[..n]);
                 for packet in out.to_network {
                     let _ = socket.send_to(&packet, dst).await;
                 }
@@ -3854,16 +3885,15 @@ pub async fn connect_wg_tunnel(
         if addr != dst {
             continue;
         }
-        let out = pump.lock().unwrap_or_else(|e| e.into_inner()).decapsulate(&buf[..n]);
+        let out = pump
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .decapsulate(&buf[..n]);
         for packet in out.to_network {
             let _ = socket.send_to(&packet, dst).await;
         }
         pending_tunnel.extend(out.to_tunnel);
-        if pump
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .has_session()
-        {
+        if pump.lock().unwrap_or_else(|e| e.into_inner()).has_session() {
             break;
         }
         // A cookie reply already retried the initiation; keep waiting
@@ -3880,7 +3910,12 @@ pub async fn connect_wg_tunnel(
         drop(guard);
         wake_udp_half(&half);
     }
-    tokio::spawn(run_wg_receiver(socket.clone(), dst, pump.clone(), half.clone()));
+    tokio::spawn(run_wg_receiver(
+        socket.clone(),
+        dst,
+        pump.clone(),
+        half.clone(),
+    ));
     tokio::spawn(run_wg_sender(
         socket.clone(),
         dst,
@@ -3934,11 +3969,7 @@ pub struct WgVtListener {
 impl WgVtListener {
     /// `WgTunnelListener::listen` (wireguard.rs:556-578): bind, then the
     /// `handle_udp_incoming` task.
-    pub async fn bind(
-        local: SocketAddr,
-        network_name: &str,
-        network_secret: &str,
-    ) -> Result<Self> {
+    pub async fn bind(local: SocketAddr, network_name: &str, network_secret: &str) -> Result<Self> {
         let socket = tokio::net::UdpSocket::bind(local)
             .await
             .map_err(|e| Error::network(format!("easytier: wg listen {local}: {e}")))?;
@@ -3998,7 +4029,7 @@ async fn run_wg_listener(
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let mut guard = peers.lock().unwrap_or_else(|e| e.into_inner());
-                    let now_idle = |peer: &WgListenerPeer| peer.last_seen.elapsed() >= WG_PEER_IDLE;
+                let now_idle = |peer: &WgListenerPeer| peer.last_seen.elapsed() >= WG_PEER_IDLE;
                 let dead: Vec<SocketAddr> = guard
                     .iter()
                     .filter(|(_, peer)| now_idle(peer))
@@ -4176,9 +4207,10 @@ impl<'a> ProtoReader<'a> {
         let mut value = 0u64;
         let mut shift = 0;
         loop {
-            let byte = *self.buf.get(self.pos).ok_or_else(|| {
-                Error::protocol("easytier: truncated protobuf varint")
-            })?;
+            let byte = *self
+                .buf
+                .get(self.pos)
+                .ok_or_else(|| Error::protocol("easytier: truncated protobuf varint"))?;
             self.pos += 1;
             value |= ((byte & 0x7f) as u64) << shift;
             if byte & 0x80 == 0 {
@@ -4209,17 +4241,21 @@ impl<'a> ProtoReader<'a> {
                 self.varint()?;
             }
             1 => {
-                self.pos = self.pos.checked_add(8).filter(|p| *p <= self.buf.len()).ok_or_else(
-                    || Error::protocol("easytier: truncated fixed64"),
-                )?;
+                self.pos = self
+                    .pos
+                    .checked_add(8)
+                    .filter(|p| *p <= self.buf.len())
+                    .ok_or_else(|| Error::protocol("easytier: truncated fixed64"))?;
             }
             2 => {
                 self.len_bytes()?;
             }
             5 => {
-                self.pos = self.pos.checked_add(4).filter(|p| *p <= self.buf.len()).ok_or_else(
-                    || Error::protocol("easytier: truncated fixed32"),
-                )?;
+                self.pos = self
+                    .pos
+                    .checked_add(4)
+                    .filter(|p| *p <= self.buf.len())
+                    .ok_or_else(|| Error::protocol("easytier: truncated fixed32"))?;
             }
             _ => return Err(Error::protocol("easytier: unknown protobuf wire type")),
         }
@@ -4377,8 +4413,6 @@ pub struct PacketEncryptor {
     cipher: Cipher,
 }
 
-
-
 /// `AEAD_TAIL_SIZE` = `StandardAeadTail::SIZE` (packet/mod.rs:339-346).
 pub const AEAD_TAIL_SIZE: usize = 28;
 
@@ -4386,11 +4420,7 @@ pub const AEAD_TAIL_SIZE: usize = 28;
 // changes the payload length (clippy::ptr_arg).
 #[allow(clippy::ptr_arg)]
 impl PacketEncryptor {
-    fn aead_seal_detached(
-        &self,
-        nonce: &[u8; 12],
-        payload: &mut Vec<u8>,
-    ) -> Result<[u8; 16]> {
+    fn aead_seal_detached(&self, nonce: &[u8; 12], payload: &mut Vec<u8>) -> Result<[u8; 16]> {
         let nonce = Nonce::from_slice(nonce);
         let tag = match &self.cipher {
             Cipher::Aes128Gcm(cipher) => cipher.encrypt_in_place_detached(nonce, b"", payload),
@@ -4461,11 +4491,7 @@ impl PacketEncryptor {
     }
 
     /// `encrypt` (encrypt/ring.rs:110-113): random nonce from the OS.
-    pub fn encrypt_packet(
-        &self,
-        hdr: &mut PeerManagerHeader,
-        payload: &mut Vec<u8>,
-    ) -> Result<()> {
+    pub fn encrypt_packet(&self, hdr: &mut PeerManagerHeader, payload: &mut Vec<u8>) -> Result<()> {
         let mut nonce = [0u8; 12];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
         self.encrypt_packet_with_nonce(hdr, payload, &nonce)
@@ -4474,11 +4500,7 @@ impl PacketEncryptor {
     /// `decrypt` (encrypt/ring.rs:72-108): unencrypted packets pass; the
     /// AEAD tail is the last 28 bytes, the tag sits directly after the
     /// ciphertext, and the 28 tail bytes are truncated after opening.
-    pub fn decrypt_packet(
-        &self,
-        hdr: &mut PeerManagerHeader,
-        payload: &mut Vec<u8>,
-    ) -> Result<()> {
+    pub fn decrypt_packet(&self, hdr: &mut PeerManagerHeader, payload: &mut Vec<u8>) -> Result<()> {
         if !hdr.is_encrypted() {
             return Ok(());
         }
@@ -4520,9 +4542,15 @@ impl PacketEncryptor {
 /// from the network secret. `enable_encryption` defaults to **true**
 /// (`gen_default_flags`, config/toml.rs:34) — a real peer drops plaintext
 /// data packets when the flag is on.
-pub fn create_encryptor(algorithm: &str, enable: bool, network_secret: &str) -> Result<PacketEncryptor> {
+pub fn create_encryptor(
+    algorithm: &str,
+    enable: bool,
+    network_secret: &str,
+) -> Result<PacketEncryptor> {
     if !enable {
-        return Ok(PacketEncryptor { cipher: Cipher::Null });
+        return Ok(PacketEncryptor {
+            cipher: Cipher::Null,
+        });
     }
     let Ok(algorithm) = algorithm.parse::<EncryptionAlgorithm>() else {
         return Err(Error::config(format!(
@@ -5888,8 +5916,7 @@ impl SecureDatagramSession {
         dir: SecureDirection,
         now_ms: u64,
     ) -> bool {
-        self.precheck_replay(epoch, seq, dir, now_ms)
-            && self.commit_replay(epoch, seq, dir, now_ms)
+        self.precheck_replay(epoch, seq, dir, now_ms) && self.commit_replay(epoch, seq, dir, now_ms)
     }
 }
 
@@ -5987,8 +6014,12 @@ impl PeerSecureSession {
         initial_epoch: u32,
         preserve_rx_grace: bool,
     ) {
-        self.datagram
-            .sync_root_key(root_key, session_generation, initial_epoch, preserve_rx_grace);
+        self.datagram.sync_root_key(
+            root_key,
+            session_generation,
+            initial_epoch,
+            preserve_rx_grace,
+        );
     }
 
     /// `dir_for_sender` (peer_session.rs:329-338): the peer-id order
@@ -6165,9 +6196,15 @@ impl PeerSessionStore {
                 Ok(session)
             }
             PeerConnSessionAction::Sync | PeerConnSessionAction::Create => {
-                let root_key = root_key_32
-                    .ok_or_else(|| Error::protocol("easytier: missing root_key"))?;
-                if self.sessions.lock().unwrap().get(&key).is_some_and(|s| !s.is_valid()) {
+                let root_key =
+                    root_key_32.ok_or_else(|| Error::protocol("easytier: missing root_key"))?;
+                if self
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .get(&key)
+                    .is_some_and(|s| !s.is_valid())
+                {
                     self.sessions.lock().unwrap().remove(&key);
                 }
                 let mut guard = self.sessions.lock().unwrap();
@@ -6260,9 +6297,8 @@ impl SecureModeCtx {
                 let raw = base64::engine::general_purpose::STANDARD
                     .decode(s.trim())
                     .map_err(|e| Error::config(format!("easytier: peer-public-key: {e}")))?;
-                raw.try_into().map_err(|_| {
-                    Error::config("easytier: peer-public-key must be 32 bytes base64")
-                })
+                raw.try_into()
+                    .map_err(|_| Error::config("easytier: peer-public-key must be 32 bytes base64"))
             })
             .transpose()?;
         Ok(SecureModeCtx {
@@ -6400,7 +6436,8 @@ where
     // as of OUR msg1 (peer_conn.rs:840).
     let server_handshake_hash = hs.handshake_hash();
 
-    let msg2_packet = recv_noise_frame(&mut reader, noise_packet_type::NOISE_HANDSHAKE_MSG2).await?;
+    let msg2_packet =
+        recv_noise_frame(&mut reader, noise_packet_type::NOISE_HANDSHAKE_MSG2).await?;
     let remote_peer_id = msg2_packet.hdr.from_peer_id;
     if remote_peer_id == 0 {
         return Err(Error::protocol("easytier: noise msg2 missing src peer id"));
@@ -6408,7 +6445,9 @@ where
     let payload2 = hs.read_msg2(&msg2_packet.payload)?;
     let msg2 = NoiseMsg2::decode(&payload2)?;
     if msg2.a_conn_id_echo != Some(a_conn_id) {
-        return Err(Error::protocol("easytier: noise msg2 conn_id_echo mismatch"));
+        return Err(Error::protocol(
+            "easytier: noise msg2 conn_id_echo mismatch",
+        ));
     }
     let remote_network_name = msg2.b_network_name.clone();
     if remote_network_name == ctx.network_name && msg2.role_hint != 1 {
@@ -6496,7 +6535,9 @@ where
     });
     let remote_peer_id = first_msg1.hdr.from_peer_id;
     if remote_peer_id == 0 {
-        return Err(Error::protocol("easytier: noise msg1 must have src peer id"));
+        return Err(Error::protocol(
+            "easytier: noise msg1 must have src peer id",
+        ));
     }
     let payload1 = hs.read_msg1(&first_msg1.payload)?;
     let msg1 = NoiseMsg1::decode(&payload1)?;
@@ -6541,7 +6582,8 @@ where
     // as of OUR msg2 (peer_conn.rs:1134).
     let handshake_hash_for_proof = hs.handshake_hash();
 
-    let msg3_packet = recv_noise_frame(&mut reader, noise_packet_type::NOISE_HANDSHAKE_MSG3).await?;
+    let msg3_packet =
+        recv_noise_frame(&mut reader, noise_packet_type::NOISE_HANDSHAKE_MSG3).await?;
     let payload3 = hs.read_msg3(&msg3_packet.payload)?;
     let msg3 = NoiseMsg3::decode(&payload3)?;
     if msg3.a_conn_id_echo != msg1.a_conn_id {
@@ -6982,7 +7024,12 @@ fn next_transaction_id() -> i64 {
         // First use: install the random seed like `LazyLock<AtomicI64>`'s
         // `rand::random()` initializer (client.rs:40).
         let seed: i64 = rand::random();
-        let _ = RPC_TRANSACTION_ID.compare_exchange(0, seed as u64, Ordering::Relaxed, Ordering::Relaxed);
+        let _ = RPC_TRANSACTION_ID.compare_exchange(
+            0,
+            seed as u64,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
         return seed;
     }
     RPC_TRANSACTION_ID.fetch_add(1, Ordering::Relaxed) as i64
@@ -7345,8 +7392,7 @@ impl RoutePeerInfo {
                     .proxy_cidrs
                     .push(String::from_utf8_lossy(reader.len_bytes()?).into_owned()),
                 (6, 2) => {
-                    info.hostname =
-                        Some(String::from_utf8_lossy(reader.len_bytes()?).into_owned())
+                    info.hostname = Some(String::from_utf8_lossy(reader.len_bytes()?).into_owned())
                 }
                 (8, 2) => {
                     let inner = reader.len_bytes()?;
@@ -7757,8 +7803,7 @@ async fn run_recv_loop<R: AsyncRead + Unpin>(mut reader: R, state: Arc<ConnState
             // Direct two-node mesh: only frames addressed to us from the
             // joined peer carry our data (the peer manager would forward
             // anything else; there is nothing to forward to yet).
-            if packet.hdr.from_peer_id != state.peer_id
-                || packet.hdr.to_peer_id != state.my_peer_id
+            if packet.hdr.from_peer_id != state.peer_id || packet.hdr.to_peer_id != state.my_peer_id
             {
                 continue;
             }
@@ -7797,7 +7842,11 @@ async fn run_recv_loop<R: AsyncRead + Unpin>(mut reader: R, state: Arc<ConnState
 }
 
 /// The writer half: drains the outbound channel to the socket.
-async fn run_writer_loop<W: AsyncWrite + Unpin>(mut writer: W, state: Arc<ConnState>, mut rx: mpsc::Receiver<PeerPacket>) {
+async fn run_writer_loop<W: AsyncWrite + Unpin>(
+    mut writer: W,
+    state: Arc<ConnState>,
+    mut rx: mpsc::Receiver<PeerPacket>,
+) {
     while let Some(packet) = rx.recv().await {
         state.tx_packets.fetch_add(1, Ordering::Relaxed);
         if write_frame(&mut writer, &packet).await.is_err() {
@@ -8115,8 +8164,9 @@ async fn conn_ping(state: &Arc<ConnState>) -> Result<Duration> {
     tokio::time::timeout(PONG_TIMEOUT, async {
         loop {
             match receiver.recv().await {
-                Ok(p) if p.payload.len() >= 4
-                    && u32::from_le_bytes(p.payload[0..4].try_into().unwrap()) == seq =>
+                Ok(p)
+                    if p.payload.len() >= 4
+                        && u32::from_le_bytes(p.payload[0..4].try_into().unwrap()) == seq =>
                 {
                     return Ok(())
                 }
@@ -8182,12 +8232,15 @@ where
     }
 }
 
-
 /// Build the plain-mode handshake message (`send_handshake`,
 /// peer_conn.rs:529-573): magic, our peer id, version, the
 /// liveness-echo feature, the network name and the 32-byte digest (zeros
 /// when we have no secret to prove).
-fn build_handshake(my_peer_id: PeerId, network_name: &str, digest: Option<&NetworkSecretDigest>) -> PeerPacket {
+fn build_handshake(
+    my_peer_id: PeerId,
+    network_name: &str,
+    digest: Option<&NetworkSecretDigest>,
+) -> PeerPacket {
     let mut req = HandshakeRequest {
         magic: HANDSHAKE_MAGIC,
         my_peer_id,
@@ -8209,9 +8262,9 @@ fn build_handshake(my_peer_id: PeerId, network_name: &str, digest: Option<&Netwo
 async fn wait_handshake<R: AsyncRead + Unpin>(reader: &mut R) -> Result<HandshakeRequest> {
     let deadline = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         loop {
-            let packet = read_frame(reader)
-                .await?
-                .ok_or_else(|| Error::network("easytier: conn closed during wait handshake response"))?;
+            let packet = read_frame(reader).await?.ok_or_else(|| {
+                Error::network("easytier: conn closed during wait handshake response")
+            })?;
             if packet.hdr.packet_type != packet_type::HANDSHAKE {
                 // `wait_handshake` sets need_retry=true and loops until
                 // the 5s timeout (peer_conn.rs:478, 510-527).
@@ -8237,7 +8290,11 @@ async fn wait_handshake<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Handshak
 /// 395-412): same network name, and digests compared only when both
 /// sides sent a non-zero one (a secret-less peer sends zeros and is
 /// checked by name alone).
-fn check_network_identity(local_name: &str, local_digest: &NetworkSecretDigest, peer: &PeerInfo) -> Result<()> {
+fn check_network_identity(
+    local_name: &str,
+    local_digest: &NetworkSecretDigest,
+    peer: &PeerInfo,
+) -> Result<()> {
     if peer.network_name != local_name {
         return Err(Error::config("easytier: network identity not match"));
     }
@@ -8462,7 +8519,9 @@ pub fn parse_peer_endpoint(uri: &str) -> Result<PeerEndpoint> {
         }
     };
     if host.is_empty() {
-        return Err(Error::config(format!("easytier: peer URI has no host: {uri:?}")));
+        return Err(Error::config(format!(
+            "easytier: peer URI has no host: {uri:?}"
+        )));
     }
     Ok(PeerEndpoint {
         transport,
@@ -8479,7 +8538,12 @@ async fn resolve_peer_addr(endpoint: &PeerEndpoint) -> Result<SocketAddr> {
         .await
         .map_err(|e| Error::network(format!("easytier: resolve peer {}: {e}", endpoint.host)))?
         .next()
-        .ok_or_else(|| Error::network(format!("easytier: peer host resolved to nothing: {}", endpoint.host)))?;
+        .ok_or_else(|| {
+            Error::network(format!(
+                "easytier: peer host resolved to nothing: {}",
+                endpoint.host
+            ))
+        })?;
     Ok(addr)
 }
 
@@ -8527,9 +8591,15 @@ pub async fn connect_peer_as(
     encryptor: PacketEncryptor,
     secure: Option<&SecureModeCtx>,
 ) -> Result<EasyTierNode> {
-    let halves =
-        dial_session(endpoint, my_peer_id, network_name, network_secret, encryptor, secure)
-            .await?;
+    let halves = dial_session(
+        endpoint,
+        my_peer_id,
+        network_name,
+        network_secret,
+        encryptor,
+        secure,
+    )
+    .await?;
     Ok(halves.into_node(network_name.to_owned()))
 }
 
@@ -8613,7 +8683,10 @@ where
             );
             (outcome.peer, Some(outcome.session))
         }
-        None => (handshake_as_client(&mut stream, my_peer_id, network_name, digest).await?, None),
+        None => (
+            handshake_as_client(&mut stream, my_peer_id, network_name, digest).await?,
+            None,
+        ),
     };
     check_network_identity(network_name, digest, &peer)?;
     let halves = spawn_connection_halves(stream, my_peer_id, &peer, encryptor, session).await;
@@ -8662,8 +8735,7 @@ pub async fn serve_peer_as(
     let (peer, session) =
         handshake_as_server(&mut stream, my_peer_id, network_name, &digest, secure).await?;
     check_network_identity(network_name, &digest, &peer)?;
-    let halves =
-        spawn_connection_halves(stream, my_peer_id, &peer, encryptor, session).await;
+    let halves = spawn_connection_halves(stream, my_peer_id, &peer, encryptor, session).await;
     Ok((halves, peer))
 }
 
@@ -9055,7 +9127,11 @@ impl RouteGossip {
     /// version (`route_info.version > old.version`), and fold the conn
     /// bitmap into the adjacency map (`update_conn_info_with_bitmap`,
     /// 1407-1437). Returns the infos actually stored.
-    pub fn merge_sync_request(&mut self, infos: &[RoutePeerInfo], bitmap: Option<&RouteConnBitmap>) {
+    pub fn merge_sync_request(
+        &mut self,
+        infos: &[RoutePeerInfo],
+        bitmap: Option<&RouteConnBitmap>,
+    ) {
         for info in infos {
             if info.peer_id == 0 {
                 continue;
@@ -9419,7 +9495,10 @@ struct Conn {
     handle: SocketHandle,
     shared: Arc<StreamShared>,
     fin_sent: bool,
-    pending: Option<(oneshot::Sender<Result<Arc<StreamShared>>>, std::time::Instant)>,
+    pending: Option<(
+        oneshot::Sender<Result<Arc<StreamShared>>>,
+        std::time::Instant,
+    )>,
 }
 
 type UdpDownlink = mpsc::Receiver<(SocketAddr, Vec<u8>)>;
@@ -9845,10 +9924,7 @@ impl EtStack {
     /// The client's response pump (client.rs:161-221) for the single
     /// outstanding route-sync call of one session.
     fn on_rpc_response(&mut self, idx: usize, packet: RpcPacket) {
-        let Some(transaction_id) = self
-            .sess(idx)
-            .and_then(|s| s.outstanding_sync)
-        else {
+        let Some(transaction_id) = self.sess(idx).and_then(|s| s.outstanding_sync) else {
             return;
         };
         if packet.transaction_id != transaction_id {
@@ -9933,7 +10009,8 @@ impl EtStack {
 
     /// One decrypted control packet off one session's channel.
     async fn on_ctrl(&mut self, idx: usize, packet: PeerPacket) {
-        if packet.hdr.packet_type != packet_type::RPC_REQ && packet.hdr.packet_type != packet_type::RPC_RESP
+        if packet.hdr.packet_type != packet_type::RPC_REQ
+            && packet.hdr.packet_type != packet_type::RPC_RESP
         {
             return;
         }
@@ -10121,7 +10198,9 @@ impl EtStack {
                     Err(_) => break,
                 };
                 let from = match meta.endpoint.addr {
-                    IpAddress::Ipv4(src) => SocketAddr::V4(SocketAddrV4::new(src, meta.endpoint.port)),
+                    IpAddress::Ipv4(src) => {
+                        SocketAddr::V4(SocketAddrV4::new(src, meta.endpoint.port))
+                    }
                     // The overlay interface is IPv4-only (the adapter
                     // dials tcp4/udp4); a v6 endpoint cannot occur.
                     IpAddress::Ipv6(_) => continue,
@@ -10219,7 +10298,8 @@ impl EtStack {
                 if self.ready() {
                     let _ = reply.send(());
                 } else {
-                    self.wait_ready.push((Instant::now() + ROUTE_READY_TIMEOUT, reply));
+                    self.wait_ready
+                        .push((Instant::now() + ROUTE_READY_TIMEOUT, reply));
                 }
             }
             Cmd::Connect { remote, reply } => {
@@ -10261,9 +10341,7 @@ impl EtStack {
                 let endpoint = IpEndpoint::new(IpAddress::Ipv4(*remote.ip()), remote.port());
                 let cx = self.iface.context();
                 if let Err(e) = sock.connect(cx, endpoint, local) {
-                    let _ = reply.send(Err(Error::network(format!(
-                        "easytier: connect: {e:?}"
-                    ))));
+                    let _ = reply.send(Err(Error::network(format!("easytier: connect: {e:?}"))));
                     return;
                 }
                 let handle = self.sockets.add(sock);
@@ -10310,7 +10388,14 @@ impl EtStack {
                 let id = self.next_udp_id;
                 self.next_udp_id += 1;
                 let (tx, rx) = mpsc::channel(64);
-                self.udp.insert(id, UdpSock { handle, port, down: tx });
+                self.udp.insert(
+                    id,
+                    UdpSock {
+                        handle,
+                        port,
+                        down: tx,
+                    },
+                );
                 let _ = reply.send(Ok((id, rx)));
             }
             Cmd::UdpSend { id, dst, data } => {
@@ -10323,10 +10408,8 @@ impl EtStack {
                 let SocketAddr::V4(dst) = dst else {
                     return;
                 };
-                let mut meta = udp::UdpMetadata::from(IpEndpoint::new(
-                    IpAddress::Ipv4(*dst.ip()),
-                    dst.port(),
-                ));
+                let mut meta =
+                    udp::UdpMetadata::from(IpEndpoint::new(IpAddress::Ipv4(*dst.ip()), dst.port()));
                 meta.local_address = Some(local_addr);
                 let sock = self.sockets.get_mut::<udp::Socket>(handle);
                 if let Err(e) = sock.send_slice(&data, meta) {
@@ -10407,12 +10490,7 @@ fn ipv4_destination(frame: &[u8]) -> Option<Ipv4Addr> {
     if frame.len() < 20 || frame[0] >> 4 != 4 {
         return None;
     }
-    Some(Ipv4Addr::new(
-        frame[16],
-        frame[17],
-        frame[18],
-        frame[19],
-    ))
+    Some(Ipv4Addr::new(frame[16], frame[17], frame[18], frame[19]))
 }
 
 /// `addr` inside `subnet/len` (the route lookup of `send_msg_by_ip`).
@@ -10431,8 +10509,7 @@ fn ipv4_in_subnet(addr: Ipv4Addr, subnet: Ipv4Addr, len: u8) -> bool {
 /// Parse one `a.b.c.d/len` proxy CIDR.
 fn parse_cidr(cidr: &str) -> Option<(Ipv4Addr, u8)> {
     let (addr, len) = cidr.trim().split_once('/')?;
-    Some((addr.parse().ok()?, len.parse().ok()?))
-        .filter(|(_, len)| *len <= 32)
+    Some((addr.parse().ok()?, len.parse().ok()?)).filter(|(_, len)| *len <= 32)
 }
 
 /// Drive one overlay node: the per-session gossip timers, every peer's
@@ -10533,7 +10610,9 @@ fn node_cache_key(cfg: &EasyTierConfig) -> String {
         cfg.hostname.as_deref().unwrap_or(""),
         cfg.instance_name.as_deref().unwrap_or(""),
         cfg.encryption_algorithm.as_deref().unwrap_or(""),
-        &cfg.enable_encryption.map(|b| b.to_string()).unwrap_or_default(),
+        &cfg.enable_encryption
+            .map(|b| b.to_string())
+            .unwrap_or_default(),
         &cfg.mtu.to_string(),
         &cfg.proxy_networks.join(","),
         &cfg.no_listener.map(|b| b.to_string()).unwrap_or_default(),
@@ -10603,7 +10682,8 @@ async fn node_for(cfg: &EasyTierConfig) -> Result<mpsc::Sender<Cmd>> {
         .unwrap_or_else(|| format!("rustcrash-{}", my_peer_id & 0xffff));
     let static_addr = static_overlay_address(cfg)?;
     let (addr, prefix) = static_addr.unzip();
-    let want_dhcp = addr.is_none() && (cfg.dhcp || cfg.ipv4.as_deref().unwrap_or("").trim().is_empty());
+    let want_dhcp =
+        addr.is_none() && (cfg.dhcp || cfg.ipv4.as_deref().unwrap_or("").trim().is_empty());
     let mtu = if cfg.mtu > 0 {
         cfg.mtu as usize
     } else {
@@ -10870,9 +10950,7 @@ async fn bind_listener_uri(
         PeerTransport::Tcp => {
             let listener = tokio::net::TcpListener::bind((endpoint.host.as_str(), endpoint.port))
                 .await
-                .map_err(|e| {
-                    Error::network(format!("easytier: listen on {uri}: {e}"))
-                })?;
+                .map_err(|e| Error::network(format!("easytier: listen on {uri}: {e}")))?;
             Ok(BoundListener::Tcp(listener))
         }
         PeerTransport::Udp => {
@@ -10943,8 +11021,7 @@ pub async fn serve(cfg: &EasyTierConfig) -> Result<EasyTierServer> {
     // the node starts (listeners.rs:258-277).
     let mut bound_listeners: Vec<BoundListener> = Vec::new();
     for uri in &listener_uris {
-        bound_listeners
-            .push(bind_listener_uri(uri, &cfg.network_name, &cfg.network_secret).await?);
+        bound_listeners.push(bind_listener_uri(uri, &cfg.network_name, &cfg.network_secret).await?);
     }
     // The IPv6 dual-stack mirror (listeners.rs:145-161): an unspecified
     // v4 host additionally gets a `[::]` listener on the same port,
@@ -11008,8 +11085,11 @@ pub async fn serve(cfg: &EasyTierConfig) -> Result<EasyTierServer> {
                     .encryption_algorithm
                     .clone()
                     .unwrap_or_else(|| EncryptionAlgorithm::default().as_str().to_owned());
-                let encryptor =
-                    create_encryptor(&algorithm, cfg.enable_encryption.unwrap_or(true), &cfg.network_secret)?;
+                let encryptor = create_encryptor(
+                    &algorithm,
+                    cfg.enable_encryption.unwrap_or(true),
+                    &cfg.network_secret,
+                )?;
                 Ok((endpoint, encryptor))
             });
             match dial {
@@ -11076,14 +11156,14 @@ pub async fn serve(cfg: &EasyTierConfig) -> Result<EasyTierServer> {
                 };
                 // A fresh encryptor per connection (deterministic from
                 // the network secret).
-                let encryptor = match create_encryptor(&algorithm, enable_encryption, &network_secret)
-                {
-                    Ok(encryptor) => encryptor,
-                    Err(e) => {
-                        tracing::debug!(target: "engine", "easytier: encryptor: {e}");
-                        continue;
-                    }
-                };
+                let encryptor =
+                    match create_encryptor(&algorithm, enable_encryption, &network_secret) {
+                        Ok(encryptor) => encryptor,
+                        Err(e) => {
+                            tracing::debug!(target: "engine", "easytier: encryptor: {e}");
+                            continue;
+                        }
+                    };
                 match serve_peer_as(
                     stream,
                     my_peer_id,
@@ -11214,11 +11294,9 @@ mod tests {
     /// parallel test binaries apart.
     fn unique_test_port() -> u16 {
         static BASE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-        static NEXT: std::sync::atomic::AtomicU32 =
-            std::sync::atomic::AtomicU32::new(0);
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let base = *BASE.get_or_init(|| 21000 + rand::random::<u32>() % 8000);
-        u16::try_from(base + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-            .unwrap()
+        u16::try_from(base + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)).unwrap()
     }
 
     use super::*;
@@ -11250,7 +11328,10 @@ mod tests {
             hostname: "peer".into(),
             ipv4: ip,
         }];
-        assert_eq!(lookup_overlay_host("peer.et.net.", "et.net.", &nodes), Some(ip));
+        assert_eq!(
+            lookup_overlay_host("peer.et.net.", "et.net.", &nodes),
+            Some(ip)
+        );
         assert_eq!(lookup_overlay_host("peer", "et.net.", &nodes), Some(ip));
         assert_eq!(lookup_overlay_host("missing", "et.net.", &nodes), None);
         // PTR + node IPv4 (overlay_test.go:20-29).
@@ -11263,10 +11344,16 @@ mod tests {
             parse_node_ipv4("10.144.0.1/24").unwrap(),
             "10.144.0.1".parse::<Ipv4Addr>().unwrap()
         );
-        assert_eq!(parse_node_ipv4("10.144.0.1").unwrap().to_string(), "10.144.0.1");
+        assert_eq!(
+            parse_node_ipv4("10.144.0.1").unwrap().to_string(),
+            "10.144.0.1"
+        );
         assert!(parse_node_ipv4("").is_err());
         assert!(parse_node_ipv4("not-an-ip").is_err());
-        assert_eq!(ipv4_from_u32(0x0a900002), "10.144.0.2".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(
+            ipv4_from_u32(0x0a900002),
+            "10.144.0.2".parse::<Ipv4Addr>().unwrap()
+        );
         // MagicDNS membership (overlay_test.go:31-41).
         assert!(!is_magic_dns("peer", "et.net."));
         assert!(is_magic_dns("peer.et.net", ""));
@@ -11277,7 +11364,10 @@ mod tests {
             lookup_overlay_ptr(ip, "et.net.", &nodes),
             Some("peer.et.net.".to_string())
         );
-        assert_eq!(lookup_overlay_ptr(ip, "", &nodes), Some("peer.et.net.".to_string()));
+        assert_eq!(
+            lookup_overlay_ptr(ip, "", &nodes),
+            Some("peer.et.net.".to_string())
+        );
         let other: Ipv4Addr = "10.1.2.3".parse().unwrap();
         assert_eq!(lookup_overlay_ptr(other, "et.net.", &nodes), None);
         // Normalization.
@@ -11298,9 +11388,15 @@ mod tests {
         .render_toml()
         .unwrap_err()
         .to_string();
-        assert!(err.contains("peers is required when listeners are empty"), "{err}");
+        assert!(
+            err.contains("peers is required when listeners are empty"),
+            "{err}"
+        );
         // network-name required.
-        let err = EasyTierTomlConfig::default().validate().unwrap_err().to_string();
+        let err = EasyTierTomlConfig::default()
+            .validate()
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("network-name is required"), "{err}");
     }
 
@@ -11378,7 +11474,10 @@ mod tests {
             ..minimal_config(&["tcp://192.0.2.10:11010"])
         };
         let toml = cfg.render_toml().unwrap();
-        assert!(toml.contains("tld_dns_zone = \"overlay.example.\""), "{toml}");
+        assert!(
+            toml.contains("tld_dns_zone = \"overlay.example.\""),
+            "{toml}"
+        );
         assert!(toml.contains("mtu = 1200"));
         assert!(toml.contains("accept_dns = true"));
         assert!(toml.contains("encryption_algorithm = \"aes-256-gcm\""));
@@ -11452,7 +11551,10 @@ mod tests {
         .validate()
         .unwrap_err()
         .to_string();
-        assert!(err.contains("no-listener cannot be combined with listeners"), "{err}");
+        assert!(
+            err.contains("no-listener cannot be combined with listeners"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -11485,14 +11587,20 @@ mod tests {
             parse_peer_uri("tcp://x?peer-public-key=%zz").is_err(),
             "bad key escape"
         );
-        assert!(parse_peer_uri("tcp://x?k=%zz").is_ok(), "other values pass through");
+        assert!(
+            parse_peer_uri("tcp://x?k=%zz").is_ok(),
+            "other values pass through"
+        );
     }
 
     #[test]
     fn apply_required_flags_injects_and_replaces() {
         // TestApplyRequiredFlagsInjectsNoTun (toml_test.go:54-62).
         let got = apply_required_flags("[network_identity]\nnetwork_name = \"n\"\n");
-        assert!(got.contains("[flags]") && got.contains("no_tun = true"), "{got}");
+        assert!(
+            got.contains("[flags]") && got.contains("no_tun = true"),
+            "{got}"
+        );
         assert!(got.contains("bind_device = false"));
         // TestApplyRequiredFlagsReplacesNoTun (toml_test.go:64-75).
         let got = apply_required_flags("[flags]\nno_tun = false\nmtu = 1200\n");
@@ -11579,7 +11687,10 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("peers is required when listeners are empty"), "{err}");
+        assert!(
+            err.contains("peers is required when listeners are empty"),
+            "{err}"
+        );
         // An unsupported-scheme peer names the missing transports; the
         // five direct transports (wg:// included) dial now.
         let cfg = EasyTierConfig {
@@ -11587,7 +11698,10 @@ mod tests {
             ..EasyTierConfig::new("et", "net")
         };
         let err = connect(&cfg).await.unwrap_err().to_string();
-        assert!(err.contains("no tcp://, udp://, quic://, wg://, ws:// or wss:// peer"), "{err}");
+        assert!(
+            err.contains("no tcp://, udp://, quic://, wg://, ws:// or wss:// peer"),
+            "{err}"
+        );
         // Secure mode runs the Noise_XX handshake now (its hermetic
         // round-trip tests are below); an invalid key still fails the
         // config before the dial.
@@ -11628,10 +11742,22 @@ mod tests {
         assert_eq!(
             bytes,
             [
-                0x04, 0x03, 0x02, 0x01, // from_peer_id LE
-                0x0d, 0x0c, 0x0b, 0x0a, // to_peer_id LE
-                packet_type::DATA, 0x03, 0x01, 0x00, // type, flags, fwd, reserved
-                0xdc, 0x05, 0x00, 0x00, // len = 1500 LE
+                0x04,
+                0x03,
+                0x02,
+                0x01, // from_peer_id LE
+                0x0d,
+                0x0c,
+                0x0b,
+                0x0a, // to_peer_id LE
+                packet_type::DATA,
+                0x03,
+                0x01,
+                0x00, // type, flags, fwd, reserved
+                0xdc,
+                0x05,
+                0x00,
+                0x00, // len = 1500 LE
             ]
         );
         assert_eq!(PeerManagerHeader::from_bytes(&bytes).unwrap(), hdr);
@@ -11673,7 +11799,9 @@ mod tests {
         assert!(err.contains("body too short"), "{err}");
         // `body too long`: len > TCP_MTU_BYTES (framed.rs:71-73).
         let (mut a, mut b) = tokio::io::duplex(64);
-        a.write_all(&(TCP_MTU_BYTES as u32 + 1).to_le_bytes()).await.unwrap();
+        a.write_all(&(TCP_MTU_BYTES as u32 + 1).to_le_bytes())
+            .await
+            .unwrap();
         let err = read_frame(&mut b).await.unwrap_err().to_string();
         assert!(err.contains("body too long"), "{err}");
         // Writing a packet beyond the MTU fails before the socket
@@ -11688,7 +11816,10 @@ mod tests {
             u32::from_le_bytes(frame[0..4].try_into().unwrap()) as usize,
             PEER_MANAGER_HEADER_SIZE + 100
         );
-        assert_eq!(frame.len(), TCP_TUNNEL_HEADER_SIZE + PEER_MANAGER_HEADER_SIZE + 100);
+        assert_eq!(
+            frame.len(),
+            TCP_TUNNEL_HEADER_SIZE + PEER_MANAGER_HEADER_SIZE + 100
+        );
     }
 
     // --------------------------------------------- handshake proto3 codec
@@ -11765,9 +11896,7 @@ mod tests {
         // 28-byte AEAD tail. Passing this proves the tail layout AND the
         // cipher choice match the upstream ring backend byte for byte.
         let encryptor = PacketEncryptor {
-            cipher: Cipher::Aes128Gcm(Box::new(
-                Aes128Gcm::new_from_slice(&[0u8; 16]).unwrap(),
-            )),
+            cipher: Cipher::Aes128Gcm(Box::new(Aes128Gcm::new_from_slice(&[0u8; 16]).unwrap())),
         };
         let mut hdr = PeerPacket::new(0, 0, packet_type::DATA, &[0u8; 16]).hdr;
         let mut payload = vec![0u8; 16];
@@ -11778,10 +11907,10 @@ mod tests {
         assert_eq!(
             payload,
             [
-                0x03, 0x88, 0xda, 0xce, 0x60, 0xb6, 0xa3, 0x92, 0xf3, 0x28, 0xc2, 0xb9, 0x71,
-                0xb2, 0xfe, 0x78, // ciphertext
-                0xab, 0x6e, 0x47, 0xd4, 0x2c, 0xec, 0x13, 0xbd, 0xf5, 0x3a, 0x67, 0xb2, 0x12,
-                0x57, 0xbd, 0xdf, // tag
+                0x03, 0x88, 0xda, 0xce, 0x60, 0xb6, 0xa3, 0x92, 0xf3, 0x28, 0xc2, 0xb9, 0x71, 0xb2,
+                0xfe, 0x78, // ciphertext
+                0xab, 0x6e, 0x47, 0xd4, 0x2c, 0xec, 0x13, 0xbd, 0xf5, 0x3a, 0x67, 0xb2, 0x12, 0x57,
+                0xbd, 0xdf, // tag
                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // nonce echoed in the tail
             ]
         );
@@ -11793,7 +11922,14 @@ mod tests {
     #[test]
     fn encryptor_round_trips_every_algorithm() {
         let plaintext = b"an overlay ip frame";
-        for name in ["xor", "aes-gcm", "aes-256-gcm", "chacha20", "chacha20-poly1305", "openssl-aes-gcm"] {
+        for name in [
+            "xor",
+            "aes-gcm",
+            "aes-256-gcm",
+            "chacha20",
+            "chacha20-poly1305",
+            "openssl-aes-gcm",
+        ] {
             let encryptor = create_encryptor(name, true, test_secret().as_str()).unwrap();
             let mut hdr = PeerPacket::new(1, 2, packet_type::DATA, plaintext).hdr;
             let mut payload = plaintext.to_vec();
@@ -11831,8 +11967,16 @@ mod tests {
         let encryptor = create_encryptor("aes-gcm", true, test_secret().as_str()).unwrap();
         assert!(encryptor.decrypt_packet(&mut hdr, &mut payload).is_err());
         // EncryptionAlgorithm alias table (config/encryption.rs:29-41).
-        assert_eq!("chacha20-poly1305".parse::<EncryptionAlgorithm>().unwrap(), EncryptionAlgorithm::ChaCha20);
-        assert_eq!("openssl-aes-256-gcm".parse::<EncryptionAlgorithm>().unwrap(), EncryptionAlgorithm::Aes256Gcm);
+        assert_eq!(
+            "chacha20-poly1305".parse::<EncryptionAlgorithm>().unwrap(),
+            EncryptionAlgorithm::ChaCha20
+        );
+        assert_eq!(
+            "openssl-aes-256-gcm"
+                .parse::<EncryptionAlgorithm>()
+                .unwrap(),
+            EncryptionAlgorithm::Aes256Gcm
+        );
         assert!("nope".parse::<EncryptionAlgorithm>().is_err());
         assert_eq!(EncryptionAlgorithm::default().as_str(), "aes-gcm");
     }
@@ -11863,7 +12007,11 @@ mod tests {
     fn parse_peer_endpoint_forms() {
         assert_eq!(
             parse_peer_endpoint("tcp://192.0.2.10:11010").unwrap(),
-            PeerEndpoint { transport: PeerTransport::Tcp, host: "192.0.2.10".into(), port: 11010 }
+            PeerEndpoint {
+                transport: PeerTransport::Tcp,
+                host: "192.0.2.10".into(),
+                port: 11010
+            }
         );
         // protocol_default_port("tcp") = 11010
         // (connectivity/protocol/mod.rs:55-64).
@@ -11951,7 +12099,9 @@ mod tests {
                 port: 11011
             }
         );
-        let err = parse_peer_endpoint("faketcp://192.0.2.10").unwrap_err().to_string();
+        let err = parse_peer_endpoint("faketcp://192.0.2.10")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("faketcp"), "{err}");
         assert!(parse_peer_endpoint("tcp://:11010").is_err());
         assert!(parse_peer_endpoint("tcp://host:notaport").is_err());
@@ -11973,8 +12123,9 @@ mod tests {
         let server = tokio::spawn(async move {
             handshake_as_server(&mut server_io, 0xdead_beef, "mesh", &digest, None).await
         });
-        let client_peer =
-            handshake_as_client(&mut client_io, 0x0000_0042, "mesh", &digest).await.unwrap();
+        let client_peer = handshake_as_client(&mut client_io, 0x0000_0042, "mesh", &digest)
+            .await
+            .unwrap();
         let (server_peer, secure) = server.await.unwrap().unwrap();
         assert!(secure.is_none());
         // Each side sees the other's id and the shared identity.
@@ -11982,7 +12133,10 @@ mod tests {
         assert_eq!(server_peer.peer_id, 0x0000_0042);
         assert_eq!(client_peer.network_name, "mesh");
         assert_eq!(server_peer.network_secret_digest, digest);
-        assert!(client_peer.features.iter().any(|f| f == LIVENESS_ECHO_FEATURE));
+        assert!(client_peer
+            .features
+            .iter()
+            .any(|f| f == LIVENESS_ECHO_FEATURE));
         assert_eq!(client_peer.version, HANDSHAKE_VERSION);
         // A peer answering with OUR peer id is a self-connection
         // (peer_conn.rs:1238-1242, 1269-1275).
@@ -12038,7 +12192,9 @@ mod tests {
         let secret = secret.to_owned();
         tokio::spawn(async move {
             loop {
-                let Ok((stream, _)) = listener.accept().await else { break };
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
                 let seen_tx = seen_tx.clone();
                 let err_tx = err_tx.clone();
                 let network_name = network_name.clone();
@@ -12048,7 +12204,10 @@ mod tests {
                     match serve_peer(stream, &network_name, &secret, encryptor).await {
                         Ok((node, peer_info)) => {
                             let _ = seen_tx
-                                .send((peer_info.network_name.clone(), peer_info.network_secret_digest))
+                                .send((
+                                    peer_info.network_name.clone(),
+                                    peer_info.network_secret_digest,
+                                ))
                                 .await;
                             // Echo every IP frame back (the data-plane
                             // round trip).
@@ -12118,7 +12277,9 @@ mod tests {
             ..e2e_config(&mimic.addr, "plain-net", &secret)
         };
         let node = connect(&cfg).await.unwrap();
-        node.send_ip_frame(b"plaintext overlay frame").await.unwrap();
+        node.send_ip_frame(b"plaintext overlay frame")
+            .await
+            .unwrap();
         let echoed = node.recv_ip_frame().await.unwrap();
         assert_eq!(echoed, b"plaintext overlay frame");
         node.close().await;
@@ -12158,7 +12319,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(peer_err.contains("network identity not match"), "{peer_err}");
+        assert!(
+            peer_err.contains("network identity not match"),
+            "{peer_err}"
+        );
     }
 
     #[tokio::test]
@@ -12188,8 +12352,8 @@ mod tests {
             assert_eq!(req.network_name, network);
             assert_eq!(req.network_secret_digest, digest);
             assert_eq!(req.features, vec!["liveness-echo-v1".to_owned()]); // liveness.rs:10
-            // Answer with our own handshake (server sends its digest
-            // only on identity match — here it matches).
+                                                                           // Answer with our own handshake (server sends its digest
+                                                                           // only on identity match — here it matches).
             let reply = build_handshake(0xfeed_face, network, Some(&digest));
             write_frame(&mut stream, &reply).await.unwrap();
             // Echo pings as pongs (peer_conn.rs:1334-1341).
@@ -12271,10 +12435,9 @@ mod tests {
             // Handshake, then keep the socket open while swallowing
             // every ping without answering (the connection stays alive;
             // only the keepalive can tear it down).
-            let (peer, secure) =
-                handshake_as_server(&mut stream, 0xaa, network, &digest, None)
-                    .await
-                    .unwrap();
+            let (peer, secure) = handshake_as_server(&mut stream, 0xaa, network, &digest, None)
+                .await
+                .unwrap();
             assert!(secure.is_none());
             drop(peer);
             while matches!(read_frame(&mut stream).await, Ok(Some(_))) {}
@@ -12416,7 +12579,9 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            SyncRouteInfoResponse::decode(&err_resp.encode()).unwrap().error,
+            SyncRouteInfoResponse::decode(&err_resp.encode())
+                .unwrap()
+                .error,
             Some(1)
         );
     }
@@ -12600,18 +12765,19 @@ mod tests {
         };
         dhcp_node.merge_sync_request(&[peer_info], None);
         assert!(dhcp_node.allocate_dhcp_ipv4());
-        assert_eq!(
-            dhcp_node.my_ipv4().unwrap().to_string(),
-            "10.126.126.2"
-        );
+        assert_eq!(dhcp_node.my_ipv4().unwrap().to_string(), "10.126.126.2");
         // Allocation is once; the announced version bumped.
         assert!(!dhcp_node.allocate_dhcp_ipv4());
         assert_eq!(dhcp_node.my_peer_info().version, 2);
         assert_eq!(dhcp_node.my_peer_info().network_length, 24);
         // The MagicDNS table includes ourselves and the learned peer.
         let nodes = dhcp_node.overlay_nodes();
-        assert!(nodes.iter().any(|n| n.ipv4 == "10.126.126.1".parse::<Ipv4Addr>().unwrap()));
-        assert!(nodes.iter().any(|n| n.ipv4 == "10.126.126.2".parse::<Ipv4Addr>().unwrap()));
+        assert!(nodes
+            .iter()
+            .any(|n| n.ipv4 == "10.126.126.1".parse::<Ipv4Addr>().unwrap()));
+        assert!(nodes
+            .iter()
+            .any(|n| n.ipv4 == "10.126.126.2".parse::<Ipv4Addr>().unwrap()));
     }
 
     // ------------------------------------------------- the in-test mesh
@@ -12652,7 +12818,9 @@ mod tests {
             let underlay_task = underlay_conns.clone();
             tokio::spawn(async move {
                 loop {
-                    let Ok((stream, _)) = listener.accept().await else { break };
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
                     let network = network.clone();
                     let secret = secret.clone();
                     let learned = learned_task.clone();
@@ -12660,9 +12828,15 @@ mod tests {
                     underlay_task.fetch_add(1, Ordering::Relaxed);
                     tokio::spawn(async move {
                         let encryptor = create_encryptor("aes-gcm", true, &secret).unwrap();
-                        let Ok((halves, _peer_info)) =
-                            serve_peer_as(stream, random_peer_id(), &network, &secret, encryptor, None)
-                                .await
+                        let Ok((halves, _peer_info)) = serve_peer_as(
+                            stream,
+                            random_peer_id(),
+                            &network,
+                            &secret,
+                            encryptor,
+                            None,
+                        )
+                        .await
                         else {
                             return;
                         };
@@ -13108,10 +13282,16 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let encryptor = create_encryptor("aes-gcm", true, &server_secret).unwrap();
-            let (halves, _peer_info) =
-                serve_peer_as(stream, random_peer_id(), network, &server_secret, encryptor, None)
-                    .await
-                    .unwrap();
+            let (halves, _peer_info) = serve_peer_as(
+                stream,
+                random_peer_id(),
+                network,
+                &server_secret,
+                encryptor,
+                None,
+            )
+            .await
+            .unwrap();
             let mut stack = EtStack::new(
                 halves.state.my_peer_id,
                 network,
@@ -13124,7 +13304,15 @@ mod tests {
             );
             let (events_tx, events_rx) = mpsc::channel::<PeerEvent>(64);
             stack.attach_session(halves, false, &events_tx);
-            run_mimic(stack, events_rx, server_learned, server_accepted, 9051, 9052).await;
+            run_mimic(
+                stack,
+                events_rx,
+                server_learned,
+                server_accepted,
+                9051,
+                9052,
+            )
+            .await;
         });
 
         // The client: a raw direct-tunnel node, hand-built gossip bytes.
@@ -13140,7 +13328,11 @@ mod tests {
         let mut rpi = Vec::new();
         hfield_varint(&mut rpi, 1, 0x1111);
         let mut ipv4 = Vec::new();
-        hfield_varint(&mut ipv4, 1, u32::from("10.200.0.7".parse::<Ipv4Addr>().unwrap()) as u64);
+        hfield_varint(
+            &mut ipv4,
+            1,
+            u32::from("10.200.0.7".parse::<Ipv4Addr>().unwrap()) as u64,
+        );
         hfield_len(&mut rpi, 4, &ipv4);
         hfield_varint(&mut rpi, 9, 1);
         let mut infos = Vec::new();
@@ -13173,10 +13365,7 @@ mod tests {
         // arrive first, so read until the RpcResp for our transaction.
         let ctrl = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let ctrl = node
-                    .recv_ctrl_packet()
-                    .await
-                    .expect("ctrl packet");
+                let ctrl = node.recv_ctrl_packet().await.expect("ctrl packet");
                 if ctrl.hdr.packet_type == packet_type::RPC_RESP {
                     return ctrl;
                 }
@@ -13226,7 +13415,10 @@ mod tests {
         assert_ne!(is_initiator, Some(1), "responder is not the initiator");
         let session_id = session_id.expect("session id");
         assert_ne!(session_id, 0);
-        assert_ne!(session_id, 0x0098_7654_3210, "session id must be the peer's");
+        assert_ne!(
+            session_id, 0x0098_7654_3210,
+            "session id must be the peer's"
+        );
         // The mimic learned our hand-announced address.
         let learned_addr = wait_for_routes(&learned, 0x1111).await;
         assert_eq!(
@@ -13402,7 +13594,10 @@ mod tests {
             header.to_bytes(),
             [0x44, 0x33, 0x22, 0x11, 0x01, 0x00, 0x08, 0x00]
         );
-        assert_eq!(UdpTunnelHeader::from_bytes(&header.to_bytes()), Some(header));
+        assert_eq!(
+            UdpTunnelHeader::from_bytes(&header.to_bytes()),
+            Some(header)
+        );
         assert_eq!(UDP_TUNNEL_HEADER_SIZE, 8);
         // The SYN/SACK datagram: 8 header bytes + the magic, LE
         // (`new_syn_packet`, tunnel/udp.rs:63-72).
@@ -13469,8 +13664,7 @@ mod tests {
         // answers the SYN/SACK and observes the actual datagrams.
         let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = sock.local_addr().unwrap();
-        let client =
-            tokio::spawn(async move { connect_udp_tunnel(addr).await.unwrap() });
+        let client = tokio::spawn(async move { connect_udp_tunnel(addr).await.unwrap() });
         let mut buf = vec![0u8; 1600];
         let (n, from) = sock.recv_from(&mut buf).await.unwrap();
         let (syn, body) = parse_udp_datagram(&buf[..n]).unwrap();
@@ -13484,8 +13678,9 @@ mod tests {
         .unwrap();
         let mut client = client.await.unwrap();
         // One peer frame write → one datagram whose body is PMH+payload.
-        let frame =
-            PeerPacket::new(9, 8, packet_type::HANDSHAKE, b"pmh-only").to_tcp_frame().unwrap();
+        let frame = PeerPacket::new(9, 8, packet_type::HANDSHAKE, b"pmh-only")
+            .to_tcp_frame()
+            .unwrap();
         client.write_all(&frame).await.unwrap();
         client.flush().await.unwrap();
         let (n, _) = sock.recv_from(&mut buf).await.unwrap();
@@ -13502,8 +13697,9 @@ mod tests {
         assert_eq!(&data_body[PEER_MANAGER_HEADER_SIZE..], b"pmh-only");
         // And the inverse: a [PMH][payload] datagram reads back as one
         // framed peer packet.
-        let inbound =
-            PeerPacket::new(8, 9, packet_type::PONG, &[1, 0, 0, 0]).to_tcp_frame().unwrap();
+        let inbound = PeerPacket::new(8, 9, packet_type::PONG, &[1, 0, 0, 0])
+            .to_tcp_frame()
+            .unwrap();
         let wire = udp_wire_datagram(&inbound).unwrap();
         sock.send_to(
             &UdpTunnelHeader::datagram(udp_packet_type::DATA, syn.conn_id, wire),
@@ -13539,7 +13735,9 @@ mod tests {
             let underlay_task = underlay_conns.clone();
             tokio::spawn(async move {
                 loop {
-                    let Ok(stream) = listener.accept().await else { break };
+                    let Ok(stream) = listener.accept().await else {
+                        break;
+                    };
                     let network = network.clone();
                     let secret = secret.clone();
                     let learned = learned_task.clone();
@@ -13547,9 +13745,15 @@ mod tests {
                     underlay_task.fetch_add(1, Ordering::Relaxed);
                     tokio::spawn(async move {
                         let encryptor = create_encryptor("aes-gcm", true, &secret).unwrap();
-                        let Ok((halves, _peer_info)) =
-                            serve_peer_as(stream, random_peer_id(), &network, &secret, encryptor, None)
-                                .await
+                        let Ok((halves, _peer_info)) = serve_peer_as(
+                            stream,
+                            random_peer_id(),
+                            &network,
+                            &secret,
+                            encryptor,
+                            None,
+                        )
+                        .await
                         else {
                             return;
                         };
@@ -13634,8 +13838,15 @@ mod tests {
                 port: addr.port(),
             };
             let encryptor = create_encryptor("aes-gcm", true, &secret).unwrap();
-            let Ok(halves) =
-                dial_session(&endpoint, random_peer_id(), &network, &secret, encryptor, None).await
+            let Ok(halves) = dial_session(
+                &endpoint,
+                random_peer_id(),
+                &network,
+                &secret,
+                encryptor,
+                None,
+            )
+            .await
             else {
                 return;
             };
@@ -13739,8 +13950,15 @@ mod tests {
                     port,
                 };
                 let encryptor = create_encryptor("aes-gcm", true, &secret).unwrap();
-                let Ok(halves) =
-                    dial_session(&endpoint, random_peer_id(), &network, &secret, encryptor, None).await
+                let Ok(halves) = dial_session(
+                    &endpoint,
+                    random_peer_id(),
+                    &network,
+                    &secret,
+                    encryptor,
+                    None,
+                )
+                .await
                 else {
                     return;
                 };
@@ -13827,7 +14045,10 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("unexpected packet type during handshake: 13"), "{err}");
+        assert!(
+            err.contains("unexpected packet type during handshake: 13"),
+            "{err}"
+        );
         assert!(err.contains("secure mode"), "{err}");
     }
 
@@ -13896,13 +14117,8 @@ mod tests {
         // secure_datagram.rs:391-410: prk = HMAC-SHA256(0^32, root_key);
         // key = HMAC(prk, "et-traffic" || epoch_be || dir || 0x01).
         let root_key: [u8; 32] = core::array::from_fn(|i| (i * 7) as u8);
-        let session = SecureDatagramSession::new(
-            root_key,
-            1,
-            0,
-            "aes-gcm".to_owned(),
-            "aes-gcm".to_owned(),
-        );
+        let session =
+            SecureDatagramSession::new(root_key, 1, 0, "aes-gcm".to_owned(), "aes-gcm".to_owned());
         // Direction 0, epoch 0x0102_0304.
         session.sync_root_key(root_key, 1, 0x0102_0304, false);
         let got = session.hkdf_traffic_key(0x0102_0304, SecureDirection::AToB);
@@ -13985,7 +14201,8 @@ mod tests {
             len: plaintext.len() as u32,
         };
         let mut payload = plaintext.to_vec();
-        a.encrypt_payload(a_id, b_id, &mut hdr, &mut payload).unwrap();
+        a.encrypt_payload(a_id, b_id, &mut hdr, &mut payload)
+            .unwrap();
         assert!(hdr.is_encrypted());
         assert_eq!(payload.len(), plaintext.len() + AEAD_TAIL_SIZE);
         let mut decrypted_hdr = hdr;
@@ -13998,22 +14215,21 @@ mod tests {
         // Replaying the same ciphertext is rejected (same epoch+seq).
         let mut replay_hdr = hdr;
         let mut replay = payload.clone();
-        assert!(
-            b.decrypt_payload(a_id, b_id, &mut replay_hdr, &mut replay)
-                .is_err()
-        );
+        assert!(b
+            .decrypt_payload(a_id, b_id, &mut replay_hdr, &mut replay)
+            .is_err());
 
         // A tampered nonce (far-future epoch) fails without poisoning:
         // the next honest packet still decrypts.
         let mut forged_hdr = hdr;
         let mut forged = plaintext.to_vec();
-        a.encrypt_payload(a_id, b_id, &mut forged_hdr, &mut forged).unwrap();
+        a.encrypt_payload(a_id, b_id, &mut forged_hdr, &mut forged)
+            .unwrap();
         let len = forged.len();
         forged[len - 12..len - 8].copy_from_slice(&1000u32.to_be_bytes());
-        assert!(
-            b.decrypt_payload(a_id, b_id, &mut forged_hdr, &mut forged)
-                .is_err()
-        );
+        assert!(b
+            .decrypt_payload(a_id, b_id, &mut forged_hdr, &mut forged)
+            .is_err());
         let mut next_hdr = PeerManagerHeader {
             from_peer_id: a_id,
             to_peer_id: b_id,
@@ -14024,8 +14240,10 @@ mod tests {
             len: plaintext.len() as u32,
         };
         let mut next = plaintext.to_vec();
-        a.encrypt_payload(a_id, b_id, &mut next_hdr, &mut next).unwrap();
-        b.decrypt_payload(a_id, b_id, &mut next_hdr, &mut next).unwrap();
+        a.encrypt_payload(a_id, b_id, &mut next_hdr, &mut next)
+            .unwrap();
+        b.decrypt_payload(a_id, b_id, &mut next_hdr, &mut next)
+            .unwrap();
         assert_eq!(next, plaintext);
 
         // The reverse direction derives the BToA keys.
@@ -14039,8 +14257,10 @@ mod tests {
             len: 4,
         };
         let mut back = b"ping?".to_vec();
-        b.encrypt_payload(b_id, a_id, &mut back_hdr, &mut back).unwrap();
-        a.decrypt_payload(b_id, a_id, &mut back_hdr, &mut back).unwrap();
+        b.encrypt_payload(b_id, a_id, &mut back_hdr, &mut back)
+            .unwrap();
+        a.decrypt_payload(b_id, a_id, &mut back_hdr, &mut back)
+            .unwrap();
         assert_eq!(back, b"ping?");
     }
 
@@ -14138,20 +14358,18 @@ mod tests {
         assert_eq!(second.root_key, None);
 
         // Join with the wrong generation on the client side is fatal.
-        assert!(
-            store
-                .apply_initiator_action(
-                    key.clone(),
-                    PeerConnSessionAction::Join,
-                    99,
-                    None,
-                    0,
-                    "aes-gcm",
-                    "aes-gcm",
-                    None,
-                )
-                .is_err()
-        );
+        assert!(store
+            .apply_initiator_action(
+                key.clone(),
+                PeerConnSessionAction::Join,
+                99,
+                None,
+                0,
+                "aes-gcm",
+                "aes-gcm",
+                None,
+            )
+            .is_err());
 
         // A client without a generation hint (the engine's dial path)
         // gets a Sync of the stored key.
@@ -14198,8 +14416,9 @@ mod tests {
                 .unwrap();
             noise_handshake_as_server(&mut server_io, server_peer_id, &server_ctx, first).await
         });
-        let client =
-            noise_handshake_as_client(&mut client_io, client_peer_id, &client_ctx).await.unwrap();
+        let client = noise_handshake_as_client(&mut client_io, client_peer_id, &client_ctx)
+            .await
+            .unwrap();
         let server = server.await.unwrap().unwrap();
 
         assert_eq!(client.peer.peer_id, server_peer_id);
@@ -14300,7 +14519,10 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("pinned remote static pubkey mismatch"), "{err}");
+        assert!(
+            err.contains("pinned remote static pubkey mismatch"),
+            "{err}"
+        );
         let _ = server.await;
     }
 
@@ -14339,8 +14561,8 @@ mod tests {
                 host: "127.0.0.1".to_owned(),
                 port,
             };
-            let ctx = SecureModeCtx::new(&network_owned, &secret_clone, "", "aes-gcm", None)
-                .unwrap();
+            let ctx =
+                SecureModeCtx::new(&network_owned, &secret_clone, "", "aes-gcm", None).unwrap();
             let encryptor = create_encryptor("aes-gcm", true, &secret_clone).unwrap();
             let Ok(halves) = dial_session(
                 &endpoint,
@@ -14366,7 +14588,15 @@ mod tests {
             );
             let (events_tx, events_rx) = mpsc::channel::<PeerEvent>(64);
             stack.attach_session(halves, true, &events_tx);
-            run_mimic(stack, events_rx, learned, accepted, echo_port, echo_port + 1).await;
+            run_mimic(
+                stack,
+                events_rx,
+                learned,
+                accepted,
+                echo_port,
+                echo_port + 1,
+            )
+            .await;
         });
 
         tokio::time::timeout(Duration::from_secs(15), server.wait_ready())
@@ -14380,11 +14610,10 @@ mod tests {
         );
         // Overlay traffic through the session AEAD both ways.
         let target = SocketAddr::V4(SocketAddrV4::new(overlay, echo_port));
-        let mut stream =
-            tokio::time::timeout(Duration::from_secs(15), connect_tcp(&cfg, &target))
-                .await
-                .expect("dial through the secure peer")
-                .expect("connect_tcp via the secure listener");
+        let mut stream = tokio::time::timeout(Duration::from_secs(15), connect_tcp(&cfg, &target))
+            .await
+            .expect("dial through the secure peer")
+            .expect("connect_tcp via the secure listener");
         stream.write_all(b"secure-relay").await.unwrap();
         let mut buf = [0u8; 16];
         let n = stream.read(&mut buf).await.unwrap();
@@ -14423,11 +14652,10 @@ mod tests {
             .expect("plain peer did not sync in time")
             .unwrap();
         let target = SocketAddr::V4(SocketAddrV4::new(mimic_ip, echo_port));
-        let mut stream =
-            tokio::time::timeout(Duration::from_secs(15), connect_tcp(&cfg, &target))
-                .await
-                .expect("dial through the plain peer")
-                .expect("connect_tcp via the mixed listener");
+        let mut stream = tokio::time::timeout(Duration::from_secs(15), connect_tcp(&cfg, &target))
+            .await
+            .expect("dial through the plain peer")
+            .expect("connect_tcp via the mixed listener");
         stream.write_all(b"plain-still-works").await.unwrap();
         let mut buf = [0u8; 24];
         let n = stream.read(&mut buf).await.unwrap();
@@ -14437,12 +14665,7 @@ mod tests {
 
     /// Run the real binary with the common interop flags; returns the
     /// child (killed on drop).
-    fn spawn_real_binary(
-        bin: &str,
-        network: &str,
-        secret: &str,
-        extra: &[&str],
-    ) -> KillChild {
+    fn spawn_real_binary(bin: &str, network: &str, secret: &str, extra: &[&str]) -> KillChild {
         let mut command = std::process::Command::new(bin);
         command.args(["--network-name", network, "--network-secret", secret]);
         for arg in extra {
@@ -14464,11 +14687,10 @@ mod tests {
     /// no-auth method selection.
     async fn assert_socks5_on_overlay(cfg: &EasyTierConfig, socks5_port: u16) {
         let socks5: SocketAddr = format!("10.126.126.1:{socks5_port}").parse().unwrap();
-        let mut stream =
-            tokio::time::timeout(Duration::from_secs(25), connect_tcp(cfg, &socks5))
-                .await
-                .expect("dial through the real node timed out")
-                .expect("dial through the real node");
+        let mut stream = tokio::time::timeout(Duration::from_secs(25), connect_tcp(cfg, &socks5))
+            .await
+            .expect("dial through the real node timed out")
+            .expect("dial through the real node");
         stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
         let mut greeting = [0u8; 2];
         stream.read_exact(&mut greeting).await.unwrap();
@@ -14759,13 +14981,13 @@ mod tests {
         let cases: &[(&[u8], &[u8], u64)] = &[
             (&[], &[], 15605663169668837975),
             (&[0x45, 0, 0, 10], &[1, 2, 3, 4, 5, 6], 14432687309312439075),
-            (
-                &0u64.to_le_bytes(),
-                b"abcdefgh",
-                2896981824816784093,
-            ),
+            (&0u64.to_le_bytes(), b"abcdefgh", 2896981824816784093),
             (&[0x11u8; 3], &0u64.to_le_bytes(), 4620115072304201297),
-            (&1200u64.to_le_bytes(), &[0xabu8; 1200], 15336253554449442413),
+            (
+                &1200u64.to_le_bytes(),
+                &[0xabu8; 1200],
+                15336253554449442413,
+            ),
             (&8u64.to_le_bytes(), &[0u8; 8], 4785788110206384021),
             (&16u64.to_le_bytes(), &[0xffu8; 16], 681446427028685233),
             (&5u64.to_le_bytes(), &[9, 8, 7, 6, 5], 11526691439214515923),
@@ -14773,15 +14995,20 @@ mod tests {
             (
                 &[1, 2, 3, 4, 5, 6, 7],
                 &[
-                    8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-                    27, 28, 29, 30, 31, 32, 33, 34, 35,
+                    8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+                    28, 29, 30, 31, 32, 33, 34, 35,
                 ],
                 1067341436300427410,
             ),
         ];
         for (header, payload, expected) in cases {
             let got = quic_plaintext::packet_tag(header, payload);
-            assert_eq!(got, *expected, "header {header:?} payload len {}", payload.len());
+            assert_eq!(
+                got,
+                *expected,
+                "header {header:?} payload len {}",
+                payload.len()
+            );
         }
     }
 
@@ -14798,7 +15025,7 @@ mod tests {
         let mut buf = header.to_vec();
         buf.extend_from_slice(&payload);
         buf.extend_from_slice(&[0u8; 8]); // tag space
-        // encrypt writes only the tag into the tail (payload untouched).
+                                          // encrypt writes only the tag into the tail (payload untouched).
         key.encrypt(0, &mut buf, header.len());
         assert_eq!(&buf[..header.len()], &header);
         assert_eq!(&buf[header.len()..header.len() + payload.len()], &payload);

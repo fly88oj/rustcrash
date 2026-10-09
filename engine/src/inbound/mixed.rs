@@ -18,8 +18,12 @@ pub async fn serve(
 ) -> Result<SocketAddr> {
     let listener = TcpListener::bind((cfg.bind.as_str(), cfg.port))
         .await
-        .map_err(|e| crate::inbound::bind_failure("mixed", format!("{}:{}", cfg.bind, cfg.port), e))?;
-    let addr = listener.local_addr().map_err(|e| Error::network(e.to_string()))?;
+        .map_err(|e| {
+            crate::inbound::bind_failure("mixed", format!("{}:{}", cfg.bind, cfg.port), e)
+        })?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| Error::network(e.to_string()))?;
     let tag = cfg.tag.clone();
     let authentication = authentication.to_vec();
     tokio::spawn(async move {
@@ -68,7 +72,8 @@ async fn route(
             )
             .await
         }
-        b'C' | b'G' | b'H' | b'P' | b'D' | b'O' | b'T' | b'U' | b'c' | b'g' | b'h' | b'p' | b'd' | b'o' | b't' | b'u' => {
+        b'C' | b'G' | b'H' | b'P' | b'D' | b'O' | b'T' | b'U' | b'c' | b'g' | b'h' | b'p'
+        | b'd' | b'o' | b't' | b'u' => {
             crate::inbound::http::handle_stream(
                 stream,
                 peer,

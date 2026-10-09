@@ -579,9 +579,9 @@ impl UdpSessionKey {
 /// address wildcard on port 53 only — matching by address alone captured
 /// non-DNS traffic to a hijack address), in either family.
 pub(crate) fn is_dns_hijack(dst: SocketAddr, hijack: &[DnsHijack]) -> bool {
-    hijack.iter().any(|h| {
-        h.port == dst.port() && h.ip.is_none_or(|ip| ip == dst.ip())
-    })
+    hijack
+        .iter()
+        .any(|h| h.port == dst.port() && h.ip.is_none_or(|ip| ip == dst.ip()))
 }
 
 /// Facts about one live TCP socket that decide whether an arriving SYN needs
@@ -1036,7 +1036,12 @@ impl Netstack {
                 }
                 self.shim.stage(pkt);
             }
-            Classified::Udp { src, dst, payload, ext } => {
+            Classified::Udp {
+                src,
+                dst,
+                payload,
+                ext,
+            } => {
                 // The stack needs a UDP socket bound to this port even though
                 // the payload is handled here: without one smoltcp answers
                 // every relayed datagram with an ICMP port-unreachable, which
@@ -1353,6 +1358,7 @@ impl Netstack {
                         inbound: self.tag.clone(),
                         inbound_port: None,
                         inbound_kind: "tun",
+                        in_user: None,
                     },
                     Box::new(TunStream {
                         shared: shared.clone(),
@@ -1524,8 +1530,9 @@ pub(crate) async fn run(
 ) -> Result<()> {
     // Room for the largest packet the interface can deliver, plus headroom
     // for the utun 4-byte family header macOS recv strips in place.
-    let mut reader = DeviceReader::spawn(dev.clone(), cfg.mtu.max(576) as usize + 64, READER_CHANNEL)
-        .map_err(|e| Error::network(e.to_string()))?;
+    let mut reader =
+        DeviceReader::spawn(dev.clone(), cfg.mtu.max(576) as usize + 64, READER_CHANNEL)
+            .map_err(|e| Error::network(e.to_string()))?;
     let mut rx = reader
         .take_receiver()
         .expect("the receiver is taken exactly once");
@@ -2353,8 +2360,14 @@ mod tests {
         use crate::inbound::tun::DnsHijack;
         let ip_a = IpAddr::V4(Ipv4Addr::new(10, 7, 0, 1));
         let hijack_v4 = vec![
-            DnsHijack { ip: Some(ip_a), port: 53 },
-            DnsHijack { ip: Some(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1))), port: 53 },
+            DnsHijack {
+                ip: Some(ip_a),
+                port: 53,
+            },
+            DnsHijack {
+                ip: Some(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1))),
+                port: 53,
+            },
         ];
         // The configured destination matches on BOTH address and port...
         assert!(is_dns_hijack(SocketAddr::new(ip_a, 53), &hijack_v4));
@@ -2379,7 +2392,10 @@ mod tests {
 
         // v6 works symmetrically, and families never cross-match.
         let fd00_1 = IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1));
-        let hijack_v6 = vec![DnsHijack { ip: Some(fd00_1), port: 53 }];
+        let hijack_v6 = vec![DnsHijack {
+            ip: Some(fd00_1),
+            port: 53,
+        }];
         assert!(is_dns_hijack(SocketAddr::new(fd00_1, 53), &hijack_v6));
         assert!(!is_dns_hijack(SocketAddr::new(fd00_1, 5353), &hijack_v6));
         assert!(!is_dns_hijack(
@@ -3221,7 +3237,7 @@ mod tests {
         let hijack = SocketAddr::new(gateway, 53);
         let hbh = ext8(43, &[0x05, 0x02, 0, 0, 0, 0]); // -> routing follows
         let routing = ext8(17, &[0u8; 8]); // -> UDP follows
-        // AAAA query so the hosts entry's v6 address answers it.
+                                           // AAAA query so the hosts entry's v6 address answers it.
         let mut q = dns_query("probe-xh.test", 0x0a0b);
         let q_len = q.len();
         q[q_len - 4] = 0x00;
@@ -3233,12 +3249,17 @@ mod tests {
             IpAddr::V6(ip) => ip,
             _ => unreachable!(),
         };
-        let is_answer =
-            |p: &[u8]| p[0] >> 4 == 6 && p[6] == 17 && p[24..40] == client_ip.octets();
+        let is_answer = |p: &[u8]| p[0] >> 4 == 6 && p[6] == 17 && p[24..40] == client_ip.octets();
         let mut answer_pkt = None;
         for _ in 0..200 {
             net.step();
-            answer_pkt = sink.0.lock().unwrap().iter().find(|p| is_answer(p)).cloned();
+            answer_pkt = sink
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|p| is_answer(p))
+                .cloned();
             if answer_pkt.is_some() {
                 break;
             }
@@ -3416,12 +3437,7 @@ mod tests {
         let relay = Arc::new(CaptureRelay::default());
         let cfg = test_cfg_v6();
         let io_dev: Arc<dyn TunIo> = dev.clone();
-        let task = tokio::spawn(run(
-            io_dev,
-            cfg,
-            relay.clone(),
-            TunHooks { dns: None },
-        ));
+        let task = tokio::spawn(run(io_dev, cfg, relay.clone(), TunHooks { dns: None }));
 
         let client = SocketAddr::new(
             IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2)),
@@ -3432,7 +3448,10 @@ mod tests {
             53,
         );
         dev.inject(&udp6_packet(client, server, b"pumpme"));
-        let up = wait_until("relay uplink", || relay.udp.lock().unwrap().first().cloned()).await;
+        let up = wait_until("relay uplink", || {
+            relay.udp.lock().unwrap().first().cloned()
+        })
+        .await;
         assert_eq!(up.0, client, "session keyed by the v6 source");
         assert_eq!(up.1.to_string(), "[2001:4860:4860::8888]:53");
         assert_eq!(up.2, b"pumpme");
@@ -3484,12 +3503,7 @@ mod tests {
         let relay = Arc::new(CaptureRelay::default());
         let cfg = test_cfg_v6();
         let io_dev: Arc<dyn TunIo> = dev.clone();
-        let task = tokio::spawn(run(
-            io_dev,
-            cfg,
-            relay.clone(),
-            TunHooks { dns: None },
-        ));
+        let task = tokio::spawn(run(io_dev, cfg, relay.clone(), TunHooks { dns: None }));
 
         let client = SocketAddr::new(
             IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2)),
@@ -3560,12 +3574,7 @@ mod tests {
         let dns = DnsEngine::new(dns_cfg, crate::rule::DomainMatcher::default()).unwrap();
 
         let io_dev: Arc<dyn TunIo> = dev.clone();
-        let task = tokio::spawn(run(
-            io_dev,
-            cfg,
-            relay.clone(),
-            TunHooks { dns: Some(dns) },
-        ));
+        let task = tokio::spawn(run(io_dev, cfg, relay.clone(), TunHooks { dns: Some(dns) }));
 
         let client = SocketAddr::new(
             IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2)),
@@ -3615,7 +3624,10 @@ mod tests {
             &dev,
             "the framed DNS answer must come back over the stream",
             |p| {
-                p[0] >> 4 == 6 && p[6] == 6 && p.len() > 60 && p[60..].ends_with(&answer_v6.octets())
+                p[0] >> 4 == 6
+                    && p[6] == 6
+                    && p.len() > 60
+                    && p[60..].ends_with(&answer_v6.octets())
             },
             &mut spill,
         )
@@ -3650,12 +3662,7 @@ mod tests {
         let dns = DnsEngine::new(dns_cfg, crate::rule::DomainMatcher::default()).unwrap();
 
         let io_dev: Arc<dyn TunIo> = dev.clone();
-        let task = tokio::spawn(run(
-            io_dev,
-            cfg,
-            relay.clone(),
-            TunHooks { dns: Some(dns) },
-        ));
+        let task = tokio::spawn(run(io_dev, cfg, relay.clone(), TunHooks { dns: Some(dns) }));
 
         let client = SocketAddr::new(
             IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2)),
@@ -3707,12 +3714,7 @@ mod tests {
         let dev = LoopbackTun::new();
         let relay = Arc::new(CaptureRelay::default());
         let io_dev: Arc<dyn TunIo> = dev.clone();
-        let task = tokio::spawn(run(
-            io_dev,
-            test_cfg(),
-            relay,
-            TunHooks { dns: None },
-        ));
+        let task = tokio::spawn(run(io_dev, test_cfg(), relay, TunHooks { dns: None }));
         dev.kill("device vanished");
         let outcome = tokio::time::timeout(Duration::from_secs(10), task)
             .await

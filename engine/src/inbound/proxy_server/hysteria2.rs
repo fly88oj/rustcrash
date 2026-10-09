@@ -341,7 +341,11 @@ async fn handle_auth(
     let mut block = Vec::with_capacity(64);
     // QPACK field section prefix: required insert count 0, base 0.
     block.extend_from_slice(&[0x00, 0x00]);
-    let status = if ok { STATUS_AUTH_OK } else { STATUS_AUTH_DENIED };
+    let status = if ok {
+        STATUS_AUTH_OK
+    } else {
+        STATUS_AUTH_DENIED
+    };
     quic::put_qpack_literal(&mut block, b":status", status.as_bytes());
     if ok {
         quic::put_qpack_literal(&mut block, b"hysteria-udp", b"true");
@@ -432,7 +436,13 @@ fn udp_session(shared: &Hy2Shared, session_id: u32) -> mpsc::Sender<(NetAddr, Ve
         .clone()
         .handle_udp(shared.peer, shared.tag.clone(), up_rx, down);
     let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
-    sessions.insert(session_id, UdpSession { up: up.clone(), generation });
+    sessions.insert(
+        session_id,
+        UdpSession {
+            up: up.clone(),
+            generation,
+        },
+    );
     drop(sessions);
     tokio::spawn(downlink(
         shared.conn.clone(),
@@ -462,8 +472,7 @@ async fn downlink(
 ) {
     let mut packet_id: u16 = rand::random();
     loop {
-        let Ok(Some((target, data))) =
-            tokio::time::timeout(UDP_SESSION_TTL, down_rx.recv()).await
+        let Ok(Some((target, data))) = tokio::time::timeout(UDP_SESSION_TTL, down_rx.recv()).await
         else {
             break;
         };
@@ -558,7 +567,12 @@ impl Fragments {
         }
         self.parts[frag_id as usize] = Some(data.to_vec());
         if self.parts.iter().all(|p| p.is_some()) {
-            return Some(self.parts.drain(..).flat_map(|p| p.unwrap_or_default()).collect());
+            return Some(
+                self.parts
+                    .drain(..)
+                    .flat_map(|p| p.unwrap_or_default())
+                    .collect(),
+            );
         }
         None
     }
@@ -615,8 +629,8 @@ async fn read_varint_stream(recv: &mut quinn::RecvStream) -> Result<u64> {
 /// exactly one HEADERS frame per exchange).
 async fn read_h3_request_headers(recv: &mut quinn::RecvStream) -> Result<Vec<u8>> {
     let len = read_varint_stream(recv).await?;
-    let len = usize::try_from(len)
-        .map_err(|_| Error::protocol("hysteria2 auth: frame too large"))?;
+    let len =
+        usize::try_from(len).map_err(|_| Error::protocol("hysteria2 auth: frame too large"))?;
     if len > MAX_H3_EXCHANGE {
         return Err(Error::protocol("hysteria2 auth: frame too large"));
     }
@@ -725,7 +739,10 @@ const QPACK_STATIC_TABLE: &[(&str, &str)] = &[
     ("content-type", "text/plain;charset=utf-8"),
     ("range", "bytes=0-"),
     ("strict-transport-security", "max-age=31536000"),
-    ("strict-transport-security", "max-age=31536000;includesubdomains"),
+    (
+        "strict-transport-security",
+        "max-age=31536000;includesubdomains",
+    ),
     (
         "strict-transport-security",
         "max-age=31536000;includesubdomains;preload",
@@ -825,8 +842,8 @@ fn read_string_literal(
 /// indexed-static and literal entries (dynamic references are rejected
 /// — a conforming peer never emits them against this server).
 fn decode_field_section(buf: &[u8]) -> Result<Vec<(String, String)>> {
-    let (required_inserts, off) = read_prefixed_int(buf, 0, 8)
-        .ok_or_else(|| Error::protocol("qpack: truncated prefix"))?;
+    let (required_inserts, off) =
+        read_prefixed_int(buf, 0, 8).ok_or_else(|| Error::protocol("qpack: truncated prefix"))?;
     if required_inserts != 0 {
         return Err(Error::protocol("qpack: dynamic table required"));
     }

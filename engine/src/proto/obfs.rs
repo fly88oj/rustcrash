@@ -474,7 +474,10 @@ impl TlsObfsStream {
     fn at_frame_boundary(&self) -> bool {
         self.remain == 0
             && self.rbuf.is_empty()
-            && matches!(self.phase, TlsReadPhase::ServerHello | TlsReadPhase::RecordPrefix)
+            && matches!(
+                self.phase,
+                TlsReadPhase::ServerHello | TlsReadPhase::RecordPrefix
+            )
     }
 
     /// Read more transport bytes into `rbuf`; `Ok(false)` means clean EOF.
@@ -536,8 +539,7 @@ impl TlsObfsStream {
                     }
                     TlsReadPhase::RecordLen => {
                         if self.rbuf.len() >= 2 {
-                            self.remain =
-                                u16::from_be_bytes([self.rbuf[0], self.rbuf[1]]) as usize;
+                            self.remain = u16::from_be_bytes([self.rbuf[0], self.rbuf[1]]) as usize;
                             self.rbuf.advance(2);
                             self.phase = TlsReadPhase::RecordPrefix;
                             continue;
@@ -756,7 +758,10 @@ mod tests {
         let mut wire = Vec::new();
         server_io.read_to_end(&mut wire).await.unwrap();
         let (head, _) = split_head(&wire);
-        assert!(head.starts_with("GET /assets/app.js HTTP/1.1\r\n"), "{head:?}");
+        assert!(
+            head.starts_with("GET /assets/app.js HTTP/1.1\r\n"),
+            "{head:?}"
+        );
         assert!(head.contains("Host: obfs.example\r\n"));
         assert!(!head.contains("Host: obfs.example:80"));
     }
@@ -810,7 +815,10 @@ mod tests {
         let mut stream = http_obfs_client(Box::new(client_io), &settings(HOST, 8388))
             .await
             .unwrap();
-        server_io.write_all(b"HTTP/1.1 200 OK\r\nServer: nginx").await.unwrap();
+        server_io
+            .write_all(b"HTTP/1.1 200 OK\r\nServer: nginx")
+            .await
+            .unwrap();
         drop(server_io);
         let err = stream.read_exact(&mut out).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
@@ -911,9 +919,18 @@ mod tests {
         // record / handshake / extensions lengths are back-computed from the
         // buffered window (upstream emits the hello only once it is known).
         assert_eq!(&wire[..3], &[0x16, 0x03, 0x01]);
-        assert_eq!(u16::from_be_bytes([wire[3], wire[4]]), 212 + window + host_len);
-        assert_eq!(u16::from_be_bytes([wire[7], wire[8]]), 208 + window + host_len);
-        assert_eq!(u16::from_be_bytes([wire[136], wire[137]]), 79 + window + host_len);
+        assert_eq!(
+            u16::from_be_bytes([wire[3], wire[4]]),
+            212 + window + host_len
+        );
+        assert_eq!(
+            u16::from_be_bytes([wire[7], wire[8]]),
+            208 + window + host_len
+        );
+        assert_eq!(
+            u16::from_be_bytes([wire[136], wire[137]]),
+            79 + window + host_len
+        );
         // fake session ticket carries the buffered window
         assert_eq!(&wire[138..140], &[0x00, 0x23]);
         assert_eq!(u16::from_be_bytes([wire[140], wire[141]]), window);
@@ -921,8 +938,14 @@ mod tests {
         // SNI = settings.host
         let sni = 142 + TLS_CHUNK_SIZE;
         assert_eq!(&wire[sni..sni + 2], &[0x00, 0x00]);
-        assert_eq!(u16::from_be_bytes([wire[sni + 2], wire[sni + 3]]), host_len + 5);
-        assert_eq!(u16::from_be_bytes([wire[sni + 4], wire[sni + 5]]), host_len + 3);
+        assert_eq!(
+            u16::from_be_bytes([wire[sni + 2], wire[sni + 3]]),
+            host_len + 5
+        );
+        assert_eq!(
+            u16::from_be_bytes([wire[sni + 4], wire[sni + 5]]),
+            host_len + 3
+        );
         assert_eq!(wire[sni + 6], 0);
         assert_eq!(u16::from_be_bytes([wire[sni + 7], wire[sni + 8]]), host_len);
         assert_eq!(&wire[sni + 9..sni + 9 + HOST.len()], HOST.as_bytes());
@@ -996,7 +1019,10 @@ mod tests {
         let record_len = u16::from_be_bytes([head[3], head[4]]) as usize;
         let mut hello = vec![0u8; record_len];
         sock.read_exact(&mut hello).await.unwrap();
-        assert_eq!(u16::from_be_bytes([hello[2], hello[3]]) as usize, record_len - 4);
+        assert_eq!(
+            u16::from_be_bytes([hello[2], hello[3]]) as usize,
+            record_len - 4
+        );
         assert_eq!(&hello[4..6], &[0x03, 0x03]);
         // fixed ClientHello prefix: extensions length at 131, ticket type at
         // 133, ticket (payload window) length at 135.
@@ -1080,8 +1106,10 @@ mod tests {
             .await
             .is_err());
         let (client_io, _server_io) = tokio::io::duplex(64);
-        assert!(tls_obfs_client(Box::new(client_io), &settings("bad\r\nhost", 443))
-            .await
-            .is_err());
+        assert!(
+            tls_obfs_client(Box::new(client_io), &settings("bad\r\nhost", 443))
+                .await
+                .is_err()
+        );
     }
 }

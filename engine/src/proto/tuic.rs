@@ -218,7 +218,12 @@ pub async fn dissociate(conn: &quinn::Connection, session_id: u16) -> Result<()>
         .open_uni()
         .await
         .map_err(|e| Error::network(format!("tuic dissociate stream: {e}")))?;
-    let frame = [VERSION, CMD_DISSOCIATE, (session_id >> 8) as u8, session_id as u8];
+    let frame = [
+        VERSION,
+        CMD_DISSOCIATE,
+        (session_id >> 8) as u8,
+        session_id as u8,
+    ];
     stream
         .write_all(&frame)
         .await
@@ -356,10 +361,16 @@ pub fn decode_packet_frame(msg: &[u8]) -> Result<PacketFrame<'_>> {
         return Err(Error::protocol("tuic packet: short header"));
     }
     if msg[0] != VERSION {
-        return Err(Error::protocol(format!("tuic packet: bad version {}", msg[0])));
+        return Err(Error::protocol(format!(
+            "tuic packet: bad version {}",
+            msg[0]
+        )));
     }
     if msg[1] != CMD_PACKET {
-        return Err(Error::protocol(format!("tuic packet: bad command {}", msg[1])));
+        return Err(Error::protocol(format!(
+            "tuic packet: bad command {}",
+            msg[1]
+        )));
     }
     let session_id = u16::from_be_bytes([msg[2], msg[3]]);
     let packet_id = u16::from_be_bytes([msg[4], msg[5]]);
@@ -393,15 +404,17 @@ fn packet_header_size(target: &NetAddr) -> usize {
 /// Split one payload into Packet frames fitting [`UDP_MTU`],
 /// mirroring upstream `fragUDPMessage`: uniform chunks sized by the
 /// first fragment's header, later fragments carry the empty address.
-fn fragment_packet(
-    session_id: u16,
-    packet_id: u16,
-    target: &NetAddr,
-    data: &[u8],
-) -> Vec<Vec<u8>> {
+fn fragment_packet(session_id: u16, packet_id: u16, target: &NetAddr, data: &[u8]) -> Vec<Vec<u8>> {
     let budget = UDP_MTU.saturating_sub(packet_header_size(target));
     if data.len() <= budget || budget == 0 {
-        return vec![encode_packet_frame(session_id, packet_id, 0, 1, Some(target), data)];
+        return vec![encode_packet_frame(
+            session_id,
+            packet_id,
+            0,
+            1,
+            Some(target),
+            data,
+        )];
     }
     let mut fragments = Vec::new();
     let mut off = 0usize;
@@ -430,10 +443,7 @@ mod tests {
     fn addr_roundtrip_all_families() {
         let targets = [
             NetAddr::domain("example.com", 443).unwrap(),
-            NetAddr::new(
-                Host::Ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
-                8080,
-            ),
+            NetAddr::new(Host::Ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))), 8080),
             NetAddr::new(Host::Ip(IpAddr::V6("2001:db8::1".parse().unwrap())), 53),
         ];
         for t in targets {
@@ -454,18 +464,24 @@ mod tests {
     #[test]
     fn addr_known_bytes() {
         let mut buf = Vec::new();
-        encode_addr_port(&mut buf, Some(&NetAddr::domain("example.com", 443).unwrap()));
+        encode_addr_port(
+            &mut buf,
+            Some(&NetAddr::domain("example.com", 443).unwrap()),
+        );
         assert_eq!(
             buf,
             vec![
-                0x00, 11, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o', b'm',
-                0x01, 0xbb
+                0x00, 11, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o', b'm', 0x01,
+                0xbb
             ]
         );
         let mut buf = Vec::new();
         encode_addr_port(
             &mut buf,
-            Some(&NetAddr::new(Host::Ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))), 80)),
+            Some(&NetAddr::new(
+                Host::Ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+                80,
+            )),
         );
         assert_eq!(buf, vec![0x01, 127, 0, 0, 1, 0x00, 0x50]);
         // Truncated and invalid forms are rejected.
@@ -507,7 +523,10 @@ mod tests {
         let target = NetAddr::domain("example.com", 53).unwrap();
         let frame = encode_packet_frame(9, 513, 0, 1, Some(&target), b"query");
         let f = decode_packet_frame(&frame).unwrap();
-        assert_eq!((f.session_id, f.packet_id, f.frag_id, f.frag_total), (9, 513, 0, 1));
+        assert_eq!(
+            (f.session_id, f.packet_id, f.frag_id, f.frag_total),
+            (9, 513, 0, 1)
+        );
         assert_eq!(f.addr.as_ref(), Some(&target));
         assert_eq!(f.data, b"query");
         // Header layout: ver, cmd, sid u16be, pid u16be, total, id, len
@@ -559,7 +578,10 @@ mod tests {
         let one = fragment_packet(3, 78, &target, b"tiny");
         assert_eq!(one.len(), 1);
         let f = decode_packet_frame(&one[0]).unwrap();
-        assert_eq!((f.frag_id, f.frag_total, f.addr.as_ref(), f.data), (0, 1, Some(&target), &b"tiny"[..]));
+        assert_eq!(
+            (f.frag_id, f.frag_total, f.addr.as_ref(), f.data),
+            (0, 1, Some(&target), &b"tiny"[..])
+        );
     }
 
     // ---------------------------------------------------- ECH over QUIC

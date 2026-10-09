@@ -131,9 +131,7 @@ impl DiscoPrivateKey {
 
     /// `DiscoPrivate.Public` (disco.go:67-74).
     pub fn public(&self) -> DiscoPublicKey {
-        DiscoPublicKey(
-            curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(self.0).0,
-        )
+        DiscoPublicKey(curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(self.0).0)
     }
 
     pub(crate) fn secret(&self) -> &[u8; 32] {
@@ -208,11 +206,7 @@ fn open_shared(shared: &[u8; 32], sealed: &[u8]) -> Option<Vec<u8>> {
 
 /// Build a full disco wrapper to `peer`: the framing `sendDiscoMessage`
 /// assembles (magicsock.go:1991-2001) — `Magic || our pub || box`.
-pub fn seal(
-    sk: &DiscoPrivateKey,
-    peer: &DiscoPublicKey,
-    msg: &DiscoMessage,
-) -> Result<Vec<u8>> {
+pub fn seal(sk: &DiscoPrivateKey, peer: &DiscoPublicKey, msg: &DiscoMessage) -> Result<Vec<u8>> {
     let shared = shared(sk, peer)?;
     let mut out = Vec::with_capacity(DISCO_HEADER_LEN + NONCE_LEN + 16 + 64);
     out.extend_from_slice(&MAGIC);
@@ -225,12 +219,8 @@ pub fn seal(
 /// `handleDiscoMessage` (magicsock.go:2164-2253) — read the sender off
 /// the header, precompute against it, open the box, parse the payload.
 /// The MAC check IS the authentication (there is no second signature).
-pub fn open(
-    sk: &DiscoPrivateKey,
-    wrapper: &[u8],
-) -> Result<(DiscoPublicKey, DiscoMessage)> {
-    let sender =
-        source(wrapper).ok_or_else(|| Error::protocol("disco: not a disco wrapper"))?;
+pub fn open(sk: &DiscoPrivateKey, wrapper: &[u8]) -> Result<(DiscoPublicKey, DiscoMessage)> {
+    let sender = source(wrapper).ok_or_else(|| Error::protocol("disco: not a disco wrapper"))?;
     let shared = shared(sk, &DiscoPublicKey::from_bytes(sender))?;
     let payload = open_shared(&shared, &wrapper[DISCO_HEADER_LEN..])
         .ok_or_else(|| Error::protocol("disco: nacl box authentication failed"))?;
@@ -331,9 +321,7 @@ impl DiscoMessage {
     pub fn marshal(&self) -> Vec<u8> {
         let mut out = match self {
             // PingLen sizes the no-padding ping (disco.go:152).
-            DiscoMessage::Ping(p) => {
-                Vec::with_capacity(MESSAGE_HEADER_LEN + PING_LEN + p.padding)
-            }
+            DiscoMessage::Ping(p) => Vec::with_capacity(MESSAGE_HEADER_LEN + PING_LEN + p.padding),
             DiscoMessage::Pong(_) => Vec::with_capacity(MESSAGE_HEADER_LEN + PONG_LEN),
             DiscoMessage::CallMeMaybe(m) => {
                 Vec::with_capacity(MESSAGE_HEADER_LEN + m.my_number.len() * EP_LENGTH)
@@ -424,10 +412,7 @@ pub fn parse(payload: &[u8]) -> Result<DiscoMessage> {
             }
             let mut pong = Pong {
                 txid: [0u8; 12],
-                src: SocketAddr::new(
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                    0,
-                ),
+                src: SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
             };
             pong.txid.copy_from_slice(&p[..12]);
             pong.src = read_ep(&p[12..]).ok_or_else(|| Error::protocol("disco: bad pong src"))?;
@@ -600,7 +585,10 @@ mod tests {
         let wrapper = seal(&alice, &bob.public(), &msg).unwrap();
         assert!(looks_like_disco(&wrapper));
         assert_eq!(source(&wrapper), Some(*alice.public().as_bytes()));
-        assert_eq!(wrapper.len(), DISCO_HEADER_LEN + NONCE_LEN + msg.marshal().len() + 16);
+        assert_eq!(
+            wrapper.len(),
+            DISCO_HEADER_LEN + NONCE_LEN + msg.marshal().len() + 16
+        );
 
         // Bob opens it and sees Alice as the sender.
         let (sender, got) = open(&bob, &wrapper).unwrap();
@@ -627,8 +615,7 @@ mod tests {
         assert!(open(&bob, &tampered).is_err());
         let mut garbage = vec![0u8; DISCO_HEADER_LEN + NONCE_LEN + 16];
         garbage[..MAGIC.len()].copy_from_slice(&MAGIC);
-        garbage[MAGIC.len()..DISCO_HEADER_LEN]
-            .copy_from_slice(alice.public().as_bytes());
+        garbage[MAGIC.len()..DISCO_HEADER_LEN].copy_from_slice(alice.public().as_bytes());
         assert!(open(&bob, &garbage).is_err());
         // Wrong-key plaintext is not parseable even if the box somehow
         // were (the parse layer refuses nonsense payloads).

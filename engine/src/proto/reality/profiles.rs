@@ -116,7 +116,7 @@ impl UtslProfile {
                 EXT_SUPPORTED_VERSIONS,
                 EXT_COMPRESS_CERTIFICATE,
                 EXT_APPLICATION_SETTINGS,
-                GREASE, // second GREASE (1-byte body), pinned second-to-last
+                GREASE,      // second GREASE (1-byte body), pinned second-to-last
                 EXT_PADDING, // BoringSSL padding, pinned last
             ],
             UtslProfile::Firefox => &[
@@ -141,8 +141,7 @@ impl UtslProfile {
     pub fn cipher_suites(self) -> &'static [u16] {
         match self {
             UtslProfile::Chrome => &[
-                GREASE,
-                0x1301, // TLS_AES_128_GCM_SHA256
+                GREASE, 0x1301, // TLS_AES_128_GCM_SHA256
                 0x1302, // TLS_AES_256_GCM_SHA384
                 0x1303, // TLS_CHACHA20_POLY1305_SHA256
                 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc013, 0xc014, 0x009c, 0x009d,
@@ -154,6 +153,26 @@ impl UtslProfile {
             ],
         }
     }
+}
+
+/// Whether `name` is one of mihomo's `client-fingerprint` browser
+/// spellings (component/ca fingerprint.go's rejection list — the names a
+/// confused `fingerprint:` pin produces). Single source for the config
+/// dialects' pointer-to-client-fingerprint error.
+pub fn is_client_fingerprint_name(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "chrome"
+            | "firefox"
+            | "safari"
+            | "ios"
+            | "android"
+            | "edge"
+            | "360"
+            | "qq"
+            | "random"
+            | "randomized"
+    )
 }
 
 /// The GREASE values of one ClientHello, one per slot.
@@ -237,7 +256,16 @@ pub fn build_client_hello_alpn(
     key_share_public: &[u8; 32],
     alpn: Option<&[String]>,
 ) -> Vec<u8> {
-    build_client_hello_opts(profile, sni, random, session_id, key_share_public, alpn, None, true)
+    build_client_hello_opts(
+        profile,
+        sni,
+        random,
+        session_id,
+        key_share_public,
+        alpn,
+        None,
+        true,
+    )
 }
 
 /// The full builder every wrapper above funnels into.
@@ -290,12 +318,21 @@ pub fn build_client_hello_opts(
             exts.push((false, ext(EXT_EC_POINT_FORMATS, &[0x01, 0x00])));
             exts.push((false, ext(EXT_SESSION_TICKET, &[])));
             exts.push((false, alpn_extension(EXT_ALPN, alpn)));
-            exts.push((false, ext(EXT_STATUS_REQUEST, &[0x01, 0x00, 0x00, 0x00, 0x00])));
-            exts.push((false, signature_algorithms_extension(&[
-                0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
-            ])));
+            exts.push((
+                false,
+                ext(EXT_STATUS_REQUEST, &[0x01, 0x00, 0x00, 0x00, 0x00]),
+            ));
+            exts.push((
+                false,
+                signature_algorithms_extension(&[
+                    0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
+                ]),
+            ));
             exts.push((false, ext(EXT_SIGNED_CERT_TIMESTAMP, &[])));
-            exts.push((false, key_share_extension(key_share_public, grease.group, true)));
+            exts.push((
+                false,
+                key_share_extension(key_share_public, grease.group, true),
+            ));
             exts.push((false, ext(EXT_PSK_KEY_EXCHANGE_MODES, &[0x01, 0x01])));
             exts.push((
                 false,
@@ -307,7 +344,10 @@ pub fn build_client_hello_opts(
             // a count-of-1 body makes strict parsers reject the hello.
             exts.push((false, ext(EXT_COMPRESS_CERTIFICATE, &[0x02, 0x00, 0x02])));
             if alps {
-                exts.push((false, alpn_extension(EXT_APPLICATION_SETTINGS, &["h2".to_string()])));
+                exts.push((
+                    false,
+                    alpn_extension(EXT_APPLICATION_SETTINGS, &["h2".to_string()]),
+                ));
             }
             exts.push((true, grease_extension(grease.extension2, &[0x00])));
             shuffle_chrome_extensions(&mut exts, &structure_seed);
@@ -330,16 +370,22 @@ pub fn build_client_hello_opts(
             exts.push((true, ext(EXT_EC_POINT_FORMATS, &[0x01, 0x00])));
             exts.push((true, ext(EXT_SESSION_TICKET, &[])));
             exts.push((true, alpn_extension(EXT_ALPN, alpn)));
-            exts.push((true, ext(EXT_STATUS_REQUEST, &[0x01, 0x00, 0x00, 0x00, 0x00])));
+            exts.push((
+                true,
+                ext(EXT_STATUS_REQUEST, &[0x01, 0x00, 0x00, 0x00, 0x00]),
+            ));
             exts.push((true, key_share_extension(key_share_public, 0, false)));
             exts.push((
                 true,
                 supported_versions_extension(&[VERSION_TLS13, VERSION_TLS12]),
             ));
-            exts.push((true, signature_algorithms_extension(&[
-                0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203,
-                0x0201,
-            ])));
+            exts.push((
+                true,
+                signature_algorithms_extension(&[
+                    0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203,
+                    0x0201,
+                ]),
+            ));
             exts.push((true, ext(EXT_PSK_KEY_EXCHANGE_MODES, &[0x01, 0x01])));
             // `FakeRecordSizeLimitExtension{Limit: 0x4001}`.
             exts.push((true, ext(EXT_RECORD_SIZE_LIMIT, &[0x40, 0x01])));
@@ -580,8 +626,7 @@ mod tests {
         while off < end {
             let typ = u16_at(b, off);
             let len = u16_at(b, off + 2) as usize;
-            p.extensions
-                .push((typ, b[off + 4..off + 4 + len].to_vec()));
+            p.extensions.push((typ, b[off + 4..off + 4 + len].to_vec()));
             off += 4 + len;
         }
         p
@@ -648,8 +693,14 @@ mod tests {
         assert_eq!(types.len(), 18);
         assert_eq!(types[0], g.extension1, "first extension is GREASE");
         assert_eq!(types[17], EXT_PADDING, "padding is pinned last");
-        assert_eq!(types[16], g.extension2, "second GREASE is pinned second-to-last");
-        assert_ne!(g.extension1, g.extension2, "two extensions may not share an id");
+        assert_eq!(
+            types[16], g.extension2,
+            "second GREASE is pinned second-to-last"
+        );
+        assert_ne!(
+            g.extension1, g.extension2,
+            "two extensions may not share an id"
+        );
 
         // Everything in between is the template set, only reordered.
         let mut got = types[1..16].to_vec();
@@ -664,15 +715,29 @@ mod tests {
 
         // supported_groups / key_share lead with GREASE.
         let (gb, gs) = ((g.group >> 8) as u8, (g.group & 0xff) as u8);
-        let curves = &p.extensions.iter().find(|(t, _)| *t == EXT_SUPPORTED_GROUPS).unwrap().1;
+        let curves = &p
+            .extensions
+            .iter()
+            .find(|(t, _)| *t == EXT_SUPPORTED_GROUPS)
+            .unwrap()
+            .1;
         assert_eq!(
             curves,
             &[0x00, 0x08, gb, gs, 0x00, 0x1d, 0x00, 0x17, 0x00, 0x18][..]
         );
-        let ks = &p.extensions.iter().find(|(t, _)| *t == EXT_KEY_SHARE).unwrap().1;
+        let ks = &p
+            .extensions
+            .iter()
+            .find(|(t, _)| *t == EXT_KEY_SHARE)
+            .unwrap()
+            .1;
         assert_eq!(u16_at(ks, 0) as usize, ks.len() - 2);
         let mut koff = 2;
-        assert_eq!(u16_at(ks, koff), g.group, "key share agrees with supported_groups");
+        assert_eq!(
+            u16_at(ks, koff),
+            g.group,
+            "key share agrees with supported_groups"
+        );
         assert_eq!(u16_at(ks, koff + 2), 1);
         assert_eq!(ks[koff + 4], 0x00);
         koff += 5;
@@ -681,33 +746,64 @@ mod tests {
         assert_eq!(&ks[koff + 4..koff + 36], &key[..]);
 
         // supported_versions = [GREASE, 1.3, 1.2]
-        let sv = &p.extensions.iter().find(|(t, _)| *t == EXT_SUPPORTED_VERSIONS).unwrap().1;
+        let sv = &p
+            .extensions
+            .iter()
+            .find(|(t, _)| *t == EXT_SUPPORTED_VERSIONS)
+            .unwrap()
+            .1;
         assert_eq!(sv[0] as usize, sv.len() - 1);
         assert_eq!(u16_at(sv, 1), g.version);
         assert_eq!(u16_at(sv, 3), VERSION_TLS13);
         assert_eq!(u16_at(sv, 5), VERSION_TLS12);
 
         // signature_algorithms: Chrome's exact list (no Ed25519).
-        let sa = &p.extensions.iter().find(|(t, _)| *t == EXT_SIGNATURE_ALGORITHMS).unwrap().1;
+        let sa = &p
+            .extensions
+            .iter()
+            .find(|(t, _)| *t == EXT_SIGNATURE_ALGORITHMS)
+            .unwrap()
+            .1;
         assert_eq!(
             &sa[2..],
-            &[0x04, 0x03, 0x08, 0x04, 0x04, 0x01, 0x05, 0x03, 0x08, 0x05, 0x05, 0x01, 0x08, 0x06, 0x06, 0x01]
+            &[
+                0x04, 0x03, 0x08, 0x04, 0x04, 0x01, 0x05, 0x03, 0x08, 0x05, 0x05, 0x01, 0x08, 0x06,
+                0x06, 0x01
+            ]
         );
 
         // ALPN body: h2 + http/1.1.
         let alpn = &p.extensions.iter().find(|(t, _)| *t == EXT_ALPN).unwrap().1;
-        assert_eq!(alpn, &[0x00, 0x0c, 0x02, b'h', b'2', 0x08, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1'][..]);
+        assert_eq!(
+            alpn,
+            &[0x00, 0x0c, 0x02, b'h', b'2', 0x08, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1'][..]
+        );
         // ALPS body: h2 only.
-        let alps = &p.extensions.iter().find(|(t, _)| *t == EXT_APPLICATION_SETTINGS).unwrap().1;
+        let alps = &p
+            .extensions
+            .iter()
+            .find(|(t, _)| *t == EXT_APPLICATION_SETTINGS)
+            .unwrap()
+            .1;
         assert_eq!(alps, &[0x00, 0x03, 0x02, b'h', b'2'][..]);
         // SNI: server_name_list length, name_type, name length, then the host.
-        let sni = &p.extensions.iter().find(|(t, _)| *t == EXT_SERVER_NAME).unwrap().1;
+        let sni = &p
+            .extensions
+            .iter()
+            .find(|(t, _)| *t == EXT_SERVER_NAME)
+            .unwrap()
+            .1;
         assert_eq!(&sni[..2], &[0x00, 0x12]);
         assert_eq!(sni[2], 0x00);
         assert_eq!(&sni[3..5], &[0x00, 0x0f]);
         assert_eq!(&sni[5..], b"www.example.com");
         // compress_certificate: brotli.
-        let cc = &p.extensions.iter().find(|(t, _)| *t == EXT_COMPRESS_CERTIFICATE).unwrap().1;
+        let cc = &p
+            .extensions
+            .iter()
+            .find(|(t, _)| *t == EXT_COMPRESS_CERTIFICATE)
+            .unwrap()
+            .1;
         assert_eq!(cc, &[0x02, 0x00, 0x02], "brotli, byte-counted list");
     }
 
@@ -759,7 +855,10 @@ mod tests {
         sa.sort_unstable();
         sc.sort_unstable();
         assert_eq!(sa, sc, "same extension set (GREASE normalized)");
-        assert_ne!(grease_values(&random).extension1, grease_values(&other).extension1);
+        assert_ne!(
+            grease_values(&random).extension1,
+            grease_values(&other).extension1
+        );
         assert_eq!(
             exts_c[0].0,
             grease_values(&other).extension1,
@@ -771,7 +870,8 @@ mod tests {
     #[test]
     fn firefox_shape_has_no_grease_and_the_parrot_order() {
         let (random, sid, key) = fixed();
-        let hello = build_client_hello(UtslProfile::Firefox, "www.example.com", &random, &sid, &key);
+        let hello =
+            build_client_hello(UtslProfile::Firefox, "www.example.com", &random, &sid, &key);
         let p = parse(&hello);
         assert_eq!(p.legacy_version, VERSION_TLS12);
         assert_eq!(p.session_id.len(), 32);
@@ -779,20 +879,37 @@ mod tests {
         let types: Vec<u16> = p.extensions.iter().map(|(t, _)| *t).collect();
         assert_eq!(types, UtslProfile::Firefox.extension_template().to_vec());
         assert!(
-            !types.iter().any(|t| *t >> 8 == *t & 0xff && *t & 0x0f == 0x0a),
+            !types
+                .iter()
+                .any(|t| *t >> 8 == *t & 0xff && *t & 0x0f == 0x0a),
             "Firefox does not GREASE"
         );
         // X25519-only key share.
-        let ks = &p.extensions.iter().find(|(t, _)| *t == EXT_KEY_SHARE).unwrap().1;
+        let ks = &p
+            .extensions
+            .iter()
+            .find(|(t, _)| *t == EXT_KEY_SHARE)
+            .unwrap()
+            .1;
         assert_eq!(u16_at(ks, 2), GROUP_X25519);
         assert_eq!(u16_at(ks, 4), 32);
         assert_eq!(ks.len(), 2 + 4 + 32, "no second share");
         // delegated_credentials and encrypted_client_hello are not offered.
         assert!(!types.contains(&0x0022));
         assert!(!types.contains(&0xfe0d));
-        let rsl = &p.extensions.iter().find(|(t, _)| *t == EXT_RECORD_SIZE_LIMIT).unwrap().1;
+        let rsl = &p
+            .extensions
+            .iter()
+            .find(|(t, _)| *t == EXT_RECORD_SIZE_LIMIT)
+            .unwrap()
+            .1;
         assert_eq!(rsl, &[0x40, 0x01]);
-        let sv = &p.extensions.iter().find(|(t, _)| *t == EXT_SUPPORTED_VERSIONS).unwrap().1;
+        let sv = &p
+            .extensions
+            .iter()
+            .find(|(t, _)| *t == EXT_SUPPORTED_VERSIONS)
+            .unwrap()
+            .1;
         assert_eq!(sv, &[0x04, 0x03, 0x04, 0x03, 0x03]);
     }
 
@@ -855,7 +972,14 @@ mod tests {
         fake[31] = 0x01;
         for profile in [UtslProfile::Chrome, UtslProfile::Firefox] {
             let pass1 = build_client_hello_opts(
-                profile, "www.example.com", &random, &sid, &key, None, None, true,
+                profile,
+                "www.example.com",
+                &random,
+                &sid,
+                &key,
+                None,
+                None,
+                true,
             );
             let pass2 = build_client_hello_opts(
                 profile,
@@ -911,7 +1035,14 @@ mod tests {
                 None,
                 true,
             ),
-            build_client_hello_alpn(UtslProfile::Chrome, "x.test", &random, &sid, &key, Some(&http1))
+            build_client_hello_alpn(
+                UtslProfile::Chrome,
+                "x.test",
+                &random,
+                &sid,
+                &key,
+                Some(&http1)
+            )
         );
     }
 }

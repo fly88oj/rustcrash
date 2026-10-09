@@ -75,12 +75,25 @@ pub enum OutboundKind {
         port: u16,
         username: Option<String>,
         password: Option<String>,
+        /// TLS over the proxy connection (mihomo `tls: true` on http /
+        /// sing-box `tls: {enabled}`).
+        tls: TlsSettings,
+        /// Request-target path override (sing-box `path`, HTTP/1 only —
+        /// rides CONNECT's request line).
+        path: Option<String>,
+        /// Extra request headers (mihomo/sing-box `headers`).
+        headers: Vec<(String, String)>,
+        /// sing-box requires CONNECT status 200 exactly; mihomo's
+        /// net/http client accepts any 2xx — dialect flag.
+        strict_200: bool,
     },
     Socks {
         server: String,
         port: u16,
         username: Option<String>,
         password: Option<String>,
+        /// TLS over the proxy connection (mihomo `tls: true` on socks5).
+        tls: TlsSettings,
     },
     Shadowsocks {
         server: String,
@@ -217,7 +230,8 @@ struct QuicConnCache(tokio::sync::Mutex<Option<std::sync::Arc<quinn::Connection>
 #[derive(Default)]
 struct W7Clients {
     shadowquic: tokio::sync::Mutex<Option<std::sync::Arc<crate::proto::shadowquic::Client>>>,
-    trusttunnel: tokio::sync::Mutex<Option<std::sync::Arc<crate::proto::trusttunnel::TrustTunnelPool>>>,
+    trusttunnel:
+        tokio::sync::Mutex<Option<std::sync::Arc<crate::proto::trusttunnel::TrustTunnelPool>>>,
     masque: tokio::sync::Mutex<Option<std::sync::Arc<crate::proto::masque::MasqueClient>>>,
     /// pools: snell conn pool (reuse-capable versions), anytls
     /// session pool, mieru mux.
@@ -321,7 +335,8 @@ impl Outbound {
         if let Some(p) = slot.as_ref() {
             return Ok(p.clone());
         }
-        let p = std::sync::Arc::new(crate::proto::trusttunnel::TrustTunnelPool::new(cfg, None).await?);
+        let p =
+            std::sync::Arc::new(crate::proto::trusttunnel::TrustTunnelPool::new(cfg, None).await?);
         *slot = Some(p.clone());
         Ok(p)
     }
@@ -335,9 +350,8 @@ impl Outbound {
         if let Some(c) = slot.as_ref() {
             return Ok(c.clone());
         }
-        let c = std::sync::Arc::new(
-            crate::proto::masque::MasqueClient::connect(cfg.clone()).await?,
-        );
+        let c =
+            std::sync::Arc::new(crate::proto::masque::MasqueClient::connect(cfg.clone()).await?);
         *slot = Some(c.clone());
         Ok(c)
     }
@@ -377,9 +391,7 @@ impl Outbound {
         if let Some(p) = slot.as_ref() {
             return Ok(p.clone());
         }
-        let p = std::sync::Arc::new(crate::proto::anytls::AnyTlsSessionPool::new(
-            cfg.clone(),
-        )?);
+        let p = std::sync::Arc::new(crate::proto::anytls::AnyTlsSessionPool::new(cfg.clone())?);
         *slot = Some(p.clone());
         Ok(p)
     }
@@ -394,10 +406,7 @@ impl Outbound {
         if let Some(m) = slot.as_ref() {
             return Ok(m.clone());
         }
-        let m = std::sync::Arc::new(crate::proto::mieru::MieruMux::new(
-            cfg,
-            cfg.multiplexing,
-        )?);
+        let m = std::sync::Arc::new(crate::proto::mieru::MieruMux::new(cfg, cfg.multiplexing)?);
         *slot = Some(m.clone());
         Ok(m)
     }
@@ -442,9 +451,7 @@ impl Outbound {
         } else {
             base64::engine::general_purpose::STANDARD
                 .decode(opts.config.as_bytes())
-                .map_err(|e| {
-                    Error::config(format!("ech-opts.config is not valid base64: {e}"))
-                })?
+                .map_err(|e| Error::config(format!("ech-opts.config is not valid base64: {e}")))?
         };
         let selection = crate::proto::ech::select_ech_config(&list)?;
         let inner_name = effective_sni(tls, server, None);
@@ -459,22 +466,16 @@ impl Outbound {
             server_name: inner_name,
         };
         let dial_server = server.to_string();
-        let stream = crate::proto::reality::tls13::connect_ech(
-            &ech_cfg,
-            &auth,
-            move || {
-                let server = dial_server.clone();
-                Box::pin(async move {
-                    let tcp = crate::mark::tcp_connect(server.as_str(), port)
-                        .await
-                        .map_err(|e| {
-                            Error::network(format!("dial {server}:{port}: {e}"))
-                        })?;
-                    let _ = tcp.set_nodelay(true);
-                    Ok(Box::new(tcp) as BoxProxyStream)
-                })
-            },
-        )
+        let stream = crate::proto::reality::tls13::connect_ech(&ech_cfg, &auth, move || {
+            let server = dial_server.clone();
+            Box::pin(async move {
+                let tcp = crate::mark::tcp_connect(server.as_str(), port)
+                    .await
+                    .map_err(|e| Error::network(format!("dial {server}:{port}: {e}")))?;
+                let _ = tcp.set_nodelay(true);
+                Ok(Box::new(tcp) as BoxProxyStream)
+            })
+        })
         .await?;
         Ok(Box::new(stream))
     }
@@ -580,9 +581,8 @@ impl Outbound {
             let sni = effective_sni(&tls, server, None);
             stream = tls_connect(stream, &sni, &tls).await?;
         }
-        let host_header = |host: &Option<String>| {
-            host.clone().unwrap_or_else(|| format!("{server}:{port}"))
-        };
+        let host_header =
+            |host: &Option<String>| host.clone().unwrap_or_else(|| format!("{server}:{port}"));
         if let TransportKind::Ws { path, host } = transport {
             let settings = WsSettings {
                 path: path.clone(),
@@ -594,11 +594,7 @@ impl Outbound {
             stream =
                 crate::transport::httpupgrade_connect(stream, path, &host_header(host)).await?;
         }
-        if let TransportKind::Grpc {
-            service_name,
-            host,
-        } = transport
-        {
+        if let TransportKind::Grpc { service_name, host } = transport {
             let settings = crate::grpc::GrpcSettings {
                 service_name: service_name.clone(),
                 host: host.clone(),
@@ -609,44 +605,44 @@ impl Outbound {
     }
 
     /// Compose the vless front end: REALITY or a uTLS fingerprint replaces
-/// the rustls handshake; the resulting stream goes straight into the
-/// vless protocol (both are raw-TCP shapes, so ws/grpc underneath are
-/// refused loudly rather than silently mis-layered).
-async fn vless_front(
-    server: &str,
-    port: u16,
-    transport: &TransportKind,
-    tls: &TlsSettings,
-    reality: &Option<crate::proto::reality::RealityCfg>,
-    fingerprint: &Option<crate::proto::reality::UtslProfile>,
-) -> Result<BoxProxyStream> {
-    if reality.is_none() && fingerprint.is_none() {
-        return Self::dial_transport(server, port, transport, tls).await;
-    }
-    if !matches!(transport, TransportKind::Tcp) {
-        return Err(Error::config(
-            "reality / client-fingerprint cannot be combined with a layered transport \
+    /// the rustls handshake; the resulting stream goes straight into the
+    /// vless protocol (both are raw-TCP shapes, so ws/grpc underneath are
+    /// refused loudly rather than silently mis-layered).
+    async fn vless_front(
+        server: &str,
+        port: u16,
+        transport: &TransportKind,
+        tls: &TlsSettings,
+        reality: &Option<crate::proto::reality::RealityCfg>,
+        fingerprint: &Option<crate::proto::reality::UtslProfile>,
+    ) -> Result<BoxProxyStream> {
+        if reality.is_none() && fingerprint.is_none() {
+            return Self::dial_transport(server, port, transport, tls).await;
+        }
+        if !matches!(transport, TransportKind::Tcp) {
+            return Err(Error::config(
+                "reality / client-fingerprint cannot be combined with a layered transport \
              (ws/httpupgrade/grpc) yet",
-        ));
+            ));
+        }
+        let tcp = crate::mark::tcp_connect(server, port)
+            .await
+            .map_err(|e| Error::network(format!("dial {server}:{port}: {e}")))?;
+        let _ = tcp.set_nodelay(true);
+        let tcp: BoxProxyStream = Box::new(tcp);
+        if let Some(cfg) = reality {
+            return crate::proto::reality::reality_connect(cfg, tcp).await;
+        }
+        let profile = fingerprint.expect("fingerprint checked above");
+        let utls = crate::proto::reality::UtlsCfg {
+            server_name: effective_sni(tls, server, None),
+            profile,
+            alpn: vec!["h2".to_string(), "http/1.1".to_string()],
+        };
+        crate::proto::reality::utls_connect(&utls, tcp).await
     }
-    let tcp = crate::mark::tcp_connect(server, port)
-        .await
-        .map_err(|e| Error::network(format!("dial {server}:{port}: {e}")))?;
-    let _ = tcp.set_nodelay(true);
-    let tcp: BoxProxyStream = Box::new(tcp);
-    if let Some(cfg) = reality {
-        return crate::proto::reality::reality_connect(cfg, tcp).await;
-    }
-    let profile = fingerprint.expect("fingerprint checked above");
-    let utls = crate::proto::reality::UtlsCfg {
-        server_name: effective_sni(tls, server, None),
-        profile,
-        alpn: vec!["h2".to_string(), "http/1.1".to_string()],
-    };
-    crate::proto::reality::utls_connect(&utls, tcp).await
-}
 
-/// Run an inner leaf protocol's handshake over an already-wrapped
+    /// Run an inner leaf protocol's handshake over an already-wrapped
     /// stream (shadowtls nesting). The inner outbound never dials.
     async fn shadowtls_inner(
         inner: &OutboundKind,
@@ -675,9 +671,7 @@ async fn vless_front(
                 let s = TrojanStream::handshake(stream, &cfg, target, false).await?;
                 Ok(Box::new(s))
             }
-            OutboundKind::Vmess {
-                uuid, security, ..
-            } => {
+            OutboundKind::Vmess { uuid, security, .. } => {
                 let cfg = VmessOut {
                     server: String::new(),
                     port: 0,
@@ -714,9 +708,7 @@ async fn vless_front(
                 // The OS resolver stays only for engines with no DNS
                 // configured (dns.enable: false).
                 let dial_addr = match &target.host {
-                    crate::addr::Host::Ip(ip) => {
-                        Some(std::net::SocketAddr::new(*ip, target.port))
-                    }
+                    crate::addr::Host::Ip(ip) => Some(std::net::SocketAddr::new(*ip, target.port)),
                     crate::addr::Host::Domain(d) => self
                         .resolve_via_engine(d)
                         .await
@@ -744,15 +736,22 @@ async fn vless_front(
                 port,
                 username,
                 password,
+                tls,
+                path,
+                headers,
+                strict_200,
             } => {
                 let cfg = HttpOut {
                     server: server.clone(),
                     port: *port,
                     username: username.clone(),
                     password: password.clone(),
+                    path: path.clone(),
+                    headers: headers.clone(),
+                    strict_200: *strict_200,
                 };
-                let tcp = Self::dial_transport(server, *port, &TransportKind::Tcp, &TlsSettings::default())
-                    .await?;
+                // dial_transport layers TLS itself when tls.enabled.
+                let tcp = Self::dial_transport(server, *port, &TransportKind::Tcp, tls).await?;
                 let s = HttpStream::handshake(tcp, &cfg, target).await?;
                 Ok(Box::new(s))
             }
@@ -761,6 +760,7 @@ async fn vless_front(
                 port,
                 username,
                 password,
+                tls,
             } => {
                 let cfg = SocksOut {
                     server: server.clone(),
@@ -768,8 +768,8 @@ async fn vless_front(
                     username: username.clone(),
                     password: password.clone(),
                 };
-                let tcp = Self::dial_transport(server, *port, &TransportKind::Tcp, &TlsSettings::default())
-                    .await?;
+                // dial_transport layers TLS itself when tls.enabled.
+                let tcp = Self::dial_transport(server, *port, &TransportKind::Tcp, tls).await?;
                 let s = SocksStream::handshake(tcp, &cfg, target).await?;
                 Ok(Box::new(s))
             }
@@ -790,11 +790,16 @@ async fn vless_front(
                 let mut tcp = match plugin {
                     // SIP003: the ss stream rides the plugin child's
                     // local listener instead of a direct dial.
-                    Some(plg) => {
-                        Box::new(plg.connect(server, *port).await?) as BoxProxyStream
+                    Some(plg) => Box::new(plg.connect(server, *port).await?) as BoxProxyStream,
+                    None => {
+                        Self::dial_transport(
+                            server,
+                            *port,
+                            &TransportKind::Tcp,
+                            &TlsSettings::default(),
+                        )
+                        .await?
                     }
-                    None => Self::dial_transport(server, *port, &TransportKind::Tcp, &TlsSettings::default())
-                        .await?,
                 };
                 // simple-obfs wraps the RAW stream, below the cipher
                 // (mihomo: obfs(conn) then StreamConn).
@@ -864,15 +869,11 @@ async fn vless_front(
                     // (REALITY over raw TCP — no layered transport), hand
                     // the unboxed stream to VisionConn so a server direct
                     // command rebinds the raw transport (Xray direct copy).
-                    if reality.is_some()
-                        && matches!(transport, TransportKind::Tcp)
-                        && jls.is_none()
+                    if reality.is_some() && matches!(transport, TransportKind::Tcp) && jls.is_none()
                     {
                         let raw = crate::mark::tcp_connect(server, *port)
                             .await
-                            .map_err(|e| {
-                                Error::network(format!("dial {server}:{port}: {e}"))
-                            })?;
+                            .map_err(|e| Error::network(format!("dial {server}:{port}: {e}")))?;
                         let _ = raw.set_nodelay(true);
                         let rs = crate::proto::reality::reality_connect_stream(
                             reality.as_ref().expect("checked above"),
@@ -907,9 +908,7 @@ async fn vless_front(
                         // JLS + vision: cover the handshake, then frame.
                         let tcp = crate::mark::tcp_connect(server, *port)
                             .await
-                            .map_err(|e| {
-                                Error::network(format!("dial {server}:{port}: {e}"))
-                            })?;
+                            .map_err(|e| Error::network(format!("dial {server}:{port}: {e}")))?;
                         let _ = tcp.set_nodelay(true);
                         let out = crate::proto::jls::JlsOut {
                             username: user.username.clone(),
@@ -948,8 +947,7 @@ async fn vless_front(
                 let stream = if jls.is_some() || ech_enable(ech) {
                     Self::tls_or_jls(server, *port, tls, jls, ech).await?
                 } else {
-                    Self::vless_front(server, *port, transport, tls, reality, fingerprint)
-                        .await?
+                    Self::vless_front(server, *port, transport, tls, reality, fingerprint).await?
                 };
                 let s = VlessStream::handshake(stream, &cfg, target, false).await?;
                 Ok(Box::new(s))
@@ -1028,10 +1026,8 @@ async fn vless_front(
                 };
                 let conn = if let Some(opts) = ech.as_ref().filter(|o| o.enable) {
                     let opts = opts.clone();
-                    self.quic_conn(|| async {
-                        crate::proto::tuic::connect_ech(&cfg, &opts).await
-                    })
-                    .await?
+                    self.quic_conn(|| async { crate::proto::tuic::connect_ech(&cfg, &opts).await })
+                        .await?
                 } else {
                     self.quic_conn(|| async { crate::proto::tuic::connect(&cfg).await })
                         .await?
@@ -1085,14 +1081,13 @@ async fn vless_front(
                     server_name: Some(sni.clone()),
                     skip_cert_verify: *skip_verify,
                     alpn: Vec::new(),
+                    ..Default::default()
                 };
                 let stream = tls_connect(st, sni, &tls).await?;
                 // The inner protocol's handshake over the wrapped stream.
                 Self::shadowtls_inner(inner, stream, target).await
             }
-            OutboundKind::Wireguard(cfg) => {
-                crate::proto::wireguard::connect(cfg, target).await
-            }
+            OutboundKind::Wireguard(cfg) => crate::proto::wireguard::connect(cfg, target).await,
             OutboundKind::Snell(cfg) => {
                 // Security fronting (shadow-tls/res-tls/jls): the cover
                 // handshake under the snell wire, then the normal path
@@ -1100,8 +1095,7 @@ async fn vless_front(
                 // applies to the plain/obfs wire like upstream's).
                 if let Some(front) = &cfg.fronting {
                     let stream =
-                        crate::proto::snell::fronting_connect(front, &cfg.server, cfg.port)
-                            .await?;
+                        crate::proto::snell::fronting_connect(front, &cfg.server, cfg.port).await?;
                     let s = crate::proto::snell::handshake(stream, cfg, target, false).await?;
                     return Ok(s);
                 }
@@ -1109,7 +1103,13 @@ async fn vless_front(
                     let conn = pool.dial(target).await?;
                     return Ok(Box::new(conn));
                 }
-                let tcp = Self::dial_transport(&cfg.server, cfg.port, &TransportKind::Tcp, &TlsSettings::default()).await?;
+                let tcp = Self::dial_transport(
+                    &cfg.server,
+                    cfg.port,
+                    &TransportKind::Tcp,
+                    &TlsSettings::default(),
+                )
+                .await?;
                 let s = crate::proto::snell::handshake(tcp, cfg, target, false).await?;
                 Ok(s)
             }
@@ -1122,7 +1122,13 @@ async fn vless_front(
                 mux.connect(target).await
             }
             OutboundKind::Restls { server, port, cfg } => {
-                let tcp = Self::dial_transport(server, *port, &TransportKind::Tcp, &TlsSettings::default()).await?;
+                let tcp = Self::dial_transport(
+                    server,
+                    *port,
+                    &TransportKind::Tcp,
+                    &TlsSettings::default(),
+                )
+                .await?;
                 crate::proto::restls::connect(cfg, tcp).await
             }
             OutboundKind::ShadowQuic(opt) => {
@@ -1134,12 +1140,24 @@ async fn vless_front(
                     let dialer = Self::sudoku_tunnel_dialer(cfg);
                     crate::proto::sudoku::connect_tunnel(cfg, dialer, target).await
                 } else {
-                    let tcp = Self::dial_transport(&cfg.server, cfg.port, &TransportKind::Tcp, &TlsSettings::default()).await?;
+                    let tcp = Self::dial_transport(
+                        &cfg.server,
+                        cfg.port,
+                        &TransportKind::Tcp,
+                        &TlsSettings::default(),
+                    )
+                    .await?;
                     crate::proto::sudoku::connect(cfg, tcp, target).await
                 }
             }
             OutboundKind::GostRelay(cfg) => {
-                let tcp = Self::dial_transport(&cfg.server, cfg.port, &TransportKind::Tcp, &TlsSettings::default()).await?;
+                let tcp = Self::dial_transport(
+                    &cfg.server,
+                    cfg.port,
+                    &TransportKind::Tcp,
+                    &TlsSettings::default(),
+                )
+                .await?;
                 crate::proto::gost_relay::connect(cfg, tcp, target).await
             }
             OutboundKind::TrustTunnel(cfg) => {
@@ -1203,9 +1221,7 @@ async fn vless_front(
                 });
                 Ok(Box::new(client) as BoxProxyStream)
             }
-            OutboundKind::ZeroTier(cfg) => {
-                crate::proto::zerotier::connect(cfg, target).await
-            }
+            OutboundKind::ZeroTier(cfg) => crate::proto::zerotier::connect(cfg, target).await,
             OutboundKind::EasyTier(cfg) => {
                 // IPv4 overlay (adapter dials tcp4); domains resolve
                 // before routing — refuse with the reason, like openvpn.
@@ -1256,6 +1272,7 @@ async fn vless_front(
                             server_name: Some(sni.clone()),
                             skip_cert_verify: false,
                             alpn: Vec::new(),
+                            ..Default::default()
                         },
                     )
                     .await
@@ -1291,6 +1308,7 @@ async fn vless_front(
                 port,
                 username,
                 password,
+                tls,
             } => {
                 let cfg = SocksOut {
                     server: server.clone(),
@@ -1298,9 +1316,18 @@ async fn vless_front(
                     username: username.clone(),
                     password: password.clone(),
                 };
-                let tcp = crate::mark::tcp_connect(server, *port)
-                    .await
-                    .map_err(|e| Error::network(format!("dial {server}:{port}: {e}")))?;
+                let mut tcp: crate::stream::BoxProxyStream = Box::new(
+                    crate::mark::tcp_connect(server, *port)
+                        .await
+                        .map_err(|e| Error::network(format!("dial {server}:{port}: {e}")))?,
+                );
+                if tls.enabled {
+                    // The UDP-ASSOCIATE handshake itself rides the TLS
+                    // stream; the datagrams then flow to the returned
+                    // relay address over plain UDP (mihomo socks5-tls).
+                    let sni = effective_sni(tls, server, None);
+                    tcp = tls_connect(tcp, &sni, tls).await?;
+                }
                 let socks_udp = SocksUdp::associate(tcp, &cfg).await?;
                 Ok(UdpChannel::Socks(Box::new(socks_udp)))
             }
@@ -1508,12 +1535,24 @@ async fn vless_front(
             // BoxProxyStream yet — refused loudly (tracked in the
             // audit) rather than corrupting datagrams.
             OutboundKind::AnyTls(cfg) if cfg.udp => {
-                let tcp = Self::dial_transport(&cfg.server, cfg.port, &TransportKind::Tcp, &TlsSettings::default()).await?;
+                let tcp = Self::dial_transport(
+                    &cfg.server,
+                    cfg.port,
+                    &TransportKind::Tcp,
+                    &TlsSettings::default(),
+                )
+                .await?;
                 let udp = crate::proto::anytls::udp_stream(cfg, tcp).await?;
                 Ok(UdpChannel::AnyTls(udp))
             }
             OutboundKind::Snell(cfg) => {
-                let tcp = Self::dial_transport(&cfg.server, cfg.port, &TransportKind::Tcp, &TlsSettings::default()).await?;
+                let tcp = Self::dial_transport(
+                    &cfg.server,
+                    cfg.port,
+                    &TransportKind::Tcp,
+                    &TlsSettings::default(),
+                )
+                .await?;
                 let udp = crate::proto::snell::udp_session(cfg, tcp).await?;
                 Ok(UdpChannel::Snell(udp))
             }
@@ -1526,7 +1565,13 @@ async fn vless_front(
                     let dialer = Self::sudoku_tunnel_dialer(cfg);
                     crate::proto::sudoku::connect_tunnel_udp(cfg, dialer).await?
                 } else {
-                    let tcp = Self::dial_transport(&cfg.server, cfg.port, &TransportKind::Tcp, &TlsSettings::default()).await?;
+                    let tcp = Self::dial_transport(
+                        &cfg.server,
+                        cfg.port,
+                        &TransportKind::Tcp,
+                        &TlsSettings::default(),
+                    )
+                    .await?;
                     crate::proto::sudoku::connect_udp(cfg, tcp).await?
                 };
                 Ok(UdpChannel::SudokuUot(tokio::sync::Mutex::new(s)))
@@ -1536,7 +1581,13 @@ async fn vless_front(
                 Ok(UdpChannel::Mieru(mux.connect_udp(initial).await?))
             }
             OutboundKind::GostRelay(cfg) => {
-                let tcp = Self::dial_transport(&cfg.server, cfg.port, &TransportKind::Tcp, &TlsSettings::default()).await?;
+                let tcp = Self::dial_transport(
+                    &cfg.server,
+                    cfg.port,
+                    &TransportKind::Tcp,
+                    &TlsSettings::default(),
+                )
+                .await?;
                 let s = crate::proto::gost_relay::connect_udp(cfg, tcp, initial).await?;
                 Ok(UdpChannel::GostRelay {
                     stream: tokio::sync::Mutex::new(s),
@@ -1581,10 +1632,10 @@ async fn vless_front(
                 let udp = crate::proto::zerotier::ZtUdp::bind(cfg).await?;
                 Ok(UdpChannel::ZeroTier(udp))
             }
-            OutboundKind::AnyTls(_)
-            | OutboundKind::Restls { .. } => Err(
-                Error::protocol(format!("{} does not support UDP", self.kind_name())),
-            ),
+            OutboundKind::AnyTls(_) | OutboundKind::Restls { .. } => Err(Error::protocol(format!(
+                "{} does not support UDP",
+                self.kind_name()
+            ))),
             OutboundKind::Reject
             | OutboundKind::Http { .. }
             | OutboundKind::Ssh { .. }
@@ -1598,9 +1649,7 @@ async fn vless_front(
 
 /// Read a framed UDP downlink prefix: RFC 1928 address, then the
 /// big-endian u16 payload length. Returns (addr, payload_len).
-async fn read_framed_addr(
-    stream: &mut BoxProxyStream,
-) -> Result<(NetAddr, usize)> {
+async fn read_framed_addr(stream: &mut BoxProxyStream) -> Result<(NetAddr, usize)> {
     use tokio::io::AsyncReadExt;
     let mut atyp = [0u8; 1];
     stream.read_exact(&mut atyp).await?;
@@ -1796,11 +1845,10 @@ impl UdpChannel {
                                     .and_then(|v| v.first().copied());
                                 let aaaa = match a {
                                     Some(_) => None,
-                                    None => {
-                                        dns.resolve(name, crate::dns::wire::TYPE_AAAA)
-                                            .await
-                                            .and_then(|v| v.first().copied())
-                                    }
+                                    None => dns
+                                        .resolve(name, crate::dns::wire::TYPE_AAAA)
+                                        .await
+                                        .and_then(|v| v.first().copied()),
                                 };
                                 match a.or(aaaa) {
                                     Some(ip) => Some(std::net::SocketAddr::new(ip, target.port)),
@@ -2019,8 +2067,7 @@ impl UdpChannel {
                 Ok((addr, data))
             }
             UdpChannel::Quic(q) => {
-                q.rx
-                    .recv()
+                q.rx.recv()
                     .await
                     .ok_or_else(|| Error::network("quic udp channel closed"))
             }
@@ -2039,8 +2086,8 @@ impl UdpChannel {
                 crate::proto::sudoku::read_uot_datagram(&mut *stream).await
             }
             UdpChannel::GostRelay { stream, peer } => {
-                let payload = crate::proto::gost_relay::read_relay_udp(&mut *stream.lock().await)
-                    .await?;
+                let payload =
+                    crate::proto::gost_relay::read_relay_udp(&mut *stream.lock().await).await?;
                 Ok((peer.clone(), payload))
             }
             UdpChannel::TrustTunnel(stream) => {
@@ -2064,10 +2111,7 @@ impl UdpChannel {
             UdpChannel::ZeroTier(z) => z.recv().await,
             UdpChannel::EasyTier(e) => {
                 let (addr, data) = e.recv().await?;
-                Ok((
-                    NetAddr::ip(addr.ip(), addr.port()),
-                    data,
-                ))
+                Ok((NetAddr::ip(addr.ip(), addr.port()), data))
             }
         }
     }
@@ -2084,6 +2128,34 @@ pub struct Registry {
     /// connection — a time-sliced index would pin every connection in the
     /// same second to one member).
     lb_counter: std::sync::atomic::AtomicU64,
+    /// Per-process random seed for load-balance hashing (mihomo
+    /// utils.MapHash hashes with a process-random maphash seed — stable
+    /// within the process, random across restarts; one RandomState gives
+    /// the same distribution property).
+    lb_seed: std::sync::OnceLock<std::collections::hash_map::RandomState>,
+}
+
+/// load-balance `strategy` (mihomo adapter/outboundgroup/loadbalance.go
+/// NewLoadBalance; the empty string defaults to consistent-hashing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LbStrategy {
+    #[default]
+    ConsistentHashing,
+    RoundRobin,
+    StickySessions,
+}
+
+impl LbStrategy {
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "" | "consistent-hashing" => Ok(LbStrategy::ConsistentHashing),
+            "round-robin" => Ok(LbStrategy::RoundRobin),
+            "sticky-sessions" => Ok(LbStrategy::StickySessions),
+            other => Err(Error::config(format!(
+                "unsupported strategy: {other} (consistent-hashing, round-robin, sticky-sessions)"
+            ))),
+        }
+    }
 }
 
 /// A proxy group.
@@ -2095,6 +2167,12 @@ pub struct GroupConfig {
     pub url: Option<String>,
     pub interval: u64,
     pub tolerance: u16,
+    /// load-balance `strategy` (ignored by other policies).
+    pub lb_strategy: LbStrategy,
+    /// load-balance `hash-key: in-user`: pin the hashing strategies on
+    /// the inbound-authenticated user instead of the address key
+    /// (loadbalance.go getKeyWithInUser).
+    pub lb_hash_key_in_user: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2112,6 +2190,140 @@ pub struct GroupState {
     /// (or the member was never probed — absent key);
     /// `Some(ms)` = alive, where `Some(0)` is a legitimate sub-ms success.
     latencies: RwLock<HashMap<String, Option<u32>>>,
+    /// sticky-sessions pin table (per group, like the upstream strategy
+    /// closure's own lru.Cache): key → member index, TTL 10 min, cap
+    /// 1000 entries.
+    sticky: std::sync::Mutex<StickyCache>,
+}
+
+/// Tiny LRU-with-TTL for sticky-sessions (upstream: lru.New with
+/// WithAge(600s) + WithSize(1000)).
+#[derive(Default)]
+struct StickyCache {
+    map: HashMap<u64, (usize, std::time::Instant)>,
+    order: std::collections::VecDeque<u64>,
+}
+
+impl StickyCache {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(600);
+    const CAP: usize = 1000;
+
+    fn get(&mut self, key: u64, members_len: u64) -> Option<usize> {
+        if let Some((idx, at)) = self.map.get(&key).copied() {
+            if at.elapsed() < Self::TTL && (idx as u64) < members_len {
+                // refresh LRU position
+                self.order.retain(|k| *k != key);
+                self.order.push_back(key);
+                return Some(idx);
+            }
+            self.map.remove(&key);
+            self.order.retain(|k| *k != key);
+        }
+        None
+    }
+
+    fn put(&mut self, key: u64, idx: usize) {
+        if self.order.len() >= Self::CAP {
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+            }
+        }
+        self.order.retain(|k| *k != key);
+        self.order.push_back(key);
+        self.map.insert(key, (idx, std::time::Instant::now()));
+    }
+}
+
+impl GroupState {
+    fn sticky_lock(&self) -> std::sync::MutexGuard<'_, StickyCache> {
+        match self.sticky.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+/// The per-connection data load-balance strategies hash on (mihomo
+/// Unwrap(metadata) → getKey / getKeyWithSrcAndDst / getKeyWithInUser).
+pub struct LbKey<'a> {
+    pub target: &'a NetAddr,
+    pub src_ip: Option<std::net::IpAddr>,
+    pub in_user: Option<&'a str>,
+}
+
+impl<'a> LbKey<'a> {
+    /// The relay-side shape: effective target, client source, and the
+    /// inbound-authenticated user when the session carries one (TCP
+    /// only today — UDP sessions have no in_user channel yet).
+    pub fn from_parts(
+        target: &'a NetAddr,
+        src_ip: Option<std::net::IpAddr>,
+        in_user: Option<&'a str>,
+    ) -> Self {
+        LbKey {
+            target,
+            src_ip,
+            in_user,
+        }
+    }
+}
+
+/// getKey (loadbalance.go:43-58): an IP-literal host hashes as itself; a
+/// domain hashes as its eTLD+1 (publicsuffix EffectiveTLDPlusOne — the
+/// psl crate's compiled-in list is the offline equivalent); anything
+/// else falls back toward "" (the router may not have resolved the
+/// destination yet — upstream reads DstIP the same way pre-resolution).
+fn consistent_key(lb: Option<&LbKey<'_>>) -> String {
+    match lb {
+        None => String::new(),
+        Some(k) => match &k.target.host {
+            crate::addr::Host::Ip(ip) => ip.to_string(),
+            crate::addr::Host::Domain(d) => {
+                psl::domain_str(d).map(str::to_string).unwrap_or_default()
+            }
+        },
+    }
+}
+
+/// The strategy's key after the `hash-key` decorator (getKeyWithInUser):
+/// with `hash-key: in-user` an authenticated inbound user pins the hash;
+/// unauthenticated requests keep the strategy's own address key.
+fn group_key(lb: Option<&LbKey<'_>>, group: &GroupState, with_src: bool) -> String {
+    if group.cfg.lb_hash_key_in_user {
+        if let Some(user) = lb.and_then(|k| k.in_user).filter(|u| !u.is_empty()) {
+            return user.to_string();
+        }
+    }
+    if with_src {
+        let dst = consistent_key(lb);
+        let src = lb
+            .and_then(|k| k.src_ip)
+            .map(|ip| ip.to_string())
+            .unwrap_or_default();
+        format!("{src}{dst}")
+    } else {
+        consistent_key(lb)
+    }
+}
+
+fn now_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// Lipton–Vasca jump consistent hash (loadbalance.go jumpHash, exact
+/// arithmetic transcription — the f64 division is part of the spec).
+fn jump_hash(mut key: u64, buckets: i64) -> i64 {
+    let mut b: i64 = 0;
+    let mut j: i64 = 0;
+    while j < buckets {
+        b = j;
+        key = key.wrapping_mul(2862933555777941757).wrapping_add(1);
+        j = (((b + 1) as f64) * (2147483648.0f64 / (((key >> 33) + 1) as f64))) as i64;
+    }
+    b
 }
 
 impl Registry {
@@ -2153,6 +2365,7 @@ impl Registry {
                 cfg,
                 selected: RwLock::new(None),
                 latencies: RwLock::new(HashMap::new()),
+                sticky: std::sync::Mutex::new(StickyCache::default()),
             });
         }
         // Validate references.
@@ -2172,6 +2385,7 @@ impl Registry {
             groups: group_states,
             group_index,
             lb_counter: std::sync::atomic::AtomicU64::new(0),
+            lb_seed: std::sync::OnceLock::new(),
         })
     }
 
@@ -2187,8 +2401,31 @@ impl Registry {
         self.group_index.get(name).map(|i| &self.groups[*i])
     }
 
-    /// Resolve a name to a leaf outbound following selections.
+    /// utils.MapHash parity: hash the strategy key with the per-process
+    /// random seed (stable within the process, random across restarts).
+    fn lb_map_hash(&self, material: String) -> u64 {
+        use std::hash::{BuildHasher, Hasher};
+        let seed = self
+            .lb_seed
+            .get_or_init(std::collections::hash_map::RandomState::new);
+        let mut h = seed.build_hasher();
+        std::hash::Hash::hash(&material, &mut h);
+        h.finish()
+    }
+
+    /// Resolve a name to a leaf outbound following selections — WITHOUT
+    /// per-connection data. Probe/API-surface only: on a load-balance
+    /// group the hash key is empty, which consistent-hashing maps to one
+    /// DETERMINISTIC member. Data paths (relays) must use
+    /// [`Registry::resolve_with`] so the strategy sees the connection.
     pub async fn resolve(&self, name: &str) -> Result<&Outbound> {
+        self.resolve_with(name, None).await
+    }
+
+    /// Resolve with the per-connection key load-balance strategies hash
+    /// on (mihomo Unwrap(metadata)): destination host (IP-literal or
+    /// eTLD+1), source IP, inbound-authenticated user.
+    pub async fn resolve_with(&self, name: &str, lb: Option<&LbKey<'_>>) -> Result<&Outbound> {
         let mut current: std::borrow::Cow<'_, str> = std::borrow::Cow::Borrowed(name);
         for _ in 0..16 {
             if let Some(i) = self.index.get(current.as_ref()) {
@@ -2198,22 +2435,21 @@ impl Registry {
                 return Err(Error::config(format!("unknown proxy {current:?}")));
             };
             let group = &self.groups[gi];
-            current = std::borrow::Cow::Owned(self.pick_member(group).await?);
+            current = std::borrow::Cow::Owned(self.pick_member(group, lb).await?);
         }
         Err(Error::config(format!("proxy group cycle at {current:?}")))
     }
 
     /// Select the active member for a group per its policy.
-    async fn pick_member(&self, group: &GroupState) -> Result<String> {
+    async fn pick_member(&self, group: &GroupState, lb: Option<&LbKey<'_>>) -> Result<String> {
         let members = &group.cfg.members;
         match group.cfg.policy {
             GroupPolicy::Select => {
                 let selected = group.selected.read().await;
                 let idx = selected.unwrap_or(0);
-                members
-                    .get(idx)
-                    .cloned()
-                    .ok_or_else(|| Error::config(format!("group {} selection out of range", group.cfg.name)))
+                members.get(idx).cloned().ok_or_else(|| {
+                    Error::config(format!("group {} selection out of range", group.cfg.name))
+                })
             }
             GroupPolicy::UrlTest => {
                 // Lowest latency wins, but only by more than `tolerance`:
@@ -2254,30 +2490,86 @@ impl Registry {
                 Ok(members[0].clone())
             }
             GroupPolicy::LoadBalance => {
-                // mihomo #1298 (load-balance continuous-fail): rotation
-                // must evict members whose latest health probe FAILED —
-                // a dead node otherwise keeps receiving 1/N of the
-                // traffic forever. Untested members stay eligible (an
-                // absent sample evicts nothing); when EVERY member failed
-                // the full set keeps rotating (parking the group would be
-                // worse than trying dead nodes).
+                // Aliveness per mihomo AliveForTestUrl with our lazy-group
+                // defense: a FAILED latest probe evicts; an absent sample
+                // (never probed — lazy groups skip health when idle)
+                // stays eligible so the group is never pinned to one
+                // node by pure absence.
                 let latencies = group.latencies.read().await;
-                let eligible: Vec<&String> = members
-                    .iter()
-                    .filter(|m| !matches!(latencies.get(*m), Some(None)))
-                    .collect();
-                let pool: Vec<&String> = if eligible.is_empty() {
-                    members.iter().collect()
-                } else {
-                    eligible
-                };
-                drop(latencies);
-                let count = pool.len().max(1) as u64;
-                let tick = self
-                    .lb_counter
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let idx = (tick % count) as usize;
-                Ok((*pool[idx]).clone())
+                let alive = |m: &String| !matches!(latencies.get(m), Some(None));
+                match group.cfg.lb_strategy {
+                    // strategyRoundRobin: rotate past dead members; when
+                    // everything failed, keep rotating the full set
+                    // (mihomo returns proxies[0]; trying beats parking).
+                    LbStrategy::RoundRobin => {
+                        let eligible: Vec<&String> = members.iter().filter(|m| alive(m)).collect();
+                        let pool: Vec<&String> = if eligible.is_empty() {
+                            members.iter().collect()
+                        } else {
+                            eligible
+                        };
+                        drop(latencies);
+                        let count = pool.len().max(1) as u64;
+                        let tick = self
+                            .lb_counter
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let idx = (tick % count) as usize;
+                        Ok((*pool[idx]).clone())
+                    }
+                    // strategyConsistentHashing: jump hash over the
+                    // connection key, +1 retries, then a full alive scan.
+                    LbStrategy::ConsistentHashing => {
+                        let key = self.lb_map_hash(group_key(lb, group, false));
+                        let buckets = members.len().max(1) as i64;
+                        let mut k = key;
+                        for _ in 0..5 {
+                            let idx = jump_hash(k, buckets) as usize;
+                            if let Some(m) = members.get(idx) {
+                                if alive(m) {
+                                    drop(latencies);
+                                    return Ok(m.clone());
+                                }
+                            }
+                            k = k.wrapping_add(1);
+                        }
+                        for m in members {
+                            if alive(m) {
+                                drop(latencies);
+                                return Ok(m.clone());
+                            }
+                        }
+                        drop(latencies);
+                        Ok(members[0].clone())
+                    }
+                    // strategyStickySessions: src+dst key pins a member
+                    // for 10 minutes (LRU, 1000 entries); a miss (or an
+                    // out-of-range cached index) picks by time-jittered
+                    // jump hash, retrying up to 5 times for an alive one.
+                    LbStrategy::StickySessions => {
+                        let key = self.lb_map_hash(group_key(lb, group, true));
+                        let len = members.len().max(1);
+                        let cached = group.sticky_lock().get(key, len as u64);
+                        let mut idx = cached.unwrap_or_else(|| {
+                            jump_hash(key.wrapping_add(now_nanos()), len as i64) as usize
+                        });
+                        for _ in 1..5 {
+                            if let Some(m) = members.get(idx) {
+                                if alive(m) {
+                                    drop(latencies);
+                                    if cached != Some(idx) {
+                                        group.sticky_lock().put(key, idx);
+                                    }
+                                    return Ok(m.clone());
+                                }
+                            }
+                            idx = jump_hash(key.wrapping_add(now_nanos()), len as i64) as usize;
+                        }
+                        drop(latencies);
+                        // Upstream tail: Set(key, 0); return proxies[0].
+                        group.sticky_lock().put(key, 0);
+                        Ok(members[0].clone())
+                    }
+                }
             }
         }
     }
@@ -2295,9 +2587,7 @@ impl Registry {
             .members
             .iter()
             .position(|m| m == member)
-            .ok_or_else(|| {
-                Error::config(format!("group {group:?} has no member {member:?}"))
-            })?;
+            .ok_or_else(|| Error::config(format!("group {group:?} has no member {member:?}")))?;
         // Only Select groups honor manual choice.
         if !matches!(g.cfg.policy, GroupPolicy::Select) {
             return Err(Error::protocol(format!(
@@ -2343,9 +2633,11 @@ impl Registry {
             ) {
                 continue;
             }
-            let url = g.cfg.url.clone().unwrap_or_else(|| {
-                "http://www.gstatic.com/generate_204".to_string()
-            });
+            let url = g
+                .cfg
+                .url
+                .clone()
+                .unwrap_or_else(|| "http://www.gstatic.com/generate_204".to_string());
             for m in &g.cfg.members {
                 let Ok(outbound) = self.resolve(m).await else {
                     continue;
@@ -2450,7 +2742,10 @@ mod tests {
 
     /// The engine-resolved DNS config used by the direct-dial tests:
     /// `hosts` answers everything (no live upstream needed).
-    fn test_dns_engine(host: &str, ip: std::net::IpAddr) -> std::sync::Arc<crate::dns::resolver::DnsEngine> {
+    fn test_dns_engine(
+        host: &str,
+        ip: std::net::IpAddr,
+    ) -> std::sync::Arc<crate::dns::resolver::DnsEngine> {
         use std::collections::HashMap;
         DnsEngine::new(
             crate::config::DnsConfig {
@@ -2501,7 +2796,10 @@ mod tests {
             .expect("the hosts entry steers the dial to loopback");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !accepted.load(std::sync::atomic::Ordering::SeqCst) {
-            assert!(std::time::Instant::now() < deadline, "listener never saw the dial");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "listener never saw the dial"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
 
@@ -2532,16 +2830,20 @@ mod tests {
         let dns = test_dns_engine("udp.test", "127.0.0.1".parse().unwrap());
         let reg = Registry::build(vec![direct("D")], vec![], Some(&dns)).unwrap();
         let out = reg.resolve("D").await.unwrap();
-        let mut channel = out.udp(&NetAddr::ip("127.0.0.1".parse().unwrap(), port)).await.unwrap();
+        let mut channel = out
+            .udp(&NetAddr::ip("127.0.0.1".parse().unwrap(), port))
+            .await
+            .unwrap();
         channel
             .send(&NetAddr::domain("udp.test", port).unwrap(), b"probe")
             .await
             .expect("domain send resolves through the engine resolver");
         let mut buf = [0u8; 16];
-        let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(5), sink.recv_from(&mut buf))
-            .await
-            .expect("the datagram lands on the mapped address")
-            .unwrap();
+        let (n, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), sink.recv_from(&mut buf))
+                .await
+                .expect("the datagram lands on the mapped address")
+                .unwrap();
         assert_eq!(&buf[..n], b"probe");
 
         // Unresolvable domain: error, not a silent system lookup.
@@ -2563,14 +2865,155 @@ mod tests {
             url: None,
             interval: 0,
             tolerance: 0,
+            lb_strategy: Default::default(),
+            lb_hash_key_in_user: false,
         }];
-        let reg = Registry::build(vec![direct("A"), direct("B"), reject("R")], groups, None).unwrap();
+        let reg =
+            Registry::build(vec![direct("A"), direct("B"), reject("R")], groups, None).unwrap();
         assert_eq!(reg.resolve("G").await.unwrap().name, "A");
         assert_eq!(reg.resolve("A").await.unwrap().name, "A");
         reg.set_selected("G", "B").await.unwrap();
         assert_eq!(reg.resolve("G").await.unwrap().name, "B");
         assert!(reg.set_selected("G", "R").await.is_err());
         assert!(reg.set_selected("A", "A").await.is_err());
+    }
+
+    // ---- drift-sync 2026-10-08: load-balance strategies (3025efa) ----
+
+    fn lb_registry(strategy: LbStrategy, hash_key_in_user: bool) -> Registry {
+        let groups = vec![GroupConfig {
+            name: "LB".into(),
+            members: vec!["A".into(), "B".into(), "C".into()],
+            policy: GroupPolicy::LoadBalance,
+            url: None,
+            interval: 0,
+            tolerance: 0,
+            lb_strategy: strategy,
+            lb_hash_key_in_user: hash_key_in_user,
+        }];
+        Registry::build(vec![direct("A"), direct("B"), direct("C")], groups, None).unwrap()
+    }
+
+    #[tokio::test]
+    async fn consistent_hashing_pins_by_destination() {
+        let reg = lb_registry(LbStrategy::ConsistentHashing, false);
+        let t1 = NetAddr::domain("cdn.example.com", 443).unwrap();
+        fn key<'a>(t: &'a NetAddr) -> crate::outbound::LbKey<'a> {
+            crate::outbound::LbKey {
+                target: t,
+                src_ip: Some("127.0.0.1".parse().unwrap()),
+                in_user: None,
+            }
+        }
+        // Same destination → the same member, every time (the eTLD+1 key
+        // is stable).
+        let first = reg
+            .resolve_with("LB", Some(&key(&t1)))
+            .await
+            .unwrap()
+            .name
+            .clone();
+        for _ in 0..8 {
+            assert_eq!(
+                reg.resolve_with("LB", Some(&key(&t1))).await.unwrap().name,
+                first
+            );
+        }
+        // Across many destinations all members see traffic (jump-hash
+        // distribution) — a broken hash would pin one member.
+        let mut seen = std::collections::HashSet::new();
+        // Distinct eTLD+1s (the key is the registrable domain —
+        // d0.example.com and d1.example.com hash the same ON PURPOSE).
+        for i in 0..60 {
+            let t = NetAddr::domain(&format!("www.d{i}.com"), 443).unwrap();
+            seen.insert(
+                reg.resolve_with("LB", Some(&key(&t)))
+                    .await
+                    .unwrap()
+                    .name
+                    .clone(),
+            );
+        }
+        assert_eq!(seen.len(), 3, "jump hash must spread over members");
+    }
+
+    #[tokio::test]
+    async fn sticky_sessions_pin_src_dst_pair() {
+        let reg = lb_registry(LbStrategy::StickySessions, false);
+        let target = NetAddr::domain("sticky.example.com", 443).unwrap();
+        let key = crate::outbound::LbKey {
+            target: &target,
+            src_ip: Some("10.0.0.7".parse().unwrap()),
+            in_user: None,
+        };
+        let first = reg
+            .resolve_with("LB", Some(&key))
+            .await
+            .unwrap()
+            .name
+            .clone();
+        for _ in 0..8 {
+            assert_eq!(
+                reg.resolve_with("LB", Some(&key)).await.unwrap().name,
+                first
+            );
+        }
+        // A different source maps independently (no crash, valid member).
+        let key2 = crate::outbound::LbKey {
+            target: &target,
+            src_ip: Some("10.0.0.8".parse().unwrap()),
+            in_user: None,
+        };
+        let _ = reg.resolve_with("LB", Some(&key2)).await.unwrap().name;
+    }
+
+    #[tokio::test]
+    async fn hash_key_in_user_pins_on_the_authenticated_user() {
+        let reg = lb_registry(LbStrategy::ConsistentHashing, true);
+        let t1 = NetAddr::domain("a.example.com", 443).unwrap();
+        let t2 = NetAddr::domain("b.example.com", 443).unwrap();
+        let user = Some("alice");
+        let k1 = crate::outbound::LbKey {
+            target: &t1,
+            src_ip: None,
+            in_user: user,
+        };
+        let k2 = crate::outbound::LbKey {
+            target: &t2,
+            src_ip: None,
+            in_user: user,
+        };
+        // One user across DIFFERENT destinations → the same egress
+        // (getKeyWithInUser: the whole session pins on the identity).
+        assert_eq!(
+            reg.resolve_with("LB", Some(&k1)).await.unwrap().name,
+            reg.resolve_with("LB", Some(&k2)).await.unwrap().name
+        );
+        // Unauthenticated keeps the address key: two destinations may
+        // land on different members (or the same — the assertion is only
+        // that both resolve).
+        fn anon<'a>(t: &'a NetAddr) -> crate::outbound::LbKey<'a> {
+            crate::outbound::LbKey {
+                target: t,
+                src_ip: None,
+                in_user: None,
+            }
+        }
+        let _ = reg.resolve_with("LB", Some(&anon(&t1))).await.unwrap();
+        let _ = reg.resolve_with("LB", Some(&anon(&t2))).await.unwrap();
+    }
+
+    #[test]
+    fn jump_hash_bounds_and_stability() {
+        // Invariants of the transcribed Lipton–Vasca jump hash.
+        for key in [0u64, 1, 42, u64::MAX / 2, u64::MAX] {
+            for buckets in [1i64, 2, 3, 7, 100] {
+                let idx = jump_hash(key, buckets);
+                assert!((0..buckets).contains(&idx), "{key} {buckets} → {idx}");
+            }
+        }
+        assert_eq!(jump_hash(0, 1), 0);
+        assert_eq!(jump_hash(1987654321, 1), 0);
     }
 
     /// mihomo #1298 (load-balance continuous-fail): a member whose latest
@@ -2587,9 +3030,12 @@ mod tests {
             url: Some("http://health.test/204".into()),
             interval: 300,
             tolerance: 0,
+            // Round-robin explicitly: the upstream DEFAULT is
+            // consistent-hashing (which pins by key, not rotation).
+            lb_strategy: LbStrategy::RoundRobin,
+            lb_hash_key_in_user: false,
         }];
-        let reg =
-            Registry::build(vec![direct("A"), direct("B")], groups, None).unwrap();
+        let reg = Registry::build(vec![direct("A"), direct("B")], groups, None).unwrap();
 
         // Untested: both rotate.
         let mut seen = std::collections::HashSet::new();
@@ -2604,7 +3050,11 @@ mod tests {
         for _ in 0..8 {
             seen.insert(reg.resolve("LB").await.unwrap().name.clone());
         }
-        assert_eq!(seen, ["A".to_string()].into(), "failed member must be evicted");
+        assert_eq!(
+            seen,
+            ["A".to_string()].into(),
+            "failed member must be evicted"
+        );
 
         // Everything failed: the full set rotates again (parking the
         // group would blackhole all traffic).
@@ -2637,6 +3087,8 @@ mod tests {
             url: Some("http://health.test/204".into()),
             interval: 300,
             tolerance: 0,
+            lb_strategy: Default::default(),
+            lb_hash_key_in_user: false,
         };
         let reg = Registry::build(
             vec![direct("A"), direct("B")],
@@ -2660,6 +3112,8 @@ mod tests {
             url: None,
             interval: 0,
             tolerance: 0,
+            lb_strategy: Default::default(),
+            lb_hash_key_in_user: false,
         }];
         assert!(Registry::build(vec![direct("A")], groups, None).is_err());
 
@@ -2671,6 +3125,8 @@ mod tests {
                 url: None,
                 interval: 0,
                 tolerance: 0,
+                lb_strategy: Default::default(),
+                lb_hash_key_in_user: false,
             },
             GroupConfig {
                 name: "G2".into(),
@@ -2679,6 +3135,8 @@ mod tests {
                 url: None,
                 interval: 0,
                 tolerance: 0,
+                lb_strategy: Default::default(),
+                lb_hash_key_in_user: false,
             },
         ];
         let reg = Registry::build(vec![], groups, None).unwrap();
@@ -2727,7 +3185,10 @@ mod tests {
     async fn udp_unsupported_errors() {
         let out = Outbound::from_config(&reject("R")).unwrap();
         assert!(out
-            .udp(&NetAddr::ip(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0))
+            .udp(&NetAddr::ip(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                0
+            ))
             .await
             .is_err());
     }
@@ -2769,8 +3230,7 @@ mod tests {
                             }
                         }
                     }
-                    let resp =
-                        format!("HTTP/1.1 {status_line}\r\nContent-Length: 0\r\n\r\n");
+                    let resp = format!("HTTP/1.1 {status_line}\r\nContent-Length: 0\r\n\r\n");
                     let _ = sock.write_all(resp.as_bytes()).await;
                 });
             }
@@ -2789,7 +3249,10 @@ mod tests {
         // no-expected-status default) accepts every status.
         let addr = spawn_status_upstream("404 Not Found").await;
         let url = format!("http://{addr}/health");
-        assert!(probe(&url, &out).await.is_err(), "legacy window rejects 404");
+        assert!(
+            probe(&url, &out).await.is_err(),
+            "legacy window rejects 404"
+        );
         assert!(
             probe_expect(&url, &out, &ExpectedStatus::parse("404").unwrap())
                 .await
@@ -2801,7 +3264,9 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(probe_expect(&url, &out, &ExpectedStatus::default()).await.is_ok());
+        assert!(probe_expect(&url, &out, &ExpectedStatus::default())
+            .await
+            .is_ok());
 
         // A 204 URL stays healthy under the legacy window.
         let addr204 = spawn_status_upstream("204 No Content").await;

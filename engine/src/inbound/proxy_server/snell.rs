@@ -144,7 +144,9 @@ pub async fn serve(cfg: &ServerConfig, relay: SharedRelay) -> Result<SocketAddr>
         jls,
     } = &cfg.protocol
     else {
-        return Err(Error::config("snell::serve called with a non-snell protocol"));
+        return Err(Error::config(
+            "snell::serve called with a non-snell protocol",
+        ));
     };
     // New()'s gate (listener/snell/server.go:37-52), verbatim messages.
     let version = parse_server_version(*version)?;
@@ -210,9 +212,7 @@ fn build_fronting(
         // default handshake dest ("missing default handshake
         // information" when empty). `skip-verify` is client-only.
         if password.is_empty() {
-            return Err(Error::config(
-                "shadow-tls: at least one user is required",
-            ));
+            return Err(Error::config("shadow-tls: at least one user is required"));
         }
         if sni.trim().is_empty() {
             return Err(Error::config(
@@ -285,7 +285,9 @@ fn split_dest(dest: &str) -> Result<(String, u16)> {
         .rsplit_once(':')
         .ok_or_else(|| Error::config(format!("jls: invalid dest address: {dest:?}")))?;
     if host.is_empty() || port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
-        return Err(Error::config(format!("jls: invalid dest address: {dest:?}")));
+        return Err(Error::config(format!(
+            "jls: invalid dest address: {dest:?}"
+        )));
     }
     let port = port
         .parse::<u16>()
@@ -327,7 +329,11 @@ async fn handle_conn(
             // codec.
             crate::proto::restls::server(cfg, stream).await?
         }
-        Fronting::Jls { cfg, dest, rate_limit } => {
+        Fronting::Jls {
+            cfg,
+            dest,
+            rate_limit,
+        } => {
             match crate::proto::jls::server(cfg, stream).await? {
                 crate::proto::jls::JlsServerHandshake::Authenticated { stream, user } => {
                     // UserFromConn → WithInUser (server.go:148-154):
@@ -436,7 +442,8 @@ async fn serve_loop_inner(
 async fn udp_relay(io: SnellServerUdp, peer: SocketAddr, _port: u16, ctx: SnellListenCtx) {
     let (up_tx, up_rx) = tokio::sync::mpsc::channel::<(crate::addr::NetAddr, Vec<u8>)>(64);
     let (down_tx, mut down_rx) = tokio::sync::mpsc::channel::<(crate::addr::NetAddr, Vec<u8>)>(64);
-    ctx.relay.handle_udp(peer, ctx.tag.to_string(), up_rx, down_tx);
+    ctx.relay
+        .handle_udp(peer, ctx.tag.to_string(), up_rx, down_tx);
 
     let (mut rd, mut wr) = tokio::io::split(io);
     // Uplink: one AEAD frame per datagram, parsed and forwarded until
@@ -926,8 +933,9 @@ impl ShadowTlsFrontStream {
                 return Err(io_invalid("shadow-tls: remote alert"));
             }
             STLS_REC_APPDATA if frame.len() > STLS_HMAC_HEADER => {
-                let tag: [u8; STLS_HMAC] =
-                    frame[STLS_HEADER..STLS_HMAC_HEADER].try_into().expect("4 bytes");
+                let tag: [u8; STLS_HMAC] = frame[STLS_HEADER..STLS_HMAC_HEADER]
+                    .try_into()
+                    .expect("4 bytes");
                 let payload = &frame[STLS_HMAC_HEADER..];
                 self.read_chain.update(payload);
                 let expected = self.read_chain.tag();
@@ -1154,9 +1162,14 @@ mod tests {
     async fn roundtrip(psk: &str, addr: SocketAddr, version: u8) -> NetAddr {
         let tcp = TcpStream::connect(addr).await.unwrap();
         let target = NetAddr::domain("echo.test", 443).unwrap();
-        let mut stream = handshake(Box::new(tcp), &client(psk, addr.port(), version), &target, false)
-            .await
-            .unwrap();
+        let mut stream = handshake(
+            Box::new(tcp),
+            &client(psk, addr.port(), version),
+            &target,
+            false,
+        )
+        .await
+        .unwrap();
         stream.write_all(b"ping-snell").await.unwrap();
         let mut buf = [0u8; 10];
         tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf))
@@ -1194,10 +1207,14 @@ mod tests {
         let (capture, addr) = spawn_server(4, &fresh_psk()).await;
         let tcp = TcpStream::connect(addr).await.unwrap();
         let target = NetAddr::domain("echo.test", 443).unwrap();
-        let mut stream =
-            handshake(Box::new(tcp), &client(&fresh_psk(), addr.port(), 4), &target, false)
-                .await
-                .unwrap();
+        let mut stream = handshake(
+            Box::new(tcp),
+            &client(&fresh_psk(), addr.port(), 4),
+            &target,
+            false,
+        )
+        .await
+        .unwrap();
         let _ = stream.write_all(b"ping").await;
         let mut buf = [0u8; 8];
         let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await;
@@ -1224,11 +1241,10 @@ mod tests {
             let target = NetAddr::ip("8.8.8.8".parse().unwrap(), 53);
             udp.send_to(&target, b"dgram").await.unwrap();
             let mut buf = [0u8; 1500];
-            let (from, n) =
-                tokio::time::timeout(Duration::from_secs(10), udp.recv_from(&mut buf))
-                    .await
-                    .expect("udp response timeout")
-                    .unwrap();
+            let (from, n) = tokio::time::timeout(Duration::from_secs(10), udp.recv_from(&mut buf))
+                .await
+                .expect("udp response timeout")
+                .unwrap();
             assert_eq!(&buf[..n], b"dgram");
             assert_eq!(from, target, "the echo comes from the requested host");
             // The datagram went through the relay's UDP side.
@@ -1268,10 +1284,9 @@ mod tests {
             .await
             .unwrap();
         let target = NetAddr::domain("echo.test", 443).unwrap();
-        let mut stream =
-            handshake(transport, &client(&psk, addr.port(), 4), &target, false)
-                .await
-                .unwrap();
+        let mut stream = handshake(transport, &client(&psk, addr.port(), 4), &target, false)
+            .await
+            .unwrap();
         stream.write_all(b"obfs-ping").await.unwrap();
         let mut buf = [0u8; 9];
         tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf))
@@ -1291,9 +1306,8 @@ mod tests {
         let addr_str = addr.to_string();
         let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let dials2 = dials.clone();
-        let pool = crate::proto::snell::SnellPool::with_dialer(
-            client(&psk, addr.port(), 4),
-            move || {
+        let pool =
+            crate::proto::snell::SnellPool::with_dialer(client(&psk, addr.port(), 4), move || {
                 let addr_str = addr_str.clone();
                 let dials = dials2.clone();
                 Box::pin(async move {
@@ -1303,9 +1317,8 @@ mod tests {
                         .map_err(|e| Error::network(e.to_string()))?;
                     Ok(Box::new(tcp) as BoxProxyStream)
                 })
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         let target = NetAddr::domain("echo.test", 443).unwrap();
         {
             let mut conn = pool.dial(&target).await.unwrap();
@@ -1351,19 +1364,28 @@ mod tests {
         // Version gate (server.go:43).
         let err = serve(&cfg(6, "p", ""), capture.clone()).await.unwrap_err();
         assert!(
-            err.to_string().contains("snell inbound version 6 is not supported"),
+            err.to_string()
+                .contains("snell inbound version 6 is not supported"),
             "{err}"
         );
         // PSK gate (server.go:45-47).
         let err = serve(&cfg(4, "", ""), capture.clone()).await.unwrap_err();
-        assert!(err.to_string().contains("snell inbound requires psk"), "{err}");
-        // obfs mode gate (server.go:48-52) + the tls precise error.
-        let err = serve(&cfg(4, "p", "weird"), capture.clone()).await.unwrap_err();
         assert!(
-            err.to_string().contains("snell inbound obfs mode error: weird"),
+            err.to_string().contains("snell inbound requires psk"),
             "{err}"
         );
-        let err = serve(&cfg(4, "p", "tls"), capture.clone()).await.unwrap_err();
+        // obfs mode gate (server.go:48-52) + the tls precise error.
+        let err = serve(&cfg(4, "p", "weird"), capture.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("snell inbound obfs mode error: weird"),
+            "{err}"
+        );
+        let err = serve(&cfg(4, "p", "tls"), capture.clone())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("tls_server.go"), "{err}");
         assert!(err.to_string().contains("obfs mode tls"), "{err}");
     }
@@ -1408,7 +1430,8 @@ mod tests {
         let certified = rcgen::generate_simple_self_signed(vec!["restls.test".to_string()])
             .expect("rcgen self-signed cert");
         let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
-        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let key =
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
         let config = std::sync::Arc::new(
             rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
                 rustls::crypto::ring::default_provider(),
@@ -1587,7 +1610,11 @@ mod tests {
             4,
             &psk,
             "",
-            Some((format!("real-{:016x}", rand::random::<u64>()), dest.to_string(), false)),
+            Some((
+                format!("real-{:016x}", rand::random::<u64>()),
+                dest.to_string(),
+                false,
+            )),
             None,
             None,
         );
@@ -1707,7 +1734,11 @@ mod tests {
             .unwrap();
         assert_eq!(&buf, b"jls+snell");
         assert_eq!(capture.targets(), vec![target]);
-        assert_eq!(capture.relayed(), 1, "the jls fronting authenticated, not fell back");
+        assert_eq!(
+            capture.relayed(),
+            1,
+            "the jls fronting authenticated, not fell back"
+        );
     }
 
     #[tokio::test]
@@ -1752,7 +1783,10 @@ mod tests {
             if len > 0 {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "dest never saw the fallback bytes");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dest never saw the fallback bytes"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(capture.relayed(), 0);
@@ -1799,11 +1833,17 @@ mod tests {
         .await
         .unwrap_err()
         .to_string();
-        assert_eq!(err, "config: security modes are mutually exclusive: res-tls, jls");
-        let err = serve(&cfg_fronted(4, "p", "", shadow(), restls(), jls()), capture.clone())
-            .await
-            .unwrap_err()
-            .to_string();
+        assert_eq!(
+            err,
+            "config: security modes are mutually exclusive: res-tls, jls"
+        );
+        let err = serve(
+            &cfg_fronted(4, "p", "", shadow(), restls(), jls()),
+            capture.clone(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert_eq!(
             err,
             "config: security modes are mutually exclusive: shadow-tls, res-tls, jls"
@@ -1816,7 +1856,14 @@ mod tests {
         // table and a default handshake dest.
         let capture = Capture::new();
         let err = serve(
-            &cfg_fronted(4, "p", "", Some(("".into(), "127.0.0.1:1".into(), false)), None, None),
+            &cfg_fronted(
+                4,
+                "p",
+                "",
+                Some(("".into(), "127.0.0.1:1".into(), false)),
+                None,
+                None,
+            ),
             capture.clone(),
         )
         .await
@@ -1824,7 +1871,14 @@ mod tests {
         .to_string();
         assert_eq!(err, "config: shadow-tls: at least one user is required");
         let err = serve(
-            &cfg_fronted(4, "p", "", Some(("pw".into(), "".into(), false)), None, None),
+            &cfg_fronted(
+                4,
+                "p",
+                "",
+                Some(("pw".into(), "".into(), false)),
+                None,
+                None,
+            ),
             capture.clone(),
         )
         .await
@@ -1836,7 +1890,14 @@ mod tests {
         );
         // jls fronting gates: dest required, SplitHostPort, users.
         let err = serve(
-            &cfg_fronted(4, "p", "", None, None, Some(("s".into(), "".into(), Vec::new(), Vec::new(), 0))),
+            &cfg_fronted(
+                4,
+                "p",
+                "",
+                None,
+                None,
+                Some(("s".into(), "".into(), Vec::new(), Vec::new(), 0)),
+            ),
             capture.clone(),
         )
         .await

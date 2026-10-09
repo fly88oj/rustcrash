@@ -117,9 +117,9 @@ impl Users {
         let mut list = Vec::with_capacity(entries.len());
         let mut by_eih = HashMap::with_capacity(entries.len());
         for (name, password) in entries {
-            let key = method.derive_key(password).map_err(|e| {
-                Error::config(format!("shadowsocks multi-user {name:?}: {e}"))
-            })?;
+            let key = method
+                .derive_key(password)
+                .map_err(|e| Error::config(format!("shadowsocks multi-user {name:?}: {e}")))?;
             let eih = identity_token(&key);
             let block = BlockCipher::new(kind, &key)?;
             by_eih.insert(eih, list.len());
@@ -245,7 +245,15 @@ impl SsServer {
         relay: SharedRelay,
     ) -> Result<()> {
         let (target, framed) = self.accept(stream).await?;
-        hand_off(tag, "shadowsocks", port, peer, target, Box::new(framed), relay);
+        hand_off(
+            tag,
+            "shadowsocks",
+            port,
+            peer,
+            target,
+            Box::new(framed),
+            relay,
+        );
         Ok(())
     }
 
@@ -267,9 +275,9 @@ impl SsServer {
                     .try_into()
                     .map_err(|_| Error::protocol("ss2022 eih: bad block"))?;
                 let token = open_eih_tcp(kind, &self.key, &client_salt, eih_ct)?;
-                let user = users.find(&token).ok_or_else(|| {
-                    Error::protocol("ss2022 eih: identity token matches no user")
-                })?;
+                let user = users
+                    .find(&token)
+                    .ok_or_else(|| Error::protocol("ss2022 eih: identity token matches no user"))?;
                 tracing::debug!(target: "engine", "shadowsocks user {}", user.name);
                 user.key.clone()
             }
@@ -403,7 +411,11 @@ pub async fn serve(cfg: &ServerConfig, relay: SharedRelay) -> Result<SocketAddr>
 
 /// One bind attempt: UDP socket, TCP listener on the same port, then the
 /// relay loop.
-async fn serve_once(server: &SsServer, cfg: &ServerConfig, relay: SharedRelay) -> Result<SocketAddr> {
+async fn serve_once(
+    server: &SsServer,
+    cfg: &ServerConfig,
+    relay: SharedRelay,
+) -> Result<SocketAddr> {
     let udp = SsUdpServer::bind(server, &cfg.bind, cfg.port, &cfg.tag, relay.clone()).await?;
     let udp_addr = udp
         .local_addr()
@@ -843,9 +855,10 @@ impl SsUdpServer {
         eih_ct.copy_from_slice(&head[16..]);
         block.decrypt(&mut sep);
         let token = open_eih_udp(block, &sep, &eih_ct);
-        let idx = *users.by_eih.get(&token).ok_or_else(|| {
-            Error::protocol("ss2022 udp eih: identity token matches no user")
-        })?;
+        let idx = *users
+            .by_eih
+            .get(&token)
+            .ok_or_else(|| Error::protocol("ss2022 udp eih: identity token matches no user"))?;
         let user = &users.list[idx];
 
         let client_session_id = u64::from_be_bytes(sep[..8].try_into().expect("8 bytes"));
@@ -889,7 +902,12 @@ impl SsUdpServer {
     /// SIP023: a multi-user session's separate header is ECB'd with the
     /// USER PSK and its body sealed under `subkey(uPSK, server session
     /// id)` — mihomo/sing-box clients look both up with their own key.
-    fn seal_2022(&self, crypto: &mut UdpCrypto, target: &NetAddr, payload: &[u8]) -> Result<Vec<u8>> {
+    fn seal_2022(
+        &self,
+        crypto: &mut UdpCrypto,
+        target: &NetAddr,
+        payload: &[u8],
+    ) -> Result<Vec<u8>> {
         crypto.server_packet_id = crypto.server_packet_id.wrapping_add(1);
         let mut sep = [0u8; 16];
         sep[..8].copy_from_slice(&crypto.server_session_id.to_be_bytes());
@@ -903,7 +921,11 @@ impl SsUdpServer {
                 user.block.encrypt(&mut sep_ct);
                 let aead = Aead::new(
                     aead_kind(self.method),
-                    &ss2022_subkey(&user.key, &crypto.server_session_id.to_be_bytes(), self.method.key_len()),
+                    &ss2022_subkey(
+                        &user.key,
+                        &crypto.server_session_id.to_be_bytes(),
+                        self.method.key_len(),
+                    ),
                 )?;
                 let mut nonce = [0u8; 12];
                 nonce.copy_from_slice(&sep[4..16]);
@@ -1191,7 +1213,8 @@ impl AsyncWrite for SsServerStream {
                         .map_err(to_io)?;
                 }
             } else {
-                seal_chunk(&this.enc, &mut this.enc_nonce, &buf[..take], &mut out).map_err(to_io)?;
+                seal_chunk(&this.enc, &mut this.enc_nonce, &buf[..take], &mut out)
+                    .map_err(to_io)?;
             }
             this.wbuf = BytesMut::from(&out[..]);
             this.pending_plain = take;
@@ -1290,14 +1313,10 @@ mod tests {
         let target = NetAddr::domain("echo.test", 443).unwrap();
         let tcp = TcpStream::connect(addr).await.unwrap();
         let cfg = client(password, method, addr.port());
-        let mut stream = crate::proto::shadowsocks::SsStream::handshake(
-            Box::new(tcp),
-            &cfg,
-            &target,
-            b"",
-        )
-        .await
-        .unwrap();
+        let mut stream =
+            crate::proto::shadowsocks::SsStream::handshake(Box::new(tcp), &cfg, &target, b"")
+                .await
+                .unwrap();
         stream.write_all(b"ping").await.unwrap();
         stream.flush().await.unwrap();
         let mut buf = [0u8; 8];
@@ -1311,11 +1330,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_tcp_roundtrip_all_methods() {
-        for method in [
-            "aes-128-gcm",
-            "aes-256-gcm",
-            "chacha20-ietf-poly1305",
-        ] {
+        for method in ["aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305"] {
             roundtrip(method, &fresh_password()).await;
         }
     }
@@ -1399,11 +1414,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_udp_roundtrip_all_methods() {
-        for method in [
-            "aes-128-gcm",
-            "aes-256-gcm",
-            "chacha20-ietf-poly1305",
-        ] {
+        for method in ["aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305"] {
             udp_roundtrip(method, &fresh_password()).await;
         }
     }
@@ -1582,7 +1593,10 @@ mod tests {
         assert!(window.accept(1));
         assert!(!window.accept(1), "the same packet id is a replay");
         assert!(window.accept(2));
-        assert!(window.accept(0), "an out-of-order id inside the window is new");
+        assert!(
+            window.accept(0),
+            "an out-of-order id inside the window is new"
+        );
         assert!(!window.accept(0));
         assert!(window.accept(UDP_REPLAY_WINDOW + 10));
         assert!(
@@ -1651,30 +1665,24 @@ mod tests {
         /// Build the EIH block exactly per the spec pseudocode.
         fn eih(&self, salt: &[u8]) -> [u8; 16] {
             let mut eih = identity_token(&self.user_key);
-            BlockCipher::new(self.kind, &identity_subkey(&self.server_key, salt, salt.len()))
-                .unwrap()
-                .encrypt(&mut eih);
+            BlockCipher::new(
+                self.kind,
+                &identity_subkey(&self.server_key, salt, salt.len()),
+            )
+            .unwrap()
+            .encrypt(&mut eih);
             eih
         }
 
         /// Connect, run the handshake with `initial` as the header
         /// payload, and read the echoed bytes of the first response
         /// chunk (the relay's echo rides on the response header).
-        async fn roundtrip(
-            &self,
-            addr: SocketAddr,
-            target: &NetAddr,
-            initial: &[u8],
-        ) -> Vec<u8> {
+        async fn roundtrip(&self, addr: SocketAddr, target: &NetAddr, initial: &[u8]) -> Vec<u8> {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let key_len = self.method.key_len();
             let salt = fresh_salt(key_len);
             let eih = self.eih(&salt);
-            let dec = Aead::new(
-                self.kind,
-                &ss2022_subkey(&self.user_key, &salt, key_len),
-            )
-            .unwrap();
+            let dec = Aead::new(self.kind, &ss2022_subkey(&self.user_key, &salt, key_len)).unwrap();
             let mut nonce = SsNonce::new();
 
             let mut var = Vec::new();
@@ -1721,11 +1729,7 @@ mod tests {
             let key_len = self.method.key_len();
             let salt = fresh_salt(key_len);
             let eih = self.eih(&salt);
-            let dec = Aead::new(
-                self.kind,
-                &ss2022_subkey(&self.user_key, &salt, key_len),
-            )
-            .unwrap();
+            let dec = Aead::new(self.kind, &ss2022_subkey(&self.user_key, &salt, key_len)).unwrap();
             let mut nonce = SsNonce::new();
             let mut var = Vec::new();
             encode_socks_addr(&mut var, &target.host, target.port);
@@ -1855,19 +1859,20 @@ mod tests {
             let server_psk = fresh_psk(psk_len);
             let alice = fresh_psk(psk_len);
             let bob = fresh_psk(psk_len);
-            let (capture, addr) = spawn_server_with(
-                method,
-                &server_psk,
-                vec![("alice", &alice), ("bob", &bob)],
-            )
-            .await;
+            let (capture, addr) =
+                spawn_server_with(method, &server_psk, vec![("alice", &alice), ("bob", &bob)])
+                    .await;
             let target = NetAddr::domain("echo.test", 443).unwrap();
             for user_psk in [&alice, &bob] {
                 let client = RawUserTcp::new(method, &server_psk, user_psk);
                 let echo = client.roundtrip(addr, &target, b"ping").await;
                 assert_eq!(echo, b"ping");
             }
-            assert_eq!(capture.relayed(), 2, "both users relay through one listener");
+            assert_eq!(
+                capture.relayed(),
+                2,
+                "both users relay through one listener"
+            );
             assert_eq!(capture.targets(), vec![target.clone(), target.clone()]);
         }
     }
@@ -1879,9 +1884,12 @@ mod tests {
         let server_psk = fresh_psk(32);
         let alice = fresh_psk(32);
         let imposter = fresh_psk(32);
-        let (capture, addr) =
-            spawn_server_with("2022-blake3-aes-256-gcm", &server_psk, vec![("alice", &alice)])
-                .await;
+        let (capture, addr) = spawn_server_with(
+            "2022-blake3-aes-256-gcm",
+            &server_psk,
+            vec![("alice", &alice)],
+        )
+        .await;
         let target = NetAddr::domain("echo.test", 443).unwrap();
         RawUserTcp::new("2022-blake3-aes-256-gcm", &server_psk, &imposter)
             .rejected_handshake(addr, &target)
@@ -1898,20 +1906,14 @@ mod tests {
             let server_psk = fresh_psk(psk_len);
             let alice = fresh_psk(psk_len);
             let bob = fresh_psk(psk_len);
-            let (capture, addr) = spawn_server_with(
-                method,
-                &server_psk,
-                vec![("alice", &alice), ("bob", &bob)],
-            )
-            .await;
+            let (capture, addr) =
+                spawn_server_with(method, &server_psk, vec![("alice", &alice), ("bob", &bob)])
+                    .await;
             let target = NetAddr::domain("echo.test", 443).unwrap();
             for (i, user_psk) in [&alice, &bob].iter().enumerate() {
                 let mut raw = RawUserUdp::new(method, &server_psk, user_psk);
                 let socket = raw_socket(addr).await;
-                socket
-                    .send(&raw.packet(&target, &[i as u8]))
-                    .await
-                    .unwrap();
+                socket.send(&raw.packet(&target, &[i as u8])).await.unwrap();
                 let mut buf = vec![0u8; 4096];
                 let n = tokio::time::timeout(Duration::from_secs(5), socket.recv(&mut buf))
                     .await
@@ -1931,9 +1933,12 @@ mod tests {
     async fn multi_user_udp_replay_dropped() {
         let server_psk = fresh_psk(32);
         let alice = fresh_psk(32);
-        let (capture, addr) =
-            spawn_server_with("2022-blake3-aes-256-gcm", &server_psk, vec![("alice", &alice)])
-                .await;
+        let (capture, addr) = spawn_server_with(
+            "2022-blake3-aes-256-gcm",
+            &server_psk,
+            vec![("alice", &alice)],
+        )
+        .await;
         let target = NetAddr::domain("echo.test", 443).unwrap();
         let mut raw = RawUserUdp::new("2022-blake3-aes-256-gcm", &server_psk, &alice);
         let packet = raw.packet(&target, b"ping");
@@ -1946,8 +1951,7 @@ mod tests {
             .expect("first reply")
             .unwrap();
         assert_eq!(raw.open(&buf[..n]).1, b"ping");
-        let second =
-            tokio::time::timeout(Duration::from_millis(400), socket.recv(&mut buf)).await;
+        let second = tokio::time::timeout(Duration::from_millis(400), socket.recv(&mut buf)).await;
         assert!(second.is_err(), "a replayed packet produced a second reply");
         assert_eq!(capture.udp_targets().len(), 1);
     }
@@ -1958,16 +1962,18 @@ mod tests {
         let server_psk = fresh_psk(32);
         let alice = fresh_psk(32);
         let imposter = fresh_psk(32);
-        let (capture, addr) =
-            spawn_server_with("2022-blake3-aes-256-gcm", &server_psk, vec![("alice", &alice)])
-                .await;
+        let (capture, addr) = spawn_server_with(
+            "2022-blake3-aes-256-gcm",
+            &server_psk,
+            vec![("alice", &alice)],
+        )
+        .await;
         let target = NetAddr::domain("echo.test", 443).unwrap();
         let mut raw = RawUserUdp::new("2022-blake3-aes-256-gcm", &server_psk, &imposter);
         let socket = raw_socket(addr).await;
         socket.send(&raw.packet(&target, b"ping")).await.unwrap();
         let mut buf = vec![0u8; 4096];
-        let reply =
-            tokio::time::timeout(Duration::from_millis(400), socket.recv(&mut buf)).await;
+        let reply = tokio::time::timeout(Duration::from_millis(400), socket.recv(&mut buf)).await;
         assert!(reply.is_err(), "unknown user must be dropped");
         assert!(capture.udp_targets().is_empty());
     }
@@ -1992,13 +1998,13 @@ mod tests {
         let err = serve(&cfg, Capture::new()).await.unwrap_err().to_string();
         assert!(err.contains("SIP023"), "{err}");
         // Direct constructor checks (serve() surfaces the same errors).
-        assert!(SsServer::new_multi("aes-128-gcm", &fresh_password(), &[("u".into(), "p".into())]).is_err());
         assert!(SsServer::new_multi(
-            "2022-blake3-aes-128-gcm",
-            &server_psk,
-            &[]
+            "aes-128-gcm",
+            &fresh_password(),
+            &[("u".into(), "p".into())]
         )
         .is_err());
+        assert!(SsServer::new_multi("2022-blake3-aes-128-gcm", &server_psk, &[]).is_err());
         assert!(SsServer::new_multi(
             "2022-blake3-aes-128-gcm",
             &server_psk,
@@ -2021,7 +2027,11 @@ mod tests {
         assert!(SsServer::new_multi("2022-blake3-aes-128-gcm", &server_psk, &users).is_ok());
         let table = Users::new(SsMethod::Blake3Aes128Gcm, &users).unwrap();
         assert_eq!(table.list.len(), 2);
-        assert_eq!(table.by_eih.len(), 1, "duplicate PSKs collapse to one token");
+        assert_eq!(
+            table.by_eih.len(),
+            1,
+            "duplicate PSKs collapse to one token"
+        );
     }
 
     // -- SIP023 block-layout unit tests built from the spec pseudocode --
@@ -2039,7 +2049,11 @@ mod tests {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&key);
         hasher.finalize_xof().fill(&mut out64);
-        assert_eq!(&token[..], &out64[..16], "XOF prefix is stable across sizes");
+        assert_eq!(
+            &token[..],
+            &out64[..16],
+            "XOF prefix is stable across sizes"
+        );
         assert_ne!(token, identity_token(&fresh_salt(32)));
     }
 
@@ -2069,14 +2083,10 @@ mod tests {
             assert_eq!(open_eih_tcp(kind, &server_key, &salt, &eih).unwrap(), token);
             // Another salt's subkey does not recover the token.
             let other_salt = fresh_salt(salt_len);
-            let wrong =
-                open_eih_tcp(kind, &server_key, &other_salt, &eih).unwrap();
+            let wrong = open_eih_tcp(kind, &server_key, &other_salt, &eih).unwrap();
             assert_ne!(wrong, token);
             // The identity context differs from the session-subkey one.
-            assert_ne!(
-                subkey,
-                ss2022_subkey(&server_key, &salt, salt_len)
-            );
+            assert_ne!(subkey, ss2022_subkey(&server_key, &salt, salt_len));
         }
     }
 

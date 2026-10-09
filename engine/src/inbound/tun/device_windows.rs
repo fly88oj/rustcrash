@@ -39,8 +39,8 @@ use std::sync::OnceLock;
 use crate::error::{Error, Result};
 
 use super::device::abi::{
-    self, Guid, MibIpInterfaceRow, MibUnicastIpAddressRow, WIN_ERROR_BUFFER_OVERFLOW,
-    WIN_ERROR_NO_MORE_ITEMS, WIN_ERROR_OBJECT_ALREADY_EXISTS, WINTUN_MAX_IP_PACKET_SIZE,
+    self, Guid, MibIpInterfaceRow, MibUnicastIpAddressRow, WINTUN_MAX_IP_PACKET_SIZE,
+    WIN_ERROR_BUFFER_OVERFLOW, WIN_ERROR_NO_MORE_ITEMS, WIN_ERROR_OBJECT_ALREADY_EXISTS,
 };
 
 /// Smallest MTU we accept — mirrors the Linux backend's RFC 791 floor.
@@ -61,8 +61,11 @@ extern "system" {
 // -- wintun.dll: resolved at runtime, signatures from api/wintun.h ----------
 
 /// `WINTUN_CREATE_ADAPTER_FUNC` (wintun.h:64-65): creates the adapter.
-type WintunCreateAdapterFn =
-    unsafe extern "system" fn(name: *const u16, tunnel_type: *const u16, requested_guid: *const Guid) -> *mut c_void;
+type WintunCreateAdapterFn = unsafe extern "system" fn(
+    name: *const u16,
+    tunnel_type: *const u16,
+    requested_guid: *const Guid,
+) -> *mut c_void;
 /// `WINTUN_OPEN_ADAPTER_FUNC` (wintun.h:80): opens an existing one.
 type WintunOpenAdapterFn = unsafe extern "system" fn(name: *const u16) -> *mut c_void;
 /// `WINTUN_CLOSE_ADAPTER_FUNC` (wintun.h:87): closes, and removes adapters
@@ -71,19 +74,23 @@ type WintunCloseAdapterFn = unsafe extern "system" fn(adapter: *mut c_void);
 /// `WINTUN_GET_ADAPTER_LUID_FUNC` (wintun.h:105): LUID out-param.
 type WintunGetAdapterLuidFn = unsafe extern "system" fn(adapter: *mut c_void, luid: *mut u64);
 /// `WINTUN_START_SESSION_FUNC` (wintun.h:179): ring-capacity session.
-type WintunStartSessionFn = unsafe extern "system" fn(adapter: *mut c_void, capacity: u32) -> *mut c_void;
+type WintunStartSessionFn =
+    unsafe extern "system" fn(adapter: *mut c_void, capacity: u32) -> *mut c_void;
 /// `WINTUN_END_SESSION_FUNC` (wintun.h:186).
 type WintunEndSessionFn = unsafe extern "system" fn(session: *mut c_void);
 /// `WINTUN_GET_READ_WAIT_EVENT_FUNC` (wintun.h:198): the ring's read event.
 type WintunGetReadWaitEventFn = unsafe extern "system" fn(session: *mut c_void) -> *mut c_void;
 /// `WINTUN_RECEIVE_PACKET_FUNC` (wintun.h:224): pointer into the ring until
 /// the matching release call.
-type WintunReceivePacketFn = unsafe extern "system" fn(session: *mut c_void, size: *mut u32) -> *mut u8;
+type WintunReceivePacketFn =
+    unsafe extern "system" fn(session: *mut c_void, size: *mut u32) -> *mut u8;
 /// `WINTUN_RELEASE_RECEIVE_PACKET_FUNC` (wintun.h:234).
-type WintunReleaseReceivePacketFn = unsafe extern "system" fn(session: *mut c_void, packet: *const u8);
+type WintunReleaseReceivePacketFn =
+    unsafe extern "system" fn(session: *mut c_void, packet: *const u8);
 /// `WINTUN_ALLOCATE_SEND_PACKET_FUNC` (wintun.h:255): writable slot in the
 /// send ring.
-type WintunAllocateSendPacketFn = unsafe extern "system" fn(session: *mut c_void, size: u32) -> *mut u8;
+type WintunAllocateSendPacketFn =
+    unsafe extern "system" fn(session: *mut c_void, size: u32) -> *mut u8;
 /// `WINTUN_SEND_PACKET_FUNC` (wintun.h:266).
 type WintunSendPacketFn = unsafe extern "system" fn(session: *mut c_void, packet: *const u8);
 
@@ -156,16 +163,26 @@ impl Wintun {
         Some(Wintun {
             module,
             // SAFETY: see above; indices follow the name list.
-            create_adapter: unsafe { std::mem::transmute::<*mut c_void, WintunCreateAdapterFn>(f(0)) },
+            create_adapter: unsafe {
+                std::mem::transmute::<*mut c_void, WintunCreateAdapterFn>(f(0))
+            },
             open_adapter: unsafe { std::mem::transmute::<*mut c_void, WintunOpenAdapterFn>(f(1)) },
-            close_adapter: unsafe { std::mem::transmute::<*mut c_void, WintunCloseAdapterFn>(f(2)) },
-            get_adapter_luid: unsafe { std::mem::transmute::<*mut c_void, WintunGetAdapterLuidFn>(f(3)) },
-            start_session: unsafe { std::mem::transmute::<*mut c_void, WintunStartSessionFn>(f(4)) },
+            close_adapter: unsafe {
+                std::mem::transmute::<*mut c_void, WintunCloseAdapterFn>(f(2))
+            },
+            get_adapter_luid: unsafe {
+                std::mem::transmute::<*mut c_void, WintunGetAdapterLuidFn>(f(3))
+            },
+            start_session: unsafe {
+                std::mem::transmute::<*mut c_void, WintunStartSessionFn>(f(4))
+            },
             end_session: unsafe { std::mem::transmute::<*mut c_void, WintunEndSessionFn>(f(5)) },
             get_read_wait_event: unsafe {
                 std::mem::transmute::<*mut c_void, WintunGetReadWaitEventFn>(f(6))
             },
-            receive_packet: unsafe { std::mem::transmute::<*mut c_void, WintunReceivePacketFn>(f(7)) },
+            receive_packet: unsafe {
+                std::mem::transmute::<*mut c_void, WintunReceivePacketFn>(f(7))
+            },
             release_receive_packet: unsafe {
                 std::mem::transmute::<*mut c_void, WintunReleaseReceivePacketFn>(f(8))
             },
@@ -178,15 +195,12 @@ impl Wintun {
 
     /// The process-wide instance, or a clear error naming the DLL.
     fn shared() -> Result<&'static Wintun> {
-        WINTUN
-            .get_or_init(Wintun::load)
-            .as_ref()
-            .ok_or_else(|| {
-                Error::network(
-                    "tun: wintun.dll is not loadable (place it next to the executable or set \
+        WINTUN.get_or_init(Wintun::load).as_ref().ok_or_else(|| {
+            Error::network(
+                "tun: wintun.dll is not loadable (place it next to the executable or set \
                      WINTUN_DLL; it ships with the official WireGuard clients)",
-                )
-            })
+            )
+        })
     }
 }
 
@@ -233,7 +247,9 @@ impl TunDevice {
         // failure (GetLastError speaks through io::Error).
         let mut adapter = unsafe { (api.open_adapter)(wname.as_ptr()) };
         if adapter.is_null() {
-            adapter = unsafe { (api.create_adapter)(wname.as_ptr(), wide("WireGuard").as_ptr(), std::ptr::null()) };
+            adapter = unsafe {
+                (api.create_adapter)(wname.as_ptr(), wide("WireGuard").as_ptr(), std::ptr::null())
+            };
             if adapter.is_null() {
                 return Err(Error::network(format!(
                     "tun: WintunCreateAdapter {name:?}: {} (the driver must be installed once; \

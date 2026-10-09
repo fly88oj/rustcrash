@@ -76,7 +76,9 @@ use rand::RngCore;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::ring as ring_provider;
 use rustls::crypto::{CryptoProvider, GetRandomFailed, SecureRandom};
-use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme};
+use rustls::{
+    ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme,
+};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -234,7 +236,9 @@ fn client_hello_tag(record: &[u8], password: &str) -> Result<[u8; HMAC_SIZE]> {
     // hmacIndex = sessionIDLengthIndex + 1 + tlsSessionIDSize - hmacSize
     let hmac_index = SESSION_ID_INDEX + TLS_SESSION_ID_SIZE - HMAC_SIZE;
     if record.len() < hmac_index + HMAC_SIZE {
-        return Err(Error::protocol("shadow-tls: ClientHello too short for a session id"));
+        return Err(Error::protocol(
+            "shadow-tls: ClientHello too short for a session id",
+        ));
     }
     let mut mac = Hmac::<Sha1>::new_from_slice(password.as_bytes())
         .map_err(|e| Error::crypto(format!("shadow-tls: hmac key: {e}")))?;
@@ -258,10 +262,13 @@ fn patch_client_hello(
     password: &str,
     random_stream: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>)> {
-    if stream.len() < TLS_HEADER_SIZE || stream[0] != REC_HANDSHAKE
+    if stream.len() < TLS_HEADER_SIZE
+        || stream[0] != REC_HANDSHAKE
         || stream[TLS_HEADER_SIZE] != HS_CLIENT_HELLO
     {
-        return Err(Error::config("shadow-tls: rustls did not emit a ClientHello"));
+        return Err(Error::config(
+            "shadow-tls: rustls did not emit a ClientHello",
+        ));
     }
     let record_len = usize::from(u16::from_be_bytes([stream[3], stream[4]]));
     if stream.len() < TLS_HEADER_SIZE + record_len || record_len < TLS_SESSION_ID_SIZE + 1 {
@@ -277,7 +284,8 @@ fn patch_client_hello(
     let tag = client_hello_tag(stream, password)?;
 
     let mut patched = stream.to_vec();
-    patched[SESSION_ID_INDEX + TLS_SESSION_ID_SIZE - HMAC_SIZE..SESSION_ID_INDEX + TLS_SESSION_ID_SIZE]
+    patched[SESSION_ID_INDEX + TLS_SESSION_ID_SIZE - HMAC_SIZE
+        ..SESSION_ID_INDEX + TLS_SESSION_ID_SIZE]
         .copy_from_slice(&tag);
 
     // Locate the same session id inside the recorded random stream. Rustls
@@ -401,11 +409,16 @@ fn x25519_keygen() -> std::result::Result<X25519Exchange, rustls::Error> {
     Ok(X25519Exchange { scalar, public })
 }
 
-fn x25519_diffie_hellman(scalar: [u8; 32], peer: &[u8]) -> std::result::Result<[u8; 32], rustls::Error> {
+fn x25519_diffie_hellman(
+    scalar: [u8; 32],
+    peer: &[u8],
+) -> std::result::Result<[u8; 32], rustls::Error> {
     let peer: [u8; 32] = peer
         .try_into()
         .map_err(|_| rustls::Error::General("shadow-tls: bad X25519 key share".into()))?;
-    let shared = curve25519_dalek::montgomery::MontgomeryPoint(peer).mul_clamped(scalar).0;
+    let shared = curve25519_dalek::montgomery::MontgomeryPoint(peer)
+        .mul_clamped(scalar)
+        .0;
     if shared.iter().all(|b| *b == 0) {
         // A low-order peer point yields the all-zero secret; ring rejects
         // these too.
@@ -417,7 +430,9 @@ fn x25519_diffie_hellman(scalar: [u8; 32], peer: &[u8]) -> std::result::Result<[
 }
 
 impl rustls::crypto::SupportedKxGroup for ReplayX25519 {
-    fn start(&self) -> std::result::Result<Box<dyn rustls::crypto::ActiveKeyExchange>, rustls::Error> {
+    fn start(
+        &self,
+    ) -> std::result::Result<Box<dyn rustls::crypto::ActiveKeyExchange>, rustls::Error> {
         Ok(Box::new(x25519_keygen()?))
     }
 
@@ -449,7 +464,11 @@ impl rustls::crypto::ActiveKeyExchange for X25519Exchange {
 fn drain_tls(conn: &mut ClientConnection) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     while conn.wants_write() {
-        if conn.write_tls(&mut out).map_err(|e| Error::config(format!("shadow-tls: tls write: {e}")))? == 0 {
+        if conn
+            .write_tls(&mut out)
+            .map_err(|e| Error::config(format!("shadow-tls: tls write: {e}")))?
+            == 0
+        {
             break;
         }
     }
@@ -560,9 +579,7 @@ fn shadow_tls_config(cfg: &ShadowTlsOut) -> Result<Arc<ClientConfig>> {
         if loaded == 0 {
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         }
-        builder
-            .with_root_certificates(roots)
-            .with_no_client_auth()
+        builder.with_root_certificates(roots).with_no_client_auth()
     };
     config.alpn_protocols = DEFAULT_ALPN.iter().map(|p| p.as_bytes().to_vec()).collect();
     Ok(Arc::new(config))
@@ -736,7 +753,9 @@ impl ShadowTlsStream {
         }
         let len = usize::from(u16::from_be_bytes([self.rbuf[3], self.rbuf[4]]));
         if len > MAX_RECORD_PAYLOAD {
-            return Err(io_invalid(Error::protocol("shadow-tls: oversized TLS record")));
+            return Err(io_invalid(Error::protocol(
+                "shadow-tls: oversized TLS record",
+            )));
         }
         if self.rbuf.len() < TLS_HEADER_SIZE + len {
             return Ok(false);
@@ -1042,7 +1061,15 @@ mod tests {
     #[test]
     fn kdf_is_sha256_of_password_and_random() {
         let random = [7u8; TLS_RANDOM_SIZE];
-        let expected: [u8; 32] = Sha256::digest(b"hunter2-secret".as_ref().iter().chain(random.iter()).copied().collect::<Vec<u8>>()).into();
+        let expected: [u8; 32] = Sha256::digest(
+            b"hunter2-secret"
+                .as_ref()
+                .iter()
+                .chain(random.iter())
+                .copied()
+                .collect::<Vec<u8>>(),
+        )
+        .into();
         assert_eq!(kdf("hunter2-secret", &random), expected);
         assert_ne!(kdf("other", &random), expected);
     }
@@ -1106,9 +1133,13 @@ mod tests {
         random_stream.extend_from_slice(&[0x42u8; TLS_SESSION_ID_SIZE]);
         random_stream.extend_from_slice(&[0xBBu8; 16]); // e.g. a key share
 
-        let (patched, replay) = patch_client_hello(&hello, "shared-password", &random_stream).unwrap();
+        let (patched, replay) =
+            patch_client_hello(&hello, "shared-password", &random_stream).unwrap();
         assert_eq!(patched.len(), hello.len(), "record length must not change");
-        assert_eq!(&patched[..SESSION_ID_INDEX + 28], &hello[..SESSION_ID_INDEX + 28]);
+        assert_eq!(
+            &patched[..SESSION_ID_INDEX + 28],
+            &hello[..SESSION_ID_INDEX + 28]
+        );
         assert_ne!(
             &patched[SESSION_ID_INDEX + 28..SESSION_ID_INDEX + 32],
             &hello[SESSION_ID_INDEX + 28..SESSION_ID_INDEX + 32],
@@ -1255,7 +1286,8 @@ mod tests {
         let mut switched = false;
 
         // 2. Relay it to "the real site" (rustls) and send the flight back.
-        tls.read_tls(&mut &hello[..]).map_err(|e| format!("read_tls: {e}"))?;
+        tls.read_tls(&mut &hello[..])
+            .map_err(|e| format!("read_tls: {e}"))?;
         tls.process_new_packets()
             .map_err(|e| format!("server process: {e}"))?;
         send_server_flight(
@@ -1312,8 +1344,7 @@ mod tests {
                     out[0] = REC_APPLICATION_DATA;
                     out[1] = 3;
                     out[2] = 3;
-                    out[3..5]
-                        .copy_from_slice(&((payload.len() + HMAC_SIZE) as u16).to_be_bytes());
+                    out[3..5].copy_from_slice(&((payload.len() + HMAC_SIZE) as u16).to_be_bytes());
                     out.extend_from_slice(&tag);
                     out.extend_from_slice(payload);
                     wr.write_all(&out).await.map_err(|e| e.to_string())?;
@@ -1321,7 +1352,8 @@ mod tests {
                 }
             }
             // Handshake-phase record: relay to the "real site".
-            tls.read_tls(&mut &frame[..]).map_err(|e| format!("read_tls: {e}"))?;
+            tls.read_tls(&mut &frame[..])
+                .map_err(|e| format!("read_tls: {e}"))?;
             tls.process_new_packets()
                 .map_err(|e| format!("server process: {e}"))?;
             send_server_flight(
@@ -1353,7 +1385,8 @@ mod tests {
     ) -> std::result::Result<(), String> {
         let mut flight = Vec::new();
         while tls.wants_write() {
-            tls.write_tls(&mut flight).map_err(|e| format!("write_tls: {e}"))?;
+            tls.write_tls(&mut flight)
+                .map_err(|e| format!("write_tls: {e}"))?;
         }
         let mut rest = &flight[..];
         while !rest.is_empty() {
@@ -1473,7 +1506,10 @@ mod tests {
             Ok(_) => panic!("a wrong password must not authenticate"),
             Err(e) => e,
         };
-        assert!(err.to_string().contains("closed during the handshake"), "{err}");
+        assert!(
+            err.to_string().contains("closed during the handshake"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -1484,7 +1520,8 @@ mod tests {
             Err(e) => e,
         };
         assert!(
-            err.to_string().contains("TLS handshake with the handshake peer"),
+            err.to_string()
+                .contains("TLS handshake with the handshake peer"),
             "{err}"
         );
     }

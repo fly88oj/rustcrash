@@ -139,9 +139,7 @@ fn relay_status_text(status: u8) -> &'static str {
 /// `encodeRelayFeature` (relay.go:375).
 fn encode_relay_feature(feature_type: u8, payload: &[u8]) -> Result<Vec<u8>> {
     if payload.len() > 0xFFFF {
-        return Err(Error::protocol(
-            "gost-relay: feature payload too large",
-        ));
+        return Err(Error::protocol("gost-relay: feature payload too large"));
     }
     let mut out = Vec::with_capacity(3 + payload.len());
     out.push(feature_type);
@@ -153,9 +151,7 @@ fn encode_relay_feature(feature_type: u8, payload: &[u8]) -> Result<Vec<u8>> {
 /// `encodeRelayUserAuth` (relay.go:388).
 fn encode_relay_user_auth(username: &str, password: &str) -> Result<Vec<u8>> {
     if username.len() > 0xFF || password.len() > 0xFF {
-        return Err(Error::protocol(
-            "gost-relay: username or password too long",
-        ));
+        return Err(Error::protocol("gost-relay: username or password too long"));
     }
     let mut out = Vec::with_capacity(2 + username.len() + password.len());
     out.push(username.len() as u8);
@@ -171,9 +167,7 @@ fn encode_relay_addr(target: &NetAddr) -> Result<Vec<u8>> {
     match &target.host {
         Host::Domain(d) => {
             if d.len() > 0xFF {
-                return Err(Error::protocol(
-                    "gost-relay: target host too long",
-                ));
+                return Err(Error::protocol("gost-relay: target host too long"));
             }
             out.push(0x03);
             out.push(d.len() as u8);
@@ -219,9 +213,7 @@ fn build_relay_request(
     )?);
     let payload_len: usize = features.iter().map(|f| f.len()).sum();
     if payload_len > 0xFFFF {
-        return Err(Error::protocol(
-            "gost-relay: feature list too large",
-        ));
+        return Err(Error::protocol("gost-relay: feature list too large"));
     }
     let mut out = Vec::with_capacity(4 + payload_len);
     out.push(RELAY_VERSION);
@@ -277,10 +269,14 @@ fn parse_relay_request(data: &[u8]) -> Result<ParsedRelayRequest> {
                 auth = (user, pass);
             }
             RELAY_FEATURE_ADDR => {
-                let atyp = *payload.first().ok_or_else(|| Error::protocol("gost-relay: empty addr"))?;
+                let atyp = *payload
+                    .first()
+                    .ok_or_else(|| Error::protocol("gost-relay: empty addr"))?;
                 let (host, used) = match atyp {
                     0x01 => {
-                        let o = payload.get(1..5).ok_or_else(|| Error::protocol("gost-relay: short ipv4"))?;
+                        let o = payload
+                            .get(1..5)
+                            .ok_or_else(|| Error::protocol("gost-relay: short ipv4"))?;
                         (
                             Host::Ip(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
                                 o[0], o[1], o[2], o[3],
@@ -289,24 +285,27 @@ fn parse_relay_request(data: &[u8]) -> Result<ParsedRelayRequest> {
                         )
                     }
                     0x04 => {
-                        let o = payload.get(1..17).ok_or_else(|| Error::protocol("gost-relay: short ipv6"))?;
+                        let o = payload
+                            .get(1..17)
+                            .ok_or_else(|| Error::protocol("gost-relay: short ipv6"))?;
                         let mut b = [0u8; 16];
                         b.copy_from_slice(o);
                         (Host::Ip(std::net::IpAddr::V6(b.into())), 16usize)
                     }
                     0x03 => {
-                        let l = *payload.get(1).ok_or_else(|| Error::protocol("gost-relay: short domain"))?
+                        let l = *payload
+                            .get(1)
+                            .ok_or_else(|| Error::protocol("gost-relay: short domain"))?
                             as usize;
                         let d = payload
                             .get(2..2 + l)
                             .ok_or_else(|| Error::protocol("gost-relay: short domain bytes"))?;
                         // 1 length byte + the domain.
-                        (
-                            Host::Domain(String::from_utf8_lossy(d).into_owned()),
-                            1 + l,
-                        )
+                        (Host::Domain(String::from_utf8_lossy(d).into_owned()), 1 + l)
                     }
-                    other => return Err(Error::protocol(format!("gost-relay: bad atyp {other:#x}"))),
+                    other => {
+                        return Err(Error::protocol(format!("gost-relay: bad atyp {other:#x}")))
+                    }
                 };
                 let port = payload
                     .get(1 + used..1 + used + 2)
@@ -385,6 +384,7 @@ async fn dial_relay_server(
             server_name: Some(server_name.clone()),
             skip_cert_verify: cfg.skip_cert_verify,
             alpn: Vec::new(),
+            ..Default::default()
         };
         conn = tls_connect(conn, &server_name, &settings).await?;
     }
@@ -498,7 +498,14 @@ mod tests {
     #[test]
     fn request_layout_tcp_with_auth() {
         let target = NetAddr::domain("echo.example", 443).unwrap();
-        let req = build_relay_request(RELAY_CMD_CONNECT, Some(&target), RELAY_NETWORK_TCP, "u", "p").unwrap();
+        let req = build_relay_request(
+            RELAY_CMD_CONNECT,
+            Some(&target),
+            RELAY_NETWORK_TCP,
+            "u",
+            "p",
+        )
+        .unwrap();
         // Feature list: userauth (3+4) + addr (3+16, "echo.example") +
         // network (3+2) = 31.
         assert_eq!(&req[..4], &[0x01, 0x01, 0x00, 31]);
@@ -523,19 +530,22 @@ mod tests {
             RELAY_NETWORK_UDP,
             "",
             "",
-        ).unwrap();
+        )
+        .unwrap();
         let (cmd, parsed, network, auth) = parse_relay_request(&req).unwrap();
         assert_eq!(cmd, RELAY_CMD_CONNECT | RELAY_FLAG_UDP);
         assert_eq!(parsed.as_ref().unwrap(), &target);
         assert_eq!(network, RELAY_NETWORK_UDP);
         assert_eq!(auth, (String::new(), String::new()));
         // forward: no addr feature.
-        let req = build_relay_request(RELAY_CMD_CONNECT, None, RELAY_NETWORK_TCP, "u", "p").unwrap();
+        let req =
+            build_relay_request(RELAY_CMD_CONNECT, None, RELAY_NETWORK_TCP, "u", "p").unwrap();
         let (_, parsed, _, _) = parse_relay_request(&req).unwrap();
         assert!(parsed.is_none());
         // IPv6 target roundtrip.
         let v6 = NetAddr::ip("2001:db8::1".parse().unwrap(), 853);
-        let req = build_relay_request(RELAY_CMD_CONNECT, Some(&v6), RELAY_NETWORK_TCP, "", "").unwrap();
+        let req =
+            build_relay_request(RELAY_CMD_CONNECT, Some(&v6), RELAY_NETWORK_TCP, "", "").unwrap();
         let (_, parsed, _, _) = parse_relay_request(&req).unwrap();
         assert_eq!(parsed.unwrap(), v6);
     }
@@ -741,7 +751,10 @@ mod tests {
         let mut cfg = test_cfg(false);
         assert!(validate_cfg(&cfg).is_ok());
         cfg.server.clear();
-        assert!(validate_cfg(&cfg).unwrap_err().to_string().contains("server"));
+        assert!(validate_cfg(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("server"));
         let mut cfg = test_cfg(false);
         cfg.port = 0;
         assert!(validate_cfg(&cfg).is_err());

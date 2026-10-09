@@ -30,7 +30,9 @@ pub async fn serve(cfg: &ServerConfig, relay: SharedRelay) -> Result<SocketAddr>
         dest,
     } = &cfg.protocol
     else {
-        return Err(Error::config("restls::serve called with a non-restls protocol"));
+        return Err(Error::config(
+            "restls::serve called with a non-restls protocol",
+        ));
     };
     if password.is_empty() {
         return Err(Error::config("restls: password is required"));
@@ -82,7 +84,11 @@ pub async fn serve(cfg: &ServerConfig, relay: SharedRelay) -> Result<SocketAddr>
 fn parse_dest(dest: &str) -> Result<NetAddr> {
     let (host, port) = if let Some((h, p)) = dest.rsplit_once(':') {
         if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) {
-            (h, p.parse::<u16>().map_err(|_| Error::config(format!("restls: bad dest port {p:?}")))?)
+            (
+                h,
+                p.parse::<u16>()
+                    .map_err(|_| Error::config(format!("restls: bad dest port {p:?}")))?,
+            )
         } else {
             (dest, 443)
         }
@@ -127,12 +133,12 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             loop {
-                let Ok((stream, _)) = listener.accept().await else { continue };
+                let Ok((stream, _)) = listener.accept().await else {
+                    continue;
+                };
                 let config = config.clone();
                 tokio::spawn(async move {
-                    let _ = tokio_rustls::TlsAcceptor::from(config)
-                        .accept(stream)
-                        .await;
+                    let _ = tokio_rustls::TlsAcceptor::from(config).accept(stream).await;
                 });
             }
         });
@@ -180,14 +186,15 @@ mod tests {
         let cfg = listener_cfg(&password, &dest_addr.to_string());
         let addr = serve(&cfg, capture.clone()).await.expect("serve");
 
-        let mut stream = tokio::time::timeout(
-            Duration::from_secs(20),
-            client_conn(addr, &password),
-        )
-        .await
-        .expect("client handshake timeout");
+        let mut stream =
+            tokio::time::timeout(Duration::from_secs(20), client_conn(addr, &password))
+                .await
+                .expect("client handshake timeout");
 
-        stream.write_all(b"ping through restls listener").await.unwrap();
+        stream
+            .write_all(b"ping through restls listener")
+            .await
+            .unwrap();
         let mut buf = vec![0u8; b"ping through restls listener".len()];
         tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut buf))
             .await

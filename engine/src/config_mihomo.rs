@@ -13,7 +13,9 @@ use crate::config::{
 };
 use crate::error::{Error, Result};
 use crate::inbound::{ListenerConfig, ListenerKind};
-use crate::outbound::{GroupConfig, GroupPolicy, OutboundConfig, OutboundKind, TransportKind};
+use crate::outbound::{
+    GroupConfig, GroupPolicy, LbStrategy, OutboundConfig, OutboundKind, TransportKind,
+};
 use crate::proto::shadowsocks::SsMethod;
 use crate::proto::vmess::VmessSecurity;
 use crate::transport::TlsSettings;
@@ -123,6 +125,14 @@ struct RawGroup {
     /// GroupCommonOption.Lazy — defaults TRUE upstream).
     #[serde(default)]
     lazy: Option<bool>,
+    /// `strategy` (load-balance only): consistent-hashing (default) /
+    /// round-robin / sticky-sessions.
+    #[serde(default)]
+    strategy: Option<String>,
+    /// `hash-key` (load-balance only, mihomo 1.19.33+): `in-user` pins
+    /// hashing strategies on the authenticated inbound user.
+    #[serde(default, rename = "hash-key")]
+    hash_key: Option<String>,
     /// `expected-status`: statuses a health probe must return to count
     /// (parser.go ExpectedStatus → utils.NewUnsignedRanges[uint16]).
     #[serde(default, rename = "expected-status")]
@@ -193,8 +203,8 @@ struct ProfileRaw {
 
 /// Load from YAML text.
 pub fn load(text: &str) -> Result<EngineConfig> {
-    let raw: RawConfig = serde_yaml::from_str(text)
-        .map_err(|e| Error::config(format!("mihomo config: {e}")))?;
+    let raw: RawConfig =
+        serde_yaml::from_str(text).map_err(|e| Error::config(format!("mihomo config: {e}")))?;
 
     if raw.proxies.is_empty()
         && raw.proxy_groups.is_empty()
@@ -209,9 +219,7 @@ pub fn load(text: &str) -> Result<EngineConfig> {
     }
 
     let bind = if raw.allow_lan {
-        raw.bind_address
-            .clone()
-            .unwrap_or_else(|| "*".to_string())
+        raw.bind_address.clone().unwrap_or_else(|| "*".to_string())
     } else {
         "127.0.0.1".to_string()
     };
@@ -285,6 +293,45 @@ pub fn load(text: &str) -> Result<EngineConfig> {
             };
             members.extend(nodes.iter().cloned());
         }
+        // load-balance strategy + hash-key (adapter/outboundgroup/
+        // loadbalance.go NewLoadBalance): unknown values and a hash-key
+        // on round-robin (which hashes nothing) are config errors —
+        // mihomo 3025efa rejects both rather than ignore them.
+        let (lb_strategy, lb_hash_key_in_user) = if g.group_type == "load-balance" {
+            let strategy = LbStrategy::parse(g.strategy.as_deref().unwrap_or(""))?;
+            let hash_key = g.hash_key.as_deref().unwrap_or("");
+            let in_user = match hash_key {
+                "" => false,
+                "in-user" => true,
+                other => {
+                    return Err(Error::config(format!(
+                        "group {}: unsupported hash-key: {other} (in-user)",
+                        g.name
+                    )))
+                }
+            };
+            if in_user && strategy == LbStrategy::RoundRobin {
+                return Err(Error::config(format!(
+                    "group {}: unsupported hash-key: round-robin does not hash",
+                    g.name
+                )));
+            }
+            (strategy, in_user)
+        } else {
+            if let Some(strategy) = g.strategy.as_deref().filter(|s| !s.is_empty()) {
+                return Err(Error::config(format!(
+                    "group {}: strategy {strategy:?} only applies to load-balance groups",
+                    g.name
+                )));
+            }
+            if let Some(hk) = g.hash_key.as_deref().filter(|s| !s.is_empty()) {
+                return Err(Error::config(format!(
+                    "group {}: hash-key {hk:?} only applies to load-balance groups",
+                    g.name
+                )));
+            }
+            (LbStrategy::default(), false)
+        };
         groups.push(GroupConfig {
             name: g.name.clone(),
             members,
@@ -292,6 +339,8 @@ pub fn load(text: &str) -> Result<EngineConfig> {
             url: g.url.clone(),
             interval: g.interval.unwrap_or(300),
             tolerance: g.tolerance.unwrap_or(50),
+            lb_strategy,
+            lb_hash_key_in_user,
         });
         if g.disable_udp || g.hidden {
             group_flags.insert(
@@ -302,10 +351,9 @@ pub fn load(text: &str) -> Result<EngineConfig> {
                 },
             );
         }
-        let expected_status = crate::config::ExpectedStatus::parse(
-            g.expected_status.as_deref().unwrap_or_default(),
-        )
-        .map_err(|e| Error::config(format!("group {}: {e}", g.name)))?;
+        let expected_status =
+            crate::config::ExpectedStatus::parse(g.expected_status.as_deref().unwrap_or_default())
+                .map_err(|e| Error::config(format!("group {}: {e}", g.name)))?;
         group_health.insert(
             g.name.clone(),
             crate::config::GroupHealth {
@@ -451,15 +499,13 @@ pub fn load(text: &str) -> Result<EngineConfig> {
 /// firewall owns routes and the resolver address; the engine owns the
 /// netstack). `auto-route`/`auto-detect-interface`/`stack` are accepted
 /// and logged — the engine always uses its own userspace stack.
-fn parse_tun(raw: Option<&BTreeMap<String, Yaml>>) -> Result<Option<crate::inbound::tun::TunConfig>> {
+fn parse_tun(
+    raw: Option<&BTreeMap<String, Yaml>>,
+) -> Result<Option<crate::inbound::tun::TunConfig>> {
     let Some(map) = raw else {
         return Ok(None);
     };
-    if !map
-        .get("enable")
-        .and_then(Yaml::as_bool)
-        .unwrap_or(false)
-    {
+    if !map.get("enable").and_then(Yaml::as_bool).unwrap_or(false) {
         return Ok(None);
     }
     if map.get("auto-route").and_then(Yaml::as_bool) == Some(true) {
@@ -467,18 +513,44 @@ fn parse_tun(raw: Option<&BTreeMap<String, Yaml>>) -> Result<Option<crate::inbou
             "tun.auto-route is handled by the crash firewall layer, not the engine; \
              ensure the firewall TUN mode is enabled");
     }
-    if let Some(stack) = yaml_str(map, "stack") {
-        if !stack.is_empty() {
-            tracing::debug!(target: "engine",
-                "tun.stack {stack:?} ignored: the engine always uses its userspace stack");
+    if let Some(stack) = yaml_str(map, "stack").filter(|s| !s.is_empty()) {
+        // Upstream validates against {system, gvisor, mixed, mips}
+        // (constant/tun.go MapTun; the default is mips since 63bd52e).
+        // The engine always runs its own userspace netstack — a KNOWN
+        // stack name is accepted with a note, anything else is a typo
+        // upstream would also reject.
+        match stack.to_ascii_lowercase().as_str() {
+            "system" | "gvisor" | "mixed" | "mips" => {
+                tracing::debug!(target: "engine",
+                    "tun.stack {stack:?} ignored: the engine always uses its userspace stack");
+            }
+            other => {
+                return Err(Error::config(format!(
+                    "tun.stack {other:?} is not a stack name (system, gvisor, mixed, mips)"
+                )))
+            }
         }
+    }
+    // `congestion-controller` (mihomo RawTun, feeds mipstack's
+    // TCPCongestionControl): the engine's smoltcp netstack has one fixed
+    // congestion-control behavior and no switch — a value here would be
+    // a silent no-op, so it fails loudly (empty = the engine default,
+    // accepted).
+    if let Some(cc) = yaml_str(map, "congestion-controller").filter(|s| !s.is_empty()) {
+        return Err(Error::config(format!(
+            "tun.congestion-controller {cc:?} is not implemented: the engine's netstack has a \
+             fixed congestion-control behavior and no selector (leave the field unset for the \
+             engine default)"
+        )));
     }
     // Address: `inet4-address: 172.19.0.1/30` (or the legacy `interface-name` family).
     let addr_spec = yaml_str(map, "inet4-address")
         .or_else(|| yaml_str(map, "inet4_address"))
         .unwrap_or_else(|| "172.19.0.1/30".to_string());
     let (address, netmask) = parse_cidr_v4(&addr_spec).ok_or_else(|| {
-        Error::config(format!("tun.inet4-address {addr_spec:?} is not an IPv4 CIDR"))
+        Error::config(format!(
+            "tun.inet4-address {addr_spec:?} is not an IPv4 CIDR"
+        ))
     })?;
     let mtu = map
         .get("mtu")
@@ -500,7 +572,9 @@ fn parse_tun(raw: Option<&BTreeMap<String, Yaml>>) -> Result<Option<crate::inbou
         .unwrap_or_default();
     Ok(Some(crate::inbound::tun::TunConfig {
         tag: yaml_str(map, "tag").unwrap_or_else(|| "tun".to_string()),
-        name: yaml_str(map, "device").or_else(|| yaml_str(map, "interface-name")).unwrap_or_default(),
+        name: yaml_str(map, "device")
+            .or_else(|| yaml_str(map, "interface-name"))
+            .unwrap_or_default(),
         address,
         netmask,
         mtu,
@@ -868,9 +942,7 @@ fn load_proxy_providers(
         let vehicle = match p.provider_type.as_deref() {
             Some("file") => crate::api::ProviderVehicle::File {
                 path: p.path.clone().ok_or_else(|| {
-                    Error::config(format!(
-                        "proxy provider {name}: type file requires a path"
-                    ))
+                    Error::config(format!("proxy provider {name}: type file requires a path"))
                 })?,
             },
             Some("http") => crate::api::ProviderVehicle::Http {
@@ -892,9 +964,8 @@ fn load_proxy_providers(
         let hc = p.health_check.clone().unwrap_or_default();
         let expected_status = hc.expected_status.clone().unwrap_or_default();
         if !expected_status.is_empty() {
-            crate::config::ExpectedStatus::parse(&expected_status).map_err(|e| {
-                Error::config(format!("proxy provider {name}: health-check: {e}"))
-            })?;
+            crate::config::ExpectedStatus::parse(&expected_status)
+                .map_err(|e| Error::config(format!("proxy provider {name}: health-check: {e}")))?;
         }
         let health_check = crate::api::ProviderHealthCheck {
             enable: hc.enable,
@@ -917,9 +988,8 @@ fn load_proxy_providers(
                 None,
             ),
             crate::api::ProviderVehicle::Http { url } => {
-                let reply = crate::api::http_get_sync(url).map_err(|e| {
-                    Error::config(format!("proxy provider {name}: {e}"))
-                })?;
+                let reply = crate::api::http_get_sync(url)
+                    .map_err(|e| Error::config(format!("proxy provider {name}: {e}")))?;
                 let info = reply
                     .header("subscription-userinfo")
                     .map(crate::api::parse_subscription_userinfo);
@@ -954,7 +1024,6 @@ fn load_proxy_providers(
     }
     Ok(nodes_by_provider)
 }
-
 
 /// condition holds, the named bundle's rules run with THEIR outbounds;
 /// if none of them matches, evaluation continues past the reference.
@@ -995,7 +1064,9 @@ fn expand_sub_rules(
                 .and_then(|c| c.strip_suffix(')'))
                 .unwrap_or(cond);
             if cond_core.is_empty() {
-                return Err(Error::config(format!("SUB-RULE without condition: {line:?}")));
+                return Err(Error::config(format!(
+                    "SUB-RULE without condition: {line:?}"
+                )));
             }
             let name = name.trim();
             let Some(bundle) = bundles.get(name) else {
@@ -1056,10 +1127,7 @@ fn parse_obfs(entry: &BTreeMap<String, Yaml>) -> Result<Option<crate::outbound::
     }
     let (mut http, mut host) = (true, None);
     if let Some(Yaml::Mapping(opts)) = entry.get("plugin-opts") {
-        if let Some(mode) = opts
-            .get(Yaml::String("mode".into()))
-            .and_then(Yaml::as_str)
-        {
+        if let Some(mode) = opts.get(Yaml::String("mode".into())).and_then(Yaml::as_str) {
             http = match mode {
                 "http" => true,
                 "tls" => false,
@@ -1464,9 +1532,9 @@ fn parse_tlsmirror_opts(
     // The sub-structs (defer write time, padding, enrolment, generator
     // steps) are validated by the proto module on use; carry the raw
     // fields across.
-    if let Some(Yaml::Mapping(sub)) = opts.get(Yaml::String(
-        "defer-instance-derived-write-time".into(),
-    )) {
+    if let Some(Yaml::Mapping(sub)) =
+        opts.get(Yaml::String("defer-instance-derived-write-time".into()))
+    {
         out.defer_instance_derived_write = crate::proto::tlsmirror::TimeSpec {
             base_nanoseconds: sub
                 .get(Yaml::String("base-nanoseconds".into()))
@@ -1478,9 +1546,7 @@ fn parse_tlsmirror_opts(
                 .unwrap_or(0),
         };
     }
-    if let Some(Yaml::Mapping(sub)) =
-        opts.get(Yaml::String("transport-layer-padding".into()))
-    {
+    if let Some(Yaml::Mapping(sub)) = opts.get(Yaml::String("transport-layer-padding".into())) {
         out.transport_layer_padding = sub
             .get(Yaml::String("enabled".into()))
             .and_then(Yaml::as_bool)
@@ -1499,8 +1565,7 @@ fn parse_proxy(
     index: usize,
     all: &[BTreeMap<String, Yaml>],
 ) -> Result<OutboundConfig> {
-    let name = yaml_str(entry, "name")
-        .unwrap_or_else(|| format!("proxy-{index}"));
+    let name = yaml_str(entry, "name").unwrap_or_else(|| format!("proxy-{index}"));
     let ptype = yaml_str(entry, "type").unwrap_or_default();
     // mihomo #2426 (the dialer-proxy leak): chaining an outbound's dial
     // through another proxy is NOT implemented here. Silently ignoring
@@ -1516,16 +1581,13 @@ fn parse_proxy(
     // Wireguard carries server/port on peers[0], not the entry itself;
     // tailscale dials itself through the tsnet stack (no server field
     // upstream either).
-    let is_wireguard = ptype == "wireguard"
-        || ptype == "tailscale"
-        || ptype == "zerotier"
-        || ptype == "easytier";
+    let is_wireguard =
+        ptype == "wireguard" || ptype == "tailscale" || ptype == "zerotier" || ptype == "easytier";
     let server = if is_wireguard {
         String::new()
     } else {
-        yaml_str(entry, "server").ok_or_else(|| {
-            Error::config(format!("proxy {name:?} missing server"))
-        })?
+        yaml_str(entry, "server")
+            .ok_or_else(|| Error::config(format!("proxy {name:?} missing server")))?
     };
     let port: u16 = if is_wireguard {
         0
@@ -1542,10 +1604,7 @@ fn parse_proxy(
             .ok_or_else(|| Error::config(format!("proxy {name:?} missing port")))?
     };
     // mihomo's default is udp: false.
-    let udp = entry
-        .get("udp")
-        .and_then(Yaml::as_bool)
-        .unwrap_or(false);
+    let udp = entry.get("udp").and_then(Yaml::as_bool).unwrap_or(false);
 
     let tls = parse_tls(entry);
     // Overlay outbounds (zerotier) use `network:` for the network id —
@@ -1693,10 +1752,7 @@ fn parse_proxy(
         "trojan" => {
             // mihomo treats trojan as TLS-by-default (the protocol is
             // defined over TLS); `tls: false` is the explicit opt-out.
-            let tls_enabled = entry
-                .get("tls")
-                .and_then(Yaml::as_bool)
-                .unwrap_or(true);
+            let tls_enabled = entry.get("tls").and_then(Yaml::as_bool).unwrap_or(true);
             let mut tls = tls;
             tls.enabled = tls_enabled;
             let jls = parse_jls_opts(entry, &name, &transport)?;
@@ -1716,18 +1772,44 @@ fn parse_proxy(
                 ech,
             }
         }
-        "socks5" => OutboundKind::Socks {
-            username: yaml_str(entry, "username"),
-            password: yaml_str(entry, "password"),
-            server,
-            port,
-        },
-        "http" => OutboundKind::Http {
-            username: yaml_str(entry, "username"),
-            password: yaml_str(entry, "password"),
-            server,
-            port,
-        },
+        "socks5" => {
+            let tls = parse_http_socks5_tls(entry, &name)?;
+            OutboundKind::Socks {
+                username: yaml_str(entry, "username"),
+                password: yaml_str(entry, "password"),
+                server,
+                port,
+                tls,
+            }
+        }
+        "http" => {
+            let tls = parse_http_socks5_tls(entry, &name)?;
+            let mut headers = Vec::new();
+            if let Some(Yaml::Mapping(map)) = entry.get("headers") {
+                for (k, v) in map {
+                    // mihomo's Headers is map[string]string — a non-string
+                    // key or value is a config error, not a dropped entry.
+                    let (Some(k), Some(v)) = (k.as_str(), v.as_str()) else {
+                        return Err(Error::config(format!(
+                            "proxy {name:?}: headers keys and values must be strings \
+                             (got key {k:?}, value {v:?})"
+                        )));
+                    };
+                    headers.push((k.to_string(), v.to_string()));
+                }
+            }
+            OutboundKind::Http {
+                username: yaml_str(entry, "username"),
+                password: yaml_str(entry, "password"),
+                server,
+                port,
+                tls,
+                path: None,
+                headers,
+                // mihomo's client is net/http: any 2xx opens the tunnel.
+                strict_200: false,
+            }
+        }
         "hysteria2" | "hy2" => {
             // Port hopping (`ports` ranges + `hop-interval`, mihomo
             // adapter/outbound/hysteria2.go:44-45) rides quic-go's ability
@@ -1742,27 +1824,27 @@ fn parse_proxy(
                 )));
             }
             OutboundKind::Hysteria2 {
-            password: yaml_str(entry, "password").unwrap_or_default(),
-            sni: yaml_str(entry, "sni"),
-            skip_verify: entry
-                .get("skip-cert-verify")
-                .and_then(Yaml::as_bool)
-                .unwrap_or(false),
-            // Only salamander exists upstream; an unknown obfs errors.
-            obfs: match yaml_str(entry, "obfs").as_deref() {
-                None | Some("") => None,
-                Some("salamander") => yaml_str(entry, "obfs-password"),
-                Some(other) => {
-                    return Err(Error::config(format!(
-                        "proxy {name:?}: obfs {other:?} not supported (salamander)"
-                    )))
-                }
-            },
-            server,
-            port,
-            ech: parse_ech_opts(entry, &name, &TransportKind::Tcp),
+                password: yaml_str(entry, "password").unwrap_or_default(),
+                sni: yaml_str(entry, "sni"),
+                skip_verify: entry
+                    .get("skip-cert-verify")
+                    .and_then(Yaml::as_bool)
+                    .unwrap_or(false),
+                // Only salamander exists upstream; an unknown obfs errors.
+                obfs: match yaml_str(entry, "obfs").as_deref() {
+                    None | Some("") => None,
+                    Some("salamander") => yaml_str(entry, "obfs-password"),
+                    Some(other) => {
+                        return Err(Error::config(format!(
+                            "proxy {name:?}: obfs {other:?} not supported (salamander)"
+                        )))
+                    }
+                },
+                server,
+                port,
+                ech: parse_ech_opts(entry, &name, &TransportKind::Tcp),
+            }
         }
-        },
         "tuic" => OutboundKind::Tuic {
             uuid: yaml_str(entry, "uuid")
                 .unwrap_or_default()
@@ -1839,13 +1921,13 @@ fn parse_proxy(
             let peers_entry: BTreeMap<String, Yaml> = match peer {
                 Yaml::Mapping(m) => m
                     .iter()
-                    .filter_map(|(k, v)| {
-                        k.as_str().map(|ks| (ks.to_string(), v.clone()))
-                    })
+                    .filter_map(|(k, v)| k.as_str().map(|ks| (ks.to_string(), v.clone())))
                     .collect(),
-                _ => return Err(Error::config(format!(
-                    "proxy {name:?}: wireguard peers[0] must be a mapping"
-                ))),
+                _ => {
+                    return Err(Error::config(format!(
+                        "proxy {name:?}: wireguard peers[0] must be a mapping"
+                    )))
+                }
             };
             OutboundKind::Wireguard(crate::proto::wireguard::WgOut {
                 server: yaml_str(&peers_entry, "server").ok_or_else(|| {
@@ -1861,8 +1943,7 @@ fn parse_proxy(
                     })?,
                 private_key: yaml_str(entry, "private-key").unwrap_or_default(),
                 peer_public_key: yaml_str(&peers_entry, "public-key").unwrap_or_default(),
-                pre_shared_key: yaml_str(&peers_entry, "pre-shared-key")
-                    .filter(|k| !k.is_empty()),
+                pre_shared_key: yaml_str(&peers_entry, "pre-shared-key").filter(|k| !k.is_empty()),
                 local_ip: yaml_str(entry, "ip")
                     .and_then(|ip| ip.parse().ok())
                     .unwrap_or(std::net::Ipv4Addr::new(172, 16, 0, 1)),
@@ -1884,10 +1965,7 @@ fn parse_proxy(
                     })
                     .unwrap_or([0u8; 3]),
                 // mihomo's wireguard is udp-capable unless opted out.
-                udp: entry
-                    .get("udp")
-                    .and_then(Yaml::as_bool)
-                    .unwrap_or(true),
+                udp: entry.get("udp").and_then(Yaml::as_bool).unwrap_or(true),
             })
         }
         "snell" => {
@@ -2027,10 +2105,7 @@ fn parse_proxy(
             port,
         },
         "shadowquic" => {
-            let mut opt = crate::proto::shadowquic::ShadowQuicOption::new(
-                server.clone(),
-                port,
-            );
+            let mut opt = crate::proto::shadowquic::ShadowQuicOption::new(server.clone(), port);
             opt.name = name.clone();
             opt.username = yaml_str(entry, "username").unwrap_or_default();
             opt.password = yaml_str(entry, "password").unwrap_or_default();
@@ -2056,9 +2131,8 @@ fn parse_proxy(
             // module's precise error at parse time when credentials are
             // set (upstream always enables JLS; the empty-credential
             // framing-only mode is this port's documented delta).
-            crate::proto::shadowquic::parse_quic_versions(&opt.quic_versions).map_err(
-                |e| Error::config(format!("proxy {name:?}: shadowquic: {e}")),
-            )?;
+            crate::proto::shadowquic::parse_quic_versions(&opt.quic_versions)
+                .map_err(|e| Error::config(format!("proxy {name:?}: shadowquic: {e}")))?;
             OutboundKind::ShadowQuic(opt)
         }
         "sudoku" => {
@@ -2070,8 +2144,7 @@ fn parse_proxy(
             cfg.table_type = yaml_str(entry, "table-type").unwrap_or_default();
             cfg.enable_pure_downlink = entry.get("enable-pure-downlink").and_then(Yaml::as_bool);
             cfg.http_mask = entry.get("http-mask").and_then(Yaml::as_bool);
-            cfg.http_mask_mode =
-                yaml_str(entry, "http-mask-mode").unwrap_or_default();
+            cfg.http_mask_mode = yaml_str(entry, "http-mask-mode").unwrap_or_default();
             cfg.http_mask_tls = yaml_bool(entry, "http-mask-tls");
             cfg.http_mask_host = yaml_str(entry, "http-mask-host").unwrap_or_default();
             cfg.path_root = yaml_str(entry, "path-root").unwrap_or_default();
@@ -2118,13 +2191,11 @@ fn parse_proxy(
             cfg.username = yaml_str(entry, "username").unwrap_or_default();
             cfg.password = yaml_str(entry, "password").unwrap_or_default();
             cfg.skip_cert_verify = yaml_bool(entry, "skip-cert-verify");
-            cfg.name_cert_verify =
-                yaml_str(entry, "name-cert-verify").unwrap_or_default();
+            cfg.name_cert_verify = yaml_str(entry, "name-cert-verify").unwrap_or_default();
             cfg.fingerprint = yaml_str(entry, "fingerprint").unwrap_or_default();
             cfg.certificate = yaml_str(entry, "certificate").unwrap_or_default();
             cfg.private_key = yaml_str(entry, "private-key").unwrap_or_default();
-            cfg.client_fingerprint =
-                yaml_str(entry, "client-fingerprint").unwrap_or_default();
+            cfg.client_fingerprint = yaml_str(entry, "client-fingerprint").unwrap_or_default();
             OutboundKind::GostRelay(cfg)
         }
         "trusttunnel" => {
@@ -2134,13 +2205,11 @@ fn parse_proxy(
             cfg.alpn = yaml_str_list(entry, "alpn");
             cfg.sni = yaml_str(entry, "sni").unwrap_or_default();
             cfg.skip_cert_verify = yaml_bool(entry, "skip-cert-verify");
-            cfg.name_cert_verify =
-                yaml_str(entry, "name-cert-verify").unwrap_or_default();
+            cfg.name_cert_verify = yaml_str(entry, "name-cert-verify").unwrap_or_default();
             cfg.fingerprint = yaml_str(entry, "fingerprint").unwrap_or_default();
             cfg.certificate = yaml_str(entry, "certificate").unwrap_or_default();
             cfg.private_key = yaml_str(entry, "private-key").unwrap_or_default();
-            cfg.client_fingerprint =
-                yaml_str(entry, "client-fingerprint").unwrap_or_default();
+            cfg.client_fingerprint = yaml_str(entry, "client-fingerprint").unwrap_or_default();
             cfg.udp = udp;
             cfg.health_check = yaml_bool(entry, "health-check");
             cfg.quic = yaml_bool(entry, "quic");
@@ -2170,8 +2239,7 @@ fn parse_proxy(
                 skip_cert_verify: yaml_bool(entry, "skip-cert-verify"),
                 name_cert_verify: yaml_str(entry, "name-cert-verify").unwrap_or_default(),
                 network: yaml_str(entry, "network").unwrap_or_default(),
-                congestion_controller: yaml_str(entry, "congestion-controller")
-                    .unwrap_or_default(),
+                congestion_controller: yaml_str(entry, "congestion-controller").unwrap_or_default(),
                 cwnd: yaml_i64(entry, "cwnd").unwrap_or(0),
                 bbr_profile: yaml_str(entry, "bbr-profile").unwrap_or_default(),
                 remote_dns_resolve: yaml_bool(entry, "remote-dns-resolve"),
@@ -2236,8 +2304,7 @@ fn parse_proxy(
                 dev: yaml_str(entry, "dev").unwrap_or_default(),
                 cipher: yaml_str(entry, "cipher").unwrap_or_default(),
                 data_ciphers: yaml_str_list(entry, "data-ciphers"),
-                data_cipher_fallback: yaml_str(entry, "data-ciphers-fallback")
-                    .unwrap_or_default(),
+                data_cipher_fallback: yaml_str(entry, "data-ciphers-fallback").unwrap_or_default(),
                 auth: yaml_str(entry, "auth").unwrap_or_default(),
                 comp_lzo: yaml_str(entry, "comp-lzo").unwrap_or_default(),
                 ca,
@@ -2261,22 +2328,20 @@ fn parse_proxy(
             })
         }
         "dns" => OutboundKind::Dns,
-        "tailscale" => {
-            OutboundKind::Tailscale(crate::proto::tailscale::TailscaleConfig {
-                name: name.clone(),
-                hostname: yaml_str(entry, "hostname"),
-                auth_key: yaml_str(entry, "auth-key"),
-                control_url: yaml_str(entry, "control-url"),
-                state_dir: yaml_str(entry, "state-dir"),
-                ephemeral: yaml_bool(entry, "ephemeral"),
-                udp: yaml_bool(entry, "udp"),
-                accept_routes: entry.get("accept-routes").and_then(Yaml::as_bool),
-                exit_node: yaml_str(entry, "exit-node"),
-                exit_node_allow_lan_access: entry
-                    .get("exit-node-allow-lan-access")
-                    .and_then(Yaml::as_bool),
-            })
-        }
+        "tailscale" => OutboundKind::Tailscale(crate::proto::tailscale::TailscaleConfig {
+            name: name.clone(),
+            hostname: yaml_str(entry, "hostname"),
+            auth_key: yaml_str(entry, "auth-key"),
+            control_url: yaml_str(entry, "control-url"),
+            state_dir: yaml_str(entry, "state-dir"),
+            ephemeral: yaml_bool(entry, "ephemeral"),
+            udp: yaml_bool(entry, "udp"),
+            accept_routes: entry.get("accept-routes").and_then(Yaml::as_bool),
+            exit_node: yaml_str(entry, "exit-node"),
+            exit_node_allow_lan_access: entry
+                .get("exit-node-allow-lan-access")
+                .and_then(Yaml::as_bool),
+        }),
         "zerotier" => {
             let ip_stack = match yaml_str(entry, "ip-stack") {
                 Some(s) => crate::proto::zerotier::IpStack::parse(&s)
@@ -2361,16 +2426,90 @@ fn parse_proxy(
         | OutboundKind::Tuic { .. }
         | OutboundKind::ShadowQuic(_)
         | OutboundKind::Sudoku(_)
-        | OutboundKind::Masque(_) => {
-            entry.get("udp").and_then(Yaml::as_bool).unwrap_or(true)
-        }
+        | OutboundKind::Masque(_) => entry.get("udp").and_then(Yaml::as_bool).unwrap_or(true),
         _ => udp,
     };
-    Ok(OutboundConfig {
-        name,
-        udp,
-        kind,
-    })
+    Ok(OutboundConfig { name, udp, kind })
+}
+
+/// Decode a (colon-separated) hex SHA-256 pin — exactly 32 bytes —
+/// without a hex crate (the tree's house style: openvpn.rs and
+/// sudoku.rs keep their own decoders for the same reason).
+fn decode_sha256_hex(s: &str) -> Option<[u8; 32]> {
+    let cleaned: String = s.trim().chars().filter(|c| *c != ':').collect();
+    if cleaned.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, pair) in cleaned.as_bytes().chunks(2).enumerate() {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out[i] = ((hi << 4) | lo) as u8;
+    }
+    Some(out)
+}
+
+/// mihomo http/socks5 TLS surface (HttpOption/Socks5Option: tls, sni,
+/// skip-cert-verify, fingerprint, certificate, private-key,
+/// name-cert-verify) — adapter/outbound/{http,socks5}.go via
+/// component/ca GetTLSConfig. `fingerprint` is a hex SHA-256 pin over
+/// any certificate in the peer chain (NewFingerprintVerifier: colons
+/// stripped, must decode to 32 bytes; browser names are rejected with
+/// the client-fingerprint pointer); certificate/private-key is the
+/// client's own mTLS identity; name-cert-verify is not implemented and
+/// fails loudly.
+fn parse_http_socks5_tls(
+    entry: &std::collections::BTreeMap<String, Yaml>,
+    name: &str,
+) -> Result<crate::transport::TlsSettings> {
+    let enabled = entry.get("tls").and_then(Yaml::as_bool).unwrap_or(false);
+    let mut settings = crate::transport::TlsSettings {
+        enabled,
+        server_name: yaml_str(entry, "sni"),
+        skip_cert_verify: entry
+            .get("skip-cert-verify")
+            .and_then(Yaml::as_bool)
+            .unwrap_or(false),
+        ..Default::default()
+    };
+    if let Some(fp) = yaml_str(entry, "fingerprint").filter(|s| !s.is_empty()) {
+        if crate::proto::reality::is_client_fingerprint_name(&fp) {
+            return Err(Error::config(format!(
+                "proxy {name:?}: `fingerprint` is used for TLS certificate pinning. If you \
+                 need to specify the browser fingerprint, use `client-fingerprint`"
+            )));
+        }
+        let pin = decode_sha256_hex(&fp).ok_or_else(|| {
+            Error::config(format!(
+                "proxy {name:?}: fingerprint string decode error, need sha256 fingerprint"
+            ))
+        })?;
+        settings.cert_sha256.push(pin);
+        settings.cert_pin_scope = crate::transport::PinScope::AnyChain;
+    }
+    let certificate = yaml_str(entry, "certificate").filter(|s| !s.is_empty());
+    let private_key = yaml_str(entry, "private-key").filter(|s| !s.is_empty());
+    match (certificate, private_key) {
+        (Some(cert), Some(key)) => {
+            settings.client_cert = Some(crate::transport::ClientIdentity {
+                cert_pem: cert,
+                key_pem: key,
+            })
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(Error::config(format!(
+                "proxy {name:?}: certificate and private-key must be set together"
+            )))
+        }
+        (None, None) => {}
+    }
+    if let Some(ncv) = yaml_str(entry, "name-cert-verify").filter(|s| !s.is_empty()) {
+        return Err(Error::config(format!(
+            "proxy {name:?}: name-cert-verify {ncv:?} is not implemented by the Rust engine \
+             (verify the server under a different name via sni + skip-cert-verify off)"
+        )));
+    }
+    Ok(settings)
 }
 
 /// mihomo `hosts:` values may be an IP string, an IP list, or (legacy) an
@@ -2397,7 +2536,9 @@ fn parse_nameserver_policy(
     out
 }
 
-fn parse_hosts(raw: Option<&std::collections::HashMap<String, Yaml>>) -> std::collections::HashMap<String, Vec<std::net::IpAddr>> {
+fn parse_hosts(
+    raw: Option<&std::collections::HashMap<String, Yaml>>,
+) -> std::collections::HashMap<String, Vec<std::net::IpAddr>> {
     let mut out = std::collections::HashMap::new();
     let Some(map) = raw else { return out };
     for (domain, value) in map {
@@ -2439,20 +2580,14 @@ fn parse_sniffer(raw: Option<&BTreeMap<String, Yaml>>) -> crate::sniffer::SniffC
     let Some(map) = raw else {
         return Default::default();
     };
-    if !map
-        .get("enable")
-        .and_then(Yaml::as_bool)
-        .unwrap_or(false)
-    {
+    if !map.get("enable").and_then(Yaml::as_bool).unwrap_or(false) {
         return Default::default();
     }
     let (tls, http, quic) = match map.get("sniff") {
         Some(Yaml::Mapping(sub)) => {
             let has = |key: &str| {
-                sub.keys().any(|k| {
-                    k.as_str()
-                        .is_some_and(|s| s.eq_ignore_ascii_case(key))
-                })
+                sub.keys()
+                    .any(|k| k.as_str().is_some_and(|s| s.eq_ignore_ascii_case(key)))
             };
             (has("TLS"), has("HTTP"), has("QUIC"))
         }
@@ -2518,7 +2653,12 @@ fn parse_sniffer(raw: Option<&BTreeMap<String, Yaml>>) -> crate::sniffer::SniffC
 /// mihomo `profile.store-fake-ip: true` → a JSON store beside the
 /// config's cache location (the engine's own cache dir convention).
 fn raw_profile_store_fakeip(raw: &RawConfig) -> Option<std::path::PathBuf> {
-    if raw.profile.as_ref().and_then(|p| p.store_fake_ip).unwrap_or(false) {
+    if raw
+        .profile
+        .as_ref()
+        .and_then(|p| p.store_fake_ip)
+        .unwrap_or(false)
+    {
         Some(std::path::PathBuf::from("/tmp/rustcrash-fakeip-store.json"))
     } else {
         None
@@ -2526,19 +2666,16 @@ fn raw_profile_store_fakeip(raw: &RawConfig) -> Option<std::path::PathBuf> {
 }
 
 fn parse_tls(entry: &BTreeMap<String, Yaml>) -> TlsSettings {
-    let enabled = entry
-        .get("tls")
-        .and_then(Yaml::as_bool)
-        .unwrap_or(false);
+    let enabled = entry.get("tls").and_then(Yaml::as_bool).unwrap_or(false);
     TlsSettings {
         enabled,
-        server_name: yaml_str(entry, "sni")
-            .or_else(|| yaml_str(entry, "servername")),
+        server_name: yaml_str(entry, "sni").or_else(|| yaml_str(entry, "servername")),
         skip_cert_verify: entry
             .get("skip-cert-verify")
             .and_then(Yaml::as_bool)
             .unwrap_or(false),
         alpn: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -2639,6 +2776,88 @@ rules:
         assert!(err.contains("dialer-proxy"), "{err}");
         assert!(err.contains("leak the real IP"), "{err}");
         assert!(err.contains("chained"), "{err}");
+    }
+
+    // ---- drift-sync 2026-10-08: load-balance strategy/hash-key ----
+
+    #[test]
+    fn load_balance_strategy_and_hash_key_parse() {
+        let base = |extra: &str| {
+            format!(
+                "mixed-port: 7890\nproxies:\n  - name: A\n    type: ss\n    server: a.example\n    port: 1\n    cipher: aes-128-gcm\n    password: p\nproxy-groups:\n  - name: LB\n    type: load-balance\n    proxies: [A]\n{extra}rules:\n  - MATCH,DIRECT\n"
+            )
+        };
+        for extra in [
+            "",
+            "    strategy: consistent-hashing\n",
+            "    strategy: round-robin\n",
+            "    strategy: sticky-sessions\n    hash-key: in-user\n",
+        ] {
+            let cfg = load(&base(extra)).unwrap();
+            let lb = cfg.groups.iter().find(|g| g.name == "LB").unwrap();
+            assert_eq!(lb.policy, crate::outbound::GroupPolicy::LoadBalance);
+        }
+        let err = load(&base("    strategy: magic\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unsupported strategy: magic"), "{err}");
+        let err = load(&base(
+            "    strategy: sticky-sessions\n    hash-key: src-ip\n",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unsupported hash-key: src-ip"), "{err}");
+        let err = load(&base("    strategy: round-robin\n    hash-key: in-user\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("round-robin does not hash"), "{err}");
+        let err = load(&base("    strategy: round-robin\n").replace("load-balance", "select"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("only applies to load-balance"), "{err}");
+    }
+
+    #[test]
+    fn tun_congestion_controller_and_unknown_stack_fail_loudly() {
+        let base = |tun: &str| format!("tun:\n{tun}mixed-port: 7890\nrules:\n  - MATCH,DIRECT\n");
+        let err = load(&base("  enable: true\n  congestion-controller: bbr\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("congestion-controller"), "{err}");
+        let err = load(&base("  enable: true\n  stack: foobar\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a stack name"), "{err}");
+        load(&base("  enable: true\n  stack: mips\n")).unwrap();
+    }
+
+    #[test]
+    fn http_socks5_tls_surface_parses() {
+        let cfg = load(
+            "mixed-port: 7890\nproxies:\n  - name: hp\n    type: http\n    server: h.example\n    port: 8080\n    tls: true\n    sni: h.example\n    skip-cert-verify: true\n    headers:\n      X-Custom: v\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .unwrap();
+        match &cfg.outbounds.iter().find(|o| o.name == "hp").unwrap().kind {
+            crate::outbound::OutboundKind::Http { tls, headers, .. } => {
+                assert!(tls.enabled, "http tls: true must carry into the dial");
+                assert_eq!(tls.server_name.as_deref(), Some("h.example"));
+                assert!(tls.skip_cert_verify);
+                assert_eq!(headers, &vec![("X-Custom".to_string(), "v".to_string())]);
+            }
+            other => panic!("wrong kind {other:?}"),
+        }
+        let err = load(
+            "mixed-port: 7890\nproxies:\n  - name: hp\n    type: http\n    server: h.example\n    port: 8080\n    tls: true\n    fingerprint: chrome\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("use `client-fingerprint`"), "{err}");
+        let err = load(
+            "mixed-port: 7890\nproxies:\n  - name: hp\n    type: http\n    server: h.example\n    port: 8080\n    tls: true\n    fingerprint: abcd\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("sha256 fingerprint"), "{err}");
     }
 
     const SAMPLE_SHELLCRASH: &str = r#"
@@ -2763,7 +2982,10 @@ rules:
     fn loads_full_config() {
         let cfg = load(SAMPLE).unwrap();
         assert_eq!(cfg.listeners.len(), 3);
-        assert!(cfg.listeners.iter().any(|l| l.kind == ListenerKind::Mixed && l.port == 7890));
+        assert!(cfg
+            .listeners
+            .iter()
+            .any(|l| l.kind == ListenerKind::Mixed && l.port == 7890));
         assert!(cfg.listeners.iter().any(|l| l.kind == ListenerKind::Redir));
         assert!(cfg.listeners.iter().any(|l| l.kind == ListenerKind::Tproxy));
         assert_eq!(cfg.listeners[0].bind, "0.0.0.0");
@@ -2882,7 +3104,10 @@ rules:
                 assert_eq!(w.peer_public_key, "cHViCg==");
                 assert_eq!(w.pre_shared_key.as_deref(), Some("cHNrCg=="));
                 assert_eq!(w.local_ip.to_string(), "172.16.0.2");
-                assert_eq!(w.local_ipv6.map(|i| i.to_string()).as_deref(), Some("fd00::2"));
+                assert_eq!(
+                    w.local_ipv6.map(|i| i.to_string()).as_deref(),
+                    Some("fd00::2")
+                );
                 assert_eq!(w.mtu, 1408);
                 assert_eq!(w.reserved, [1, 2, 3]);
                 assert!(w.udp, "mihomo defaults wg udp to true via our udp default");
@@ -3019,8 +3244,14 @@ rules:
         };
         use crate::outbound::OutboundKind;
         assert!(matches!(probe("sudoku").kind, OutboundKind::Sudoku(_)));
-        assert!(matches!(probe("gost-relay").kind, OutboundKind::GostRelay(_)));
-        assert!(matches!(probe("trusttunnel").kind, OutboundKind::TrustTunnel(_)));
+        assert!(matches!(
+            probe("gost-relay").kind,
+            OutboundKind::GostRelay(_)
+        ));
+        assert!(matches!(
+            probe("trusttunnel").kind,
+            OutboundKind::TrustTunnel(_)
+        ));
         assert!(matches!(probe("masque").kind, OutboundKind::Masque(_)));
         // Upstream: shadowquic/sudoku/masque are UDP-capable by default;
         // gost-relay/trusttunnel UDP is opt-in (`udp: true`).
@@ -3304,7 +3535,13 @@ rules:
 "#,
         )
         .unwrap();
-        match &cfg.outbounds.iter().find(|o| o.name == "ovpn").unwrap().kind {
+        match &cfg
+            .outbounds
+            .iter()
+            .find(|o| o.name == "ovpn")
+            .unwrap()
+            .kind
+        {
             crate::outbound::OutboundKind::OpenVpn(c) => {
                 assert_eq!(c.proto.as_deref(), Some("udp"));
                 assert_eq!(c.cipher, "AES-256-GCM");
@@ -3354,9 +3591,7 @@ rules:
             .expect("restls listener");
         assert_eq!(rl.protocol_name(), "restls");
         match &rl.protocol {
-            crate::inbound::proxy_server::ServerProtocol::Restls {
-                password, dest, ..
-            } => {
+            crate::inbound::proxy_server::ServerProtocol::Restls { password, dest, .. } => {
                 assert_eq!(password, "pw");
                 assert_eq!(dest, "camo.example:443");
             }
@@ -3402,7 +3637,10 @@ rules:
             } => {
                 assert!(!primary_key.is_empty());
                 assert_eq!(*defer_write_time, (100, 50));
-                assert_eq!(enrolment.as_ref(), Some(&("in".to_string(), "out".to_string())));
+                assert_eq!(
+                    enrolment.as_ref(),
+                    Some(&("in".to_string(), "out".to_string()))
+                );
                 assert!(*sequence_watermarking);
                 assert_eq!(dest, "carrier.example:443");
             }
@@ -3627,7 +3865,10 @@ rules:
 "#;
         let parsed = load(minimal).unwrap();
         let node = parsed.outbounds.iter().find(|o| o.name == "n").unwrap();
-        assert!(!node.udp, "omitted udp must default to false (mihomo default)");
+        assert!(
+            !node.udp,
+            "omitted udp must default to false (mihomo default)"
+        );
     }
 
     #[test]
@@ -3699,11 +3940,7 @@ rules:
   - MATCH,vm
 "#;
         let parsed = load(cfg).unwrap();
-        let vm = parsed
-            .outbounds
-            .iter()
-            .find(|o| o.name == "vm")
-            .unwrap();
+        let vm = parsed.outbounds.iter().find(|o| o.name == "vm").unwrap();
         let transport = match &vm.kind {
             crate::outbound::OutboundKind::Vmess { transport, .. } => transport.clone(),
             other => panic!("unexpected outbound kind {other:?}"),
@@ -3835,17 +4072,28 @@ rules:
         let parsed = load(cfg).unwrap();
         let r = parsed.outbounds.iter().find(|o| o.name == "r").unwrap();
         match &r.kind {
-            OutboundKind::Vless { reality: Some(rc), fingerprint: None, .. } => {
+            OutboundKind::Vless {
+                reality: Some(rc),
+                fingerprint: None,
+                ..
+            } => {
                 assert_eq!(rc.server_name, "cam.example");
                 assert_eq!(rc.short_id, "0102");
-                assert!(matches!(rc.fingerprint, crate::proto::reality::UtslProfile::Firefox));
+                assert!(matches!(
+                    rc.fingerprint,
+                    crate::proto::reality::UtslProfile::Firefox
+                ));
             }
             other => panic!("unexpected {other:?}"),
         }
         let u = parsed.outbounds.iter().find(|o| o.name == "u").unwrap();
         assert!(matches!(
             &u.kind,
-            OutboundKind::Vless { fingerprint: Some(_), reality: None, .. }
+            OutboundKind::Vless {
+                fingerprint: Some(_),
+                reality: None,
+                ..
+            }
         ));
     }
 
@@ -3864,7 +4112,11 @@ rules:
         let v = parsed.outbounds.iter().find(|o| o.name == "v").unwrap();
         assert!(matches!(
             &v.kind,
-            OutboundKind::Vless { vision: true, reality: Some(_), .. }
+            OutboundKind::Vless {
+                vision: true,
+                reality: Some(_),
+                ..
+            }
         ));
 
         let bad = r#"
@@ -3890,7 +4142,10 @@ rules:
   - MATCH,n
 "#;
         let err = load(cfg).err().unwrap().to_string();
-        assert!(err.contains("safari") && err.contains("not implemented yet"), "{err}");
+        assert!(
+            err.contains("safari") && err.contains("not implemented yet"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -4050,10 +4305,7 @@ rules:
         );
         // The merged config is coherent (rules resolve, groups reference
         // real outbounds).
-        assert!(crate::config::validate(
-            &parsed.clone().with_builtin_outbounds()
-        )
-        .is_ok());
+        assert!(crate::config::validate(&parsed.clone().with_builtin_outbounds()).is_ok());
         // The provider is installed for the API surface with the
         // health-check block parsed (interval defaults to 300).
         let doc = crate::api::installed_provider_document("provider1").unwrap();
@@ -4078,7 +4330,8 @@ rules:
     fn proxy_providers_http_vehicle_fetches_and_parses_userinfo() {
         let _guard = crate::api::provider_table_test_lock().blocking_lock();
         crate::api::reset_proxy_providers();
-        let body = "proxies:\n  - name: node1\n    type: socks5\n    server: 10.0.0.1\n    port: 1080\n";
+        let body =
+            "proxies:\n  - name: node1\n    type: socks5\n    server: 10.0.0.1\n    port: 1080\n";
         let resp = format!(
             "HTTP/1.1 200 OK\r\nsubscription-userinfo: upload=453211024; download=7423116545; total=107374182400; expire=1735689600\r\nConnection: close\r\n\r\n{body}"
         )
@@ -4108,10 +4361,7 @@ rules:
             vec!["provider1:node1"],
             "the fetched node joined the registry under a prefixed name"
         );
-        assert!(crate::config::validate(
-            &parsed.clone().with_builtin_outbounds()
-        )
-        .is_ok());
+        assert!(crate::config::validate(&parsed.clone().with_builtin_outbounds()).is_ok());
         let doc = crate::api::installed_provider_document("provider1").unwrap();
         assert_eq!(doc["vehicleType"], "HTTP");
         assert_eq!(doc["subscriptionInfo"]["Total"], 107374182400i64);

@@ -42,16 +42,16 @@
 //! chains (UDP, DNS hijack and ICMPv6 echo behind chains are handled; see
 //! `netstack`'s docs).
 
+/// The platform-dispatched device layer: `device::TunDevice` is the Linux
+/// `/dev/net/tun` backend, WinTUN on Windows and utun on macOS (the latter
+/// two cfg'd out here but compiled and layout-tested on their targets).
+pub mod device;
 #[cfg(target_os = "linux")]
 mod device_linux;
 #[cfg(target_os = "macos")]
 mod device_macos;
 #[cfg(target_os = "windows")]
 mod device_windows;
-/// The platform-dispatched device layer: `device::TunDevice` is the Linux
-/// `/dev/net/tun` backend, WinTUN on Windows and utun on macOS (the latter
-/// two cfg'd out here but compiled and layout-tested on their targets).
-pub mod device;
 /// The async device IO surface (`TunIo`) and the reader pump that bridges
 /// the blocking device into the netstack's async loop.
 pub(crate) mod io;
@@ -125,7 +125,10 @@ impl From<IpAddr> for DnsHijack {
     /// A bare address keeps its pre-port-matching meaning of "this
     /// resolver" and defaults to the DNS port.
     fn from(ip: IpAddr) -> Self {
-        DnsHijack { ip: Some(ip), port: 53 }
+        DnsHijack {
+            ip: Some(ip),
+            port: 53,
+        }
     }
 }
 
@@ -221,22 +224,22 @@ pub async fn serve(cfg: &TunConfig, relay: SharedRelay, hooks: TunHooks) -> Resu
     #[cfg(not(target_os = "windows"))]
     let configured = {
         let name = dev.name().to_string();
-        device::configure_interface(&name, cfg.address, cfg.netmask, cfg.mtu).and_then(
-            |()| match cfg.inet6_address {
+        device::configure_interface(&name, cfg.address, cfg.netmask, cfg.mtu).and_then(|()| {
+            match cfg.inet6_address {
                 Some((inet6, prefix)) => device::assign_inet6(&name, inet6, prefix),
                 None => Ok(()),
-            },
-        )
+            }
+        })
     };
     #[cfg(target_os = "windows")]
     let configured = {
         let luid = dev.luid();
-        device::configure_interface(luid, cfg.address, cfg.netmask, cfg.mtu).and_then(|()| {
-            match cfg.inet6_address {
+        device::configure_interface(luid, cfg.address, cfg.netmask, cfg.mtu).and_then(
+            |()| match cfg.inet6_address {
                 Some((inet6, prefix)) => device::assign_inet6(luid, inet6, prefix),
                 None => Ok(()),
-            }
-        })
+            },
+        )
     };
     configured?;
     let name = dev.name();
@@ -287,26 +290,41 @@ mod tests {
         let ip: IpAddr = "8.8.8.8".parse().unwrap();
         assert_eq!(
             parse_dns_hijack_entry("8.8.8.8:53").unwrap(),
-            DnsHijack { ip: Some(ip), port: 53 }
+            DnsHijack {
+                ip: Some(ip),
+                port: 53
+            }
         );
         // Bare IP keeps meaning "this resolver, DNS port".
         assert_eq!(
             parse_dns_hijack_entry("8.8.8.8").unwrap(),
-            DnsHijack { ip: Some(ip), port: 53 }
+            DnsHijack {
+                ip: Some(ip),
+                port: 53
+            }
         );
         assert_eq!(
             parse_dns_hijack_entry("udp://1.1.1.1:5353").unwrap(),
-            DnsHijack { ip: Some("1.1.1.1".parse().unwrap()), port: 5353 }
+            DnsHijack {
+                ip: Some("1.1.1.1".parse().unwrap()),
+                port: 5353
+            }
         );
         // v6 bracketed and bare.
         let v6: IpAddr = "fd00::1".parse().unwrap();
         assert_eq!(
             parse_dns_hijack_entry("[fd00::1]:53").unwrap(),
-            DnsHijack { ip: Some(v6), port: 53 }
+            DnsHijack {
+                ip: Some(v6),
+                port: 53
+            }
         );
         assert_eq!(
             parse_dns_hijack_entry("fd00::1").unwrap(),
-            DnsHijack { ip: Some(v6), port: 53 }
+            DnsHijack {
+                ip: Some(v6),
+                port: 53
+            }
         );
         assert!(parse_dns_hijack_entry("garbage").is_none());
         assert!(parse_dns_hijack_entry("").is_none());

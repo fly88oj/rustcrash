@@ -274,7 +274,9 @@ impl LoudsTrie {
         while let Some(frame) = stack.last_mut() {
             steps += 1;
             if steps > step_cap {
-                return Err(Error::config("malformed domain trie: walk does not terminate"));
+                return Err(Error::config(
+                    "malformed domain trie: walk does not terminate",
+                ));
             }
             if self.bit(frame.1).ok_or_else(|| truncated("domain trie"))? == 1 {
                 stack.pop();
@@ -294,12 +296,17 @@ impl LoudsTrie {
                 .rank0_before(bm_idx + 1)
                 .ok_or_else(|| truncated("domain trie"))?;
             let next_bm = self
-                .select1(next_node.checked_sub(1).ok_or_else(|| {
-                    Error::config("malformed domain trie: bad child node id")
-                })?)
+                .select1(
+                    next_node
+                        .checked_sub(1)
+                        .ok_or_else(|| Error::config("malformed domain trie: bad child node id"))?,
+                )
                 .map(|p| p + 1)
                 .ok_or_else(|| truncated("domain trie"))?;
-            if self.leaf(next_node).ok_or_else(|| truncated("domain trie"))? {
+            if self
+                .leaf(next_node)
+                .ok_or_else(|| truncated("domain trie"))?
+            {
                 result.push(current.clone());
             }
             stack.push((next_node, next_bm));
@@ -347,7 +354,11 @@ fn ip_range_to_cidrs(from: IpAddr, to: IpAddr) -> Result<Vec<String>> {
         } else {
             127u32 - (span + 1).leading_zeros()
         };
-        let tz = if cur == 0 { bits } else { cur.trailing_zeros().min(bits) };
+        let tz = if cur == 0 {
+            bits
+        } else {
+            cur.trailing_zeros().min(bits)
+        };
         k = k.min(tz);
         let plen = bits - k;
         let addr = match bits {
@@ -375,7 +386,9 @@ fn addr_from_16(bytes: &[u8]) -> Result<IpAddr> {
         .try_into()
         .map_err(|_| truncated("ip range address"))?;
     if arr[..10].iter().all(|b| *b == 0) && arr[10] == 0xff && arr[11] == 0xff {
-        Ok(IpAddr::V4(Ipv4Addr::new(arr[12], arr[13], arr[14], arr[15])))
+        Ok(IpAddr::V4(Ipv4Addr::new(
+            arr[12], arr[13], arr[14], arr[15],
+        )))
     } else {
         Ok(IpAddr::V6(Ipv6Addr::from(arr)))
     }
@@ -422,7 +435,9 @@ pub struct SrsRuleSet {
 /// Parse a sing-box `.srs` rule-set file (format versions 1-2).
 pub fn parse_srs(bytes: &[u8]) -> Result<SrsRuleSet> {
     if bytes.len() < 4 {
-        return Err(truncated("srs: file shorter than the magic + version header"));
+        return Err(truncated(
+            "srs: file shorter than the magic + version header",
+        ));
     }
     if bytes[..3] != SRS_MAGIC {
         return Err(Error::config("srs: bad magic bytes (expected \"SRS\")"));
@@ -438,9 +453,7 @@ pub fn parse_srs(bytes: &[u8]) -> Result<SrsRuleSet> {
     zlib.read_to_end(&mut raw)
         .map_err(|e| Error::config(format!("srs: bad zlib stream: {e}")))?;
     let mut cur = Cursor::new(&raw);
-    let rule_count = cur
-        .uvarint()
-        .ok_or_else(|| truncated("srs: rule count"))?;
+    let rule_count = cur.uvarint().ok_or_else(|| truncated("srs: rule count"))?;
     let mut out = SrsRuleSet::default();
     for _ in 0..rule_count {
         read_srs_rule(&mut cur, &mut out, 0)?;
@@ -485,8 +498,7 @@ fn read_srs_default_rule(cur: &mut Cursor<'_>, out: &mut SrsRuleSet) -> Result<(
         match item {
             SRS_ITEM_DOMAIN => {
                 let (exacts, suffixes) = read_srs_domain_matcher(cur)?;
-                out.domains
-                    .extend(exacts.into_iter().map(SrsDomain::Exact));
+                out.domains.extend(exacts.into_iter().map(SrsDomain::Exact));
                 out.domains
                     .extend(suffixes.into_iter().map(SrsDomain::Suffix));
             }
@@ -526,11 +538,7 @@ fn read_srs_default_rule(cur: &mut Cursor<'_>, out: &mut SrsRuleSet) -> Result<(
                 cur.byte().ok_or_else(|| truncated("srs: rule invert"))?;
                 return Ok(());
             }
-            t => {
-                return Err(Error::config(format!(
-                    "srs: unknown rule item type {t}"
-                )))
-            }
+            t => return Err(Error::config(format!("srs: unknown rule item type {t}"))),
         }
     }
 }
@@ -572,7 +580,8 @@ fn read_srs_u16_list(cur: &mut Cursor<'_>) -> Result<Vec<u16>> {
 /// arrays (u64 words / u64 words / raw bytes). Returns (exacts, suffixes)
 /// using sing's `Dump()` semantics, including the legacy v1 marker merge.
 fn read_srs_domain_matcher(cur: &mut Cursor<'_>) -> Result<(Vec<String>, Vec<String>)> {
-    cur.byte().ok_or_else(|| truncated("srs: domain trie version"))?;
+    cur.byte()
+        .ok_or_else(|| truncated("srs: domain trie version"))?;
     let leaves = read_srs_u64_words(cur)?;
     let label_bitmap = read_srs_u64_words(cur)?;
     let labels_len = cur
@@ -680,9 +689,7 @@ pub fn parse_mrs(bytes: &[u8]) -> Result<MrsRuleSet> {
     zstd.read_to_end(&mut raw)
         .map_err(|e| Error::config(format!("mrs: bad zstd stream: {e}")))?;
     let mut cur = Cursor::new(&raw);
-    let magic = cur
-        .bytes(4)
-        .ok_or_else(|| truncated("mrs: magic header"))?;
+    let magic = cur.bytes(4).ok_or_else(|| truncated("mrs: magic header"))?;
     if magic != MRS_MAGIC {
         return Err(Error::config(
             "mrs: bad magic bytes (expected \"MRS\" + version 1)",
@@ -691,13 +698,9 @@ pub fn parse_mrs(bytes: &[u8]) -> Result<MrsRuleSet> {
     let behavior = cur.byte().ok_or_else(|| truncated("mrs: behavior"))?;
     let count = cur.be_i64().ok_or_else(|| truncated("mrs: count"))?;
     if count < 0 {
-        return Err(Error::config(format!(
-            "mrs: invalid count {count}"
-        )));
+        return Err(Error::config(format!("mrs: invalid count {count}")));
     }
-    let extra_len = cur
-        .be_i64()
-        .ok_or_else(|| truncated("mrs: extra length"))?;
+    let extra_len = cur.be_i64().ok_or_else(|| truncated("mrs: extra length"))?;
     if extra_len < 0 {
         return Err(Error::config(format!(
             "mrs: invalid extra length {extra_len}"
@@ -722,7 +725,9 @@ pub fn parse_mrs(bytes: &[u8]) -> Result<MrsRuleSet> {
 /// are reversed; a trailing `+` marks a suffix entry, a `*` label marks a
 /// single-label wildcard.
 fn read_mrs_domain_payload(cur: &mut Cursor<'_>) -> Result<MrsRuleSet> {
-    let version = cur.byte().ok_or_else(|| truncated("mrs: domain-set version"))?;
+    let version = cur
+        .byte()
+        .ok_or_else(|| truncated("mrs: domain-set version"))?;
     if version != 1 {
         return Err(Error::config(format!(
             "mrs: invalid domain-set version {version} (expected 1)"
@@ -730,9 +735,7 @@ fn read_mrs_domain_payload(cur: &mut Cursor<'_>) -> Result<MrsRuleSet> {
     }
     let leaves = read_mrs_u64_words(cur)?;
     let label_bitmap = read_mrs_u64_words(cur)?;
-    let labels_len = cur
-        .be_i64()
-        .ok_or_else(|| truncated("mrs: labels count"))?;
+    let labels_len = cur.be_i64().ok_or_else(|| truncated("mrs: labels count"))?;
     if labels_len < 1 {
         return Err(Error::config("mrs: invalid labels count"));
     }
@@ -799,7 +802,9 @@ fn read_mrs_u64_words(cur: &mut Cursor<'_>) -> Result<Vec<u64>> {
 /// `cidr.ReadIpCidrSet`: version byte 1 + int64-BE range count + per range
 /// a 16-byte `from` and 16-byte `to` (v4-mapped) address.
 fn read_mrs_ipcidr_payload(cur: &mut Cursor<'_>) -> Result<MrsRuleSet> {
-    let version = cur.byte().ok_or_else(|| truncated("mrs: ipcidr-set version"))?;
+    let version = cur
+        .byte()
+        .ok_or_else(|| truncated("mrs: ipcidr-set version"))?;
     if version != 1 {
         return Err(Error::config(format!(
             "mrs: invalid ipcidr-set version {version} (expected 1)"
@@ -869,7 +874,9 @@ pub fn write_mrs(behavior: MrsWriteBehavior, rules: &[&str]) -> Result<Vec<u8>> 
             let mut keys: Vec<Vec<u8>> = Vec::new();
             for rule in rules {
                 if rule.contains('/') {
-                    tracing::warn!("mrs writer: skip invalid domain {rule:?}: slash is not allowed");
+                    tracing::warn!(
+                        "mrs writer: skip invalid domain {rule:?}: slash is not allowed"
+                    );
                     continue;
                 }
                 match domain_set_keys(rule) {
@@ -931,21 +938,17 @@ fn valid_and_split_domain(domain: &str) -> Result<Vec<String>> {
     if domain.ends_with('.') {
         return Err(invalid("trailing dot is not allowed"));
     }
-    if domain
-        .chars()
-        .next()
-        .is_some_and(char::is_whitespace)
-    {
+    if domain.chars().next().is_some_and(char::is_whitespace) {
         return Err(invalid("leading whitespace is not allowed"));
     }
-    if domain
-        .chars()
-        .next_back()
-        .is_some_and(char::is_whitespace)
-    {
+    if domain.chars().next_back().is_some_and(char::is_whitespace) {
         return Err(invalid("trailing whitespace is not allowed"));
     }
-    let parts: Vec<String> = domain.to_lowercase().split('.').map(str::to_string).collect();
+    let parts: Vec<String> = domain
+        .to_lowercase()
+        .split('.')
+        .map(str::to_string)
+        .collect();
     if parts.len() == 1 {
         if parts[0].is_empty() {
             return Err(invalid("domain is empty"));
@@ -1110,9 +1113,15 @@ fn parse_cidr_range(rule: &str) -> Result<IpRange> {
     match addr.parse::<IpAddr>() {
         Ok(IpAddr::V4(a)) => {
             if plen > 32 {
-                return Err(Error::config(format!("prefix length {plen} exceeds 32 for v4")));
+                return Err(Error::config(format!(
+                    "prefix length {plen} exceeds 32 for v4"
+                )));
             }
-            let mask = if plen == 0 { 0 } else { u32::MAX << (32 - plen) };
+            let mask = if plen == 0 {
+                0
+            } else {
+                u32::MAX << (32 - plen)
+            };
             let lo = u32::from(a) & mask;
             Ok(IpRange {
                 v6: false,
@@ -1122,9 +1131,15 @@ fn parse_cidr_range(rule: &str) -> Result<IpRange> {
         }
         Ok(IpAddr::V6(a)) => {
             if plen > 128 {
-                return Err(Error::config(format!("prefix length {plen} exceeds 128 for v6")));
+                return Err(Error::config(format!(
+                    "prefix length {plen} exceeds 128 for v6"
+                )));
             }
-            let mask = if plen == 0 { 0 } else { u128::MAX << (128 - plen) };
+            let mask = if plen == 0 {
+                0
+            } else {
+                u128::MAX << (128 - plen)
+            };
             let lo = u128::from(a) & mask;
             Ok(IpRange {
                 v6: true,
@@ -1205,7 +1220,8 @@ const MRS_ZSTD_BLOCK_MAX: usize = 64 * 1024;
 /// little-endian convention"; this is also exactly how ruzstd's reader at
 /// `decoding/frame.rs:75-83` and klauspost/compress decode it).
 fn zstd_store_frame(payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(payload.len() + 3 * (payload.len() / MRS_ZSTD_BLOCK_MAX + 1) + 18);
+    let mut out =
+        Vec::with_capacity(payload.len() + 3 * (payload.len() / MRS_ZSTD_BLOCK_MAX + 1) + 18);
     // Magic_Number 0xFD2FB528, little-endian (spec §3.1.1.1).
     out.extend_from_slice(&[0x28, 0xB5, 0x2F, 0xFD]);
     // Frame_Header_Descriptor (spec §3.1.1.1.1): FCS_Field_Size flag
@@ -1427,12 +1443,20 @@ mod tests {
         let plen: u32 = plen.parse().unwrap();
         match addr.parse::<IpAddr>().unwrap() {
             IpAddr::V4(a) => {
-                let mask = if plen == 0 { 0 } else { u32::MAX << (32 - plen) };
+                let mask = if plen == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - plen)
+                };
                 let lo = u32::from(a) & mask;
                 (lo as u128, (lo | !mask) as u128, 32)
             }
             IpAddr::V6(a) => {
-                let mask = if plen == 0 { 0 } else { u128::MAX << (128 - plen) };
+                let mask = if plen == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - plen)
+                };
                 let lo = u128::from(a) & mask;
                 (lo, lo | !mask, 128)
             }
@@ -1600,7 +1624,11 @@ mod tests {
         )]);
         let rule3 = srs_logical_rule(
             1, // or
-            &[srs_default_rule(&[srs_domain_payload(&[], &["sub.example"], false)])],
+            &[srs_default_rule(&[srs_domain_payload(
+                &[],
+                &["sub.example"],
+                false,
+            )])],
         );
         let file = make_srs(&[rule1, rule2, rule3], 2);
 
@@ -1609,7 +1637,9 @@ mod tests {
             .domains
             .contains(&SrsDomain::Exact("example.com".into())));
         assert!(set.domains.contains(&SrsDomain::Exact("a.b.c".into())));
-        assert!(set.domains.contains(&SrsDomain::Suffix("google.com".into())));
+        assert!(set
+            .domains
+            .contains(&SrsDomain::Suffix("google.com".into())));
         assert!(set
             .domains
             .contains(&SrsDomain::Keyword("analytics".into())));
@@ -1629,14 +1659,14 @@ mod tests {
         // Legacy v1 stores suffix "google.com" as a bare reversed key plus
         // a '\r'-marked ".google.com"; Dump() must merge them back into one
         // suffix and not report a bogus exact "google.com".
-        let rule = srs_default_rule(&[srs_domain_payload(
-            &["example.com"],
-            &["google.com"],
-            true,
-        )]);
+        let rule = srs_default_rule(&[srs_domain_payload(&["example.com"], &["google.com"], true)]);
         let set = parse_srs(&make_srs(&[rule], 1)).unwrap();
-        assert!(set.domains.contains(&SrsDomain::Exact("example.com".into())));
-        assert!(set.domains.contains(&SrsDomain::Suffix("google.com".into())));
+        assert!(set
+            .domains
+            .contains(&SrsDomain::Exact("example.com".into())));
+        assert!(set
+            .domains
+            .contains(&SrsDomain::Suffix("google.com".into())));
         assert!(!set.domains.contains(&SrsDomain::Exact("google.com".into())));
     }
 
@@ -1725,9 +1755,17 @@ mod tests {
     #[test]
     fn mrs_domain_round_trip() {
         let patterns = ["example.com", "+.google.com", ".dot.org", "*.wild.net"];
-        let file = make_mrs(MRS_BEHAVIOR_DOMAIN, patterns.len() as i64, &mrs_domain_payload(&patterns), &[]);
+        let file = make_mrs(
+            MRS_BEHAVIOR_DOMAIN,
+            patterns.len() as i64,
+            &mrs_domain_payload(&patterns),
+            &[],
+        );
         let set = parse_mrs(&file).unwrap();
-        assert_eq!(set.exacts, vec!["example.com".to_string(), "google.com".to_string()]);
+        assert_eq!(
+            set.exacts,
+            vec!["example.com".to_string(), "google.com".to_string()]
+        );
         assert_eq!(
             set.suffixes,
             vec![
@@ -1742,7 +1780,12 @@ mod tests {
     #[test]
     fn mrs_ipcidr_round_trip() {
         let cidrs = ["10.0.0.0/8", "192.168.1.1/32", "2001:db8::/32"];
-        let file = make_mrs(MRS_BEHAVIOR_IPCIDR, cidrs.len() as i64, &mrs_ipcidr_payload(&cidrs), &[]);
+        let file = make_mrs(
+            MRS_BEHAVIOR_IPCIDR,
+            cidrs.len() as i64,
+            &mrs_ipcidr_payload(&cidrs),
+            &[],
+        );
         let set = parse_mrs(&file).unwrap();
         assert!(set.ip_cidrs.contains(&"10.0.0.0/8".to_string()));
         assert!(set.ip_cidrs.contains(&"192.168.1.1/32".to_string()));
@@ -1803,17 +1846,11 @@ mod tests {
     #[test]
     fn ip_range_to_cidrs_splits_unaligned_ranges() {
         // 10.1.2.3..10.1.2.7 needs three prefixes to cover exactly.
-        let cidrs = ip_range_to_cidrs(
-            "10.1.2.3".parse().unwrap(),
-            "10.1.2.7".parse().unwrap(),
-        )
-        .unwrap();
+        let cidrs =
+            ip_range_to_cidrs("10.1.2.3".parse().unwrap(), "10.1.2.7".parse().unwrap()).unwrap();
         assert_eq!(
             cidrs,
-            vec![
-                "10.1.2.3/32".to_string(),
-                "10.1.2.4/30".to_string(),
-            ]
+            vec!["10.1.2.3/32".to_string(), "10.1.2.4/30".to_string(),]
         );
         // Full v4 space collapses to one /0.
         let cidrs = ip_range_to_cidrs(
@@ -1823,16 +1860,12 @@ mod tests {
         .unwrap();
         assert_eq!(cidrs, vec!["0.0.0.0/0".to_string()]);
         // Mixed families and inverted ranges are rejected.
-        assert!(ip_range_to_cidrs(
-            "1.2.3.4".parse().unwrap(),
-            "2001:db8::1".parse().unwrap(),
-        )
-        .is_err());
-        assert!(ip_range_to_cidrs(
-            "10.0.0.5".parse().unwrap(),
-            "10.0.0.1".parse().unwrap(),
-        )
-        .is_err());
+        assert!(
+            ip_range_to_cidrs("1.2.3.4".parse().unwrap(), "2001:db8::1".parse().unwrap(),).is_err()
+        );
+        assert!(
+            ip_range_to_cidrs("10.0.0.5".parse().unwrap(), "10.0.0.1".parse().unwrap(),).is_err()
+        );
     }
 
     #[test]
@@ -1879,12 +1912,7 @@ mod tests {
         let mut out = Vec::new();
         let mut pos = 14usize;
         loop {
-            let h = u32::from_le_bytes([
-                frame[pos],
-                frame[pos + 1],
-                frame[pos + 2],
-                0,
-            ]);
+            let h = u32::from_le_bytes([frame[pos], frame[pos + 1], frame[pos + 2], 0]);
             let last = h & 1 == 1;
             let btype = (h >> 1) & 0b11;
             let size = (h >> 3) as usize;
@@ -2023,7 +2051,9 @@ mod tests {
         let blocks = frame_blocks(&file);
         assert!(blocks.len() > 1, "expected a multi-block frame");
         assert!(blocks.iter().all(|(_, _, size)| *size <= 128 * 1024));
-        assert!(blocks[..blocks.len() - 1].iter().all(|(_, _, size)| *size > 0));
+        assert!(blocks[..blocks.len() - 1]
+            .iter()
+            .all(|(_, _, size)| *size > 0));
 
         let set = parse_mrs(&file).unwrap();
         assert_eq!(set.exacts.len(), owned.len());
@@ -2036,7 +2066,14 @@ mod tests {
         // semantics as the provider Insert path.
         let file = write_mrs(
             MrsWriteBehavior::Domain,
-            &["ok.com", "bad..com", "trail.com/", "no+plus.x", "par*t.x", " lead.com"],
+            &[
+                "ok.com",
+                "bad..com",
+                "trail.com/",
+                "no+plus.x",
+                "par*t.x",
+                " lead.com",
+            ],
         )
         .unwrap();
         let raw = decompress(&file);
@@ -2044,7 +2081,11 @@ mod tests {
         let set = parse_mrs(&file).unwrap();
         assert_eq!(set.exacts, vec!["ok.com".to_string()]);
 
-        let file = write_mrs(MrsWriteBehavior::IpCidr, &["10.0.0.0/8", "bogus", "10.0.0.300/24", ":::/32"]).unwrap();
+        let file = write_mrs(
+            MrsWriteBehavior::IpCidr,
+            &["10.0.0.0/8", "bogus", "10.0.0.300/24", ":::/32"],
+        )
+        .unwrap();
         let set = parse_mrs(&file).unwrap();
         assert_eq!(set.ip_cidrs, vec!["10.0.0.0/8".to_string()]);
 
@@ -2070,10 +2111,23 @@ mod tests {
             vec!["", "example", "com"]
         );
         for bad in [
-            "", "a.com.", " a.com", "a.com ", "..", "a..b", "+", "+.a+x.com", "a+.com", "*a.com",
-            "a.*b.com", "+a.com",
+            "",
+            "a.com.",
+            " a.com",
+            "a.com ",
+            "..",
+            "a..b",
+            "+",
+            "+.a+x.com",
+            "a+.com",
+            "*a.com",
+            "a.*b.com",
+            "+a.com",
         ] {
-            assert!(valid_and_split_domain(bad).is_err(), "{bad:?} must be rejected");
+            assert!(
+                valid_and_split_domain(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
         }
         // Whole-label wildcards are accepted (DomainSet::Has interprets them).
         assert_eq!(
@@ -2093,7 +2147,13 @@ mod tests {
         let recover = |keys: Vec<Vec<u8>>| -> Vec<String> {
             let mut out: Vec<String> = keys
                 .iter()
-                .map(|k| String::from_utf8(k.clone()).unwrap().chars().rev().collect())
+                .map(|k| {
+                    String::from_utf8(k.clone())
+                        .unwrap()
+                        .chars()
+                        .rev()
+                        .collect()
+                })
                 .collect();
             out.sort();
             out

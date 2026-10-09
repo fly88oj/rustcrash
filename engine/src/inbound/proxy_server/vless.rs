@@ -60,7 +60,9 @@ impl VlessServer {
         relay: SharedRelay,
     ) -> Result<()> {
         let mut stream = match &self.tls {
-            Some(config) => crate::inbound::proxy_server::tls_accept(config.clone(), stream).await?,
+            Some(config) => {
+                crate::inbound::proxy_server::tls_accept(config.clone(), stream).await?
+            }
             None => stream,
         };
 
@@ -106,7 +108,9 @@ impl VlessServer {
 /// Serve a VLESS listener; returns the bound address.
 pub async fn serve(cfg: &ServerConfig, relay: SharedRelay) -> Result<SocketAddr> {
     let ServerProtocol::Vless { uuid, tls } = &cfg.protocol else {
-        return Err(Error::config("vless::serve called with a non-vless protocol"));
+        return Err(Error::config(
+            "vless::serve called with a non-vless protocol",
+        ));
     };
     let server = VlessServer::new(uuid, tls.as_ref())?;
     let tag = cfg.tag.clone();
@@ -206,6 +210,7 @@ mod tests {
                 server_name: Some("localhost".into()),
                 skip_cert_verify: true,
                 alpn: Vec::new(),
+                ..Default::default()
             },
         )
         .await
@@ -249,8 +254,7 @@ mod tests {
         let target = NetAddr::domain("echo.test", 443).unwrap();
         let tcp = TcpStream::connect(addr).await.unwrap();
         // Like the outbound, the association header carries no real target.
-        let placeholder =
-            NetAddr::ip(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+        let placeholder = NetAddr::ip(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
         let mut stream = crate::proto::vless::VlessStream::handshake(
             Box::new(tcp),
             &client(&uuid, addr.port()),

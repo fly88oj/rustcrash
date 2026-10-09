@@ -65,7 +65,12 @@ pub const TLS_REQUIRED_NOTE: &str = concat!(
 
 /// Serve an anytls listener; returns the bound address.
 pub async fn serve(cfg: &ServerConfig, relay: SharedRelay) -> Result<SocketAddr> {
-    let ServerProtocol::AnyTls { password, users, tls } = &cfg.protocol else {
+    let ServerProtocol::AnyTls {
+        password,
+        users,
+        tls,
+    } = &cfg.protocol
+    else {
         return Err(Error::config(
             "anytls::serve called with a non-anytls protocol",
         ));
@@ -162,15 +167,7 @@ async fn handle_stream(
     }
     // h.NewConnection — "we report success directly" (server.go:250-252).
     stream.handshake_success();
-    hand_off(
-        &tag,
-        "anytls",
-        port,
-        peer,
-        target,
-        Box::new(stream),
-        relay,
-    );
+    hand_off(&tag, "anytls", port, peer, target, Box::new(stream), relay);
 }
 
 /// Bridge a uot v2 stream to [`crate::inbound::RelayHandler::handle_udp`]:
@@ -178,7 +175,12 @@ async fn handle_stream(
 /// each `uot-addr || be16 len || payload` datagram flows uplink and
 /// each relay reply is framed back down — the wire the engine's own
 /// [`crate::proto::anytls::AnyTlsUdp`] speaks.
-async fn uot_relay(stream: AnyTlsServerStream, peer: SocketAddr, tag: Arc<str>, relay: SharedRelay) {
+async fn uot_relay(
+    stream: AnyTlsServerStream,
+    peer: SocketAddr,
+    tag: Arc<str>,
+    relay: SharedRelay,
+) {
     let (up_tx, up_rx) = tokio::sync::mpsc::channel::<(NetAddr, Vec<u8>)>(64);
     let (down_tx, mut down_rx) = tokio::sync::mpsc::channel::<(NetAddr, Vec<u8>)>(64);
     relay.handle_udp(peer, tag.to_string(), up_rx, down_tx);
@@ -406,11 +408,10 @@ mod tests {
         let target = NetAddr::domain("dns.example", 53).unwrap();
         udp.send_to(&target, b"uot-ping").await.unwrap();
         let mut buf = [0u8; 64];
-        let (from, n) =
-            tokio::time::timeout(Duration::from_secs(10), udp.recv_from(&mut buf))
-                .await
-                .expect("uot response timeout")
-                .unwrap();
+        let (from, n) = tokio::time::timeout(Duration::from_secs(10), udp.recv_from(&mut buf))
+            .await
+            .expect("uot response timeout")
+            .unwrap();
         assert_eq!(from, target, "the echo comes from the requested host");
         assert_eq!(&buf[..n], b"uot-ping");
         assert_eq!(capture.udp_targets(), vec![target]);
@@ -457,9 +458,12 @@ mod tests {
     #[tokio::test]
     async fn empty_credentials_fail_before_binding() {
         let capture = Capture::new();
-        let err = serve(&cfg("", Vec::new(), None), capture).await.unwrap_err();
+        let err = serve(&cfg("", Vec::new(), None), capture)
+            .await
+            .unwrap_err();
         assert!(
-            err.to_string().contains("anytls listener requires a password or users"),
+            err.to_string()
+                .contains("anytls listener requires a password or users"),
             "{err}"
         );
     }

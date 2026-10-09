@@ -337,7 +337,10 @@ where
                 continue;
             };
             let _ = stream.set_nodelay(true);
-            let port = stream.local_addr().map(|a| a.port()).unwrap_or_else(|_| addr.port());
+            let port = stream
+                .local_addr()
+                .map(|a| a.port())
+                .unwrap_or_else(|_| addr.port());
             let handler = handler.clone();
             tokio::spawn(async move {
                 if let Err(e) = handler(Box::new(stream), peer, port).await {
@@ -366,6 +369,7 @@ pub(crate) fn hand_off(
             inbound: tag.to_string(),
             inbound_port: Some(port),
             inbound_kind: kind,
+            in_user: None,
         },
         stream,
     );
@@ -444,10 +448,7 @@ pub(crate) fn spawn_framed_udp(
 
 /// Read one `socks-addr || len-be16 || payload` datagram; `Ok(None)` at a
 /// clean EOF between frames.
-async fn read_framed_datagram<R>(
-    reader: &mut R,
-    crlf: bool,
-) -> Result<Option<(NetAddr, Vec<u8>)>>
+async fn read_framed_datagram<R>(reader: &mut R, crlf: bool) -> Result<Option<(NetAddr, Vec<u8>)>>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -504,7 +505,9 @@ pub(crate) async fn read_socks_addr(stream: &mut BoxProxyStream) -> Result<NetAd
         }
         0x04 => buf.extend_from_slice(&read_exact_vec(stream, 16).await?),
         other => {
-            return Err(Error::protocol(format!("socks address: bad atyp {other:#x}")));
+            return Err(Error::protocol(format!(
+                "socks address: bad atyp {other:#x}"
+            )));
         }
     }
     buf.extend_from_slice(&read_exact_vec(stream, 2).await?);
@@ -526,7 +529,9 @@ pub(crate) async fn read_port_first_addr(stream: &mut BoxProxyStream) -> Result<
         }
         0x03 => buf.extend_from_slice(&read_exact_vec(stream, 16).await?),
         other => {
-            return Err(Error::protocol(format!("port-first address: bad atyp {other:#x}")));
+            return Err(Error::protocol(format!(
+                "port-first address: bad atyp {other:#x}"
+            )));
         }
     }
     let (addr, _) = crate::addr::decode_port_first_addr(&buf)?;
@@ -723,7 +728,10 @@ pub(crate) mod test_support {
 
     impl crate::inbound::RelayHandler for Capture {
         fn handle_tcp(self: Arc<Self>, meta: TcpMeta, mut client: BoxProxyStream) {
-            self.metas.lock().unwrap_or_else(|e| e.into_inner()).push(meta);
+            self.metas
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(meta);
             tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut buf = vec![0u8; 16 * 1024];
@@ -795,9 +803,15 @@ pub(crate) mod test_support {
         reader.read_exact(&mut len).await.expect("frame length");
         let mut crlf = [0u8; 2];
         reader.read_exact(&mut crlf).await.expect("frame crlf");
-        assert_eq!(&crlf, b"\r\n", "trojan frames carry CRLF before the payload");
+        assert_eq!(
+            &crlf, b"\r\n",
+            "trojan frames carry CRLF before the payload"
+        );
         let mut payload = vec![0u8; u16::from_be_bytes(len) as usize];
-        reader.read_exact(&mut payload).await.expect("frame payload");
+        reader
+            .read_exact(&mut payload)
+            .await
+            .expect("frame payload");
         let (target, _) = crate::addr::decode_socks_addr(&addr).expect("frame address decodes");
         (target, payload)
     }
@@ -830,7 +844,10 @@ pub(crate) mod test_support {
         let mut len = [0u8; 2];
         reader.read_exact(&mut len).await.expect("frame length");
         let mut payload = vec![0u8; u16::from_be_bytes(len) as usize];
-        reader.read_exact(&mut payload).await.expect("frame payload");
+        reader
+            .read_exact(&mut payload)
+            .await
+            .expect("frame payload");
         let (target, _) = crate::addr::decode_socks_addr(&addr).expect("frame address decodes");
         (target, payload)
     }
@@ -913,7 +930,11 @@ mod tests {
         assert_eq!(tuic.protocol_name(), "tuic");
         // Every served protocol now has a UDP path.
         for c in [&ss, &trojan, &vmess, &vless, &hysteria2, &tuic] {
-            assert!(c.protocol.supports_udp(), "{} must serve UDP", c.protocol_name());
+            assert!(
+                c.protocol.supports_udp(),
+                "{} must serve UDP",
+                c.protocol_name()
+            );
         }
     }
 

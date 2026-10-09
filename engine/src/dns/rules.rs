@@ -183,7 +183,10 @@ impl DnsRuleMatcher {
             }
             let suffix = suffix.trim_start_matches('.');
             if suffix.is_empty() {
-                return Err(rule_error(index, format!("empty domain_suffix {pattern:?}")));
+                return Err(rule_error(
+                    index,
+                    format!("empty domain_suffix {pattern:?}"),
+                ));
             }
             if suffix.contains('*') {
                 return Err(rule_error(
@@ -324,9 +327,10 @@ impl DnsRules {
         qtype: u16,
         network: Network,
     ) -> Option<&DnsRule> {
-        self.rules
-            .iter()
-            .find(|rule| rule.matcher.matches_with_network(name, qtype, Some(network)))
+        self.rules.iter().find(|rule| {
+            rule.matcher
+                .matches_with_network(name, qtype, Some(network))
+        })
     }
 
     /// The parsed rules, in config order.
@@ -432,10 +436,12 @@ fn parse_client_subnet(raw: &str) -> std::result::Result<ClientSubnet, String> {
     let raw = raw.trim();
     let (addr_str, prefix) = match raw.split_once('/') {
         Some((addr, prefix)) => {
-            let prefix: u8 = prefix
-                .trim()
-                .parse()
-                .map_err(|_| format!("bad client_subnet {raw:?}: prefix {:?} is not a number", prefix.trim()))?;
+            let prefix: u8 = prefix.trim().parse().map_err(|_| {
+                format!(
+                    "bad client_subnet {raw:?}: prefix {:?} is not a number",
+                    prefix.trim()
+                )
+            })?;
             (addr.trim(), Some(prefix))
         }
         None => (raw, None),
@@ -521,7 +527,10 @@ mod tests {
             vec!["udp://192.0.2.2:53"]
         );
         // An empty rule list matches nothing.
-        assert!(DnsRules::parse(&[]).unwrap().match_rule("x.test", wire::TYPE_A).is_none());
+        assert!(DnsRules::parse(&[])
+            .unwrap()
+            .match_rule("x.test", wire::TYPE_A)
+            .is_none());
     }
 
     #[test]
@@ -545,17 +554,30 @@ mod tests {
         ])
         .unwrap();
         // Exact: only the name itself, case-insensitively.
-        assert_eq!(servers(rules.match_rule("EXACT.test", wire::TYPE_A).unwrap())[0], "udp://192.0.2.1:53");
+        assert_eq!(
+            servers(rules.match_rule("EXACT.test", wire::TYPE_A).unwrap())[0],
+            "udp://192.0.2.1:53"
+        );
         assert!(rules.match_rule("sub.exact.test", wire::TYPE_A).is_none());
         // A leading dot is accepted as the suffix form: apex + subdomains.
-        assert_eq!(servers(rules.match_rule("suffix.test", wire::TYPE_A).unwrap())[0], "udp://192.0.2.2:53");
         assert_eq!(
-            servers(rules.match_rule("deep.a.suffix.test", wire::TYPE_A).unwrap())[0],
+            servers(rules.match_rule("suffix.test", wire::TYPE_A).unwrap())[0],
+            "udp://192.0.2.2:53"
+        );
+        assert_eq!(
+            servers(
+                rules
+                    .match_rule("deep.a.suffix.test", wire::TYPE_A)
+                    .unwrap()
+            )[0],
             "udp://192.0.2.2:53"
         );
         assert!(rules.match_rule("xsuffix.test", wire::TYPE_A).is_none());
         // Regex is matched against the lowercased name.
-        assert_eq!(servers(rules.match_rule("Ads12.test", wire::TYPE_A).unwrap())[0], "udp://192.0.2.3:53");
+        assert_eq!(
+            servers(rules.match_rule("Ads12.test", wire::TYPE_A).unwrap())[0],
+            "udp://192.0.2.3:53"
+        );
         assert!(rules.match_rule("ads.test", wire::TYPE_A).is_none());
 
         // The four kinds share one DomainMatcher, so they are ORed: a
@@ -593,10 +615,19 @@ mod tests {
         .unwrap();
         // The inverted rule rejects its own suffix: block.test falls
         // through to the catch-all.
-        assert_eq!(servers(rules.match_rule("a.block.test", wire::TYPE_A).unwrap())[0], "udp://192.0.2.1:53");
-        assert_eq!(servers(rules.match_rule("block.test", wire::TYPE_A).unwrap())[0], "udp://192.0.2.1:53");
+        assert_eq!(
+            servers(rules.match_rule("a.block.test", wire::TYPE_A).unwrap())[0],
+            "udp://192.0.2.1:53"
+        );
+        assert_eq!(
+            servers(rules.match_rule("block.test", wire::TYPE_A).unwrap())[0],
+            "udp://192.0.2.1:53"
+        );
         // Everything else matches the inverted rule.
-        assert_eq!(servers(rules.match_rule("any.test", wire::TYPE_A).unwrap())[0], "udp://192.0.2.9:53");
+        assert_eq!(
+            servers(rules.match_rule("any.test", wire::TYPE_A).unwrap())[0],
+            "udp://192.0.2.9:53"
+        );
     }
 
     #[test]
@@ -615,8 +646,14 @@ mod tests {
         ])
         .unwrap();
         // A is not in the rule's type list → the catch-all handles it.
-        assert_eq!(servers(rules.match_rule("dual.test", wire::TYPE_A).unwrap())[0], "udp://192.0.2.1:53");
-        assert_eq!(servers(rules.match_rule("dual.test", wire::TYPE_AAAA).unwrap())[0], "tls://192.0.2.53:853");
+        assert_eq!(
+            servers(rules.match_rule("dual.test", wire::TYPE_A).unwrap())[0],
+            "udp://192.0.2.1:53"
+        );
+        assert_eq!(
+            servers(rules.match_rule("dual.test", wire::TYPE_AAAA).unwrap())[0],
+            "tls://192.0.2.53:853"
+        );
 
         // A type-only rule (any name, one type).
         let rules = DnsRules::parse(&[RuleSpec {
@@ -659,7 +696,9 @@ mod tests {
             servers(rule),
             vec!["https://192.0.2.10:443", "tcp://192.0.2.11:5353"]
         );
-        assert!(matches!(&rule.server.as_ref().unwrap()[0], Upstream::Https { path, .. } if path == "/dns-query"));
+        assert!(
+            matches!(&rule.server.as_ref().unwrap()[0], Upstream::Https { path, .. } if path == "/dns-query")
+        );
 
         // Defaults: no servers keeps the resolver's list, cache on, no
         // TTL rewrite, no subnet.
@@ -693,10 +732,18 @@ mod tests {
             },
         ])
         .unwrap();
-        let cs = rules.match_rule("v4.test", wire::TYPE_A).unwrap().client_subnet.unwrap();
+        let cs = rules
+            .match_rule("v4.test", wire::TYPE_A)
+            .unwrap()
+            .client_subnet
+            .unwrap();
         assert!(cs.addr.is_ipv4());
         assert_eq!(cs.source_prefix, 32);
-        let cs = rules.match_rule("v6.test", wire::TYPE_A).unwrap().client_subnet.unwrap();
+        let cs = rules
+            .match_rule("v6.test", wire::TYPE_A)
+            .unwrap()
+            .client_subnet
+            .unwrap();
         assert!(cs.addr.is_ipv6());
         assert_eq!(cs.source_prefix, 128);
     }
@@ -780,7 +827,13 @@ mod tests {
     #[test]
     fn malformed_rules_are_rejected() {
         // client_subnet: bad prefix, bad address, out-of-range prefix.
-        for cs in ["192.0.2.0/33", "not-an-ip", "192.0.2.0/", "2001:db8::1/200", "1.2.3.4/24/8"] {
+        for cs in [
+            "192.0.2.0/33",
+            "not-an-ip",
+            "192.0.2.0/",
+            "2001:db8::1/200",
+            "1.2.3.4/24/8",
+        ] {
             let err = DnsRules::parse(&[RuleSpec {
                 domains: strs(&["a.test"]),
                 client_subnet: Some(cs.to_string()),
@@ -836,7 +889,8 @@ mod tests {
     #[test]
     fn rewrite_ttl_single_answer_is_bytes_exact() {
         let query = wire::parse(&wire::build_query(0x1234, "a.test", wire::TYPE_A)).unwrap();
-        let original = wire::build_response(&query, wire::RCODE_NOERROR, &[(ip("198.18.0.5"), 300)]);
+        let original =
+            wire::build_response(&query, wire::RCODE_NOERROR, &[(ip("198.18.0.5"), 300)]);
         // header(12) + question("a.test" = 8 labels + 4) = 24; the answer
         // is pointer(2) type(2) class(2) ttl(4) rdlen(2) rdata(4) — the
         // TTL sits at 24 + 6 = 30.
@@ -868,7 +922,11 @@ mod tests {
         let original = wire::build_response(
             &query,
             wire::RCODE_NOERROR,
-            &[(ip("198.18.0.1"), 1), (ip("2001:db8::1"), 2), (ip("198.18.0.2"), 3)],
+            &[
+                (ip("198.18.0.1"), 1),
+                (ip("2001:db8::1"), 2),
+                (ip("198.18.0.2"), 3),
+            ],
         );
         assert_eq!(original.len(), 88);
         assert_eq!(&original[34..38], &1u32.to_be_bytes());
@@ -905,7 +963,9 @@ mod tests {
         // The same message with the owner name spelled out: the walker
         // must skip the labels instead of trusting a pointer.
         let mut inline = resp[..28].to_vec();
-        inline.extend_from_slice(&[5, b'p', b'l', b'a', b'i', b'n', 4, b't', b'e', b's', b't', 0]);
+        inline.extend_from_slice(&[
+            5, b'p', b'l', b'a', b'i', b'n', 4, b't', b'e', b's', b't', 0,
+        ]);
         inline.extend_from_slice(&resp[30..]);
         assert_eq!(inline.len(), resp.len() + 10); // 12-byte name vs pointer
         assert_eq!(wire::parse(&inline).unwrap().answers[0].ttl, 111);
@@ -932,7 +992,8 @@ mod tests {
 
         // Only answers are rewritten: an OPT RR in the additional section
         // holds EDNS flags in its TTL field and must survive.
-        let original = wire::build_response(&query, wire::RCODE_NOERROR, &[(ip("198.18.0.5"), 300)]);
+        let original =
+            wire::build_response(&query, wire::RCODE_NOERROR, &[(ip("198.18.0.5"), 300)]);
         let mut with_opt = original.clone();
         crate::dns::edns::append_to_query(&mut with_opt, None);
         let opt_at = with_opt.len() - 11;

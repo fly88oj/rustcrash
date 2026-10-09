@@ -31,7 +31,7 @@ use crate::error::{Error, Result};
 use crate::inbound::proxy_server::{hand_off, serve_with, ServerConfig, ServerProtocol};
 use crate::inbound::{SharedRelay, TcpMeta};
 use crate::proto::tlsmirror::{
-    serve_conn_ready, serve_enrollment_control_connection, TlsMirrorServerConfig, TimeSpec,
+    serve_conn_ready, serve_enrollment_control_connection, TimeSpec, TlsMirrorServerConfig,
 };
 use crate::stream::BoxProxyStream;
 
@@ -148,6 +148,7 @@ async fn handle(
             inbound: tag.clone(),
             inbound_port: Some(port),
             inbound_kind: "tlsmirror",
+            in_user: None,
         },
         Box::new(relay_side),
     );
@@ -167,12 +168,9 @@ async fn peek_preface(stream: BoxProxyStream) -> Result<(BoxProxyStream, Vec<u8>
     let mut peeked = Vec::with_capacity(H2C_PREFACE_PREFIX.len());
     let mut byte = [0u8; 1];
     while peeked.len() < H2C_PREFACE_PREFIX.len() {
-        let n = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            stream.read(&mut byte),
-        )
-        .await
-        .map_err(|_| Error::network("tlsmirror: client sent nothing"))??;
+        let n = tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut byte))
+            .await
+            .map_err(|_| Error::network("tlsmirror: client sent nothing"))??;
         if n == 0 {
             break;
         }
@@ -228,8 +226,8 @@ mod tests {
             tokio::spawn(async move {
                 let mut client = client;
                 if let Ok(mut tcp) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
-                let _ = tokio::io::copy_bidirectional(&mut client, &mut tcp).await;
-            }
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut tcp).await;
+                }
             });
         }
 
@@ -277,20 +275,16 @@ mod tests {
         relay
             .dest_port
             .store(dest_port, std::sync::atomic::Ordering::SeqCst);
-        let enrolment = enrollment_dialer.is_some().then(|| {
-            ("primary-ingress".to_string(), "primary-egress".to_string())
-        });
-        let cfg = listener_cfg(
-            primary_key,
-            &format!("dest.example:{dest_port}"),
-            enrolment,
-        );
+        let enrolment = enrollment_dialer
+            .is_some()
+            .then(|| ("primary-ingress".to_string(), "primary-egress".to_string()));
+        let cfg = listener_cfg(primary_key, &format!("dest.example:{dest_port}"), enrolment);
         let addr = serve(&cfg, relay).await.unwrap();
         let mut out = TlsMirrorOut::new(key_override.unwrap_or(primary_key), "dest.example");
         out.alpn = vec!["http/1.1".to_string()];
-        out.connection_enrolment = enrollment_dialer.as_ref().map(|_| {
-            ("primary-ingress".to_string(), "primary-egress".to_string())
-        });
+        out.connection_enrolment = enrollment_dialer
+            .as_ref()
+            .map(|_| ("primary-ingress".to_string(), "primary-egress".to_string()));
         let (client, server) = tokio::io::duplex(256 * 1024);
         tokio::spawn(async move {
             let mut server = server;
@@ -361,7 +355,10 @@ mod tests {
     /// The TLS carrier service: one trivial HTTP/1.1 response.
     async fn serve_dest_tls(config: Arc<rustls::ServerConfig>, io: BoxProxyStream) {
         let acceptor = tokio_rustls::TlsAcceptor::from(config);
-        let mut tls = match acceptor.accept(crate::inbound::proxy_server::BoxedIo(io)).await {
+        let mut tls = match acceptor
+            .accept(crate::inbound::proxy_server::BoxedIo(io))
+            .await
+        {
             Ok(t) => t,
             Err(_) => return,
         };
@@ -407,10 +404,9 @@ mod tests {
     async fn listener_serves_own_client() {
         let primary_key = generate_primary_key();
         let relay = DialRelay::new();
-        let (mut stream, _addr) =
-            client_against_listener(&primary_key, relay.clone(), None, None)
-                .await
-                .expect("connect");
+        let (mut stream, _addr) = client_against_listener(&primary_key, relay.clone(), None, None)
+            .await
+            .expect("connect");
         // The hidden channel speaks to the camouflage dest's plaintext
         // service: one HTTP request, one response.
         stream
@@ -504,13 +500,10 @@ mod tests {
             .await
             .unwrap();
         let mut buf = vec![0u8; 100];
-        let n = tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            stream.read(&mut buf),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let n = tokio::time::timeout(std::time::Duration::from_secs(20), stream.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
         let text = String::from_utf8_lossy(&buf[..n]).into_owned();
         assert!(text.starts_with("HTTP/1.1 200 OK"), "{text}");
     }
@@ -535,4 +528,3 @@ mod tests {
         assert!(result.is_err(), "no enrolment configured: {result:?}");
     }
 }
-

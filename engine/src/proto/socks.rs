@@ -46,7 +46,11 @@ impl SocksStream {
 }
 
 impl AsyncWrite for SocksStream {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
@@ -60,15 +64,17 @@ impl AsyncWrite for SocksStream {
 }
 
 impl AsyncRead for SocksStream {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 
 /// Read a SOCKS5 reply: `VER REP RSV ATYP ADDR PORT`.
-async fn read_socks_reply<S: AsyncRead + AsyncWrite + Unpin>(
-    io: &mut S,
-) -> Result<(u8, NetAddr)> {
+async fn read_socks_reply<S: AsyncRead + AsyncWrite + Unpin>(io: &mut S) -> Result<(u8, NetAddr)> {
     let mut head = [0u8; 4];
     io.read_exact(&mut head).await?;
     if head[0] != 0x05 {
@@ -78,7 +84,11 @@ async fn read_socks_reply<S: AsyncRead + AsyncWrite + Unpin>(
         0x01 => 4 + 2,
         0x03 => 255, // read length byte first
         0x04 => 16 + 2,
-        other => return Err(Error::protocol(format!("socks5: bad reply atyp {other:#x}"))),
+        other => {
+            return Err(Error::protocol(format!(
+                "socks5: bad reply atyp {other:#x}"
+            )))
+        }
     };
     let mut tail = vec![0u8; tail_len.max(1)];
     if head[3] == 0x03 {
@@ -89,14 +99,17 @@ async fn read_socks_reply<S: AsyncRead + AsyncWrite + Unpin>(
     } else {
         io.read_exact(&mut tail).await?;
     }
-    let port = tail.len()
+    let port = tail
+        .len()
         .checked_sub(2)
         .map(|p| u16::from_be_bytes([tail[p], tail[p + 1]]))
         .unwrap_or(0);
     let host = match head[3] {
-        0x01 => Host::Ip(format!("{}.{}.{}.{}", tail[0], tail[1], tail[2], tail[3])
-            .parse()
-            .map_err(|_| Error::protocol("socks5: bad ipv4 in reply"))?),
+        0x01 => Host::Ip(
+            format!("{}.{}.{}.{}", tail[0], tail[1], tail[2], tail[3])
+                .parse()
+                .map_err(|_| Error::protocol("socks5: bad ipv4 in reply"))?,
+        ),
         0x03 => Host::Domain(String::from_utf8_lossy(&tail[..tail.len() - 2]).to_string()),
         _ => {
             let mut b = [0u8; 16];
@@ -122,7 +135,10 @@ async fn negotiate<S: AsyncRead + AsyncWrite + Unpin>(io: &mut S, cfg: &SocksOut
     let mut resp = [0u8; 2];
     io.read_exact(&mut resp).await?;
     if resp[0] != 0x05 {
-        return Err(Error::protocol(format!("socks5: bad version {:#x}", resp[0])));
+        return Err(Error::protocol(format!(
+            "socks5: bad version {:#x}",
+            resp[0]
+        )));
     }
     match resp[1] {
         0x00 => Ok(()),
@@ -167,7 +183,7 @@ impl SocksUdp {
     /// Negotiate a UDP ASSOCIATE over an established TCP connection. The
     /// TCP stream is kept concrete so the UDP socket can bind to the same
     /// address family (servers key the association by source address).
-    pub async fn associate(mut tcp: tokio::net::TcpStream, cfg: &SocksOut) -> Result<Self> {
+    pub async fn associate(mut tcp: crate::stream::BoxProxyStream, cfg: &SocksOut) -> Result<Self> {
         negotiate(&mut tcp, cfg).await?;
 
         // UDP ASSOCIATE with the zero target; the reply carries the relay
@@ -192,8 +208,10 @@ impl SocksUdp {
         if relay.port() == 0 {
             return Err(Error::protocol("socks5: udp associate returned port 0"));
         }
-        let local_tcp = tcp.local_addr().map_err(|e| Error::network(e.to_string()))?;
-        let socket = tokio::net::UdpSocket::bind(if local_tcp.is_ipv4() {
+        // Bind the local UDP socket from the relay's address family (the
+        // TCP control link may be a TLS-wrapped stream with no addr
+        // accessor; the relay is what the datagrams are sent to).
+        let socket = tokio::net::UdpSocket::bind(if relay.is_ipv4() {
             "0.0.0.0:0"
         } else {
             "[::]:0"
@@ -201,9 +219,7 @@ impl SocksUdp {
         .await?;
         crate::mark::apply(&socket);
         Ok(SocksUdp {
-            control: SocksStream {
-                inner: Box::new(tcp),
-            },
+            control: SocksStream { inner: tcp },
             relay,
             socket,
         })
@@ -285,9 +301,13 @@ mod tests {
             password: None,
         };
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut stream = SocksStream::handshake(Box::new(tcp), &cfg, &NetAddr::domain("s.test", 443).unwrap())
-            .await
-            .unwrap();
+        let mut stream = SocksStream::handshake(
+            Box::new(tcp),
+            &cfg,
+            &NetAddr::domain("s.test", 443).unwrap(),
+        )
+        .await
+        .unwrap();
         stream.write_all(b"ping").await.unwrap();
         let mut buf = [0u8; 8];
         let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))
@@ -325,10 +345,11 @@ mod tests {
             password: None,
         };
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let err = SocksStream::handshake(Box::new(tcp), &cfg, &NetAddr::domain("x.test", 80).unwrap())
-            .await
-            .err()
-            .expect("handshake should fail");
+        let err =
+            SocksStream::handshake(Box::new(tcp), &cfg, &NetAddr::domain("x.test", 80).unwrap())
+                .await
+                .err()
+                .expect("handshake should fail");
         assert!(err.to_string().contains("connect failed"));
     }
 }

@@ -80,7 +80,17 @@ pub async fn serve(cfg: &ServerConfig, relay: SharedRelay) -> Result<SocketAddr>
         let tag = tag.clone();
         let dest_addr = dest_addr.clone();
         async move {
-            handle_conn(&server_cfg, stream, peer, port, &tag, &relay, dest_addr, rate_limit).await
+            handle_conn(
+                &server_cfg,
+                stream,
+                peer,
+                port,
+                &tag,
+                &relay,
+                dest_addr,
+                rate_limit,
+            )
+            .await
         }
     })
     .await
@@ -137,7 +147,9 @@ fn split_dest(dest: &str) -> Result<(String, u16)> {
         .rsplit_once(':')
         .ok_or_else(|| Error::config(format!("jls: invalid dest address: {dest:?}")))?;
     if host.is_empty() || port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
-        return Err(Error::config(format!("jls: invalid dest address: {dest:?}")));
+        return Err(Error::config(format!(
+            "jls: invalid dest address: {dest:?}"
+        )));
     }
     let port = port
         .parse::<u16>()
@@ -356,7 +368,10 @@ mod tests {
         .expect("client handshake timeout")
         .expect("client handshake failed");
 
-        stream.write_all(b"chrome through jls listener").await.unwrap();
+        stream
+            .write_all(b"chrome through jls listener")
+            .await
+            .unwrap();
         let mut buf = vec![0u8; b"chrome through jls listener".len()];
         tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut buf))
             .await
@@ -429,10 +444,7 @@ mod tests {
         .expect("timeout");
 
         // The echoed-back flight cannot verify — the dial fails.
-        assert!(
-            result.is_err(),
-            "a wrong password must not authenticate"
-        );
+        assert!(result.is_err(), "a wrong password must not authenticate");
         // The fallback relay delivered the client's hello to dest.
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -440,7 +452,10 @@ mod tests {
             if len > 0 {
                 break;
             }
-            assert!(Instant::now() < deadline, "dest never saw the fallback bytes");
+            assert!(
+                Instant::now() < deadline,
+                "dest never saw the fallback bytes"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(capture.relayed(), 0);
@@ -498,10 +513,13 @@ mod tests {
     async fn config_errors_surface_before_binding() {
         let capture = Capture::new();
         // dest without a port (net.SplitHostPort fails, jls.go:127-130).
-        let err = serve(&listener_cfg(&[("u", "p")], "camo.example"), capture.clone())
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = serve(
+            &listener_cfg(&[("u", "p")], "camo.example"),
+            capture.clone(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("invalid dest"), "{err}");
         // No users (NewServerConfig).
         let err = serve(&listener_cfg(&[], "127.0.0.1:1"), capture.clone())
@@ -513,8 +531,14 @@ mod tests {
 
     #[test]
     fn dest_splitting() {
-        assert_eq!(split_dest("example.com:8443").unwrap(), ("example.com".into(), 8443));
-        assert_eq!(split_dest("127.0.0.1:443").unwrap(), ("127.0.0.1".into(), 443));
+        assert_eq!(
+            split_dest("example.com:8443").unwrap(),
+            ("example.com".into(), 8443)
+        );
+        assert_eq!(
+            split_dest("127.0.0.1:443").unwrap(),
+            ("127.0.0.1".into(), 443)
+        );
         for bad in ["example.com", ":443", "example.com:", "example.com:http"] {
             assert!(split_dest(bad).is_err(), "{bad}");
         }

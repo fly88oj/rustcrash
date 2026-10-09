@@ -169,7 +169,10 @@ struct ChunkNonce {
 
 impl ChunkNonce {
     fn new(iv: [u8; 16]) -> Self {
-        ChunkNonce { base_iv: iv, count: 0 }
+        ChunkNonce {
+            base_iv: iv,
+            count: 0,
+        }
     }
 
     fn advance(&mut self) -> [u8; 12] {
@@ -264,10 +267,9 @@ struct BodyCodec {
 impl BodyCodec {
     fn new(security: VmessSecurity, key: [u8; 16], iv: [u8; 16]) -> Result<Self> {
         let kind = match security {
-            VmessSecurity::Aes128Gcm => Some(crate::proto::aead::Aead::new(
-                AeadKind::Aes128Gcm,
-                &key,
-            )?),
+            VmessSecurity::Aes128Gcm => {
+                Some(crate::proto::aead::Aead::new(AeadKind::Aes128Gcm, &key)?)
+            }
             VmessSecurity::Chacha20Poly1305 => {
                 // v2fly: chacha key = MD5(key) || MD5(MD5(key))
                 let mut k = Vec::with_capacity(32);
@@ -275,7 +277,10 @@ impl BodyCodec {
                 k.extend_from_slice(&h);
                 h = Md5::digest(h);
                 k.extend_from_slice(&h);
-                Some(crate::proto::aead::Aead::new(AeadKind::Chacha20Poly1305, &k)?)
+                Some(crate::proto::aead::Aead::new(
+                    AeadKind::Chacha20Poly1305,
+                    &k,
+                )?)
             }
             VmessSecurity::None => None,
         };
@@ -310,7 +315,6 @@ impl BodyCodec {
         }
         Ok(())
     }
-
 }
 
 enum RespState {
@@ -465,8 +469,7 @@ impl VmessStream {
                         if n < TAG {
                             return Err(Error::protocol("vmess body chunk shorter than a tag"));
                         }
-                        aead
-                            .open(&self.dec.nonce.advance(), &[], &self.rbuf[..n])
+                        aead.open(&self.dec.nonce.advance(), &[], &self.rbuf[..n])
                             .map_err(|e| Error::protocol(format!("vmess body: {e}")))?
                     }
                 };
@@ -478,7 +481,11 @@ impl VmessStream {
         Ok(())
     }
 
-    fn poll_read_inner(&mut self, cx: &mut Context<'_>, dst: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read_inner(
+        &mut self,
+        cx: &mut Context<'_>,
+        dst: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         loop {
             if !self.plain.is_empty() {
                 let n = self.plain.len().min(dst.remaining());
@@ -518,7 +525,11 @@ impl VmessStream {
 }
 
 impl AsyncWrite for VmessStream {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
@@ -584,7 +595,11 @@ impl VmessStream {
 }
 
 impl AsyncRead for VmessStream {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         self.poll_read_inner(cx, buf)
     }
 }
@@ -677,7 +692,10 @@ mod tests {
         let mut block = aes::cipher::generic_array::GenericArray::clone_from_slice(&auth_id);
         cipher.decrypt_block(&mut block);
         let decrypted: [u8; 16] = block.into();
-        assert_eq!(crc32fast::hash(&decrypted[..12]), u32::from_be_bytes(decrypted[12..].try_into().unwrap()));
+        assert_eq!(
+            crc32fast::hash(&decrypted[..12]),
+            u32::from_be_bytes(decrypted[12..].try_into().unwrap())
+        );
 
         let nonce: [u8; 8] = sealed[34..42].try_into().unwrap();
         let len_aead = crate::proto::aead::Aead::new(
@@ -690,7 +708,9 @@ mod tests {
             n.copy_from_slice(&vmess_kdf(&key, &[KDF_HEADER_LEN_NONCE, &auth_id, &nonce])[..12]);
             n
         };
-        let len_pt = len_aead.open(&nonce_len, &auth_id, &sealed[16..34]).unwrap();
+        let len_pt = len_aead
+            .open(&nonce_len, &auth_id, &sealed[16..34])
+            .unwrap();
         let hlen = u16::from_be_bytes([len_pt[0], len_pt[1]]) as usize;
         assert_eq!(hlen, hdr.len());
 
@@ -716,6 +736,9 @@ mod tests {
         assert_eq!(used + 38, opened.len() - 4, "fnv tail after address");
         assert_eq!(addr.host, target.host);
         assert_eq!(addr.port, 443);
-        assert_eq!(fnv1a32(&opened[..opened.len() - 4]), u32::from_be_bytes(opened[opened.len() - 4..].try_into().unwrap()));
+        assert_eq!(
+            fnv1a32(&opened[..opened.len() - 4]),
+            u32::from_be_bytes(opened[opened.len() - 4..].try_into().unwrap())
+        );
     }
 }

@@ -802,9 +802,9 @@ fn parse_server_hello(msg: &[u8]) -> Result<ParsedServerHello> {
         .get(2..34)
         .ok_or_else(|| Error::protocol("quic-tls13: short ServerHello random"))?;
     let is_hrr = random == HRR_RANDOM.as_slice();
-    let sid_len = *b
-        .get(34)
-        .ok_or_else(|| Error::protocol("quic-tls13: short ServerHello"))? as usize;
+    let sid_len =
+        *b.get(34)
+            .ok_or_else(|| Error::protocol("quic-tls13: short ServerHello"))? as usize;
     let session_id = b
         .get(35..35 + sid_len)
         .ok_or_else(|| Error::protocol("quic-tls13: short ServerHello session id"))?
@@ -876,8 +876,7 @@ fn parse_server_hello(msg: &[u8]) -> Result<ParsedServerHello> {
             cookie,
         });
     }
-    let share =
-        share.ok_or_else(|| Error::protocol("quic-tls13: ServerHello has no key_share"))?;
+    let share = share.ok_or_else(|| Error::protocol("quic-tls13: ServerHello has no key_share"))?;
     if share.len() != 32 {
         return Err(Error::protocol(
             "quic-tls13: X25519 key share is not 32 bytes",
@@ -922,17 +921,13 @@ fn parse_encrypted_extensions(msg: &[u8]) -> Result<ParsedEncryptedExtensions> {
                 if let Some(&len) = list.first() {
                     out.alpn = Some(
                         list.get(1..1 + len as usize)
-                            .ok_or_else(|| {
-                                Error::protocol("quic-tls13: truncated ALPN protocol")
-                            })?
+                            .ok_or_else(|| Error::protocol("quic-tls13: truncated ALPN protocol"))?
                             .to_vec(),
                     );
                 }
             }
             EXT_TRANSPORT_PARAMETERS => out.transport_parameters = Some(data.to_vec()),
-            ech::EXTENSION_ENCRYPTED_CLIENT_HELLO => {
-                out.ech_retry_configs = Some(data.to_vec())
-            }
+            ech::EXTENSION_ENCRYPTED_CLIENT_HELLO => out.ech_retry_configs = Some(data.to_vec()),
             _ => {}
         }
     }
@@ -944,9 +939,9 @@ fn parse_certificate(msg: &[u8]) -> Result<Vec<Vec<u8>>> {
     let b = msg
         .get(4..)
         .ok_or_else(|| Error::protocol("quic-tls13: short Certificate"))?;
-    let ctx_len = *b
-        .first()
-        .ok_or_else(|| Error::protocol("quic-tls13: short Certificate"))? as usize;
+    let ctx_len =
+        *b.first()
+            .ok_or_else(|| Error::protocol("quic-tls13: short Certificate"))? as usize;
     let mut off = 1 + ctx_len;
     if ctx_len != 0 {
         return Err(Error::protocol(
@@ -1266,14 +1261,8 @@ fn build_plain_flight(
     rand::rngs::OsRng.fill_bytes(&mut random);
     let mut session_id = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut session_id);
-    let hello = profiles::build_client_hello_alpn(
-        profile,
-        sni,
-        &random,
-        &session_id,
-        &public,
-        Some(alpn),
-    );
+    let hello =
+        profiles::build_client_hello_alpn(profile, sni, &random, &session_id, &public, Some(alpn));
     let hello = insert_extension(&hello, EXT_TRANSPORT_PARAMETERS, transport_params)?;
     Ok(ClientFlight {
         hello,
@@ -1505,8 +1494,12 @@ fn build_ech_flight(
 
     // HPKE sender: info = "tls ech\0" ‖ config.raw
     // (handshake_client.go:193-194).
-    let (enc, mut hpke) =
-        ech::HpkeSender::setup_with(&public, selection.aead, &ech::ech_hpke_info(config), &hpke_secret)?;
+    let (enc, mut hpke) = ech::HpkeSender::setup_with(
+        &public,
+        selection.aead,
+        &ech::ech_hpke_info(config),
+        &hpke_secret,
+    )?;
 
     // Seal against the placeholder outer serialization
     // (`computeAndUpdateOuterECHExtension`, ech.go:418-449).
@@ -1522,12 +1515,7 @@ fn build_ech_flight(
     )?;
 
     let ctx = EchClientContext {
-        inner_msg: serialize_ech_hello(
-            &inner_random,
-            Some(&session_id),
-            &suites_comp,
-            &inner_exts,
-        ),
+        inner_msg: serialize_ech_hello(&inner_random, Some(&session_id), &suites_comp, &inner_exts),
         inner_random,
         outer_msg: serialize_outer_with(&ech_ext),
         outer_random,
@@ -1666,9 +1654,13 @@ impl Tls13QuicClientConfig {
             Some(QuicTlsCover::Jls(user)) => {
                 build_jls_flight(self.profile, &self.sni, &self.alpn, transport_params, user)
             }
-            Some(QuicTlsCover::Ech(selection)) => {
-                build_ech_flight(self.profile, &self.sni, &self.alpn, transport_params, selection)
-            }
+            Some(QuicTlsCover::Ech(selection)) => build_ech_flight(
+                self.profile,
+                &self.sni,
+                &self.alpn,
+                transport_params,
+                selection,
+            ),
         }
     }
 }
@@ -1729,7 +1721,10 @@ impl QuinnCryptoClientConfig for Tls13QuicClientConfig {
         let flight = self
             .build_flight(&transport_params)
             .map_err(|e| ConnectError::InvalidServerName(e.to_string()))?;
-        Ok(Box::new(Tls13QuicSession::client(flight, Arc::clone(&self.auth))))
+        Ok(Box::new(Tls13QuicSession::client(
+            flight,
+            Arc::clone(&self.auth),
+        )))
     }
 }
 
@@ -2276,7 +2271,12 @@ impl Tls13QuicSession {
                 Err(e) => return Err(self.fatal(e.to_string())),
             }
         };
-        let inner2 = serialize_ech_hello(&ctx.inner_random, Some(&ctx.session_id), &ctx.suites_comp, &inner_exts);
+        let inner2 = serialize_ech_hello(
+            &ctx.inner_random,
+            Some(&ctx.session_id),
+            &ctx.suites_comp,
+            &inner_exts,
+        );
         let mut outer2_exts = ctx.outer_exts.clone();
         ech_insert_ech(&mut outer2_exts, ech_ext);
         let outer2 = serialize_ech_hello(
@@ -2337,11 +2337,11 @@ impl Tls13QuicSession {
                     self.step = FlightStep::CertificateVerify;
                     Ok(())
                 }
-                (FlightStep::Certificate, HS_COMPRESSED_CERTIFICATE) => {
-                    Err("quic-tls13: server sent a compressed certificate (RFC 8879); \
+                (FlightStep::Certificate, HS_COMPRESSED_CERTIFICATE) => Err(
+                    "quic-tls13: server sent a compressed certificate (RFC 8879); \
                          not supported"
-                        .to_string())
-                }
+                        .to_string(),
+                ),
                 (FlightStep::CertificateVerify, HS_CERTIFICATE_VERIFY) => {
                     let hash_at_cert = transcript.hash();
                     transcript.update(raw);
@@ -2394,9 +2394,8 @@ impl Tls13QuicSession {
                         if let Some(list) = self.ech_retry_configs.clone() {
                             use base64::Engine as _;
                             reason.push_str("; retry-configs=");
-                            reason.push_str(
-                                &base64::engine::general_purpose::STANDARD.encode(list),
-                            );
+                            reason
+                                .push_str(&base64::engine::general_purpose::STANDARD.encode(list));
                         }
                         return Err(reason);
                     }
@@ -2417,13 +2416,8 @@ impl Tls13QuicSession {
                     // (reality/tls13.rs:1283-1288).
                     let hash_at_sfin = transcript.hash();
                     self.exporter_master = Some(
-                        derive_secret(
-                            suite.quic_hash(),
-                            &hs.master,
-                            "exp master",
-                            &hash_at_sfin,
-                        )
-                        .map_err(err)?,
+                        derive_secret(suite.quic_hash(), &hs.master, "exp master", &hash_at_sfin)
+                            .map_err(err)?,
                     );
                     let (c_ap, s_ap) =
                         application_secrets(suite.quic_hash(), &hs.master, &hash_at_sfin)
@@ -2635,7 +2629,8 @@ impl Session for Tls13QuicSession {
                 .expect("static retry key"),
         );
         let (aad, tag) = pseudo_packet.split_at_mut(tag_start);
-        key.open_in_place(nonce, aead::Aad::from(&*aad), tag).is_ok()
+        key.open_in_place(nonce, aead::Aad::from(&*aad), tag)
+            .is_ok()
     }
 
     fn export_keying_material(
@@ -2832,8 +2827,7 @@ pub(crate) mod test_server {
                 ext_body = Some(b.to_vec());
             }
         }
-        let ext_body =
-            ext_body.ok_or_else(|| Error::protocol("test server: no ECH extension"))?;
+        let ext_body = ext_body.ok_or_else(|| Error::protocol("test server: no ECH extension"))?;
         let payload = match ech::parse_ech_ext(&ext_body)? {
             ech::EchExt::Inner => {
                 return Err(Error::protocol("test server: inner marker on the wire"));
@@ -2974,9 +2968,7 @@ pub(crate) mod test_server {
                         for (t, b) in extensions(&ch_raw[off..])? {
                             if t == ech::EXTENSION_ENCRYPTED_CLIENT_HELLO {
                                 if let Ok(ech::EchExt::Outer {
-                                    enc: e,
-                                    aead_id: a,
-                                    ..
+                                    enc: e, aead_id: a, ..
                                 }) = ech::parse_ech_ext(b)
                                 {
                                     enc = Some(e);
@@ -3026,9 +3018,7 @@ pub(crate) mod test_server {
                             for (t, b) in extensions(&ch_raw[off..])? {
                                 if t == ech::EXTENSION_ENCRYPTED_CLIENT_HELLO {
                                     if let Ok(ech::EchExt::Outer {
-                                        enc: e,
-                                        aead_id: a,
-                                        ..
+                                        enc: e, aead_id: a, ..
                                     }) = ech::parse_ech_ext(b)
                                     {
                                         enc = Some(e);
@@ -3045,8 +3035,9 @@ pub(crate) mod test_server {
                             let configs = ech::parse_ech_config_list(config_list)?;
                             let mut recipient = ech::HpkeSender::from_shared_secret(
                                 &shared,
-                                ech::HpkeAead::from_id(aead_id)
-                                    .ok_or_else(|| Error::protocol("test server: unsupported aead"))?,
+                                ech::HpkeAead::from_id(aead_id).ok_or_else(|| {
+                                    Error::protocol("test server: unsupported aead")
+                                })?,
                                 &ech::ech_hpke_info(&configs[0]),
                             )?;
                             let inner_msg = open_ech_hello(ch_raw, &mut recipient)?;
@@ -3125,14 +3116,12 @@ pub(crate) mod test_server {
                     conf_tr.update(&zeroed);
                     let prk = hkdf_extract(suite.quic_hash(), &[], &inner_random);
                     let mut conf = [0u8; 8];
-                    suite
-                        .quic_hash()
-                        .hkdf_expand_label(
-                            &prk,
-                            "ech accept confirmation",
-                            &conf_tr.hash(),
-                            &mut conf,
-                        )?;
+                    suite.quic_hash().hkdf_expand_label(
+                        &prk,
+                        "ech accept confirmation",
+                        &conf_tr.hash(),
+                        &mut conf,
+                    )?;
                     sh_raw[30..38].copy_from_slice(&conf);
                     // Re-run the transcript over the stamped SH.
                     let mut t = Transcript::new(suite.quic_hash());
@@ -3157,10 +3146,8 @@ pub(crate) mod test_server {
                     body.extend_from_slice(&list);
                     ee_exts.extend_from_slice(&ext_entry(EXT_ALPN, &body));
                 }
-                ee_exts.extend_from_slice(&ext_entry(
-                    EXT_TRANSPORT_PARAMETERS,
-                    &self.server_params,
-                ));
+                ee_exts
+                    .extend_from_slice(&ext_entry(EXT_TRANSPORT_PARAMETERS, &self.server_params));
                 if let Some(retry) = self.ech_retry_configs.clone() {
                     ee_exts.extend_from_slice(&ext_entry(
                         ech::EXTENSION_ENCRYPTED_CLIENT_HELLO,
@@ -3257,7 +3244,10 @@ pub(crate) mod test_server {
             }
         }
 
-        pub(crate) fn server_read(&mut self, buf: &[u8]) -> std::result::Result<bool, TransportError> {
+        pub(crate) fn server_read(
+            &mut self,
+            buf: &[u8],
+        ) -> std::result::Result<bool, TransportError> {
             self.pending_in.extend_from_slice(buf);
             loop {
                 match self.server_state {
@@ -3373,7 +3363,6 @@ mod tests {
     use std::net::SocketAddr;
     use std::time::Duration;
 
-
     fn dial_cfg(port: u16, sni: &str, alpn: &[&str]) -> QuicDial {
         QuicDial {
             server: "127.0.0.1".to_string(),
@@ -3422,7 +3411,8 @@ mod tests {
         let certified = rcgen::generate_simple_self_signed(vec!["sq.test".to_string()])
             .expect("rcgen self-signed cert");
         let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
-        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let key =
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
         let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -3585,7 +3575,12 @@ mod tests {
         );
         let off = hello_ext_block_offset(&with_tp).unwrap();
         let exts = extensions(&with_tp[off..]).unwrap();
-        assert_eq!(exts.iter().filter(|(t, _)| *t == EXT_TRANSPORT_PARAMETERS).count(), 1);
+        assert_eq!(
+            exts.iter()
+                .filter(|(t, _)| *t == EXT_TRANSPORT_PARAMETERS)
+                .count(),
+            1
+        );
         assert_eq!(
             exts.iter()
                 .find(|(t, _)| *t == EXT_TRANSPORT_PARAMETERS)
@@ -3593,11 +3588,15 @@ mod tests {
             Some(b"params-here".to_vec())
         );
         // Replacement, not duplication.
-        let replaced =
-            insert_extension(&with_tp, EXT_TRANSPORT_PARAMETERS, b"other").unwrap();
+        let replaced = insert_extension(&with_tp, EXT_TRANSPORT_PARAMETERS, b"other").unwrap();
         let off = hello_ext_block_offset(&replaced).unwrap();
         let exts = extensions(&replaced[off..]).unwrap();
-        assert_eq!(exts.iter().filter(|(t, _)| *t == EXT_TRANSPORT_PARAMETERS).count(), 1);
+        assert_eq!(
+            exts.iter()
+                .filter(|(t, _)| *t == EXT_TRANSPORT_PARAMETERS)
+                .count(),
+            1
+        );
         assert_eq!(
             exts.iter()
                 .find(|(t, _)| *t == EXT_TRANSPORT_PARAMETERS)
@@ -3717,13 +3716,11 @@ mod tests {
             test_server::ech_server_key(&[4u8; 32], 0x21, b"unrelated.example");
         let wrong = ech::select_ech_config(&other).unwrap();
         let cfg = dial_cfg(addr.port(), "inner.example", &["h3"]);
-        let conn = tokio::time::timeout(
-            Duration::from_secs(20),
-            crate::quic::dial_ech(&cfg, wrong),
-        )
-        .await
-        .expect("ech retry dial timed out")
-        .expect("ech retry dial failed");
+        let conn =
+            tokio::time::timeout(Duration::from_secs(20), crate::quic::dial_ech(&cfg, wrong))
+                .await
+                .expect("ech retry dial timed out")
+                .expect("ech retry dial failed");
 
         let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
         send.write_all(b"after retry").await.unwrap();
@@ -3738,10 +3735,11 @@ mod tests {
         // through the randoms; wrong credentials are the upstream
         // jls auth error.
         let user = jls::JlsUser::new("quic-user", "quic-pass").unwrap();
-        let endpoint =
-            test_server::start_quinn_server(ServerMode::Jls { users: vec![user.clone()] })
-                .await
-                .unwrap();
+        let endpoint = test_server::start_quinn_server(ServerMode::Jls {
+            users: vec![user.clone()],
+        })
+        .await
+        .unwrap();
         let addr = endpoint.local_addr().unwrap();
         tokio::spawn(echo_serve(endpoint.clone()));
 
@@ -3764,10 +3762,6 @@ mod tests {
         let err = crate::quic::dial_custom(&cfg, &QuicTlsCover::Jls(wrong))
             .await
             .expect_err("wrong password must not authenticate");
-        assert!(
-            err.to_string().contains(jls::ERR_AUTH_FAILED),
-            "{}",
-            err
-        );
+        assert!(err.to_string().contains(jls::ERR_AUTH_FAILED), "{}", err);
     }
 }

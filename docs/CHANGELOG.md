@@ -6,6 +6,58 @@ All notable changes to RustCrash. Format based on
 
 ## [Unreleased]
 
+### Engine — upstream drift sync 2026-09-23 → 2026-10-08
+
+Ported from mihomo Alpha `e4dd968` and sing-box testing `fe92ab3`
+(re-checked 2026-10-09 against `6afeff4` — no further port work;
+ShellCrash's newest commit is 2026-08-27, before the previous anchor):
+
+- **Security**: sing-box inbound `users` now feeds the engine's
+  credential list (previously silently dropped — an "authenticated"
+  mixed/socks/http listener ran open); the `tls` block on http
+  outbounds is honored in both dialects instead of silently dialing
+  cleartext.
+- load-balance groups: the full mihomo strategy surface —
+  `consistent-hashing` (the upstream DEFAULT, jump hash + eTLD+1 key
+  via the compiled-in Public Suffix List), `round-robin`,
+  `sticky-sessions` (1000-entry/10-minute LRU) — plus `hash-key:
+  in-user` pinning on the inbound-authenticated user; upstream-exact
+  config errors.
+- IN-USER now matches the inbound AUTHENTICATED user (mihomo
+  metadata.InUser), plumbed from http Basic and socks RFC 1929 auth.
+- TLS certificate pinning: `certificate_sha256` /
+  `certificate_public_key_sha256` (sing-box, base64, leaf-only like
+  upstream) and `fingerprint` (mihomo http/socks5, hex, matching any
+  chain certificate like upstream); `certificate`/`certificate_path`
+  become custom CA roots; `client_certificate`/`client_key` (sing-box)
+  and `certificate`+`private-key` (mihomo) are client mTLS identities;
+  `name-cert-verify` fails loudly.
+- sing-box TLS blocks also carry `alpn` and `ech` (PEM `ECH CONFIGS`
+  block decoded into the engine's ECH options).
+- http outbound wire parity with sing-box's rewritten client: exact
+  status-200 requirement (dialect-flagged; mihomo keeps any-2xx),
+  `Proxy-Connection: Keep-Alive`, `path`/`headers` support; the http
+  inbound strips the full hop-by-hop header set, answers 407 with
+  charset, mirrors HTTP/1.0 on CONNECT, and answers 400 to non-http/ws
+  plain-forward targets.
+- OpenVPN data channel: the P_DATA_V1 AEAD additional-data fix
+  (packet-id only; the opcode byte authenticates only on P_DATA_V2)
+  was already in the tree — this pass adds the four upstream golden
+  tests with an independent reference AEAD.
+- fake-ip store: allocations now persist (throttled every 32 fresh
+  allocations + on shutdown); domains >255 bytes are rejected.
+- `system`/`local` DNS upstream reads resolved's uplink file when
+  resolv.conf only points at the 127.0.0.53 stub.
+- Loud-fail convention closures: tun `congestion-controller` and
+  unknown `stack` values, sing-box `dns_server_address` /
+  `dns_search_domain` route AND dns rule items, UDP-NAT knobs
+  (`udp_mapping`/`udp_filtering` off-default, `udp_nat_max`,
+  `udp_timeout`), http outbound `version: 3` /
+  `disable_version_fallback`, unsupported TLS fields; the sing-box
+  masque endpoint error names the mihomo-dialect alternative;
+  `ip_cidr` accepts bare addresses (`192.0.2.1` = `/32`) and rejects
+  non-string items.
+
 ### Engine — WireGuard, QUIC servers, TUN v6/ICMP, DoH on the DNS port
 
 - WireGuard outbound: hand-rolled Noise_IKpsk2 handshake (KDF/MAC1/2

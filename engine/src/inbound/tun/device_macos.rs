@@ -26,8 +26,8 @@ use std::os::fd::{AsRawFd, RawFd};
 use crate::error::{Error, Result};
 
 use super::device::abi::{
-    self, CtlInfo, IfAliasReq, IfAliasReq6, SockaddrCtl, DARWIN_CTLIOCGINFO, DARWIN_SYSPROTO_CONTROL,
-    DARWIN_UTUN_OPT_IFNAME,
+    self, CtlInfo, IfAliasReq, IfAliasReq6, SockaddrCtl, DARWIN_CTLIOCGINFO,
+    DARWIN_SYSPROTO_CONTROL, DARWIN_UTUN_OPT_IFNAME,
 };
 
 /// Smallest MTU we accept — mirrors the Linux backend's RFC 791 floor.
@@ -159,7 +159,9 @@ impl TunDevice {
         if rc < 0 {
             let e = io::Error::last_os_error();
             cleanup(fd);
-            return Err(Error::network(format!("tun: getsockopt(UTUN_OPT_IFNAME): {e}")));
+            return Err(Error::network(format!(
+                "tun: getsockopt(UTUN_OPT_IFNAME): {e}"
+            )));
         }
         let actual = nbuf[..(len as usize).min(nbuf.len())]
             .iter()
@@ -219,13 +221,7 @@ impl TunDevice {
                 iov_len: pkt.len(),
             },
         ];
-        let n = unsafe {
-            libc::writev(
-                self.fd,
-                iovs.as_ptr(),
-                TX_IOVS as libc::c_int,
-            )
-        };
+        let n = unsafe { libc::writev(self.fd, iovs.as_ptr(), TX_IOVS as libc::c_int) };
         if n < 0 {
             return Err(io::Error::last_os_error());
         }

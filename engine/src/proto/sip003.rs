@@ -449,7 +449,9 @@ async fn try_dial(addr: &str, child: &mut Option<&mut Child>) -> Result<TcpAttem
         Ok(stream) => Ok(TcpAttempt::Connected(stream)),
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => Ok(TcpAttempt::Refused),
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Ok(TcpAttempt::Refused),
-        Err(e) => Err(Error::network(format!("sip003: dial plugin at {addr}: {e}"))),
+        Err(e) => Err(Error::network(format!(
+            "sip003: dial plugin at {addr}: {e}"
+        ))),
     }
 }
 
@@ -720,11 +722,17 @@ mod tests {
         std::fs::write(&bin2, b"").unwrap();
         make_executable(&bin2);
         assert_eq!(
-            resolve_plugin_in("obfs-local", &[dir.path().to_path_buf(), other.path().to_path_buf()]),
+            resolve_plugin_in(
+                "obfs-local",
+                &[dir.path().to_path_buf(), other.path().to_path_buf()]
+            ),
             Some(bin.clone())
         );
         assert_eq!(
-            resolve_plugin_in("obfs-local", &[empty.path().to_path_buf(), other.path().to_path_buf()]),
+            resolve_plugin_in(
+                "obfs-local",
+                &[empty.path().to_path_buf(), other.path().to_path_buf()]
+            ),
             Some(bin2)
         );
         // A name with a separator is used verbatim.

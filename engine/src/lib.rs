@@ -5,11 +5,11 @@
 pub mod addr;
 pub mod api;
 pub mod app;
+pub mod config;
 #[cfg(feature = "mihomo")]
 pub mod config_mihomo;
 #[cfg(feature = "singbox")]
 pub mod config_singbox;
-pub mod config;
 pub mod dns;
 pub mod error;
 pub mod geosite;

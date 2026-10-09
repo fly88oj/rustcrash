@@ -85,10 +85,7 @@ impl Default for DnsConfig {
             listen: None,
             enhanced_mode: EnhancedMode::FakeIp,
             ipv6: false,
-            nameservers: vec![
-                "udp://223.5.5.5".to_string(),
-                "udp://8.8.8.8".to_string(),
-            ],
+            nameservers: vec!["udp://223.5.5.5".to_string(), "udp://8.8.8.8".to_string()],
             fallback: Vec::new(),
             fakeip_range: "198.18.0.1/15".to_string(),
             fakeip_filter: vec!["*.lan".to_string(), "*.local".to_string()],
@@ -237,7 +234,13 @@ impl EngineConfig {
 
     /// Ensure built-in outbounds exist (DIRECT/REJECT/PASS, mihomo names).
     pub fn with_builtin_outbounds(mut self) -> Self {
-        for (name, udp) in [("DIRECT", true), ("REJECT", false), ("REJECT-DROP", false), ("PASS", true), ("COMPATIBLE", true)] {
+        for (name, udp) in [
+            ("DIRECT", true),
+            ("REJECT", false),
+            ("REJECT-DROP", false),
+            ("PASS", true),
+            ("COMPATIBLE", true),
+        ] {
             if !self.outbounds.iter().any(|o| o.name == name)
                 && !self.groups.iter().any(|g| g.name == name)
             {
@@ -378,7 +381,11 @@ impl ExpectedStatus {
     /// Whether a probe response status counts as healthy
     /// (utils.IntRanges.Check): an empty list accepts everything.
     pub fn matches(&self, status: u16) -> bool {
-        self.ranges.is_empty() || self.ranges.iter().any(|&(lo, hi)| lo <= status && status <= hi)
+        self.ranges.is_empty()
+            || self
+                .ranges
+                .iter()
+                .any(|&(lo, hi)| lo <= status && status <= hi)
     }
 
     /// True when no filter was configured (any status accepted).
@@ -459,7 +466,6 @@ impl GroupHealth {
     }
 }
 
-
 /// Validate a normalized config the way `engine test` does.
 pub fn validate(cfg: &EngineConfig) -> Result<Vec<String>> {
     let mut warnings = Vec::new();
@@ -481,7 +487,9 @@ pub fn validate(cfg: &EngineConfig) -> Result<Vec<String>> {
         match &r.matcher {
             crate::rule::RuleMatcher::RuleSet { name, .. } => {
                 if !cfg.rule_providers.iter().any(|p| &p.name == name) {
-                    return Err(Error::config(format!("rule references unknown rule-set {name:?}")));
+                    return Err(Error::config(format!(
+                        "rule references unknown rule-set {name:?}"
+                    )));
                 }
             }
             // Geosite names resolve at build; unknown ones warn there.
@@ -591,7 +599,10 @@ mod tests {
     #[test]
     fn controller_and_listen_mihomo_shorthands() {
         // Plain and bracketed hosts unchanged.
-        assert_eq!(split_controller("127.0.0.1:9090"), ("127.0.0.1".into(), 9090));
+        assert_eq!(
+            split_controller("127.0.0.1:9090"),
+            ("127.0.0.1".into(), 9090)
+        );
         assert_eq!(split_controller("[::1]:9090"), ("::1".into(), 9090));
         assert_eq!(split_controller("127.0.0.1"), ("127.0.0.1".into(), 9090));
         // mihomo's leading-colon / `*` all-interfaces forms bind 0.0.0.0
@@ -601,7 +612,9 @@ mod tests {
         assert_eq!(normalize_listen(":1053"), "0.0.0.0:1053");
         assert_eq!(normalize_listen("0.0.0.0:1053"), "0.0.0.0:1053");
         assert_eq!(normalize_listen(" [::]:1053 "), "[::]:1053");
-        assert!(normalize_listen(":1053").parse::<std::net::SocketAddr>().is_ok());
+        assert!(normalize_listen(":1053")
+            .parse::<std::net::SocketAddr>()
+            .is_ok());
     }
 
     #[test]
@@ -668,7 +681,10 @@ mod tests {
     #[test]
     fn compile_rules_attaches_actions_and_validate_skips_them() {
         let mut cfg = EngineConfig {
-            rules: vec!["DST-PORT,443,NOSUCHOUTBOUND".to_string(), "MATCH,DIRECT".to_string()],
+            rules: vec![
+                "DST-PORT,443,NOSUCHOUTBOUND".to_string(),
+                "MATCH,DIRECT".to_string(),
+            ],
             rule_actions: std::collections::HashMap::from([(
                 0,
                 crate::rule::RuleAction::Sniff {

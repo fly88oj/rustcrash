@@ -55,9 +55,7 @@ pub async fn tcp_connect(host: &str, port: u16) -> io::Result<tokio::net::TcpStr
     if mark == 0 {
         return tokio::net::TcpStream::connect((host, port)).await;
     }
-    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
-        .await?
-        .collect();
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
     let mut last: Option<io::Error> = None;
     for addr in addrs {
         match marked_connect_addr(addr, mark).await {
@@ -66,7 +64,10 @@ pub async fn tcp_connect(host: &str, port: u16) -> io::Result<tokio::net::TcpStr
         }
     }
     Err(last.unwrap_or_else(|| {
-        io::Error::new(io::ErrorKind::AddrNotAvailable, format!("no address for {host}:{port}"))
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("no address for {host}:{port}"),
+        )
     }))
 }
 

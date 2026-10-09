@@ -57,6 +57,11 @@ impl Drop for InFlightGuard<'_> {
 pub struct DnsEngine {
     cfg: DnsConfig,
     fakeip: Option<FakeIpPool>,
+    /// `fakeip_store` path (persist target) + allocations since the last
+    /// persist — mappings are written back throttled (upstream commits
+    /// buffered cache-file writes in batches) and once more at shutdown.
+    fakeip_store: Option<std::path::PathBuf>,
+    fakeip_since_persist: std::sync::atomic::AtomicUsize,
     fakeip_filter: DomainMatcher,
     cache: Mutex<HashMap<(String, u16), CacheEntry>>,
     /// When expired cache entries were last swept (drives the insert-time
@@ -85,6 +90,7 @@ pub struct DnsEngine {
 
 impl DnsEngine {
     pub fn new(cfg: DnsConfig, fakeip_filter: DomainMatcher) -> Result<Arc<Self>> {
+        let fakeip_store_path = cfg.fakeip_store.clone();
         let fakeip = if cfg.enhanced_mode == crate::config::EnhancedMode::FakeIp {
             Some(match &cfg.fakeip_store {
                 Some(path) => FakeIpPool::load_from(&cfg.fakeip_range, path)?,
@@ -145,6 +151,8 @@ impl DnsEngine {
         Ok(Arc::new(DnsEngine {
             cfg,
             fakeip,
+            fakeip_store: fakeip_store_path,
+            fakeip_since_persist: std::sync::atomic::AtomicUsize::new(0),
             fakeip_filter,
             cache: Mutex::new(HashMap::new()),
             next_cache_sweep: Mutex::new(Instant::now() + CACHE_SWEEP_INTERVAL),
@@ -159,6 +167,41 @@ impl DnsEngine {
 
     pub fn fakeip(&self) -> Option<&FakeIpPool> {
         self.fakeip.as_ref()
+    }
+
+    /// Allocate (or look up) a fake address, counting toward the
+    /// throttled store write-back.
+    fn alloc_fakeip(&self, domain: &str) -> Result<IpAddr> {
+        let (ip, fresh) = self
+            .fakeip
+            .as_ref()
+            .expect("caller checked fakeip mode")
+            .lookup_or_alloc_flagged(domain)?;
+        // Count FRESH allocations only — cache hits don't grow the store,
+        // so idle re-lookups never trigger writes.
+        if fresh
+            && self.fakeip_store.is_some()
+            && self
+                .fakeip_since_persist
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                >= 32
+        {
+            self.persist_fakeip();
+        }
+        Ok(ip)
+    }
+
+    /// Write the fake-ip pool back to `fakeip_store` (atomic
+    /// write-then-rename inside persist_to). Called throttled from the
+    /// allocation path and once at engine shutdown.
+    pub fn persist_fakeip(&self) {
+        if let (Some(pool), Some(path)) = (&self.fakeip, &self.fakeip_store) {
+            if let Err(e) = pool.persist_to(path) {
+                tracing::warn!(target: "engine", "fakeip store persist {}: {e}", path.display());
+            }
+            self.fakeip_since_persist
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Handle one raw DNS query; returns the response bytes.
@@ -207,7 +250,13 @@ impl DnsEngine {
                 // No AAAA in fake-ip mode without ipv6: empty NOERROR.
                 return wire::build_response(&msg, wire::RCODE_NOERROR, &[]);
             }
-            let ip = self.fakeip.as_ref().unwrap().lookup_or_alloc(&q.name);
+            let ip = match self.alloc_fakeip(&q.name) {
+                Ok(ip) => ip,
+                Err(e) => {
+                    tracing::warn!(target: "engine", "fakeip: {e}");
+                    return wire::build_response(&msg, wire::RCODE_SERVFAIL, &[]);
+                }
+            };
             if qtype == wire::TYPE_AAAA && ip.is_ipv4() {
                 return wire::build_response(&msg, wire::RCODE_NOERROR, &[]);
             }
@@ -250,7 +299,11 @@ impl DnsEngine {
         let cache_ok = rule.is_none_or(|r| !r.disable_cache);
         if cache_ok {
             if let Some(hit) = self.cache_get(name, qtype) {
-                return wire::build_response(query, wire::RCODE_NOERROR, &hit.iter().map(|ip| (*ip, 30)).collect::<Vec<_>>());
+                return wire::build_response(
+                    query,
+                    wire::RCODE_NOERROR,
+                    &hit.iter().map(|ip| (*ip, 30)).collect::<Vec<_>>(),
+                );
             }
         }
         // nameserver-policy overrides the default upstream list for
@@ -258,11 +311,7 @@ impl DnsEngine {
         let default = self.upstreams.clone();
         let upstreams: &[Upstream] = rule
             .and_then(|r| r.server.as_deref())
-            .or_else(|| {
-                self.policy
-                    .as_ref()
-                    .and_then(|p| p.match_upstreams(name))
-            })
+            .or_else(|| self.policy.as_ref().and_then(|p| p.match_upstreams(name)))
             .unwrap_or(&default);
         // Effective EDNS client subnet: the rule's overrides the global.
         let subnet = rule
@@ -371,7 +420,9 @@ impl DnsEngine {
     }
 
     fn cache_insert(&self, name: &str, qtype: u16, resp: &[u8]) {
-        let Some(msg) = wire::parse(resp).ok() else { return };
+        let Some(msg) = wire::parse(resp).ok() else {
+            return;
+        };
         let mut min_ttl = u32::MAX;
         let mut addrs = Vec::new();
         for rr in &msg.answers {
@@ -542,7 +593,7 @@ mod tests {
         // Filtered domain with a dead upstream → NXDOMAIN, not a fake ip.
         let engine = DnsEngine::new(
             DnsConfig {
-            fakeip_store: None,
+                fakeip_store: None,
                 fakeip_filter: vec!["filtered.test".into()],
                 ..dns_config()
             },
@@ -570,7 +621,7 @@ mod tests {
     async fn hosts_override_wins() {
         let engine = DnsEngine::new(
             DnsConfig {
-            fakeip_store: None,
+                fakeip_store: None,
                 hosts: HashMap::from([(
                     "static.test".to_string(),
                     vec!["9.9.9.9".parse().unwrap()],
@@ -584,7 +635,10 @@ mod tests {
         let resp = engine.handle(&query).await;
         let msg = wire::parse(&resp).unwrap();
         // Even in fake-ip mode, hosts answer with the configured address.
-        assert_eq!(rdata_ip(&msg.answers[0].rdata).unwrap().to_string(), "9.9.9.9");
+        assert_eq!(
+            rdata_ip(&msg.answers[0].rdata).unwrap().to_string(),
+            "9.9.9.9"
+        );
     }
 
     #[tokio::test]
@@ -628,11 +682,19 @@ mod tests {
         .unwrap();
         let addrs = engine.resolve("flush.test", wire::TYPE_A).await.unwrap();
         assert_eq!(addrs[0].to_string(), "203.0.113.7");
-        assert_eq!(count.load(Ordering::Relaxed), 1, "first query hit the upstream");
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "first query hit the upstream"
+        );
 
         let again = engine.resolve("flush.test", wire::TYPE_A).await.unwrap();
         assert_eq!(again, addrs);
-        assert_eq!(count.load(Ordering::Relaxed), 1, "second query served from cache");
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "second query served from cache"
+        );
 
         engine.clear_cache();
         let _ = engine.resolve("flush.test", wire::TYPE_A).await.unwrap();
@@ -697,18 +759,24 @@ mod tests {
 
         let first_engine = engine.clone();
         let first_query = query.clone();
-        let first =
-            tokio::spawn(async move { first_engine.handle(&first_query).await });
+        let first = tokio::spawn(async move { first_engine.handle(&first_query).await });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !seen.load(Ordering::SeqCst) {
-            assert!(std::time::Instant::now() < deadline, "upstream never saw the query");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "upstream never saw the query"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         // The same wire query arriving again (the looped-back packet):
         // SERVFAIL, immediately, without a second upstream exchange.
         let second = engine.handle(&query).await;
         let msg = wire::parse(&second).unwrap();
-        assert_eq!(msg.rcode, wire::RCODE_SERVFAIL, "looped query must be refused");
+        assert_eq!(
+            msg.rcode,
+            wire::RCODE_SERVFAIL,
+            "looped query must be refused"
+        );
         assert!(seen.load(Ordering::SeqCst));
 
         // The original still finishes normally.
@@ -755,7 +823,11 @@ mod tests {
         let engine = DnsEngine::new(dns_config(), DomainMatcher::default()).unwrap();
         let resp = {
             let q = wire::parse(&wire::build_query(1, "sweep.test", wire::TYPE_A)).unwrap();
-            wire::build_response(&q, wire::RCODE_NOERROR, &[("203.0.113.9".parse().unwrap(), 300)])
+            wire::build_response(
+                &q,
+                wire::RCODE_NOERROR,
+                &[("203.0.113.9".parse().unwrap(), 300)],
+            )
         };
         engine.cache_insert("sweep.test", wire::TYPE_A, &resp);
         engine.cache_insert("live.test", wire::TYPE_A, &resp);
@@ -775,5 +847,35 @@ mod tests {
         assert!(!cache.contains_key(&("sweep.test".to_string(), wire::TYPE_A)));
         assert!(cache.contains_key(&("live.test".to_string(), wire::TYPE_A)));
         assert!(cache.contains_key(&("fresh.test".to_string(), wire::TYPE_A)));
+    }
+
+    /// The fake-ip store gets its throttled write-back: after enough
+    /// fresh allocations the file exists on disk (drift-sync: persist_to
+    /// previously had NO production caller — mappings were lost on
+    /// restart).
+    #[tokio::test]
+    async fn fakeip_store_persists_under_allocation_pressure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.json");
+        let cfg = DnsConfig {
+            enable: true,
+            enhanced_mode: crate::config::EnhancedMode::FakeIp,
+            nameservers: vec!["udp://127.0.0.1:1".into()],
+            fakeip_store: Some(path.clone()),
+            ..Default::default()
+        };
+        let dns = DnsEngine::new(cfg, crate::rule::DomainMatcher::default()).unwrap();
+        // 33 fresh allocations cross the 32-allocation throttle.
+        for i in 0..33 {
+            dns.alloc_fakeip(&format!("host{i}.test")).unwrap();
+        }
+        assert!(path.is_file(), "throttled persist must have fired");
+        let reloaded = crate::dns::fakeip::FakeIpPool::load_from("198.18.0.1/15", &path).unwrap();
+        assert_eq!(reloaded.len(), 33);
+        // The explicit shutdown path persists whatever is left.
+        dns.alloc_fakeip("after-throttle.test").unwrap();
+        dns.persist_fakeip();
+        let reloaded = crate::dns::fakeip::FakeIpPool::load_from("198.18.0.1/15", &path).unwrap();
+        assert_eq!(reloaded.len(), 34);
     }
 }

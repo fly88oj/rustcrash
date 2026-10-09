@@ -350,7 +350,10 @@ pub fn frame(
         "vision: frame exceeds the upstream 8192-byte buffer"
     );
     let mut out = Vec::with_capacity(
-        content.len() + padding_len + PADDING_HEADER_LEN + if first_uuid.is_some() { 16 } else { 0 },
+        content.len()
+            + padding_len
+            + PADDING_HEADER_LEN
+            + if first_uuid.is_some() { 16 } else { 0 },
     );
     if let Some(uuid) = first_uuid {
         out.extend_from_slice(uuid);
@@ -483,8 +486,7 @@ impl TlsFilter {
         self.packets_to_filter -= 1;
         if buf.len() >= 6 {
             if buf[..3] == TLS_SERVER_HANDSHAKE && buf[5] == HANDSHAKE_SERVER_HELLO {
-                self.remaining_server_hello =
-                    ((i32::from(buf[3])) << 8 | i32::from(buf[4])) + 5;
+                self.remaining_server_hello = ((i32::from(buf[3])) << 8 | i32::from(buf[4])) + 5;
                 self.is_tls12_or_above = true;
                 self.is_tls = true;
                 // The session id length sits after record(5) + handshake header(4)
@@ -1102,7 +1104,11 @@ impl VisionConn {
         self.phase = phase;
     }
 
-    fn poll_read_inner(&mut self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read_inner(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         loop {
             match self.phase {
                 ReadPhase::VlessResp => {
@@ -1408,7 +1414,10 @@ mod tests {
         assert_eq!(padding_len_from(900, false, 255), 255);
         assert_eq!(padding_len_from(100, false, 255), 255);
         // Clamp: paddingLen = min(paddingLen, 8192 - 21 - contentLen).
-        assert_eq!(padding_len_from(8100, false, 255), FRAME_CONTENT_LIMIT - 8100);
+        assert_eq!(
+            padding_len_from(8100, false, 255),
+            FRAME_CONTENT_LIMIT - 8100
+        );
         assert_eq!(padding_len_from(8171, false, 255), 0);
         assert_eq!(padding_len_from(9000, false, 255), 0, "saturating clamp");
         assert_eq!(FRAME_CONTENT_LIMIT, 8171);
@@ -1460,7 +1469,10 @@ mod tests {
     #[test]
     fn record_classification_matches_upstream() {
         assert!(is_application_data(&[0x17, 0x03, 0x03, 0x00, 0x05, 0x00]));
-        assert!(!is_application_data(&[0x17, 0x03, 0x03, 0x00, 0x05]), "short");
+        assert!(
+            !is_application_data(&[0x17, 0x03, 0x03, 0x00, 0x05]),
+            "short"
+        );
         assert!(!is_application_data(&[0x16, 0x03, 0x03, 0x00, 0x05, 0x01]));
         assert!(!is_application_data(&[0x17, 0x03, 0x04, 0x00, 0x05, 0x00]));
 
@@ -1469,7 +1481,9 @@ mod tests {
         assert!(is_complete_record(&[]), "empty input is vacuously complete");
         assert!(!is_complete_record(&one[..7]), "truncated payload");
         assert!(!is_complete_record(&one[..5]), "truncated header");
-        assert!(!is_complete_record(&[0x16, 0x03, 0x03, 0x00, 0x03, 1, 2, 3]));
+        assert!(!is_complete_record(&[
+            0x16, 0x03, 0x03, 0x00, 0x03, 1, 2, 3
+        ]));
         let two = [one.as_slice(), one.as_slice()].concat();
         assert!(is_complete_record(&two));
         let trailing = [one.as_slice(), &[0x17, 0x03, 0x03, 0x00, 0x03, 1, 2]].concat();
@@ -1720,11 +1734,7 @@ mod tests {
                             2 => self.padding_left = usize::from(byte) << 8,
                             1 => {
                                 self.padding_left |= usize::from(byte);
-                                self.stats
-                                    .commands
-                                    .lock()
-                                    .unwrap()
-                                    .push(self.command);
+                                self.stats.commands.lock().unwrap().push(self.command);
                                 self.stats.frames.fetch_add(1, Ordering::Relaxed);
                                 if self.command != COMMAND_CONTINUE {
                                     self.padding = false;
@@ -1800,7 +1810,11 @@ mod tests {
                 (FrameCommand::Continue, true)
             };
             let pad = padding_len(data.len(), long_padding, &mut rand::thread_rng());
-            let uuid = if self.sent_uuid { None } else { Some(self.uuid) };
+            let uuid = if self.sent_uuid {
+                None
+            } else {
+                Some(self.uuid)
+            };
             self.out
                 .extend_from_slice(&frame(command, data, pad, uuid.as_ref()));
             if uuid.is_some() {
@@ -1810,11 +1824,7 @@ mod tests {
                 self.padding = false;
                 if command == FrameCommand::Direct {
                     // Upstream switches its writer to the raw transport here.
-                    self.stats
-                        .commands
-                        .lock()
-                        .unwrap()
-                        .push(COMMAND_DIRECT);
+                    self.stats.commands.lock().unwrap().push(COMMAND_DIRECT);
                 }
             }
         }
@@ -2142,7 +2152,8 @@ mod tests {
         };
         let direct = frame(FrameCommand::Direct, &b, pad, None);
         assert_eq!(direct[..5], [COMMAND_DIRECT, 0, 64, 0, 37]);
-        let expected: Vec<u8> = [a.as_slice(), b.as_slice(), raw1.as_slice(), raw2.as_slice()].concat();
+        let expected: Vec<u8> =
+            [a.as_slice(), b.as_slice(), raw1.as_slice(), raw2.as_slice()].concat();
 
         let server = tokio::spawn(async move {
             server_io.write_all(&first).await.unwrap();
@@ -2369,9 +2380,9 @@ mod tests {
     /// delivered in order before any raw byte, in both directions.
     #[tokio::test]
     async fn tls13_outer_direct_splice_end_to_end() {
+        use crate::proto::reality::profiles::{build_client_hello, UtslProfile};
         use crate::proto::reality::tls13 as outer_tls;
         use crate::proto::reality::tls13::test_server;
-        use crate::proto::reality::profiles::{build_client_hello, UtslProfile};
         use rand::RngCore;
         use tokio::io::AsyncReadExt;
 
@@ -2384,8 +2395,15 @@ mod tests {
         let mut inner_ch = vec![0x16, 0x03, 0x01, 0x00, 0x10, 0x01];
         inner_ch.resize(6 + 0x10, 0x41);
         let inner_sh = server_hello(0x1301, true);
-        let inner_app: Vec<u8> = [TLS_APPLICATION_DATA.as_slice(), &[0x00, 0x05, 1, 2, 3, 4, 5]].concat();
-        assert!(is_complete_record(&inner_app), "the transition piece is complete");
+        let inner_app: Vec<u8> = [
+            TLS_APPLICATION_DATA.as_slice(),
+            &[0x00, 0x05, 1, 2, 3, 4, 5],
+        ]
+        .concat();
+        assert!(
+            is_complete_record(&inner_app),
+            "the transition piece is complete"
+        );
         let d_tail = b"D-rides-the-input-drain".to_vec();
         let uplink_raw = b"raw-uplink-after-direct".to_vec();
         let downlink_raw = b"raw-downlink-after-direct".to_vec();
@@ -2476,7 +2494,13 @@ mod tests {
         rand::rngs::OsRng.fill_bytes(&mut random);
         let session_id = [5u8; 32];
         let (secret, public) = outer_tls::x25519_keygen();
-        let ch = build_client_hello(UtslProfile::Chrome, "localhost", &random, &session_id, &public);
+        let ch = build_client_hello(
+            UtslProfile::Chrome,
+            "localhost",
+            &random,
+            &session_id,
+            &public,
+        );
         let outer = outer_tls::connect(
             Box::new(client_io),
             &ch,
@@ -2513,19 +2537,29 @@ mod tests {
         // once it is out the uplink is raw.
         conn.write_all(&inner_app).await.unwrap();
         conn.flush().await.unwrap();
-        assert!(conn.uplink_spliced(), "the writer re-bound to the raw transport");
+        assert!(
+            conn.uplink_spliced(),
+            "the writer re-bound to the raw transport"
+        );
         conn.write_all(&uplink_raw).await.unwrap();
 
         // Downlink through the switch: the `02` frame's content, then the
         // bytes recovered from the outer TLS read-ahead (`input`), then the
         // raw transport bytes — one ordered byte string, no double-decrypt.
-        let expect: Vec<u8> =
-            [inner_app.as_slice(), d_tail.as_slice(), downlink_raw.as_slice()].concat();
+        let expect: Vec<u8> = [
+            inner_app.as_slice(),
+            d_tail.as_slice(),
+            downlink_raw.as_slice(),
+        ]
+        .concat();
         let mut got = vec![0u8; expect.len()];
         conn.read_exact(&mut got).await.unwrap();
         assert_eq!(got, expect, "content, drained read-ahead, then raw");
         assert!(conn.direct_mode());
-        assert!(conn.downlink_spliced(), "the reader re-bound to the raw transport");
+        assert!(
+            conn.downlink_spliced(),
+            "the reader re-bound to the raw transport"
+        );
 
         // Clean EOF after the splice (the raw socket's EOF, not a TLS error).
         let mut tail = [0u8; 8];

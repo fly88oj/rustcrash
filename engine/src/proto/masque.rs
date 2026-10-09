@@ -97,8 +97,8 @@ use std::task::{ready, Context, Poll};
 use std::time::{Duration, SystemTime};
 
 use bytes::{Buf, Bytes, BytesMut};
-use ring::signature::KeyPair as _;
 use rand::Rng;
+use ring::signature::KeyPair as _;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
 use rustls::pki_types::{CertificateDer, UnixTime};
@@ -784,7 +784,12 @@ impl ServerCertVerifier for PinnedKeyVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -793,7 +798,12 @@ impl ServerCertVerifier for PinnedKeyVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -1053,8 +1063,8 @@ fn read_string_literal(
 /// dynamic table capacity, mirroring `DisableCompression: true`,
 /// masque.go:119).
 fn decode_field_section(buf: &[u8]) -> Result<Vec<(String, String)>> {
-    let (required_inserts, mut off) = read_prefixed_int(buf, 0, 8)
-        .ok_or_else(|| Error::protocol("qpack: truncated prefix"))?;
+    let (required_inserts, mut off) =
+        read_prefixed_int(buf, 0, 8).ok_or_else(|| Error::protocol("qpack: truncated prefix"))?;
     if required_inserts != 0 {
         return Err(Error::protocol("qpack: dynamic table required"));
     }
@@ -1090,7 +1100,10 @@ fn decode_field_section(buf: &[u8]) -> Result<Vec<(String, String)>> {
             let (value, n) = read_string_literal(buf, off, 7, 0x80)
                 .ok_or_else(|| Error::protocol("qpack: truncated value"))?;
             off = n;
-            fields.push((name.to_string(), String::from_utf8_lossy(&value).into_owned()));
+            fields.push((
+                name.to_string(),
+                String::from_utf8_lossy(&value).into_owned(),
+            ));
         } else if b & 0xe0 == 0x20 {
             let (name, n) = read_string_literal(buf, off, 3, 0x08)
                 .ok_or_else(|| Error::protocol("qpack: truncated name"))?;
@@ -1178,7 +1191,9 @@ fn read_capsule_ip(data: &[u8], off: usize) -> Result<(IpAddr, usize)> {
         .get(off)
         .ok_or_else(|| Error::protocol("connect-ip: truncated ip version"))?;
     let (len, mk): (usize, fn([u8; 16]) -> IpAddr) = match v {
-        4 => (4, |o: [u8; 16]| IpAddr::V4(Ipv4Addr::new(o[0], o[1], o[2], o[3]))),
+        4 => (4, |o: [u8; 16]| {
+            IpAddr::V4(Ipv4Addr::new(o[0], o[1], o[2], o[3]))
+        }),
         6 => (16, |o: [u8; 16]| IpAddr::V6(o.into())),
         other => {
             return Err(Error::protocol(format!(
@@ -1447,13 +1462,18 @@ fn incoming_packet_allowed(
             d.copy_from_slice(&packet[24..40]);
             (IpAddr::V6(d.into()), 6, packet[6])
         }
-        Some(v) => return Err(Error::protocol(format!("connect-ip: unknown IP versions: {v}"))),
+        Some(v) => {
+            return Err(Error::protocol(format!(
+                "connect-ip: unknown IP versions: {v}"
+            )))
+        }
         None => return Err(Error::protocol("connect-ip: empty packet")),
     };
     if assigned.iter().any(|p| p.contains(dst)) {
         return Ok(true);
     }
-    let icmp = (version, ip_proto) == (4, IP_PROTO_ICMP) || (version, ip_proto) == (6, IP_PROTO_ICMPV6);
+    let icmp =
+        (version, ip_proto) == (4, IP_PROTO_ICMP) || (version, ip_proto) == (6, IP_PROTO_ICMPV6);
     Ok(local_routes.iter().any(|r| {
         !ip_family_mismatch(&r.start, &dst)
             && addr_ge(&dst, &r.start)
@@ -1577,7 +1597,9 @@ pub fn parse_udp_ip_packet(packet: &[u8]) -> Result<Option<(NetAddr, u16, Vec<u8
                 return Ok(None);
             }
             (
-                IpAddr::V4(Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15])),
+                IpAddr::V4(Ipv4Addr::new(
+                    packet[12], packet[13], packet[14], packet[15],
+                )),
                 u16::from_be_bytes([packet[IPV4_HEADER_LEN + 2], packet[IPV4_HEADER_LEN + 3]]),
                 &packet[IPV4_HEADER_LEN..],
             )
@@ -1768,11 +1790,9 @@ impl H3Client {
             ));
         }
         let (authority, path) = uri_authority_path(uri)?;
-        let (mut send, mut recv) = self
-            .conn
-            .open_bi()
-            .await
-            .map_err(|e| Error::network(format!("connect-ip: failed to open request stream: {e}")))?;
+        let (mut send, mut recv) = self.conn.open_bi().await.map_err(|e| {
+            Error::network(format!("connect-ip: failed to open request stream: {e}"))
+        })?;
         let block = Self::encode_headers(&[
             (b":authority", authority.as_bytes()),
             (b":method", b"CONNECT"),
@@ -2197,16 +2217,15 @@ impl MasqueClient {
     /// upstream's `ConnectionIDLength: 20` has no equivalent knob.
     pub async fn connect(mut cfg: MasqueOption) -> Result<Self> {
         cfg.validate_ip_stack()?;
-        let mode = match cfg.network.as_str() {
-            "h3-l4proxy" => MasqueMode::L4Proxy,
-            "h2" => {
-                return Err(Error::config(
+        let mode =
+            match cfg.network.as_str() {
+                "h3-l4proxy" => MasqueMode::L4Proxy,
+                "h2" => return Err(Error::config(
                     "masque: network h2 is not implemented (HTTP/2 CONNECT-IP over TLS requires \
                      a full HTTP/2 client; transport/masque client_h2.go)",
-                ))
-            }
-            _ => MasqueMode::Tun,
-        };
+                )),
+                _ => MasqueMode::Tun,
+            };
         if mode == MasqueMode::L4Proxy && cfg.udp {
             // masque.go:226-229 — "L4 proxy mode is not supported for UDP"
             warn!(target: "engine", "L4 proxy mode is not supported for UDP");
@@ -2546,9 +2565,10 @@ mod tests {
     #[test]
     fn der_helpers_roundtrip() {
         // Known OID encodings.
-        assert_eq!(der::oid(&[1, 2, 840, 10045, 3, 1, 7])[2..], [
-            0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07
-        ]);
+        assert_eq!(
+            der::oid(&[1, 2, 840, 10045, 3, 1, 7])[2..],
+            [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]
+        );
         // 2.100.3: the combined first arcs 2*40+100 = 180 needs two
         // base-128 bytes — 180 = 1*128 + 52 → (0x81, 0x34).
         assert_eq!(der::oid(&[2, 100, 3])[2..], [0x81, 0x34, 0x03]);
@@ -2636,7 +2656,10 @@ mod tests {
         let err = parse_spki_ecdsa_public_key(&rsa_spki)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("failed to assert public key as ECDSA"), "{err}");
+        assert!(
+            err.contains("failed to assert public key as ECDSA"),
+            "{err}"
+        );
     }
 
     // ------------------------------------------------------------ capsules
@@ -2716,7 +2739,10 @@ mod tests {
         // Capsule type 0, varint length, payload (client_h2.go:305-318).
         assert_eq!(frame[0], 0);
         let (ctype, payload, consumed) = parse_capsule(&frame).unwrap().unwrap();
-        assert_eq!((ctype, payload, consumed), (0, &b"packet-bytes"[..], frame.len()));
+        assert_eq!(
+            (ctype, payload, consumed),
+            (0, &b"packet-bytes"[..], frame.len())
+        );
         // Incomplete input waits rather than erroring.
         assert!(parse_capsule(&frame[..frame.len() - 1]).unwrap().is_none());
     }
@@ -2935,7 +2961,10 @@ mod tests {
         s.validate().unwrap();
         s.congestion_controller = "ls".into();
         let err = s.validate().unwrap_err().to_string();
-        assert!(err.contains("invalid IP stack congestion controller"), "{err}");
+        assert!(
+            err.contains("invalid IP stack congestion controller"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2955,10 +2984,7 @@ mod tests {
     fn effective_defaults() {
         let mut o = MasqueOption::default();
         assert_eq!(o.effective_uri(), CONNECT_URI);
-        assert_eq!(
-            o.effective_sni(MasqueMode::Tun),
-            CONNECT_SNI,
-        );
+        assert_eq!(o.effective_sni(MasqueMode::Tun), CONNECT_SNI,);
         assert_eq!(o.effective_sni(MasqueMode::L4Proxy), L4_CONNECT_SNI);
         assert_eq!(o.effective_mtu(), DEFAULT_MTU);
         o.sni = "custom.example".into();
@@ -3084,9 +3110,15 @@ mod tests {
     #[derive(Debug)]
     enum SrvEvent {
         ClientCertOk,
-        Settings { datagram: bool },
-        L4Connect { authority: String },
-        L4Rejected { authority: String },
+        Settings {
+            datagram: bool,
+        },
+        L4Connect {
+            authority: String,
+        },
+        L4Rejected {
+            authority: String,
+        },
         IpConnect {
             authority: String,
             path: String,
@@ -3106,8 +3138,11 @@ mod tests {
         events: tokio::sync::mpsc::UnboundedReceiver<SrvEvent>,
     }
 
-    fn ecdsa_cert() -> (CertificateDer<'static>, rustls::pki_types::PrivateKeyDer<'static>, Vec<u8>)
-    {
+    fn ecdsa_cert() -> (
+        CertificateDer<'static>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+        Vec<u8>,
+    ) {
         let (pkcs8, point) = generate_p256();
         let pair = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
             &rustls::pki_types::PrivatePkcs8KeyDer::from(pkcs8.as_slice()),
@@ -3215,7 +3250,9 @@ mod tests {
             _ => return None,
         };
         let dst_ip = match ip_version(packet)? {
-            4 => IpAddr::V4(Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19])),
+            4 => IpAddr::V4(Ipv4Addr::new(
+                packet[16], packet[17], packet[18], packet[19],
+            )),
             _ => {
                 let mut o = [0u8; 16];
                 o.copy_from_slice(&packet[24..40]);
@@ -3302,10 +3339,7 @@ mod tests {
                                 Err(_) => return,
                             };
                             let get = |k: &str| {
-                                fields
-                                    .iter()
-                                    .find(|(n, _)| n == k)
-                                    .map(|(_, v)| v.clone())
+                                fields.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
                             };
                             let Some(protocol) = get(":protocol") else {
                                 // Plain CONNECT (l4proxy.go).
@@ -3315,16 +3349,12 @@ mod tests {
                                 assert_eq!(get(":scheme"), None);
                                 if authority.starts_with("forbidden") {
                                     tx.send(SrvEvent::L4Rejected { authority }).ok();
-                                    send.write_all(&response_headers_frame(403))
-                                        .await
-                                        .ok();
+                                    send.write_all(&response_headers_frame(403)).await.ok();
                                     let _ = send.flush().await;
                                     return;
                                 }
                                 tx.send(SrvEvent::L4Connect { authority }).ok();
-                                send.write_all(&response_headers_frame(200))
-                                    .await
-                                    .ok();
+                                send.write_all(&response_headers_frame(200)).await.ok();
                                 let _ = send.flush().await;
                                 // Echo DATA frame payloads until EOF.
                                 echo_data_frames(&mut recv, &mut send, buf).await;
@@ -3339,9 +3369,7 @@ mod tests {
                                 user_agent: get("user-agent"),
                             })
                             .ok();
-                            send.write_all(&response_headers_frame(200))
-                                .await
-                                .ok();
+                            send.write_all(&response_headers_frame(200)).await.ok();
                             let _ = send.flush().await;
                             // Expect the ROUTE_ADVERTISEMENT capsule next.
                             let mut chunk = [0u8; 2048];
@@ -3437,7 +3465,12 @@ mod tests {
         base64::engine::general_purpose::STANDARD.encode(data)
     }
 
-    fn test_option(port: u16, network: &str, server_point: &[u8], client_sec1: &[u8]) -> MasqueOption {
+    fn test_option(
+        port: u16,
+        network: &str,
+        server_point: &[u8],
+        client_sec1: &[u8],
+    ) -> MasqueOption {
         let mut o = MasqueOption {
             server: "127.0.0.1".into(),
             port,
@@ -3597,7 +3630,10 @@ mod tests {
             }
             other => panic!("wrong event {other:?}"),
         }
-        assert!(matches!(next_event(&mut srv).await, SrvEvent::AddressAssignSent));
+        assert!(matches!(
+            next_event(&mut srv).await,
+            SrvEvent::AddressAssignSent
+        ));
         // The client picked up the ADDRESS_ASSIGN prefixes.
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(

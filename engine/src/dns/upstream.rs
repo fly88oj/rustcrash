@@ -25,17 +25,28 @@ pub enum Upstream {
     /// DNS-over-TLS: `tls://1.1.1.1[:853]` (RFC 7858).
     Tls { addr: SocketAddr, name: String },
     /// DNS-over-HTTPS: `https://host[:443]/path` (RFC 8484, HTTP/1.1).
-    Https { addr: SocketAddr, name: String, path: String },
+    Https {
+        addr: SocketAddr,
+        name: String,
+        path: String,
+    },
     /// DNS-over-QUIC: `quic://host[:853]` (RFC 9250, one stream/query).
     Doq { addr: SocketAddr, name: String },
     /// DNS-over-HTTP/3: `h3://host[:443]/path` (RFC 8484 over HTTP/3).
-    H3 { addr: SocketAddr, name: String, path: String },
+    H3 {
+        addr: SocketAddr,
+        name: String,
+        path: String,
+    },
     /// The platform resolver: `/etc/resolv.conf` nameservers read at
     /// load (mihomo `system`, sing-box `local`).
     System { servers: Vec<SocketAddr> },
     /// DHCP-provided resolvers for an interface (mihomo `dhcp://en0`):
     /// parsed from dhclient/systemd-networkd lease files at load.
-    Dhcp { servers: Vec<SocketAddr>, iface: String },
+    Dhcp {
+        servers: Vec<SocketAddr>,
+        iface: String,
+    },
 }
 
 impl std::fmt::Display for Upstream {
@@ -84,21 +95,16 @@ impl Upstream {
                 let tcp = crate::mark::tcp_connect_addr(*addr)
                     .await
                     .map_err(|e| Error::dns(format!("dot connect: {e}")))?;
-                let tls = crate::transport::tls_connect(
-                    Box::new(tcp),
-                    name,
-                    &TlsSettings::client(name),
-                )
-                .await?;
+                let tls =
+                    crate::transport::tls_connect(Box::new(tcp), name, &TlsSettings::client(name))
+                        .await?;
                 Self::exchange_tls_stream(tls, query).await
             }
             Upstream::Https { addr, name, path } => {
                 Self::exchange_https(*addr, name, path, query).await
             }
             Upstream::Doq { addr, name } => Self::exchange_doq(*addr, name, query).await,
-            Upstream::H3 { addr, name, path } => {
-                Self::exchange_h3(*addr, name, path, query).await
-            }
+            Upstream::H3 { addr, name, path } => Self::exchange_h3(*addr, name, path, query).await,
             Upstream::System { servers } | Upstream::Dhcp { servers, .. } => {
                 // The platform/DHCP resolvers are plain UDP servers.
                 let mut last = Err(Error::dns("no platform resolvers configured"));
@@ -231,10 +237,19 @@ impl Upstream {
     }
 
     async fn exchange_udp(addr: SocketAddr, query: &[u8]) -> Result<Vec<u8>> {
-        let bind = if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
-        let socket = UdpSocket::bind(bind).await.map_err(|e| Error::dns(e.to_string()))?;
+        let bind = if addr.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let socket = UdpSocket::bind(bind)
+            .await
+            .map_err(|e| Error::dns(e.to_string()))?;
         crate::mark::apply(&socket);
-        socket.send_to(query, addr).await.map_err(|e| Error::dns(e.to_string()))?;
+        socket
+            .send_to(query, addr)
+            .await
+            .map_err(|e| Error::dns(e.to_string()))?;
         let mut buf = vec![0u8; 4096];
         let (n, _) = tokio::time::timeout(EXCHANGE_TIMEOUT, socket.recv_from(&mut buf))
             .await
@@ -258,7 +273,10 @@ impl Upstream {
         Self::read_framed(&mut stream).await
     }
 
-    async fn exchange_tls_stream(mut stream: crate::stream::BoxProxyStream, query: &[u8]) -> Result<Vec<u8>> {
+    async fn exchange_tls_stream(
+        mut stream: crate::stream::BoxProxyStream,
+        query: &[u8],
+    ) -> Result<Vec<u8>> {
         Self::write_framed(&mut stream, query).await?;
         Self::read_framed(&mut stream).await
     }
@@ -306,7 +324,8 @@ impl Upstream {
         let tcp = crate::mark::tcp_connect_addr(addr)
             .await
             .map_err(|e| Error::dns(format!("doh connect: {e}")))?;
-        let mut tls = crate::transport::tls_connect(Box::new(tcp), name, &TlsSettings::client(name)).await?;
+        let mut tls =
+            crate::transport::tls_connect(Box::new(tcp), name, &TlsSettings::client(name)).await?;
         let path = if path.starts_with('/') {
             path.to_string()
         } else {
@@ -317,8 +336,12 @@ impl Upstream {
              Accept: application/dns-message\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             query.len()
         );
-        tls.write_all(req.as_bytes()).await.map_err(|e| Error::dns(e.to_string()))?;
-        tls.write_all(query).await.map_err(|e| Error::dns(e.to_string()))?;
+        tls.write_all(req.as_bytes())
+            .await
+            .map_err(|e| Error::dns(e.to_string()))?;
+        tls.write_all(query)
+            .await
+            .map_err(|e| Error::dns(e.to_string()))?;
         tls.flush().await.map_err(|e| Error::dns(e.to_string()))?;
 
         // Read the whole response, then split headers/body.
@@ -358,9 +381,10 @@ impl Upstream {
             return Err(Error::dns(format!("doh: HTTP {status}")));
         }
         let body = &raw[split + 4..];
-        let chunked = head
-            .lines()
-            .any(|l| l.to_ascii_lowercase().starts_with("transfer-encoding: chunked"));
+        let chunked = head.lines().any(|l| {
+            l.to_ascii_lowercase()
+                .starts_with("transfer-encoding: chunked")
+        });
         if chunked {
             return Self::dechunk(body);
         }
@@ -381,8 +405,7 @@ impl Upstream {
                 .map_err(|_| Error::dns("doh: chunk size"))?;
             // Chunk extensions after ';' are legal and ignored.
             let hex = size_line.split(';').next().unwrap_or("").trim();
-            let size = usize::from_str_radix(hex, 16)
-                .map_err(|_| Error::dns("doh: chunk size"))?;
+            let size = usize::from_str_radix(hex, 16).map_err(|_| Error::dns("doh: chunk size"))?;
             if size == 0 {
                 return Ok(out);
             }
@@ -447,10 +470,7 @@ pub fn parse_upstream(ns: &str) -> Option<Upstream> {
         }
         "tls" => {
             let (host, addr) = parse_host_addr(rest, 853)?;
-            Some(Upstream::Tls {
-                addr,
-                name: host,
-            })
+            Some(Upstream::Tls { addr, name: host })
         }
         "https" => {
             // Strip an optional port, then take the path.
@@ -515,7 +535,25 @@ fn resolv_conf_nameservers() -> Vec<SocketAddr> {
     let Ok(text) = std::fs::read_to_string("/etc/resolv.conf") else {
         return Vec::new();
     };
-    parse_resolv_conf(&text)
+    let servers = parse_resolv_conf(&text);
+    // systemd-resolved's stub (127.0.0.53) hides the REAL uplink servers
+    // — and when the engine hijacks loopback :53 (dns-hijack any:53 /
+    // tproxy) the stub is unreachable from our own queries, the exact
+    // shape upstream fixed in ddbf346 ("local DNS server ignoring
+    // systemd-resolved global DNS servers"). With a stub-only resolv.conf
+    // read resolved's own uplink file (its global servers) and use those
+    // THOSE directly; the stub stays in use only when no uplink file
+    // exists (returned as-is below).
+    let stub_only = servers.iter().all(|a| a.ip().is_loopback());
+    if stub_only {
+        if let Ok(uplink) = std::fs::read_to_string("/run/systemd/resolve/resolv.conf") {
+            let direct = parse_resolv_conf(&uplink);
+            if !direct.is_empty() {
+                return direct;
+            }
+        }
+    }
+    servers
 }
 
 fn parse_resolv_conf(text: &str) -> Vec<SocketAddr> {
@@ -650,7 +688,9 @@ fn resolve_once(host: &str, port: u16) -> Option<(String, SocketAddr)> {
     }
     // Blocking resolve is acceptable at config load (parse_upstream runs
     // once per nameserver, before the async engine starts).
-    let addr = std::net::ToSocketAddrs::to_socket_addrs(&(host, port)).ok()?.next()?;
+    let addr = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+        .ok()?
+        .next()?;
     Some((host.to_string(), addr))
 }
 
@@ -804,7 +844,8 @@ eth1\t0002A8C0\t00000000\t\t0001\t\t0\t0\t0\t00FFFFFF\n";
             Upstream::extract_http_body(resp).unwrap(),
             b"DNSBODY".to_vec()
         );
-        let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nDNSBODY1\r\n0\r\n\r\n";
+        let chunked =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nDNSBODY1\r\n0\r\n\r\n";
         assert_eq!(
             Upstream::extract_http_body(chunked).unwrap(),
             b"DNSBODY1".to_vec()
@@ -837,8 +878,7 @@ eth1\t0002A8C0\t00000000\t\t0001\t\t0\t0\t0\t00FFFFFF\n";
 
     fn test_pki(san: &str) -> TestPki {
         let ca_key = rcgen::KeyPair::generate().expect("ca key");
-        let mut ca_params =
-            rcgen::CertificateParams::new(Vec::new()).expect("ca params");
+        let mut ca_params = rcgen::CertificateParams::new(Vec::new()).expect("ca params");
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         let ca = ca_params.self_signed(&ca_key).expect("ca cert");
         let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
@@ -866,8 +906,7 @@ eth1\t0002A8C0\t00000000\t\t0001\t\t0\t0\t0\t00FFFFFF\n";
         .expect("server cert");
         tls.alpn_protocols = vec![alpn.to_vec()];
         let quic_tls =
-            quinn::crypto::rustls::QuicServerConfig::try_from(std::sync::Arc::new(tls))
-                .unwrap();
+            quinn::crypto::rustls::QuicServerConfig::try_from(std::sync::Arc::new(tls)).unwrap();
         quinn::ServerConfig::with_crypto(std::sync::Arc::new(quic_tls))
     }
 
@@ -876,11 +915,7 @@ eth1\t0002A8C0\t00000000\t\t0001\t\t0\t0\t0\t00FFFFFF\n";
     fn answer_dns(query: &[u8]) -> Vec<u8> {
         let msg = crate::dns::wire::parse(query).expect("responder: parse query");
         let ip: IpAddr = "192.0.2.7".parse().unwrap();
-        crate::dns::wire::build_response(
-            &msg,
-            crate::dns::wire::RCODE_NOERROR,
-            &[(ip, 30)],
-        )
+        crate::dns::wire::build_response(&msg, crate::dns::wire::RCODE_NOERROR, &[(ip, 30)])
     }
 
     /// Trust the test CA for the duration of `f`: point the engine's
@@ -889,7 +924,10 @@ eth1\t0002A8C0\t00000000\t\t0001\t\t0\t0\t0\t00FFFFFF\n";
     /// mutex; the previous value (if any) is restored before returning.
     async fn with_test_ca<F: std::future::Future>(ca_pem: String, f: F) -> F::Output {
         static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-        let _guard = LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+        let _guard = LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
         let dir = tempfile::tempdir().expect("tempdir");
         let ca_path = dir.path().join("engine-doq-test-ca.pem");
         std::fs::write(&ca_path, ca_pem).expect("write ca pem");
@@ -1016,11 +1054,7 @@ eth1\t0002A8C0\t00000000\t\t0001\t\t0\t0\t0\t00FFFFFF\n";
                             b"content-type",
                             b"application/dns-message",
                         );
-                        crate::quic::put_h3_frame(
-                            &mut out,
-                            crate::quic::H3_HEADERS,
-                            &fields,
-                        );
+                        crate::quic::put_h3_frame(&mut out, crate::quic::H3_HEADERS, &fields);
                         crate::quic::put_h3_frame(&mut out, crate::quic::H3_DATA, &resp);
                         let _ = send.write_all(&out).await;
                         let _ = send.finish();
@@ -1044,11 +1078,7 @@ eth1\t0002A8C0\t00000000\t\t0001\t\t0\t0\t0\t00FFFFFF\n";
             addr,
             name: "doq.test".to_string(),
         };
-        let query = crate::dns::wire::build_query(
-            0x1F4D,
-            "quic.example",
-            crate::dns::wire::TYPE_A,
-        );
+        let query = crate::dns::wire::build_query(0x1F4D, "quic.example", crate::dns::wire::TYPE_A);
         let resp = with_test_ca(pki.ca_pem.clone(), upstream.exchange(&query))
             .await
             .expect("doq exchange");
@@ -1066,11 +1096,8 @@ eth1\t0002A8C0\t00000000\t\t0001\t\t0\t0\t0\t00FFFFFF\n";
         assert_eq!(msg.answers[0].rdata, vec![192, 0, 2, 7]);
 
         // A second exchange dials a fresh QUIC connection and stream.
-        let query2 = crate::dns::wire::build_query(
-            0x2E60,
-            "again.example",
-            crate::dns::wire::TYPE_A,
-        );
+        let query2 =
+            crate::dns::wire::build_query(0x2E60, "again.example", crate::dns::wire::TYPE_A);
         let resp2 = with_test_ca(pki.ca_pem.clone(), upstream.exchange(&query2))
             .await
             .expect("second doq exchange");
@@ -1094,11 +1121,7 @@ eth1\t0002A8C0\t00000000\t\t0001\t\t0\t0\t0\t00FFFFFF\n";
             name: "doh3.test".to_string(),
             path: "/dns-query".to_string(),
         };
-        let query = crate::dns::wire::build_query(
-            0x3C51,
-            "h3.example",
-            crate::dns::wire::TYPE_A,
-        );
+        let query = crate::dns::wire::build_query(0x3C51, "h3.example", crate::dns::wire::TYPE_A);
         let resp = with_test_ca(pki.ca_pem.clone(), upstream.exchange(&query))
             .await
             .expect("doh3 exchange");

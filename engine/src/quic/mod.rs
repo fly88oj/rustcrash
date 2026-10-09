@@ -113,6 +113,7 @@ pub fn client_config(cfg: &QuicDial) -> Result<quinn::ClientConfig> {
         server_name: None,
         skip_cert_verify: cfg.skip_verify,
         alpn: Vec::new(),
+        ..Default::default()
     };
     let mut tls = (*tls_client_config(&settings)?).clone();
     tls.alpn_protocols = cfg.alpn.iter().map(|a| a.as_bytes().to_vec()).collect();
@@ -128,10 +129,7 @@ pub fn client_config(cfg: &QuicDial) -> Result<quinn::ClientConfig> {
 /// ([`tls13::Tls13QuicClientConfig`], a quinn `crypto::ClientConfig`)
 /// with a cover applied — JLS credentials or ECH. The transport side is
 /// identical to the rustls path.
-pub fn client_config_custom(
-    cfg: &QuicDial,
-    cover: &QuicTlsCover,
-) -> Result<quinn::ClientConfig> {
+pub fn client_config_custom(cfg: &QuicDial, cover: &QuicTlsCover) -> Result<quinn::ClientConfig> {
     let crypto: Arc<Tls13QuicClientConfig> = match cover {
         QuicTlsCover::Jls(user) => Arc::new(Tls13QuicClientConfig::new_jls(
             crate::proto::reality::UtslProfile::Chrome,
@@ -211,10 +209,7 @@ pub async fn dial(cfg: &QuicDial) -> Result<quinn::Connection> {
 
 /// [`dial`] with the engine's own TLS 1.3 stack under a cover (JLS or
 /// ECH) — the custom-crypto dial path.
-pub async fn dial_custom(
-    cfg: &QuicDial,
-    cover: &QuicTlsCover,
-) -> Result<quinn::Connection> {
+pub async fn dial_custom(cfg: &QuicDial, cover: &QuicTlsCover) -> Result<quinn::Connection> {
     let remote = resolve_remote(&cfg.server, cfg.port).await?;
     let mut endpoint = client_endpoint(family_bind_addr(remote)).await?;
     endpoint.set_default_client_config(client_config_custom(cfg, cover)?);
@@ -285,7 +280,11 @@ impl AsyncRead for QuicStream {
 }
 
 impl AsyncWrite for QuicStream {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         AsyncWrite::poll_write(Pin::new(&mut self.send), cx, buf)
     }
 
@@ -306,7 +305,12 @@ pub(crate) fn write_varint(buf: &mut Vec<u8>, v: u64) {
         buf.push((v >> 8) as u8 | 0x40);
         buf.push(v as u8);
     } else if v <= 0x3fff_ffff {
-        buf.extend_from_slice(&[(v >> 24) as u8 | 0x80, (v >> 16) as u8, (v >> 8) as u8, v as u8]);
+        buf.extend_from_slice(&[
+            (v >> 24) as u8 | 0x80,
+            (v >> 16) as u8,
+            (v >> 8) as u8,
+            v as u8,
+        ]);
     } else {
         buf.extend_from_slice(&[
             (v >> 56) as u8 | 0xc0,
@@ -488,8 +492,14 @@ mod tests {
             (16383, &[0x7f, 0xff]),
             (16384, &[0x80, 0x00, 0x40, 0x00]),
             (1073741823, &[0xbf, 0xff, 0xff, 0xff]),
-            (1073741824, &[0xc0, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00]),
-            (151288809941952652, &[0xc2, 0x19, 0x7c, 0x5e, 0xff, 0x14, 0xe8, 0x8c]),
+            (
+                1073741824,
+                &[0xc0, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00],
+            ),
+            (
+                151288809941952652,
+                &[0xc2, 0x19, 0x7c, 0x5e, 0xff, 0x14, 0xe8, 0x8c],
+            ),
         ];
         for (v, bytes) in cases {
             let mut buf = Vec::new();
@@ -507,7 +517,16 @@ mod tests {
     #[test]
     fn varint_roundtrip_all_lengths() {
         let samples = [
-            0u64, 1, 0x3f, 0x40, 0x1234, 0x3fff, 0x4000, 0xdead_beef, 0x3fff_ffff, 0x4000_0000,
+            0u64,
+            1,
+            0x3f,
+            0x40,
+            0x1234,
+            0x3fff,
+            0x4000,
+            0xdead_beef,
+            0x3fff_ffff,
+            0x4000_0000,
             u64::MAX >> 2,
         ];
         for v in samples {
