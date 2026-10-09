@@ -1,0 +1,19 @@
+# Repo-level cargo defaults — resource guardrails.
+#
+# 2026-10-09 disk-full incident: incremental caches alone reached 80 GB
+# in target/debug (every feature combination — mihomo / singbox / both —
+# builds the whole tree into a fresh incremental session, and cargo
+# never garbage-collects old sessions), and debug deps across those
+# variants added another ~33 GB. This config removes the growth modes:
+#
+#   incremental = false — this tree's usage is test-matrix runs, not
+#     edit-rebuild loops; the caches cost tens of GB and buy ~seconds.
+#     Interactive debugging still works (a full recompile per feature
+#     set is the price; override per-shell with CARGO_INCREMENTAL=1).
+#
+# Parallelism is deliberately NOT pinned here (machines differ):
+# scripts/resource-guard.sh exports CARGO_BUILD_JOBS — memory-aware,
+# capped — in every shell that runs the heavy suites.
+
+[build]
+incremental = false

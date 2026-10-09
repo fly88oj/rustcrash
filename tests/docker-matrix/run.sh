@@ -20,6 +20,11 @@
 # Usage: bash tests/docker-matrix/run.sh [platform...]   (default: all 3)
 set -u
 
+# Resource guard (2026-10-09 disk-full incident): refuse heavy work on
+# a full disk; watchdog prunes regenerable caches while this runs.
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/resource-guard.sh"
+guard_run
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
