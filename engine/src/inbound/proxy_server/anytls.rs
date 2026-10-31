@@ -20,9 +20,9 @@
 //! ([`build_tls_config`] + [`tls_accept`]) and the anytls session
 //! server runs on the plaintext. `tls: None` keeps the trojan
 //! `tls: None` position — plain TCP + auth for tests and transports
-//! fronted elsewhere. See [`TLS_REQUIRED_NOTE`] for the remaining
-//! integrator deltas (stacking, allow-insecure, ECH, client-auth,
-//! padding-scheme).
+//! fronted elsewhere; the remaining integrator deltas (stacking,
+//! allow-insecure, ECH, client-auth, padding-scheme) are listed in the
+//! deltas paragraph below.
 //!
 //! Integrator deltas (upstream `LC.AnyTLSServer` fields our enum
 //! lacks): `client-auth-*`, `ech-key`, `shadow-tls`/`res-tls`/`jls`
@@ -48,21 +48,6 @@ use crate::proto::anytls::{
 };
 use crate::stream::BoxProxyStream;
 
-/// The upstream plaintext gate, cited for the integrator: production
-/// anytls is TLS-fronted (`certificate`/`private-key`, now wired as
-/// `tls: Option<ServerTls>`) or stacked (shadow-tls/res-tls/jls) or
-/// explicitly `allow-insecure`. `tls: None` in this engine is the
-/// allow-insecure position — plain TCP + auth, like trojan's
-/// `tls: None`.
-pub const TLS_REQUIRED_NOTE: &str = concat!(
-    "anytls upstream refuses plaintext listeners: 'disallow using AnyTLS ",
-    "without certificates/shadow-tls/res-tls/jls/allow-insecure config' ",
-    "(listener/anytls/server.go:159-163); tls: Some(..) now terminates TLS ",
-    "(the certificate/private-key fronting); tls: None serves plain TCP + ",
-    "auth, upstream's allow-insecure position — the shadow-tls/res-tls/jls ",
-    "stackings remain integrator deltas until the enum grows them"
-);
-
 /// Serve an anytls listener; returns the bound address.
 pub async fn serve(cfg: &ServerConfig, relay: SharedRelay) -> Result<SocketAddr> {
     let ServerProtocol::AnyTls {
@@ -87,7 +72,10 @@ pub async fn serve(cfg: &ServerConfig, relay: SharedRelay) -> Result<SocketAddr>
     // (ca.NewTLSKeyPairLoader + tls.NewListener, server.go:52-61, 159).
     let tls_config = tls.as_ref().map(build_tls_config).transpose()?;
     if tls_config.is_none() {
-        tracing::debug!(target: "engine", "{TLS_REQUIRED_NOTE}");
+        tracing::debug!(
+            target: "engine",
+            "anytls: serving plain TCP + auth (tls: None, upstream's allow-insecure position)"
+        );
     }
     let tag: Arc<str> = Arc::from(cfg.tag.as_str());
     let user_map = Arc::new(user_map);
@@ -515,13 +503,5 @@ mod tests {
             .unwrap();
         assert_eq!(&buf, b"tls-anytls");
         assert_eq!(capture.targets(), vec![target]);
-    }
-
-    #[test]
-    fn tls_note_cites_upstream() {
-        assert!(TLS_REQUIRED_NOTE.contains("listener/anytls/server.go:159-163"));
-        assert!(TLS_REQUIRED_NOTE.contains("disallow using AnyTLS"));
-        // The note now reflects the wired fronting + the plain position.
-        assert!(TLS_REQUIRED_NOTE.contains("allow-insecure position"));
     }
 }

@@ -33,7 +33,7 @@
 # Usage:
 #   scripts/run-all-tests.sh              # everything
 #   scripts/run-all-tests.sh --unit-only  # skip all container suites
-#   scripts/run-all-tests.sh --docker-only# skip cargo suites
+#   scripts/run-all-tests.sh --docker-only  # skip cargo suites
 #   scripts/run-all-tests.sh --fast       # skip the heavy lane
 #   scripts/run-all-tests.sh --list
 #
@@ -75,7 +75,7 @@ HEAVY_SUITES=(musl-verify docker-matrix)
 
 if [ "$LIST" = 1 ]; then
     echo "unit lane: workspace, engine(mihomo,singbox), core(engine-*), doctests"
-    echo "docker lane (parallel x${PARALLEL_DOCKER:-4}): ${LIGHT_SUITES[*]}"
+    echo "docker lane (bounded parallel pool): ${LIGHT_SUITES[*]}"
     echo "heavy lane (sequential): ${HEAVY_SUITES[*]}"
     exit 0
 fi
@@ -151,7 +151,9 @@ unit_lane() {
 }
 
 docker_lane() {
-    local width="${PARALLEL_DOCKER:-4}"
+    # Pool width: env override wins; else scale with the host (>=8
+    # cores can host 4 suites comfortably, smaller machines get 2).
+    local width="${PARALLEL_DOCKER:-$([ "$(nproc)" -ge 8 ] && echo 4 || echo 2)}"
     local -a pids=()
     local suite i fail=0
     for suite in "${LIGHT_SUITES[@]}"; do
@@ -170,11 +172,12 @@ docker_lane() {
 }
 
 heavy_lane() {
-    local suite
+    local suite fail=0
     for suite in "${HEAVY_SUITES[@]}"; do
         echo "[heavy] start $suite"
-        run_step heavy "$suite" bash "$PROJECT_ROOT/tests/$suite/run.sh" || return 1
+        run_step heavy "$suite" bash "$PROJECT_ROOT/tests/$suite/run.sh" || fail=1
     done
+    return $fail
 }
 
 # SIGTERM the whole descendant tree on interrupt so every suite's EXIT

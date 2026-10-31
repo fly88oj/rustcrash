@@ -28,6 +28,8 @@ guard_run
 # Content-addressed engine-image tag, shared with the parallel e2e
 # suites (scripts/e2e-image-tag.sh).
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/e2e-image-tag.sh"
+# Shared heavy-lane artifact builders (musl binary, qemu).
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/e2e-musl.sh"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -63,36 +65,10 @@ echo "--- engine image (shared with tests/docker-engine) ---"
 ensure_engine_image || exit 1
 
 echo "--- x86_64-musl static binary ---"
-# /tmp/rustcrash-musl is SHARED with tests/musl-verify (whichever runs
-# first builds it, the other reuses); the flock makes concurrent runs
-# safe instead of racing the binary in place. The tag stamp records the
-# tree content the binary was built from — a stale artifact is rebuilt,
-# never silently reused (same content-addressing as the image tags).
-mkdir -p "$MUSL_DIR"
-(
-    flock 9
-    MUSL_WANT_TAG=$(_e2e_content_hash "$PROJECT_ROOT")
-    if [ ! -x "$MUSL_DIR/crash" ] || [ "${E2E_FORCE_BUILD:-0}" = "1" ] \
-        || [ "$(cat "$MUSL_DIR/crash.tag" 2>/dev/null)" != "$MUSL_WANT_TAG" ]; then
-        rm -f "$MUSL_DIR/crash"
-        docker run --rm \
-            -v "$PROJECT_ROOT":/src:ro \
-            -v "$MUSL_DIR":/src/target \
-            -w /src \
-            rust:1.98-slim \
-            bash -c "
-rustup target add x86_64-unknown-linux-musl 2>/dev/null
-apt-get update -qq && apt-get install -y -qq musl-tools >/dev/null 2>&1
-cargo build --release --target x86_64-unknown-linux-musl --bin crash --features engine-full -j \"${E2E_DOCKER_JOBS:-16}\" 2>&1 | grep '^error' && exit 1
-exit 0
-" | tail -3
-        [ -x "$MUSL_DIR/x86_64-unknown-linux-musl/release/crash" ] || { echo "FATAL: musl build failed"; exit 1; }
-        cp "$MUSL_DIR/x86_64-unknown-linux-musl/release/crash" "$MUSL_DIR/crash"
-        chmod +x "$MUSL_DIR/crash"
-        echo "$MUSL_WANT_TAG" > "$MUSL_DIR/crash.tag"
-    fi
-) 9>/tmp/rustcrash-musl.lock || exit 1
-echo "  musl binary: $(ls -la "$MUSL_DIR/crash" 2>/dev/null | awk '{print $5}') bytes"
+# /tmp/rustcrash-musl is SHARED with tests/musl-verify: the shared
+# helper (flock + content tag) builds it once and hands the fresh
+# artifact to whichever suite runs second.
+ensure_musl_binary || exit 1
 
 echo "--- aarch64-musl cross build + qemu-user ---"
 if command -v cross >/dev/null 2>&1; then
@@ -103,18 +79,7 @@ else
     [ -x "$ARM64_BIN" ] || { echo "FATAL: cross CLI missing and no cached arm64 binary"; exit 1; }
     echo "  cross CLI absent; using cached arm64 binary"
 fi
-# /tmp/qemu-aarch64 is shared with tests/musl-verify: extract under an
-# flock, and clear a leftover extraction container from a crashed run.
-(
-    flock 9
-    if [ ! -x "$QEMU_BIN" ]; then
-        docker rm qemu-extract-matrix >/dev/null 2>&1 || true
-        docker create --name qemu-extract-matrix ghcr.io/cross-rs/aarch64-unknown-linux-musl:0.2.5 >/dev/null 2>&1
-        docker cp qemu-extract-matrix:/usr/local/bin/qemu-aarch64 "$QEMU_BIN" >/dev/null 2>&1
-        docker rm qemu-extract-matrix >/dev/null 2>&1
-        chmod +x "$QEMU_BIN"
-    fi
-) 9>/tmp/rustcrash-qemu.lock
+ensure_qemu || exit 1
 [ -x "$QEMU_BIN" ] || { echo "FATAL: qemu-aarch64 unavailable"; exit 1; }
 echo "  arm64: $(du -h "$ARM64_BIN" | cut -f1), qemu: $QEMU_BIN"
 

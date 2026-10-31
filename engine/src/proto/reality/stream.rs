@@ -9,9 +9,8 @@
 //! the certificate list we parsed out of the handshake).
 
 use rand::RngCore;
-use rustls::RootCertStore;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::stream::BoxProxyStream;
 
 use super::profiles::{self, UtslProfile};
@@ -46,22 +45,6 @@ impl UtlsCfg {
 /// The trust anchors for WebPki verification of our own TLS 1.3 stack:
 /// the system store when present, plus the webpki-roots bundle. Shared
 /// with the ECH dial path (outbound wiring).
-pub fn root_store() -> Result<RootCertStore> {
-    let mut roots = RootCertStore::empty();
-    let mut loaded = 0usize;
-    for cert in rustls_native_certs::load_native_certs()
-        .map_err(|e| Error::config(format!("utls: native cert store: {e}")))?
-    {
-        if roots.add(cert).is_ok() {
-            loaded += 1;
-        }
-    }
-    if loaded == 0 {
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    }
-    Ok(roots)
-}
-
 /// Connect with a uTLS-style ClientHello and standard webpki verification.
 ///
 /// `transport` is the dialled TCP stream; the returned stream is the TLS
@@ -91,7 +74,7 @@ pub async fn utls_connect(cfg: &UtlsCfg, transport: BoxProxyStream) -> Result<Bo
     );
 
     let auth = ServerAuth::WebPki {
-        roots: std::sync::Arc::new(root_store()?),
+        roots: std::sync::Arc::new(crate::transport::root_store()?),
         server_name: cfg.server_name.clone(),
     };
     let stream = tls13::connect(transport, &hello, &secret, auth).await?;
@@ -181,12 +164,6 @@ mod tests {
             UtslProfile::Firefox.cipher_suites().to_vec()
         );
         let _ = server_task.await;
-    }
-
-    #[test]
-    fn root_store_is_never_empty() {
-        // Either the platform store or the bundled webpki roots are present.
-        assert!(!root_store().unwrap().is_empty());
     }
 
     #[test]

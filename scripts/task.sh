@@ -11,34 +11,19 @@ if [ -f "$CRASHDIR/libs/set_config.sh" ]; then
     . "$CRASHDIR/libs/set_config.sh" 2>/dev/null
 fi
 
+# Run one of the plain line-per-command task files (bfstart / afstart /
+# running / affirewall): strip comments, eval each non-empty line.
+run_task_file() {
+    if [ -f "$CRASHDIR/task/$1" ]; then
+        grep -v '^#' "$CRASHDIR/task/$1" 2>/dev/null | while read line; do
+            [ -n "$line" ] && eval "$line"
+        done
+    fi
+}
+
 case "$TASK_TYPE" in
-    bfstart)
-        if [ -f "$CRASHDIR/task/bfstart" ]; then
-            grep -v '^#' "$CRASHDIR/task/bfstart" 2>/dev/null | while read line; do
-                [ -n "$line" ] && eval "$line"
-            done
-        fi
-        ;;
-    afstart)
-        if [ -f "$CRASHDIR/task/afstart" ]; then
-            grep -v '^#' "$CRASHDIR/task/afstart" 2>/dev/null | while read line; do
-                [ -n "$line" ] && eval "$line"
-            done
-        fi
-        ;;
-    running)
-        if [ -f "$CRASHDIR/task/running" ]; then
-            grep -v '^#' "$CRASHDIR/task/running" 2>/dev/null | while read line; do
-                [ -n "$line" ] && eval "$line"
-            done
-        fi
-        ;;
-    affirewall)
-        if [ -f "$CRASHDIR/task/affirewall" ]; then
-            grep -v '^#' "$CRASHDIR/task/affirewall" 2>/dev/null | while read line; do
-                [ -n "$line" ] && eval "$line"
-            done
-        fi
+    bfstart|afstart|running|affirewall)
+        run_task_file "$TASK_TYPE"
         ;;
     subscription_update)
         if [ -x "$CRASHDIR/bin/crash" ]; then

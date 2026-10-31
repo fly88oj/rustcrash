@@ -93,7 +93,7 @@ use rand::{Rng, RngCore};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{ring as ring_provider, CryptoProvider};
 use rustls::{
-    ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme,
+    ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -1666,17 +1666,7 @@ fn tls_config(cfg: &TlsMirrorOut) -> Result<Arc<ClientConfig>> {
             .with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
             .with_no_client_auth()
     } else {
-        let mut roots = RootCertStore::empty();
-        let certs = rustls_native_certs::load_native_certs()
-            .map_err(|e| Error::config(format!("tlsmirror: native cert store: {e}")))?;
-        for cert in certs {
-            roots
-                .add(cert)
-                .map_err(|e| Error::config(format!("tlsmirror: bad native cert: {e}")))?;
-        }
-        if roots.is_empty() {
-            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        }
+        let roots = crate::transport::root_store()?;
         builder.with_root_certificates(roots).with_no_client_auth()
     };
     if !cfg.alpn.is_empty() {

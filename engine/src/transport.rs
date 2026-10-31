@@ -183,7 +183,12 @@ impl ServerCertVerifier for NoVerify {
     }
 }
 
-fn root_store() -> Result<RootCertStore> {
+/// The engine's ONE root-store loader (was duplicated in transport,
+/// quic/tls13, shadowtls, tlsmirror and reality/stream with drifting
+/// error handling). Native platform roots; the bundled webpki roots
+/// when the host has no store; a malformed system certificate fails
+/// loudly rather than being silently skipped.
+pub(crate) fn root_store() -> Result<RootCertStore> {
     let mut roots = RootCertStore::empty();
     let mut loaded = 0usize;
     let certs = rustls_native_certs::load_native_certs()

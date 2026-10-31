@@ -30,36 +30,14 @@ echo "=== Musl verification: build + multi-platform smoke ==="
 #    for ring's C build script).
 # ---------------------------------------------------------------------------
 echo "--- build x86_64-musl ---"
-# /tmp/rustcrash-musl is SHARED with tests/docker-matrix (this suite is
-# the fresh-build producer, matrix the reuse consumer); the flock keeps
-# a concurrent matrix run from reading a half-written binary. The tag
-# stamp records which tree content the binary was built from.
-# Content-addressed engine-image tag helper (for the content hash).
+# /tmp/rustcrash-musl is SHARED with tests/docker-matrix; the shared
+# helper (scripts/e2e-musl.sh) flocks it. "force" keeps this suite's
+# fresh-build semantics: verify what the CURRENT tree builds, never a
+# cached artifact.
 . "$PROJECT_ROOT/scripts/e2e-image-tag.sh"
-mkdir -p "$MUSL_DIR"
-(
-    flock 9
-    rm -f "$MUSL_DIR/crash"
-    docker run --rm \
-        -v "$PROJECT_ROOT":/src:ro \
-        -v "$MUSL_DIR":/src/target \
-        -w /src \
-        rust:1.98-slim \
-        bash -c "
-rustup target add x86_64-unknown-linux-musl 2>/dev/null
-apt-get update -qq && apt-get install -y -qq musl-tools file >/dev/null 2>&1
-cargo build --release --target x86_64-unknown-linux-musl --bin crash --features engine-full -j \"${E2E_DOCKER_JOBS:-16}\" 2>&1 | grep '^error' && exit 1
-exit 0
-" 2>&1 | grep -v "^$" | head -5
+. "$PROJECT_ROOT/scripts/e2e-musl.sh"
+ensure_musl_binary force || exit 1
 
-    if [ ! -x "$MUSL_DIR/x86_64-unknown-linux-musl/release/crash" ]; then
-        echo "FATAL: musl binary not built"
-        exit 1
-    fi
-    cp "$MUSL_DIR/x86_64-unknown-linux-musl/release/crash" "$MUSL_DIR/crash"
-    chmod +x "$MUSL_DIR/crash"
-    _e2e_content_hash "$PROJECT_ROOT" > "$MUSL_DIR/crash.tag"
-) 9>/tmp/rustcrash-musl.lock || exit 1
 
 # Static link check (must be "statically linked" or "static-pie linked")
 LINK_TYPE=$(docker run --rm -v "$MUSL_DIR/crash":/crash:ro alpine:latest sh -c 'apk add --no-cache file >/dev/null 2>&1; file /crash 2>/dev/null || echo nofile' 2>/dev/null)
@@ -158,20 +136,10 @@ if command -v cross >/dev/null 2>&1; then
     cross build --release --target aarch64-unknown-linux-musl --bin crash --features engine-full -j "${E2E_CROSS_JOBS:-16}" >/dev/null 2>&1
     ARM64_BIN="target/aarch64-unknown-linux-musl/release/crash"
     if [ -x "$ARM64_BIN" ]; then
-        # Extract qemu-aarch64 from the cross-rs image (cached locally)
+        # Extract qemu-aarch64 from the cross-rs image (cached locally;
+        # shared extraction helper, flocked against docker-matrix).
         QEMU_BIN=/tmp/qemu-aarch64
-        if [ ! -x "$QEMU_BIN" ]; then
-            # /tmp/qemu-aarch64 is shared with tests/docker-matrix:
-            # extract under the shared flock, clear crashed leftovers.
-            (
-                flock 9
-                docker rm -f qemu-extract-$$ >/dev/null 2>&1 || true
-                docker create --name qemu-extract-$$ ghcr.io/cross-rs/aarch64-unknown-linux-musl:0.2.5 >/dev/null 2>&1
-                docker cp qemu-extract-$$:/usr/local/bin/qemu-aarch64 "$QEMU_BIN" >/dev/null 2>&1
-                docker rm qemu-extract-$$ >/dev/null 2>&1
-            ) 9>/tmp/rustcrash-qemu.lock
-            chmod +x "$QEMU_BIN"
-        fi
+        ensure_qemu
         if [ -x "$QEMU_BIN" ]; then
             ARM64_VER=$("$QEMU_BIN" "$ARM64_BIN" engine version 2>/dev/null | head -1)
             if echo "$ARM64_VER" | grep -q "rustcrash"; then

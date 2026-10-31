@@ -58,7 +58,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{ready, Context, Poll};
 use std::time::{Duration, Instant};
@@ -738,21 +738,6 @@ impl AnyTlsSession {
     pub fn padding_md5(&self) -> String {
         self.core.padding.lock().unwrap().md5.clone()
     }
-
-    /// Whether the session has died (transport closed / alert).
-    pub fn is_dead(&self) -> bool {
-        self.core.is_dead()
-    }
-
-    /// Live stream count on this session.
-    pub fn active_streams(&self) -> usize {
-        self.core.active.load(Ordering::Relaxed)
-    }
-
-    /// `Session.Close` (session.go:110-132).
-    pub fn close(&self) {
-        self.core.kill("anytls: session closed locally");
-    }
 }
 
 /// A client anytls stream: one sid over the shared session — mihomo
@@ -850,10 +835,7 @@ impl AsyncRead for AnyTlsStream {
                     if this.core.is_dead() {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::NotConnected,
-                            format!(
-                                "anytls: session closed: {}",
-                                this.core.death_reason()
-                            ),
+                            format!("anytls: session closed: {}", this.core.death_reason()),
                         )));
                     }
                     return Poll::Pending;
@@ -1039,7 +1021,7 @@ async fn open_session(cfg: &AnyTlsOut, transport: BoxProxyStream) -> Result<AnyT
             selection,
         );
         let auth = crate::proto::reality::tls13::ServerAuth::WebPki {
-            roots: std::sync::Arc::new(crate::proto::reality::stream::root_store()?),
+            roots: std::sync::Arc::new(crate::transport::root_store()?),
             server_name: server_name.clone(),
         };
         let dial_server = cfg.server.clone();
@@ -1296,19 +1278,17 @@ struct AnyTlsPoolCore {
     /// The receiver side, under an async lock (only drained at
     /// connect/cleanup points).
     recycle_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<RecycledSession>>,
-    /// Idle policy as atomics so a constructed pool can still be
-    /// retuned (with_idle_policy) while the janitor task runs; the
-    /// janitor re-reads them every round.
-    idle_timeout_ms: AtomicU64,
-    /// Atomic millis so the janitor re-reads the interval every round
-    /// (with_idle_policy may retune a constructed-but-unshared pool).
-    check_interval_ms: AtomicU64,
-    min_idle: AtomicUsize,
+    /// Idle policy, fixed at construction (mihomo's defaults come from
+    /// the session/client.go:50-55 clamps; tests pass short timers via
+    /// the with-policy constructor).
+    idle_timeout_ms: u64,
+    check_interval_ms: u64,
+    min_idle: usize,
     /// Streams a single session may carry before the pool prefers a
     /// fresh one. Upstream's client is strictly one-stream-per-session
     /// (`CreateStream` only takes idle sessions, client.go:75-84);
     /// the engine default allows multiplexing.
-    max_streams: AtomicUsize,
+    max_streams: usize,
 }
 
 impl AnyTlsPoolCore {
@@ -1331,9 +1311,8 @@ impl AnyTlsPoolCore {
     /// sessions, keep the `min_idle` newest idle ones (refreshing their
     /// idle clock), close the expired rest.
     fn cleanup(&self) {
-        let idle_timeout =
-            Duration::from_millis(self.idle_timeout_ms.load(Ordering::Relaxed).max(1));
-        let min_idle = self.min_idle.load(Ordering::Relaxed);
+        let idle_timeout = Duration::from_millis(self.idle_timeout_ms.max(1));
+        let min_idle = self.min_idle;
         let mut sessions = self.sessions.lock().unwrap();
         let mut kept = 0usize; // sessions kept this round (activeCount)
         let mut i = 0;
@@ -1411,6 +1390,39 @@ impl AnyTlsSessionPool {
         cfg: AnyTlsOut,
         dialer: impl Fn() -> AnyTlsDialFuture + Send + Sync + 'static,
     ) -> Result<Self> {
+        Self::build(cfg, dialer, 30_000, 30_000, 0, usize::MAX)
+    }
+
+    /// `with_dialer` with an explicit idle/stream policy — the test
+    /// entry point for short timers (values verbatim, unlike the
+    /// ≤5s→30s clamp NewClient applies in session/client.go:50-55).
+    #[cfg(test)]
+    fn with_policy_dialer(
+        cfg: AnyTlsOut,
+        dialer: impl Fn() -> AnyTlsDialFuture + Send + Sync + 'static,
+        check_interval_ms: u64,
+        idle_timeout_ms: u64,
+        min_idle: usize,
+        max_streams: usize,
+    ) -> Result<Self> {
+        Self::build(
+            cfg,
+            dialer,
+            check_interval_ms,
+            idle_timeout_ms,
+            min_idle,
+            max_streams,
+        )
+    }
+
+    fn build(
+        cfg: AnyTlsOut,
+        dialer: impl Fn() -> AnyTlsDialFuture + Send + Sync + 'static,
+        check_interval_ms: u64,
+        idle_timeout_ms: u64,
+        min_idle: usize,
+        max_streams: usize,
+    ) -> Result<Self> {
         if cfg.password.is_empty() {
             return Err(Error::config("anytls: password is required"));
         }
@@ -1422,10 +1434,10 @@ impl AnyTlsSessionPool {
                 sessions: StdMutex::new(VecDeque::new()),
                 recycle_tx,
                 recycle_rx: tokio::sync::Mutex::new(recycle_rx),
-                idle_timeout_ms: AtomicU64::new(30_000),
-                check_interval_ms: AtomicU64::new(30_000),
-                min_idle: AtomicUsize::new(0),
-                max_streams: AtomicUsize::new(usize::MAX),
+                idle_timeout_ms,
+                check_interval_ms,
+                min_idle,
+                max_streams,
             }),
         };
         pool.spawn_janitor();
@@ -1445,9 +1457,7 @@ impl AnyTlsSessionPool {
                     // Scope the strong ref: holding it across the sleep
                     // would pin the pool forever.
                     let Some(core) = weak.upgrade() else { break };
-                    let interval = Duration::from_millis(
-                        core.check_interval_ms.load(Ordering::Relaxed).max(1),
-                    );
+                    let interval = Duration::from_millis(core.check_interval_ms.max(1));
                     core.drain_recycles().await;
                     core.cleanup();
                     interval
@@ -1455,34 +1465,6 @@ impl AnyTlsSessionPool {
                 tokio::time::sleep(interval).await;
             }
         });
-    }
-
-    /// Exact idle policy (mihomo clamps values ≤ 5s to 30s inside
-    /// `NewClient`, session/client.go:50-55; this builder takes the
-    /// values verbatim so embedders and tests can use short timers).
-    pub fn with_idle_policy(
-        self,
-        check_interval: Duration,
-        idle_timeout: Duration,
-        min_idle: usize,
-    ) -> Self {
-        self.core
-            .check_interval_ms
-            .store(check_interval.as_millis() as u64, Ordering::Relaxed);
-        self.core
-            .idle_timeout_ms
-            .store(idle_timeout.as_millis() as u64, Ordering::Relaxed);
-        self.core.min_idle.store(min_idle, Ordering::Relaxed);
-        self
-    }
-
-    /// Cap the streams per session (`1` reproduces upstream's
-    /// one-stream-per-session client).
-    pub fn with_max_streams(self, max_streams: usize) -> Self {
-        self.core
-            .max_streams
-            .store(max_streams.max(1), Ordering::Relaxed);
-        self
     }
 
     /// Sessions currently held (live + idle), for observability.
@@ -1511,8 +1493,7 @@ impl AnyTlsSessionPool {
                     idle = Some(s.clone());
                     break;
                 }
-                if active < self.core.max_streams.load(Ordering::Relaxed)
-                    && live.as_ref().is_none_or(|(a, _)| active < *a)
+                if active < self.core.max_streams && live.as_ref().is_none_or(|(a, _)| active < *a)
                 {
                     live = Some((active, s.clone()));
                 }
@@ -1657,6 +1638,10 @@ struct ServerCore {
 impl ServerCore {
     fn is_dead(&self) -> bool {
         *self.dead_rx.borrow()
+    }
+
+    fn death_reason(&self) -> String {
+        self.die_reason.lock().unwrap().clone()
     }
 
     /// `Session.Close` for the server role: end every stream pipe
@@ -2008,10 +1993,7 @@ impl AsyncRead for AnyTlsServerStream {
                     if this.core.is_dead() {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::NotConnected,
-                            format!(
-                                "anytls: session closed: {}",
-                                this.core.die_reason.lock().unwrap()
-                            ),
+                            format!("anytls: session closed: {}", this.core.death_reason()),
                         )));
                     }
                     this.fin = true;
@@ -2024,10 +2006,7 @@ impl AsyncRead for AnyTlsServerStream {
                     if this.core.is_dead() {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::NotConnected,
-                            format!(
-                                "anytls: session closed: {}",
-                                this.core.die_reason.lock().unwrap()
-                            ),
+                            format!("anytls: session closed: {}", this.core.death_reason()),
                         )));
                     }
                     return Poll::Pending;
@@ -2055,10 +2034,7 @@ impl AsyncWrite for AnyTlsServerStream {
         if this.core.is_dead() {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::NotConnected,
-                format!(
-                    "anytls: session closed: {}",
-                    this.core.die_reason.lock().unwrap()
-                ),
+                format!("anytls: session closed: {}", this.core.death_reason()),
             )));
         }
         if buf.is_empty() {
@@ -2846,30 +2822,50 @@ mod tests {
         cfg: &AnyTlsOut,
         close_after_all_streams: bool,
     ) -> (AnyTlsSessionPool, Arc<std::sync::atomic::AtomicUsize>) {
+        pool_with_mimic_policy(cfg, close_after_all_streams, 30_000, 30_000, 0, usize::MAX)
+    }
+
+    /// [`pool_with_mimic`] with an explicit idle/stream policy (the
+    /// with_policy_dialer test entry point).
+    fn pool_with_mimic_policy(
+        cfg: &AnyTlsOut,
+        close_after_all_streams: bool,
+        check_interval_ms: u64,
+        idle_timeout_ms: u64,
+        min_idle: usize,
+        max_streams: usize,
+    ) -> (AnyTlsSessionPool, Arc<std::sync::atomic::AtomicUsize>) {
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter2 = counter.clone();
         let password = cfg.password.clone();
-        let pool = AnyTlsSessionPool::with_dialer(cfg.clone(), move || {
-            let counter = counter2.clone();
-            let password = password.clone();
-            let close = close_after_all_streams;
-            Box::pin(async move {
-                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let (client, server) = tokio::io::duplex(256 * 1024);
-                let opts = PoolMimicOptions {
-                    password,
-                    close_after_all_streams: close,
-                };
-                tokio::spawn(async move {
-                    if let Err(e) = anytls_pool_mimic(server, opts).await {
-                        panic!("anytls pool mimic failed: {e}");
-                    }
-                });
-                // The pool applies the TLS layer per session
-                // (open_session); hand it the raw duplex.
-                Ok(Box::new(client) as BoxProxyStream)
-            })
-        })
+        let pool = AnyTlsSessionPool::with_policy_dialer(
+            cfg.clone(),
+            move || {
+                let counter = counter2.clone();
+                let password = password.clone();
+                let close = close_after_all_streams;
+                Box::pin(async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let (client, server) = tokio::io::duplex(256 * 1024);
+                    let opts = PoolMimicOptions {
+                        password,
+                        close_after_all_streams: close,
+                    };
+                    tokio::spawn(async move {
+                        if let Err(e) = anytls_pool_mimic(server, opts).await {
+                            panic!("anytls pool mimic failed: {e}");
+                        }
+                    });
+                    // The pool applies the TLS layer per session
+                    // (open_session); hand it the raw duplex.
+                    Ok(Box::new(client) as BoxProxyStream)
+                })
+            },
+            check_interval_ms,
+            idle_timeout_ms,
+            min_idle,
+            max_streams,
+        )
         .unwrap();
         (pool, counter)
     }
@@ -2980,8 +2976,7 @@ mod tests {
         // idle-session-timeout is closed; the next connect dials fresh.
         let password = test_password();
         let cfg = test_cfg(&password);
-        let (pool, counter) = pool_with_mimic(&cfg, false);
-        let pool = pool.with_idle_policy(Duration::from_millis(60), Duration::from_millis(120), 0);
+        let (pool, counter) = pool_with_mimic_policy(&cfg, false, 120, 60, 0, usize::MAX);
         let target = NetAddr::domain("echo.example", 443).unwrap();
         {
             let mut s = pool.connect(&target).await.unwrap();
@@ -3006,8 +3001,7 @@ mod tests {
         // sessions; with_max_streams(1) reproduces that exactly.
         let password = test_password();
         let cfg = test_cfg(&password);
-        let (pool, counter) = pool_with_mimic(&cfg, false);
-        let pool = pool.with_max_streams(1);
+        let (pool, counter) = pool_with_mimic_policy(&cfg, false, 30_000, 30_000, 0, 1);
         let t1 = NetAddr::domain("one.example", 443).unwrap();
         let t2 = NetAddr::domain("two.example", 80).unwrap();
         let mut s1 = pool.connect(&t1).await.unwrap();

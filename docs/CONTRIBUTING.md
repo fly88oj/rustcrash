@@ -59,7 +59,12 @@ Parallel-safety rules for new tests:
    (config-driven listeners), draw it from
    `engine::test_support::unique_test_port()` — a host-wide,
    file-locked counter below the ephemeral port range. Never bind a
-   literal port on the host.
+   literal port on the host. Exception class: a `:0` bind lands the
+   LISTENER inside the kernel's ephemeral range, where a concurrent
+   process's outbound connect can draw the same number as its source
+   port; byte-level mock peers that assert on connection endings
+   (strace-verified: stray RSTs) should therefore use
+   `unique_test_port()` directly.
 2. Never mutate process env vars or global statics in tests (build
    platforms with `Platform::for_crash_dir`); the few legacy
    exceptions survive only because nextest isolates each test in its

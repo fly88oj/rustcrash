@@ -77,7 +77,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::ring as ring_provider;
 use rustls::crypto::{CryptoProvider, GetRandomFailed, SecureRandom};
 use rustls::{
-    ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme,
+    ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme,
 };
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -566,19 +566,7 @@ fn shadow_tls_config(cfg: &ShadowTlsOut) -> Result<Arc<ClientConfig>> {
     } else {
         // Same policy as transport::tls_client_config: native roots, with
         // the bundled webpki roots when the host has no store.
-        let mut roots = RootCertStore::empty();
-        let mut loaded = 0usize;
-        let certs = rustls_native_certs::load_native_certs()
-            .map_err(|e| Error::config(format!("shadow-tls: native cert store: {e}")))?;
-        for cert in certs {
-            roots
-                .add(cert)
-                .map_err(|e| Error::config(format!("shadow-tls: bad native cert: {e}")))?;
-            loaded += 1;
-        }
-        if loaded == 0 {
-            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        }
+        let roots = crate::transport::root_store()?;
         builder.with_root_certificates(roots).with_no_client_auth()
     };
     config.alpn_protocols = DEFAULT_ALPN.iter().map(|p| p.as_bytes().to_vec()).collect();

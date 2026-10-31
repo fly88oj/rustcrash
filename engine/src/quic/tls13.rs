@@ -1083,25 +1083,6 @@ fn verify_chain_webpki(
     Ok(())
 }
 
-/// System + bundled webpki trust anchors — the engine's shared loader,
-/// mirrored from transport.rs:109-126 (private there).
-fn root_store() -> Result<Arc<rustls::RootCertStore>> {
-    let mut roots = rustls::RootCertStore::empty();
-    let mut loaded = 0usize;
-    let certs = rustls_native_certs::load_native_certs()
-        .map_err(|e| Error::config(format!("native cert store: {e}")))?;
-    for cert in certs {
-        roots
-            .add(cert)
-            .map_err(|e| Error::config(format!("bad native cert: {e}")))?;
-        loaded += 1;
-    }
-    if loaded == 0 {
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    }
-    Ok(Arc::new(roots))
-}
-
 // ---------------------------------------------------------------------------
 // First flights: plain profile hello, JLS-stamped, ECH outer/inner.
 // ---------------------------------------------------------------------------
@@ -1585,7 +1566,7 @@ impl Tls13QuicClientConfig {
             Arc::new(engine_tls13::ServerAuth::AcceptAny)
         } else {
             Arc::new(engine_tls13::ServerAuth::WebPki {
-                roots: root_store()?,
+                roots: Arc::new(crate::transport::root_store()?),
                 server_name: sni.clone(),
             })
         };
@@ -1634,7 +1615,7 @@ impl Tls13QuicClientConfig {
             Arc::new(engine_tls13::ServerAuth::AcceptAny)
         } else {
             Arc::new(engine_tls13::ServerAuth::WebPki {
-                roots: root_store()?,
+                roots: Arc::new(crate::transport::root_store()?),
                 server_name: sni.clone(),
             })
         };

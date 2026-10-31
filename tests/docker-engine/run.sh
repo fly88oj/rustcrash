@@ -40,6 +40,9 @@ fi
 echo "=== Building engine interop image ==="
 # Content-addressed: rebuild exactly when the tree content changed,
 # share the one build with parallel suites, never run a stale engine.
+# worktree (not the archive-of-HEAD default of the sibling suites): this
+# is the fast-iteration suite, historically testing the working tree.
+# On a dirty tree that means one extra image build vs the siblings.
 ensure_engine_image worktree || exit 1
 
 echo "=== Starting container ==="

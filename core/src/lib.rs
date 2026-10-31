@@ -8,7 +8,6 @@ pub mod engine;
 pub mod error;
 pub mod firewall;
 pub mod geo;
-pub mod import_export;
 pub mod init;
 pub mod kernels;
 pub mod logging;
@@ -19,7 +18,6 @@ pub mod service;
 pub mod subconverter;
 pub mod subscription;
 pub mod task;
-pub mod template;
 pub mod validate;
 
 pub use api::ApiServer;
@@ -34,7 +32,6 @@ pub use firewall::{
     DEFAULT_MIXED_PORT, DEFAULT_PROXY_PORT,
 };
 pub use geo::{GeoUpdateReport, GeoUpdater, DEFAULT_GEO_REPO};
-pub use import_export::{export_config, export_config_auto, import_config, ConfigFormat};
 pub use kernels::sha256_hex;
 pub use kernels::{KernelInfo, KernelManager};
 pub use logging::{append_rotated, init_logging, install_crash_reporting, tail_file};
@@ -55,5 +52,4 @@ pub use subconverter::{ProxyNode, ProxyProtocol, TargetFormat};
 pub use subscription::{
     SubscriptionFormat, SubscriptionInfo, SubscriptionManager, UrlValidationResult,
 };
-pub use template::{Template, TemplateManager};
 pub use validate::{ConfigValidator, ValidationError, ValidationResult};

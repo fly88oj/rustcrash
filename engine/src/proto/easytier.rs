@@ -11281,18 +11281,9 @@ impl EasyTierUdp {
 
 #[cfg(test)]
 mod tests {
-    /// Sequentially-unique listener port for tests, drawn from
-    /// 21000-32699 — deliberately BELOW the Linux ephemeral port range
-    /// (ip_local_port_range, typically 32768-60999): the old random
-    /// draw inside 31000-50999 could collide with the kernel handing
-    /// the same number to a concurrent test's outgoing-connection
-    /// source port, which blocks the listener bind (an active socket
-    /// ignores SO_REUSEADDR), and two random draws can also collide
-    /// with each other (observed on CI: two-node relay serve() died
-    /// with Address already in use). The host-wide file-locked counter
-    /// makes collisions impossible across processes too — the random
-    /// base + atomic counter it replaces still let two test processes
-    /// (cargo-nextest runs one per test) land overlapping ranges.
+    /// Listener port for tests — delegates to the host-wide allocator
+    /// (see `crate::test_support::unique_test_port` for the collision
+    /// rationale; git d2c31a3 records the CI failure that started it).
     fn unique_test_port() -> u16 {
         crate::test_support::unique_test_port()
     }
@@ -12371,8 +12362,8 @@ mod tests {
             loop {
                 let p = match read_frame(&mut stream).await {
                     Ok(Some(p)) => p,
-                    Ok(None) => break,                       // clean FIN
-                    Err(e) if e.to_string().contains("reset") => break,
+                    Ok(None) => break, // clean FIN
+                    Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
                     Err(e) => panic!("mimic read: {e}"),
                 };
                 if p.hdr.packet_type != packet_type::PING {

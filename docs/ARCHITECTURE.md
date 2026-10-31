@@ -48,7 +48,7 @@ RustCrash is a Cargo workspace with two libraries and one binary:
 | `subscription` | `SubscriptionManager::{fetch,convert,…}`, `ConvertOptions` | URL validation, base64, concurrent fetch, format detection |
 | `task` | `CronExpr`, `TaskManager`, updaters | cron parsing, hooks, scheduled sub/kernel updates |
 | `init` | init-system integrations | systemd/OpenWrt/OpenRC generation, container detection |
-| `backup`, `template`, `validate`, `import_export` | backup tarballs, config templates, validation | |
+| `backup`, `validate` | backup tarballs, config validation | |
 | `engine` (core) | `KernelSelection`, `EngineFlavor`, `engine::{run,test,version}` | feature-gated bridge into the engine crate; geo-path wiring; builds without engine features get precise errors |
 | `engine` (crate) | `Engine::build/run`, `EngineConfig`, `RelayHandler` | the integrated data plane: protocol codecs, transports, inbounds, DNS/fake-IP, rules, groups, Clash API, dialect loaders |
 
