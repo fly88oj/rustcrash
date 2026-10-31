@@ -688,8 +688,15 @@ fn matcher_needs_ip(m: &RuleMatcher) -> bool {
 
 /// `domain == suffix` or domain sits directly under `suffix`
 /// (`a.b.com` matches `b.com`; `ab.com` does not).
+///
+/// Byte-wise, no `format!`: this runs per suffix per rule per routed
+/// connection, and the joined-string version allocated once per check.
 pub(crate) fn domain_matches_suffix(domain: &str, suffix: &str) -> bool {
-    domain == suffix || domain.ends_with(&format!(".{suffix}"))
+    if domain == suffix {
+        return true;
+    }
+    let (d, s) = (domain.as_bytes(), suffix.as_bytes());
+    d.len() > s.len() + 1 && d.ends_with(s) && d[d.len() - s.len() - 1] == b'.'
 }
 
 /// The inbound kinds a `PROXY,<outbound>` rule compiles to (an
@@ -853,8 +860,17 @@ impl DomainMatcher {
     }
 
     pub fn matches(&self, domain: &str) -> bool {
-        let d = domain.to_ascii_lowercase();
-        if self.exact.contains(&d) {
+        // Lowercase lazily: DNS names are almost always already
+        // lowercase, and this runs per domain-set rule per routed
+        // connection — the unconditional to_ascii_lowercase() paid a
+        // String each call.
+        let d = if domain.bytes().any(|b| b.is_ascii_uppercase()) {
+            std::borrow::Cow::Owned(domain.to_ascii_lowercase())
+        } else {
+            std::borrow::Cow::Borrowed(domain)
+        };
+        let d: &str = &d;
+        if self.exact.contains(d) {
             return true;
         }
         if self.suffix.iter().any(|s| {
@@ -863,14 +879,14 @@ impl DomainMatcher {
             // wildcard over every label: any domain — one label or
             // more — matches, exactly like mihomo's domain trie
             // (`+.` allows one-or-more labels above the wildcard).
-            *s == "*" || d == *s || d.ends_with(&format!(".{s}"))
+            *s == "*" || domain_matches_suffix(d, s)
         }) {
             return true;
         }
         if self.keyword.iter().any(|k| d.contains(k.as_str())) {
             return true;
         }
-        self.regex.iter().any(|r| r.is_match(&d))
+        self.regex.iter().any(|r| r.is_match(d))
     }
 }
 

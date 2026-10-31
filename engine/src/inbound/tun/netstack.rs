@@ -610,14 +610,73 @@ pub(crate) fn needs_new_listener(facts: &[SocketFacts], src: SocketAddr, dst: So
 // TCP bridge: StreamShared + TunStream
 // ---------------------------------------------------------------------------
 
+/// A FIFO byte queue with memcpy push/pop. The bridge previously used
+/// `VecDeque<u8>`, whose extend/drain move bridged TUN bytes one
+/// element at a time and whose `make_contiguous()` re-compacts up to
+/// STREAM_QUEUE_MAX bytes on every send — this is the path of every
+/// byte crossing the netstack, so the queue is a Vec with a consumed
+/// prefix cursor instead: pushes and pops are one memcpy each, the
+/// dead prefix is compacted only once it grows past 64 KiB.
+#[derive(Default)]
+struct ByteQueue {
+    buf: Vec<u8>,
+    /// Consumed prefix of `buf` (head..buf.len() is the live data).
+    head: usize,
+}
+
+impl ByteQueue {
+    fn len(&self) -> usize {
+        self.buf.len() - self.head
+    }
+
+    fn is_empty(&self) -> bool {
+        self.head == self.buf.len()
+    }
+
+    #[cfg(test)] // only the netstack internals tests clear wholesale
+    fn clear(&mut self) {
+        self.buf.clear();
+        self.head = 0;
+    }
+
+    /// Append bytes (one memcpy; the Vec's capacity is reused across
+    /// drain cycles).
+    fn push(&mut self, data: &[u8]) {
+        if self.is_empty() {
+            self.buf.clear();
+            self.head = 0;
+        }
+        self.buf.extend_from_slice(data);
+    }
+
+    /// The contiguous live data (always one slice — unlike a deque's
+    /// two-segment view).
+    fn front(&self) -> &[u8] {
+        &self.buf[self.head..]
+    }
+
+    /// Consume `n` bytes from the front. O(1); compacts the dead
+    /// prefix when it exceeds 64 KiB so the slack stays bounded.
+    fn pop_front(&mut self, n: usize) {
+        self.head = (self.head + n).min(self.buf.len());
+        if self.is_empty() {
+            self.buf.clear();
+            self.head = 0;
+        } else if self.head > 64 * 1024 {
+            self.buf.drain(..self.head);
+            self.head = 0;
+        }
+    }
+}
+
 /// Queues and wakers of one bridged TCP connection. Everything lives under a
 /// single mutex: pushing bytes and taking the waker happen in one critical
 /// section, which is what makes the hand-off race-free.
 struct StreamBufs {
     /// stack -> proxy (read off the smoltcp socket, waiting to be read).
-    to_proxy: VecDeque<u8>,
+    to_proxy: ByteQueue,
     /// proxy -> stack (waiting for the smoltcp send buffer / window).
-    to_stack: VecDeque<u8>,
+    to_stack: ByteQueue,
     /// The peer finished sending and the socket's rx is drained: read EOF.
     read_eof: bool,
     /// The proxy half-closed; FIN once `to_stack` drains.
@@ -638,8 +697,8 @@ impl StreamShared {
     fn new(wake: Arc<Notify>) -> Self {
         StreamShared {
             bufs: Mutex::new(StreamBufs {
-                to_proxy: VecDeque::new(),
-                to_stack: VecDeque::new(),
+                to_proxy: ByteQueue::default(),
+                to_stack: ByteQueue::default(),
                 read_eof: false,
                 write_closed: false,
                 aborted: false,
@@ -686,13 +745,8 @@ impl AsyncRead for TunStream {
         let mut g = self.shared.lock();
         if !g.to_proxy.is_empty() {
             let n = g.to_proxy.len().min(buf.remaining());
-            let (front, back) = g.to_proxy.as_slices();
-            let take_front = n.min(front.len());
-            buf.put_slice(&front[..take_front]);
-            if take_front < n {
-                buf.put_slice(&back[..n - take_front]);
-            }
-            g.to_proxy.drain(..n);
+            buf.put_slice(&g.to_proxy.front()[..n]);
+            g.to_proxy.pop_front(n);
             return Poll::Ready(Ok(()));
         }
         if g.read_eof {
@@ -723,7 +777,7 @@ impl AsyncWrite for TunStream {
             return Poll::Pending;
         }
         let n = space.min(buf.len());
-        g.to_stack.extend(buf[..n].iter().copied());
+        g.to_stack.push(&buf[..n]);
         drop(g);
         self.shared.wake.notify_one();
         Poll::Ready(Ok(n))
@@ -1412,7 +1466,7 @@ impl Netstack {
                     Ok(n) => n,
                     Err(_) => break,
                 };
-                g.to_proxy.extend(self.pump_buf[..n].iter().copied());
+                g.to_proxy.push(&self.pump_buf[..n]);
             }
             if !sock.may_recv() && sock.recv_queue() == 0 {
                 g.read_eof = true;
@@ -1420,11 +1474,11 @@ impl Netstack {
 
             // proxy -> stack
             while !g.to_stack.is_empty() && sock.can_send() {
-                let n = match sock.send_slice(g.to_stack.make_contiguous()) {
+                let n = match sock.send_slice(g.to_stack.front()) {
                     Ok(n) => n,
                     Err(_) => break,
                 };
-                g.to_stack.drain(..n);
+                g.to_stack.pop_front(n);
             }
             if g.write_closed && g.to_stack.is_empty() && !c.fin_sent {
                 sock.close();
@@ -2492,7 +2546,7 @@ mod tests {
         assert!(shared.lock().read_waker.is_some());
 
         // The netstack pushed bytes: the parked reader is woken and reads.
-        shared.lock().to_proxy.extend(b"hello".iter().copied());
+        shared.lock().to_proxy.push(b"hello");
         shared.lock().read_waker.take().unwrap().wake();
         assert!(flag.0.load(Ordering::SeqCst));
         let mut rb = ReadBuf::new(&mut buf);

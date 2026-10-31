@@ -462,7 +462,7 @@ impl Outbound {
         );
         ech_cfg.alpn = tls.alpn.clone();
         let auth = crate::proto::reality::tls13::ServerAuth::WebPki {
-            roots: std::sync::Arc::new(crate::proto::reality::stream::root_store()?),
+            roots: std::sync::Arc::new(crate::transport::root_store()?),
             server_name: inner_name,
         };
         let dial_server = server.to_string();
@@ -2028,7 +2028,8 @@ impl UdpChannel {
                     std::net::IpAddr::V4(_) => "0.0.0.0".parse().unwrap(),
                     std::net::IpAddr::V6(_) => "::".parse().unwrap(),
                 };
-                Ok((NetAddr::ip(peer_ip, 0), buf[..n].to_vec()))
+                buf.truncate(n);
+                Ok((NetAddr::ip(peer_ip, 0), buf))
             }
             UdpChannel::Socks(socks) => {
                 let mut buf = vec![0u8; 65536];
@@ -2075,7 +2076,8 @@ impl UdpChannel {
             UdpChannel::AnyTls(a) => {
                 let mut buf = vec![0u8; 65536];
                 let (addr, n) = a.recv_from(&mut buf).await?;
-                Ok((addr, buf[..n].to_vec()))
+                buf.truncate(n);
+                Ok((addr, buf))
             }
             UdpChannel::ShadowQuic(assoc) => {
                 let packet = assoc.recv_from().await?;
@@ -2098,12 +2100,14 @@ impl UdpChannel {
             UdpChannel::Snell(s) => {
                 let mut buf = vec![0u8; 65536];
                 let (addr, n) = s.recv_from(&mut buf).await?;
-                Ok((addr, buf[..n].to_vec()))
+                buf.truncate(n);
+                Ok((addr, buf))
             }
             UdpChannel::Mieru(m) => {
                 let mut buf = vec![0u8; 65536];
                 let (addr, n) = m.recv_from(&mut buf).await?;
-                Ok((addr, buf[..n].to_vec()))
+                buf.truncate(n);
+                Ok((addr, buf))
             }
             UdpChannel::OpenVpn(o) => o.recv().await,
             UdpChannel::Tailscale(t) => t.recv().await,
