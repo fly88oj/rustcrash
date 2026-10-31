@@ -8,7 +8,6 @@
 //! verifier rustls uses for its own client, ring backend — we only feed it
 //! the certificate list we parsed out of the handshake).
 
-use rand::RngCore;
 
 use crate::error::Result;
 use crate::stream::BoxProxyStream;
@@ -52,11 +51,11 @@ impl UtlsCfg {
 /// raw byte tunnel).
 pub async fn utls_connect(cfg: &UtlsCfg, transport: BoxProxyStream) -> Result<BoxProxyStream> {
     let mut random = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut random);
+    rand::fill(&mut random);
     // A fresh random legacy session id, like Chrome's (32 bytes, no
     // resumption in this client).
     let mut session_id = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut session_id);
+    rand::fill(&mut session_id);
     let (secret, public) = tls13::x25519_keygen();
 
     let alpn = if cfg.alpn.is_empty() {

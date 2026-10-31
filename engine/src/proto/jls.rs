@@ -193,7 +193,6 @@ use aes_gcm::aead::consts::U32;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::AesGcm;
 use bytes::{Buf, BufMut, BytesMut};
-use rand::RngCore;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::ring as ring_provider;
 use rustls::crypto::{CryptoProvider, GetRandomFailed, SecureRandom};
@@ -322,7 +321,7 @@ pub fn build_fake_random(user: &JlsUser, random16: &[u8], auth_data: &[u8]) -> R
     }
     let aead = jls_aead(user, auth_data);
     let nonce = jls_hash(&user.username, auth_data);
-    let nonce = aes_gcm::Nonce::<U32>::from_slice(&nonce);
+    let nonce = &aes_gcm::Nonce::<U32>::from(nonce);
     let mut seed = random16.to_vec();
     loop {
         let sealed = aead
@@ -342,7 +341,7 @@ pub fn build_fake_random(user: &JlsUser, random16: &[u8], auth_data: &[u8]) -> R
         }
         // Regenerate N instead of emitting a FakeRandom ending in one of
         // the reserved suffixes (jls-tls/jls.go:162-171).
-        rand::rngs::OsRng.fill_bytes(&mut seed);
+        rand::fill(&mut seed);
     }
 }
 
@@ -354,7 +353,7 @@ pub fn check_fake_random(user: &JlsUser, fake_random: &[u8], auth_data: &[u8]) -
     }
     let aead = jls_aead(user, auth_data);
     let nonce = jls_hash(&user.username, auth_data);
-    let nonce = aes_gcm::Nonce::<U32>::from_slice(&nonce);
+    let nonce = &aes_gcm::Nonce::<U32>::from(nonce);
     match aead.decrypt(
         nonce,
         Payload {
@@ -677,7 +676,7 @@ fn build_stamped_client_hello(
 ) -> Result<(ClientConnection, Vec<u8>)> {
     // Fixed X25519 pair shared by both passes.
     let mut scalar = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut scalar);
+    rand::fill(&mut scalar);
     let public = curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(scalar).0;
     FIXED_KEY.with(|k| k.set(Some((scalar, public))));
 
@@ -944,18 +943,18 @@ fn build_profile_hello(
 ) -> Result<(Vec<u8>, [u8; 32])> {
     // The fingerprint's single real key share (X25519).
     let mut scalar = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut scalar);
+    rand::fill(&mut scalar);
     let public = curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(scalar).0;
     // A browser's 32-byte legacy session id (middlebox compatibility);
     // uTLS draws it per connection. JLS leaves it untouched (REALITY's
     // sealed session id is a different protocol).
     let mut session_id = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut session_id);
+    rand::fill(&mut session_id);
 
     // Pass 1 — `BuildHandshakeState` (`utls.go:70-78`): the hello as the
     // fingerprint engine emits it, with a fresh random.
     let mut random = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut random);
+    rand::fill(&mut random);
     // `overrideUTLSALPN` (`utls.go:208-241`): ALPS stays only with h2.
     let alps = alpn.iter().any(|a| a == "h2");
     let hello1 = profiles::build_client_hello_opts(
@@ -1275,10 +1274,9 @@ async fn jls_client_http_fallback(
     use tokio::io::AsyncWriteExt;
     // `defer uConn.Close()`: the conn is dropped when this returns.
     let alpn_h2 = conn.alpn() == Some(b"h2".as_slice());
-    use rand::Rng;
     let mut padding = String::with_capacity(61);
     padding.push_str(
-        &(0..rand::rngs::OsRng.gen_range(30..=61))
+        &(0..rand::random_range(30..=61))
             .map(|_| '0')
             .collect::<String>(),
     );
@@ -1731,11 +1729,11 @@ fn generate_camouflage_cert() -> Result<(
 
     // Random common name (hex) and a positive, minimally-encoded serial.
     let mut cn_bytes = [0u8; 8];
-    rand::rngs::OsRng.fill_bytes(&mut cn_bytes);
+    rand::fill(&mut cn_bytes);
     let cn: String = cn_bytes.iter().map(|b| format!("{b:02x}")).collect();
     let name = der_name(&cn);
     let mut serial_bytes = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut serial_bytes);
+    rand::fill(&mut serial_bytes);
     let mut serial: Vec<u8> = serial_bytes.to_vec();
     while serial.first() == Some(&0) {
         serial.remove(0);
@@ -2084,7 +2082,7 @@ fn stamped_server_handshake(
     // Fixed X25519 pair shared by both passes (a fresh ephemeral per
     // connection, like the Go server).
     let mut scalar = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut scalar);
+    rand::fill(&mut scalar);
     let public = curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(scalar).0;
     FIXED_KEY.with(|k| k.set(Some((scalar, public))));
     #[cfg(test)]
@@ -2127,7 +2125,7 @@ fn stamped_server_handshake(
             HS_SERVER_HELLO,
         )?;
         let mut seed = [0u8; RANDOM_SEED_LEN];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
+        rand::fill(&mut seed);
         let fake = build_fake_random(user, &seed, &sh_auth)?;
 
         // Pass 2: replay every draw with the server random replaced (the
@@ -2435,7 +2433,7 @@ mod tests {
         let mut hello = vec![HS_CLIENT_HELLO, 0, 0, 0];
         hello.extend_from_slice(&[0x03, 0x03]);
         let mut random: [u8; 32] = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut random);
+        rand::fill(&mut random);
         hello.extend_from_slice(&random);
         hello.extend_from_slice(b"rest of the hello");
         let body_len = (hello.len() - HELLO_HEADER_LEN) as u32;
@@ -2687,7 +2685,7 @@ mod tests {
         let certified = rcgen::generate_simple_self_signed(vec!["jls.test".to_string()])
             .expect("rcgen self-signed cert");
         let cert = CertificateDer::from(certified.cert.der().to_vec());
-        let key = PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let key = PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into());
         let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
             ring_provider::default_provider(),
         ))
@@ -3743,7 +3741,7 @@ mod tests {
             let mut record = Vec::with_capacity(RECORD_HEADER_LEN + len);
             record.extend_from_slice(&[0x17, 0x03, 0x03, (len >> 8) as u8, len as u8]);
             let nonce_bytes = self.nonce(seq);
-            let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
+            let nonce = &aes_gcm::Nonce::from(nonce_bytes);
             let sealed = match &self.aead {
                 MimicAead::Aes256(a) => a
                     .encrypt(
@@ -3772,7 +3770,7 @@ mod tests {
         /// content-type byte (and any padding) stripped.
         fn open_record(&self, seq: u64, record: &[u8]) -> Vec<u8> {
             let nonce_bytes = self.nonce(seq);
-            let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
+            let nonce = &aes_gcm::Nonce::from(nonce_bytes);
             let inner = match &self.aead {
                 MimicAead::Aes256(a) => a
                     .decrypt(

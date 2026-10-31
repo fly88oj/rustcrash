@@ -97,7 +97,6 @@ use std::task::{ready, Context, Poll};
 use std::time::{Duration, SystemTime};
 
 use bytes::{Buf, Bytes, BytesMut};
-use rand::Rng;
 use ring::signature::KeyPair as _;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
@@ -2322,7 +2321,7 @@ impl MasqueClient {
             tunnel,
             local4,
             local6,
-            src_port: rand::rngs::OsRng.gen_range(32768..=60999),
+            src_port: rand::random_range(32768..=60999),
         })
     }
 }

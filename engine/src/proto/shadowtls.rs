@@ -71,8 +71,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{ready, Context, Poll};
 
 use bytes::{Buf, BytesMut};
-use hmac::{Hmac, Mac};
-use rand::RngCore;
+use hmac::{Hmac, KeyInit, Mac};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::ring as ring_provider;
 use rustls::crypto::{CryptoProvider, GetRandomFailed, SecureRandom};
@@ -730,7 +729,7 @@ impl ShadowTlsStream {
         record[2] = 3;
         record[3] = 0;
         record[4] = 26;
-        rand::rngs::OsRng.fill_bytes(&mut record[TLS_HEADER_SIZE..]);
+        rand::fill(&mut record[TLS_HEADER_SIZE..]);
         self.wbuf.extend_from_slice(&record);
     }
 
@@ -1222,7 +1221,7 @@ mod tests {
         let certified = rcgen::generate_simple_self_signed(vec!["shadowtls.test".to_string()])
             .expect("rcgen self-signed cert");
         let cert = CertificateDer::from(certified.cert.der().to_vec());
-        let key = PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let key = PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into());
         let provider = Arc::new(ring_provider::default_provider());
         Arc::new(
             rustls::ServerConfig::builder_with_provider(provider)

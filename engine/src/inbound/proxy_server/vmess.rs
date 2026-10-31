@@ -32,7 +32,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 
-use aes::cipher::{BlockDecrypt, KeyInit};
+use aes::cipher::{BlockCipherDecrypt, KeyInit};
 use bytes::{Buf, BytesMut};
 use md5::{Digest, Md5};
 use sha2::Sha256;
@@ -397,7 +397,7 @@ fn verify_auth_id(cmd_key: &[u8; 16], auth_id: &[u8; 16]) -> Result<()> {
     let key = &vmess_kdf(cmd_key, &[KDF_AUTH_ID_ENC_KEY])[..16];
     let cipher = aes::Aes128::new_from_slice(key)
         .map_err(|e| Error::crypto(format!("vmess auth id cipher: {e}")))?;
-    let mut block = aes::cipher::generic_array::GenericArray::clone_from_slice(auth_id);
+    let mut block = aes::cipher::Array::from(*auth_id);
     cipher.decrypt_block(&mut block);
     let plain: [u8; 16] = block.into();
     let crc = u32::from_be_bytes(plain[12..16].try_into().expect("4 bytes"));
@@ -718,7 +718,7 @@ impl VmessBody {
         if pad > 0 {
             let start = out.len();
             out.resize(start + pad, 0);
-            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut out[start..]);
+            rand::fill(&mut out[start..]);
         }
         Ok(())
     }
@@ -1157,11 +1157,11 @@ mod tests {
             cmd: u8,
             target: &NetAddr,
         ) -> Result<Self> {
-            use aes::cipher::BlockEncrypt;
+            use aes::cipher::BlockCipherEncrypt;
             let mut stream = TcpStream::connect(addr).await?;
             let key = cmd_key(uuid::Uuid::parse_str(uuid).unwrap());
             let mut rnd = [0u8; 33];
-            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut rnd);
+            rand::fill(&mut rnd);
             let mut req_key = [0u8; 16];
             req_key.copy_from_slice(&rnd[..16]);
             let mut req_iv = [0u8; 16];
@@ -1192,17 +1192,17 @@ mod tests {
             // Auth id: AES-ECB(ts || rand4 || crc32).
             let mut body = [0u8; 16];
             body[..8].copy_from_slice(&(now_secs() as i64).to_be_bytes());
-            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut body[8..12]);
+            rand::fill(&mut body[8..12]);
             let crc = crc32fast::hash(&body[..12]);
             body[12..].copy_from_slice(&crc.to_be_bytes());
             let cipher = aes::Aes128::new_from_slice(&kdf16(&key, &[KDF_AUTH_ID_ENC_KEY]))
                 .map_err(|e| Error::crypto(e.to_string()))?;
-            let mut block = aes::cipher::generic_array::GenericArray::from(body);
+            let mut block = aes::cipher::Array::from(body);
             cipher.encrypt_block(&mut block);
             let auth_id: [u8; 16] = block.into();
 
             let mut nonce8 = [0u8; 8];
-            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce8);
+            rand::fill(&mut nonce8);
 
             let len_plain = (hdr.len() as u16).to_be_bytes();
             let len_aead = Aead::new(
@@ -1279,7 +1279,7 @@ mod tests {
             if pad > 0 {
                 let start = out.len();
                 out.resize(start + pad, 0);
-                rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut out[start..]);
+                rand::fill(&mut out[start..]);
             }
             self.stream.write_all(&out).await?;
             self.stream.flush().await?;

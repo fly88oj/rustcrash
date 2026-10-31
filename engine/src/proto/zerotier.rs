@@ -755,9 +755,8 @@ impl NodeIdentity {
     /// hashcash condition holds. ~16.6 expected memory-hard hashes —
     /// seconds in release, minutes in debug.
     pub fn generate() -> Result<Self> {
-        use rand::RngCore;
         let mut secret = [0u8; PRIVATE_KEY_SIZE];
-        rand::rngs::OsRng.fill_bytes(&mut secret);
+        rand::fill(&mut secret);
         let mut public = [0u8; PUBLIC_KEY_SIZE];
         public[32..64].copy_from_slice(&ed25519_public_from_seed(&secret[32..64])?);
         loop {
@@ -1162,9 +1161,8 @@ impl WirePacket {
     /// `Packet(dest, source, verb)` — random IV, zero flags
     /// (node/Packet.hpp:424-430).
     pub fn new(dest: u64, source: u64, verb: Verb) -> Self {
-        use rand::RngCore;
         let mut buf = vec![0u8; PACKET_HEADER_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut buf[PACKET_IDX_IV..PACKET_IDX_DEST]);
+        rand::fill(&mut buf[PACKET_IDX_IV..PACKET_IDX_DEST]);
         buf[PACKET_IDX_DEST..PACKET_IDX_SOURCE].copy_from_slice(&dest.to_be_bytes()[3..8]);
         buf[PACKET_IDX_SOURCE..PACKET_IDX_FLAGS].copy_from_slice(&source.to_be_bytes()[3..8]);
         buf[PACKET_IDX_FLAGS] = 0;

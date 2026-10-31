@@ -1308,7 +1308,7 @@ mod tests {
         let certified = rcgen::generate_simple_self_signed(vec!["sq.test".to_string()])
             .expect("rcgen self-signed cert");
         let cert = CertificateDer::from(certified.cert.der().to_vec());
-        let key = PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let key = PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into());
         let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
             ring_provider::default_provider(),
         ))

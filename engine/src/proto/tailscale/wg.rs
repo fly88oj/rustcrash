@@ -113,7 +113,6 @@ use std::time::{Duration, Instant};
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::ChaCha20Poly1305;
-use rand::RngCore;
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
@@ -308,7 +307,7 @@ fn build_initiation(
     let mut h = hash2(&ident_hash, peer_pub);
 
     let mut e_priv = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut e_priv);
+    rand::fill(&mut e_priv);
     let e_pub = x25519_pub(&e_priv);
     h = hash2(&h, &e_pub);
     ck = kdf1(&ck, &e_pub);
@@ -2040,9 +2039,9 @@ mod tests {
     /// key material is generated in-test; nothing leaves loopback.
     async fn spawn_peer_tunnel(relay: Arc<dyn RelayHandler>) -> TsTunnel {
         let mut our_sk = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut our_sk);
+        rand::fill(&mut our_sk);
         let mut peer_sk = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut peer_sk);
+        rand::fill(&mut peer_sk);
         let cfg = crate::proto::wireguard::WgEndpointCfg {
             tag: "ts-wg13-peer".into(),
             private_key: b64(&peer_sk),

@@ -18,7 +18,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 
-use rand::Rng;
+use rand::RngExt;
 use russh::client::{self, Config, Handle, Msg};
 use russh::keys::{
     decode_secret_key, parse_public_key_base64, PrivateKeyWithHashAlg, PublicKey, PublicKeyBase64,
@@ -145,11 +145,11 @@ impl client::Handler for Handler {
 /// Client config: mihomo randomizes the client banner over OpenSSH 7.x/8.x
 /// and lets Go set TCP_NODELAY; keep both behaviours.
 fn client_config() -> Config {
-    let mut rng = rand::thread_rng();
-    let id = if rng.gen_bool(0.5) {
-        format!("SSH-2.0-OpenSSH_7.{}", rng.gen_range(0..10))
+    let mut rng = rand::rng();
+    let id = if rng.random_bool(0.5) {
+        format!("SSH-2.0-OpenSSH_7.{}", rng.random_range(0..10))
     } else {
-        format!("SSH-2.0-OpenSSH_8.{}", rng.gen_range(0..9))
+        format!("SSH-2.0-OpenSSH_8.{}", rng.random_range(0..9))
     };
     Config {
         client_id: SshId::Standard(Cow::Owned(id)),

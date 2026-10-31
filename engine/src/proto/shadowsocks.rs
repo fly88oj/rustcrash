@@ -5,10 +5,9 @@ use std::io;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
+use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use base64::Engine;
 use bytes::{Buf, BytesMut};
-use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::addr::{decode_socks_addr, encode_socks_addr, NetAddr};
@@ -103,7 +102,7 @@ fn now_secs() -> u64 {
 
 fn fresh_salt(len: usize) -> Vec<u8> {
     let mut s = vec![0u8; len];
-    rand::rngs::OsRng.fill_bytes(&mut s);
+    rand::fill(&mut s);
     s
 }
 
@@ -392,7 +391,7 @@ enum AesBlock {
 
 impl AesBlock {
     fn encrypt_block(&self, block: &mut [u8; 16]) {
-        let b = aes::cipher::generic_array::GenericArray::from_mut_slice(&mut block[..]);
+        let b: &mut aes::cipher::Array<u8, _> = (&mut block[..]).try_into().expect("16-byte AES block");
         match self {
             AesBlock::Aes128(c) => c.encrypt_block(b),
             AesBlock::Aes256(c) => c.encrypt_block(b),
@@ -400,7 +399,7 @@ impl AesBlock {
     }
 
     fn decrypt_block(&self, block: &mut [u8; 16]) {
-        let b = aes::cipher::generic_array::GenericArray::from_mut_slice(&mut block[..]);
+        let b: &mut aes::cipher::Array<u8, _> = (&mut block[..]).try_into().expect("16-byte AES block");
         match self {
             AesBlock::Aes128(c) => c.decrypt_block(b),
             AesBlock::Aes256(c) => c.decrypt_block(b),
@@ -431,7 +430,7 @@ impl SsUdp {
             None
         };
         let mut session_id = [0u8; 8];
-        rand::rngs::OsRng.fill_bytes(&mut session_id);
+        rand::fill(&mut session_id);
         Ok(SsUdp {
             socket,
             server,
@@ -593,7 +592,7 @@ mod tests {
     /// usable is ever committed.
     fn fresh_password() -> String {
         let mut b = [0u8; 12];
-        rand::rngs::OsRng.fill_bytes(&mut b);
+        rand::fill(&mut b);
         b.iter().map(|x| format!("{x:02x}")).collect()
     }
 
@@ -625,7 +624,7 @@ mod tests {
                 assert_eq!(target.port, 443);
                 // Server response: own salt + one chunk.
                 let mut resp_salt = [0u8; 16];
-                rand::rngs::OsRng.fill_bytes(&mut resp_salt);
+                rand::fill(&mut resp_salt);
                 let rskey = ss_subkey_legacy(&key, &resp_salt);
                 let renc = Aead::new(AeadKind::Aes128Gcm, &rskey).unwrap();
                 let mut enonce = SsNonce::new();

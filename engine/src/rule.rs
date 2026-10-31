@@ -906,7 +906,7 @@ impl GeoLookups {
     /// ISO country code for an IP from the MaxMind database.
     pub fn country(&self, ip: IpAddr) -> Option<String> {
         let reader = self.geoip.as_ref()?;
-        let val: serde_json::Value = reader.lookup(ip).ok()?;
+        let val: serde_json::Value = reader.lookup(ip).ok()?.decode().ok().flatten()?;
         val["country"]["iso_code"]
             .as_str()
             .or_else(|| val["registered_country"]["iso_code"].as_str())
@@ -918,7 +918,7 @@ impl GeoLookups {
     /// None when nothing is loaded or the IP has no entry.
     pub fn asn(&self, ip: IpAddr) -> Option<u32> {
         let reader = self.asn_mmdb.as_ref().or(self.geoip.as_ref())?;
-        let val: serde_json::Value = reader.lookup(ip).ok()?;
+        let val: serde_json::Value = reader.lookup(ip).ok()?.decode().ok().flatten()?;
         val["autonomous_system_number"]
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())

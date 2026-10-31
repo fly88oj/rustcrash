@@ -4,7 +4,7 @@
 //! (redir/tproxy with IP destinations) can still route by domain —
 //! mirroring mihomo's `sniffer` config.
 
-use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit as _};
+use aes::cipher::{Array, BlockCipherEncrypt, KeyInit as _};
 use aes_gcm::aead::{Aead as _, Payload};
 use aes_gcm::Aes128Gcm;
 use hkdf::Hkdf;
@@ -328,8 +328,8 @@ fn quic_initial_keys(dcid: &[u8]) -> QuicInitialKeys {
 /// Header-protection mask: one raw AES-128 block encryption of the
 /// sample (RFC 9001 §5.4.3).
 fn quic_hp_mask(hp: &[u8; 16], sample: &[u8]) -> Option<[u8; 16]> {
-    let cipher = aes::Aes128::new(GenericArray::from_slice(hp));
-    let mut block = *GenericArray::from_slice(sample.get(..16)?);
+    let cipher = aes::Aes128::new(hp.into());
+    let mut block = Array::try_from(sample.get(..16)?).expect("16-byte sample");
     cipher.encrypt_block(&mut block);
     Some(block.into())
 }
@@ -409,10 +409,10 @@ fn sniff_quic(buf: &[u8]) -> Option<String> {
     header[0] = first_clear;
     header[pn_off..pn_off + pn_len].copy_from_slice(&pn_be[4 - pn_len..]);
     let ciphertext = buf.get(pn_off + pn_len..end)?;
-    let aead = Aes128Gcm::new(GenericArray::from_slice(&keys.key));
+    let aead = Aes128Gcm::new((&keys.key).into());
     let plain = aead
         .decrypt(
-            GenericArray::from_slice(&nonce),
+            (&nonce).into(),
             Payload {
                 msg: ciphertext,
                 aad: &header,
@@ -776,7 +776,7 @@ mod tests {
     /// Protect a QUIC v1 client Initial with the same key schedule the
     /// sniffer derives — encrypting here is the round-trip proof.
     fn quic_protect(dcid: &[u8], pn: u32, pn_len: usize, frames: &[u8]) -> Vec<u8> {
-        use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit as _};
+        use aes::cipher::{Array, BlockCipherEncrypt, KeyInit as _};
         use aes_gcm::aead::{Aead as _, Payload};
         use aes_gcm::Aes128Gcm;
 
@@ -797,10 +797,10 @@ mod tests {
         for i in 0..4 {
             nonce[8 + i] ^= pn_bytes[i];
         }
-        let aead = Aes128Gcm::new(GenericArray::from_slice(&keys.key));
+        let aead = Aes128Gcm::new((&keys.key).into());
         let ciphertext = aead
             .encrypt(
-                GenericArray::from_slice(&nonce),
+                (&nonce).into(),
                 Payload {
                     msg: frames,
                     aad: &header,
@@ -811,8 +811,8 @@ mod tests {
         packet.extend_from_slice(&ciphertext);
 
         let pn_off = header.len() - pn_len;
-        let cipher = aes::Aes128::new(GenericArray::from_slice(&keys.hp));
-        let mut block = *GenericArray::from_slice(&packet[pn_off + 4..pn_off + 20]);
+        let cipher = aes::Aes128::new((&keys.hp).into());
+        let mut block = Array::try_from(&packet[pn_off + 4..pn_off + 20]).expect("16-byte sample");
         cipher.encrypt_block(&mut block);
         let mask: [u8; 16] = block.into();
         packet[0] ^= mask[0] & 0x0f;

@@ -42,7 +42,6 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use rand::RngCore;
 
 use super::derp::{box_shared, poly1305, xsalsa20_xor};
 use crate::error::{Error, Result};
@@ -119,7 +118,7 @@ impl DiscoPrivateKey {
     /// `key.NewDisco()` (disco.go:37-43): fresh random + clamp.
     pub fn generate() -> Self {
         let mut sk = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut sk);
+        rand::fill(&mut sk);
         sk[0] &= 248;
         sk[31] &= 127;
         sk[31] |= 64;
@@ -171,7 +170,7 @@ pub fn shared(sk: &DiscoPrivateKey, peer: &DiscoPublicKey) -> Result<[u8; 32]> {
 /// uses — same primitive, different framing).
 fn seal_shared(shared: &[u8; 32], cleartext: &[u8]) -> Vec<u8> {
     let mut nonce = [0u8; NONCE_LEN];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    rand::fill(&mut nonce);
     let mut ct = vec![0u8; cleartext.len()];
     let mac_key = xsalsa20_xor(shared, &nonce, cleartext, &mut ct);
     let tag = poly1305(&mac_key, &ct);
@@ -236,7 +235,7 @@ pub fn open(sk: &DiscoPrivateKey, wrapper: &[u8]) -> Result<(DiscoPublicKey, Dis
 /// (endpoint.go:1397; 12 bytes like a stun TxID, Ping.TxID's own type).
 pub fn new_txid() -> [u8; 12] {
     let mut txid = [0u8; 12];
-    rand::rngs::OsRng.fill_bytes(&mut txid);
+    rand::fill(&mut txid);
     txid
 }
 

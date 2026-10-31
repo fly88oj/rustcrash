@@ -44,13 +44,33 @@ def mm_str(s: str) -> bytes:
     b = s.encode()
     return ctrl(2, len(b)) + b
 
+def mm_payload(t: int, v: int) -> bytes:
+    # mmdbwriter / MaxMind convention: the wire TYPE is fixed by the
+    # field's Go/Rust type, only the payload length is minimized.
+    n = max(1, (v.bit_length() + 7) // 8)
+    return ctrl(t, n) + v.to_bytes(n, "big")
+
+
 def mm_uint(v: int) -> bytes:
-    # uint16 when it fits (mihomo's own writer behavior), else uint64
+    # Data-section helper: uint16 when it fits (Value decode accepts any
+    # width), else uint64. Metadata must NOT use this — see mm_u32/mm_u64.
     if v < 1 << 16:
-        out = v.to_bytes(2, "big")
-        return ctrl(5, 2) + out
-    out = v.to_bytes(8, "big")
-    return ctrl(9, 8) + out
+        return ctrl(5, 2) + v.to_bytes(2, "big")
+    return ctrl(9, 8) + v.to_bytes(8, "big")
+
+
+def mm_u16(v: int) -> bytes:
+    return mm_payload(5, v)
+
+
+def mm_u32(v: int) -> bytes:
+    return mm_payload(6, v)
+
+
+def mm_u64(v: int) -> bytes:
+    # types >= 8 use the extended form: ctrl(0, size) + (type - 7) byte
+    n = max(1, (v.bit_length() + 7) // 8)
+    return ctrl(0, n) + bytes([9 - 7]) + v.to_bytes(n, "big")
 
 def mm_map(pairs) -> bytes:
     body = b"".join(mm_str(k) + v for k, v in pairs)
@@ -164,12 +184,15 @@ def build_mmdb(prefixes: list) -> bytes:
     assert len(tree) == node_count * 6
 
     metadata = mm_map([
-        ("node_count", mm_uint(node_count)),
-        ("record_size", mm_uint(24)),
-        ("ip_version", mm_uint(4)),
-        ("binary_format_major_version", mm_uint(2)),
-        ("binary_format_minor_version", mm_uint(0)),
-        ("build_epoch", mm_uint(1)),
+        # maxminddb-rust 0.27+ deserializes metadata with strict integer
+        # widths (deserialize_u32 requires wire type 6): node_count must
+        # be uint32 and build_epoch uint64, exactly like mmdbwriter.
+        ("node_count", mm_u32(node_count)),
+        ("record_size", mm_u16(24)),
+        ("ip_version", mm_u16(4)),
+        ("binary_format_major_version", mm_u16(2)),
+        ("binary_format_minor_version", mm_u16(0)),
+        ("build_epoch", mm_u64(1)),
         ("database_type", mm_str("GeoLite2-Country")),
         # empty array; types > 7 use the extended form: control byte with
         # type 0, then one byte carrying (real type - 7) — the rust

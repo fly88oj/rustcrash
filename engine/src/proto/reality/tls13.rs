@@ -36,7 +36,6 @@ use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 
 use hkdf::Hkdf;
-use rand::RngCore;
 use ring::signature;
 use sha2::{Digest, Sha256, Sha384};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -373,7 +372,7 @@ impl HashKind {
 
     /// HMAC of `data` under `key` (the Finished `verify_data`).
     fn hmac(self, key: &[u8], data: &[u8]) -> Vec<u8> {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         match self {
             HashKind::Sha256 => {
                 let mut mac =
@@ -392,7 +391,7 @@ impl HashKind {
 
     /// Constant-time check that `tag` is `HMAC(key, data)`.
     fn hmac_verify(self, key: &[u8], data: &[u8], tag: &[u8]) -> bool {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         match self {
             HashKind::Sha256 => {
                 let mut mac =
@@ -1000,7 +999,7 @@ pub(crate) fn x25519(secret: &[u8; 32], peer: &[u8]) -> Result<[u8; 32]> {
 /// Fresh X25519 keypair; the secret is clamped by `mul_base_clamped`.
 pub(crate) fn x25519_keygen() -> ([u8; 32], [u8; 32]) {
     let mut secret = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut secret);
+    rand::fill(&mut secret);
     let public = curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(secret).0;
     (secret, public)
 }
@@ -2114,7 +2113,7 @@ impl EchHelloSet {
 fn ech_fixed_or_rng(fixed: Option<[u8; 32]>) -> [u8; 32] {
     fixed.unwrap_or_else(|| {
         let mut v = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut v);
+        rand::fill(&mut v);
         v
     })
 }
@@ -3097,7 +3096,7 @@ pub(crate) mod test_server {
 
         let server_random: [u8; 32] = {
             let mut r = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut r);
+            rand::fill(&mut r);
             r
         };
         let (server_secret, server_public) = x25519_keygen();
@@ -3400,7 +3399,7 @@ pub(crate) mod test_server {
     ) -> Result<Tls13Stream> {
         let mut t = transport;
         let mut server_random = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut server_random);
+        rand::fill(&mut server_random);
         let (server_secret, server_public) = x25519_keygen();
         let shared = x25519(&server_secret, &hello.x25519_share)?;
 
@@ -3945,10 +3944,10 @@ mod tests {
 
         let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut random = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut random);
+        rand::fill(&mut random);
         let session_id: [u8; 32] = {
             let mut s = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut s);
+            rand::fill(&mut s);
             s
         };
         let (secret, public) = x25519_keygen();
@@ -4192,7 +4191,7 @@ mod tests {
         });
 
         let mut random = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut random);
+        rand::fill(&mut random);
         let session_id = [7u8; 32];
         let (secret, public) = x25519_keygen();
         let hello = build_client_hello(
@@ -4248,7 +4247,7 @@ mod tests {
         });
 
         let mut random = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut random);
+        rand::fill(&mut random);
         let session_id = [9u8; 32];
         let (secret, public) = x25519_keygen();
         let hello = build_client_hello(

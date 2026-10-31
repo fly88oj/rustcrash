@@ -154,7 +154,7 @@ fn validate_endpoint(url: &str) -> Result<()> {
 /// geo/rules downloads).
 pub(crate) fn shared_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
+    CLIENT.get_or_init(|| crate::http::tls_builder().build().expect("shared http client"))
 }
 
 /// Fan-out notification sender.

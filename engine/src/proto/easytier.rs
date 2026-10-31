@@ -278,7 +278,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use aes_gcm::aead::{Aead as _, AeadInPlace, KeyInit};
+use aes_gcm::aead::{Aead as _, AeadInOut, KeyInit};
 use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce};
 use base64::Engine as _;
 use chacha20poly1305::ChaCha20Poly1305;
@@ -2962,7 +2962,7 @@ pub async fn connect_ws_tunnel(endpoint: &PeerEndpoint) -> Result<WsPeerStream> 
     // peer URI carries no path, so `GET /`).
     use base64::Engine as _;
     let mut key_bytes = [0u8; 16];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key_bytes);
+    rand::fill(&mut key_bytes);
     let key = base64::engine::general_purpose::STANDARD.encode(key_bytes);
     let host_header = format!("{}:{}", endpoint.host, endpoint.port);
     let req = format!(
@@ -3083,7 +3083,7 @@ fn ws_self_signed_pair() -> Result<(
 
     // Random CN, positive minimal serial.
     let mut cn_bytes = [0u8; 8];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut cn_bytes);
+    rand::fill(&mut cn_bytes);
     let cn: String = cn_bytes.iter().map(|b| format!("{b:02x}")).collect();
     let mut cn_body = Vec::new();
     ws_der_put(&mut cn_body, 0x0c, cn.as_bytes()); // UTF8String
@@ -3092,7 +3092,7 @@ fn ws_self_signed_pair() -> Result<(
     let mut name = Vec::new();
     ws_der_put(&mut name, 0x30, &rdn);
     let mut serial_bytes = [0u8; 16];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut serial_bytes);
+    rand::fill(&mut serial_bytes);
     let mut serial: Vec<u8> = serial_bytes.to_vec();
     while serial.first() == Some(&0) {
         serial.remove(0);
@@ -4421,11 +4421,11 @@ pub const AEAD_TAIL_SIZE: usize = 28;
 #[allow(clippy::ptr_arg)]
 impl PacketEncryptor {
     fn aead_seal_detached(&self, nonce: &[u8; 12], payload: &mut Vec<u8>) -> Result<[u8; 16]> {
-        let nonce = Nonce::from_slice(nonce);
+        let nonce = &Nonce::from(*nonce);
         let tag = match &self.cipher {
-            Cipher::Aes128Gcm(cipher) => cipher.encrypt_in_place_detached(nonce, b"", payload),
-            Cipher::Aes256Gcm(cipher) => cipher.encrypt_in_place_detached(nonce, b"", payload),
-            Cipher::ChaCha20(cipher) => cipher.encrypt_in_place_detached(nonce, b"", payload),
+            Cipher::Aes128Gcm(cipher) => cipher.encrypt_inout_detached(nonce, b"", payload.as_mut_slice().into()),
+            Cipher::Aes256Gcm(cipher) => cipher.encrypt_inout_detached(nonce, b"", payload.as_mut_slice().into()),
+            Cipher::ChaCha20(cipher) => cipher.encrypt_inout_detached(nonce, b"", payload.as_mut_slice().into()),
             Cipher::Null | Cipher::Xor(_) => {
                 return Err(Error::crypto("easytier: cipher is not an AEAD"))
             }
@@ -4442,16 +4442,16 @@ impl PacketEncryptor {
         text_and_tag: &mut [u8],
         tag: &[u8; 16],
     ) -> Result<()> {
-        let nonce = Nonce::from_slice(nonce);
+        let nonce = &Nonce::from(*nonce);
         let result = match &self.cipher {
             Cipher::Aes128Gcm(cipher) => {
-                cipher.decrypt_in_place_detached(nonce, b"", text_and_tag, tag.as_ref().into())
+                cipher.decrypt_inout_detached(nonce, b"", (&mut text_and_tag[..]).into(), tag.into())
             }
             Cipher::Aes256Gcm(cipher) => {
-                cipher.decrypt_in_place_detached(nonce, b"", text_and_tag, tag.as_ref().into())
+                cipher.decrypt_inout_detached(nonce, b"", (&mut text_and_tag[..]).into(), tag.into())
             }
             Cipher::ChaCha20(cipher) => {
-                cipher.decrypt_in_place_detached(nonce, b"", text_and_tag, tag.as_ref().into())
+                cipher.decrypt_inout_detached(nonce, b"", (&mut text_and_tag[..]).into(), tag.into())
             }
             Cipher::Null | Cipher::Xor(_) => {
                 return Err(Error::crypto("easytier: cipher is not an AEAD"))
@@ -4493,7 +4493,7 @@ impl PacketEncryptor {
     /// `encrypt` (encrypt/ring.rs:110-113): random nonce from the OS.
     pub fn encrypt_packet(&self, hdr: &mut PeerManagerHeader, payload: &mut Vec<u8>) -> Result<()> {
         let mut nonce = [0u8; 12];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+        rand::fill(&mut nonce);
         self.encrypt_packet_with_nonce(hdr, payload, &nonce)
     }
 
@@ -4667,7 +4667,7 @@ impl SecureStaticKeys {
 
     fn random() -> Self {
         let mut sk = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut sk);
+        rand::fill(&mut sk);
         Self::from_secret(sk)
     }
 }
@@ -4689,7 +4689,7 @@ fn secure_x25519_dh(sk: &[u8; 32], peer: &[u8; 32]) -> Result<[u8; 32]> {
 type SecureHmac = hmac::Hmac<sha2::Sha256>;
 
 fn hmac_sha256(key: &[u8], msg_parts: &[&[u8]]) -> [u8; 32] {
-    let mut mac = <SecureHmac as hmac::Mac>::new_from_slice(key).expect("hmac accepts any key");
+    let mut mac = <SecureHmac as hmac::KeyInit>::new_from_slice(key).expect("hmac accepts any key");
     for part in msg_parts {
         mac.update(part);
     }
@@ -5483,7 +5483,7 @@ impl SecureDatagramSession {
     /// `new_root_key` (secure_datagram.rs:308-312): 32 random bytes.
     pub fn new_root_key() -> [u8; 32] {
         let mut out = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut out);
+        rand::fill(&mut out);
         out
     }
 
@@ -7905,7 +7905,7 @@ impl PingIntervalController {
         // `use this makes two peers not pingpong at the same time`
         // (peer_conn_ping.rs:120-122).
         if self.backoff_idx > self.max_backoff_idx - 2
-            && rand::Rng::gen_bool(&mut rand::thread_rng(), 0.2)
+            && rand::RngExt::random_bool(&mut rand::rng(), 0.2)
         {
             self.backoff_idx -= 1;
         }

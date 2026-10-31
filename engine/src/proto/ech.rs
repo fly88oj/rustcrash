@@ -637,8 +637,7 @@ impl HpkeSender {
     /// `pk.encap()` drawing from `rand.Reader`).
     pub fn setup(pk_r: &[u8; 32], aead: HpkeAead, info: &[u8]) -> Result<([u8; 32], HpkeSender)> {
         let mut sk_e = [0u8; 32];
-        use rand::RngCore;
-        rand::rngs::OsRng.fill_bytes(&mut sk_e);
+        rand::fill(&mut sk_e);
         Self::setup_with(pk_r, aead, info, &sk_e)
     }
 

@@ -69,8 +69,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{ChaCha20Poly1305, XChaCha20Poly1305, XNonce};
-use rand::RngCore;
+use chacha20poly1305::{ChaCha20Poly1305, XChaCha20Poly1305};
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::{tcp, udp};
@@ -453,7 +452,7 @@ impl StaticKeys {
 
 fn x25519_keypair() -> StaticKeys {
     let mut sk = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut sk);
+    rand::fill(&mut sk);
     StaticKeys::from_secret(sk)
 }
 
@@ -844,7 +843,7 @@ fn consume_cookie_reply(
         .map_err(|_| Error::crypto("wg: bad cookie key"))?;
     let plain = cipher
         .decrypt(
-            XNonce::from_slice(nonce),
+            nonce.into(),
             Payload {
                 msg: enc_cookie,
                 aad: &pending.last_mac1,
@@ -2377,11 +2376,11 @@ fn build_cookie_reply(
     cookie: [u8; 16],
 ) -> Result<Vec<u8>> {
     let mut nonce = [0u8; 24];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    rand::fill(&mut nonce);
     let enc = XChaCha20Poly1305::new_from_slice(&cookie_key(server_static_pk))
         .map_err(|_| Error::crypto("endpoint: bad cookie key"))?
         .encrypt(
-            XNonce::from_slice(&nonce),
+            (&nonce).into(),
             Payload {
                 msg: &cookie,
                 aad: initiation_mac1,
@@ -2563,7 +2562,7 @@ impl Endpoint {
             });
         }
         let mut secret = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut secret);
+        rand::fill(&mut secret);
         Ok(Endpoint {
             statics,
             peers,
@@ -2590,7 +2589,7 @@ impl Endpoint {
     fn cookie_for(&mut self, now: Instant) -> [u8; 16] {
         if now.duration_since(self.cookie.1) >= EP_COOKIE_REFRESH {
             let mut secret = [0u8; 16];
-            rand::rngs::OsRng.fill_bytes(&mut secret);
+            rand::fill(&mut secret);
             self.cookie = (secret, now);
         }
         self.cookie.0
@@ -3926,7 +3925,7 @@ mod tests {
         let statics = x25519_keypair();
         let peer_keys = x25519_keypair();
         let mut psk = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut psk);
+        rand::fill(&mut psk);
         (statics, peer_keys.pk, psk)
     }
 
@@ -4035,11 +4034,11 @@ mod tests {
         // initiation's mac1 (exactly the whitepaper's cookie packet).
         let cookie = blake2s_mac(&blake2s256(b"server secret"), b"1.2.3.4:5678");
         let mut nonce = [0u8; 24];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        rand::fill(&mut nonce);
         let enc = XChaCha20Poly1305::new_from_slice(&cookie_key(&server.pk))
             .unwrap()
             .encrypt(
-                XNonce::from_slice(&nonce),
+                (&nonce).into(),
                 Payload {
                     msg: &cookie,
                     aad: &pending.last_mac1,
@@ -4373,7 +4372,7 @@ mod tests {
     async fn spawn_wg_echo_server(expected_reserved: Option<[u8; 3]>) -> LoopbackServer {
         let statics = x25519_keypair();
         let mut psk = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut psk);
+        rand::fill(&mut psk);
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let endpoint = socket.local_addr().unwrap();
         let socket = Arc::new(socket);
@@ -5296,7 +5295,7 @@ mod tests {
         let server_statics = x25519_keypair();
         let client_keys = x25519_keypair();
         let mut psk = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut psk);
+        rand::fill(&mut psk);
         let cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
         let (addr, task) = spawn_test_endpoint(&cfg).await;
 
@@ -5327,7 +5326,7 @@ mod tests {
         let server_statics = x25519_keypair();
         let client_keys = x25519_keypair();
         let mut psk = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut psk);
+        rand::fill(&mut psk);
         let cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
         let (addr, task) = spawn_test_endpoint(&cfg).await;
 
@@ -5377,7 +5376,7 @@ mod tests {
         let server_statics = x25519_keypair();
         let client_keys = x25519_keypair();
         let mut psk = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut psk);
+        rand::fill(&mut psk);
         let cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
         let (addr, task) = spawn_test_endpoint(&cfg).await;
 
@@ -5438,7 +5437,7 @@ mod tests {
         let server_statics = x25519_keypair();
         let client_keys = x25519_keypair();
         let mut psk = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut psk);
+        rand::fill(&mut psk);
         let cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
         let relay = Arc::new(DropAfterFirstRead);
         let (addr, task) = spawn_endpoint(&cfg, relay).await.expect("endpoint starts");
@@ -5526,7 +5525,7 @@ mod tests {
         let server_statics = x25519_keypair();
         let client_keys = x25519_keypair();
         let mut psk = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut psk);
+        rand::fill(&mut psk);
         let cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
         let (addr, task) = spawn_test_endpoint(&cfg).await;
 
@@ -5558,7 +5557,7 @@ mod tests {
         let server_statics = x25519_keypair();
         let client_keys = x25519_keypair();
         let mut psk = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut psk);
+        rand::fill(&mut psk);
         let cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
         let (addr, task) = spawn_test_endpoint(&cfg).await;
 
@@ -5581,7 +5580,7 @@ mod tests {
         let server_statics = x25519_keypair();
         let client_keys = x25519_keypair();
         let mut psk = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut psk);
+        rand::fill(&mut psk);
         let cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
         let (addr, task) = spawn_test_endpoint(&cfg).await;
         let ep = v4_ep(addr);
@@ -5624,7 +5623,7 @@ mod tests {
         let server_statics = x25519_keypair();
         let client_keys = x25519_keypair();
         let mut psk = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut psk);
+        rand::fill(&mut psk);
         let cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
         let (addr, task) = spawn_test_endpoint(&cfg).await;
         let ep = v4_ep(addr);
@@ -5649,7 +5648,7 @@ mod tests {
         let server_statics = x25519_keypair();
         let client_keys = x25519_keypair();
         let mut psk = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut psk);
+        rand::fill(&mut psk);
         let cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
         let (addr, task) = spawn_test_endpoint(&cfg).await;
         let ep = v4_ep(addr);
@@ -5685,7 +5684,7 @@ mod tests {
         let server_statics = x25519_keypair();
         let client_keys = x25519_keypair();
         let mut psk = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut psk);
+        rand::fill(&mut psk);
         let cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
         let (addr, task) = spawn_test_endpoint(&cfg).await;
         let ep = v4_ep(addr);
@@ -5711,7 +5710,7 @@ mod tests {
         let server_statics = x25519_keypair();
         let client_keys = x25519_keypair();
         let mut psk = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut psk);
+        rand::fill(&mut psk);
         let cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
         let (addr, task) = spawn_test_endpoint(&cfg).await;
         let ep = v4_ep(addr);
@@ -5753,7 +5752,7 @@ mod tests {
         let server_statics = x25519_keypair();
         let client_keys = x25519_keypair();
         let mut psk = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut psk);
+        rand::fill(&mut psk);
         let cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
         let (addr, task) = spawn_test_endpoint(&cfg).await;
         let ep = v4_ep(addr);
@@ -5781,7 +5780,7 @@ mod tests {
         let server_statics = x25519_keypair();
         let client_keys = x25519_keypair();
         let mut psk = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut psk);
+        rand::fill(&mut psk);
         let cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
         let (addr, task) = spawn_test_endpoint(&cfg).await;
         let ep = v4_ep(addr);
@@ -5824,7 +5823,7 @@ mod tests {
         let server_statics = x25519_keypair();
         let client_keys = x25519_keypair();
         let mut psk = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut psk);
+        rand::fill(&mut psk);
         let mut cfg = endpoint_cfg(&server_statics, client_keys.pk, psk);
         cfg.peers[0].persistent_keepalive = Some(1);
         let (addr, task) = spawn_test_endpoint(&cfg).await;

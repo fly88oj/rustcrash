@@ -145,7 +145,7 @@ impl HttpTgApi {
     pub fn new(base: &str, token: &str) -> Result<Self> {
         validate_token(token)?;
         Ok(HttpTgApi {
-            client: reqwest::Client::builder()
+            client: crate::http::tls_builder()
                 .build()
                 .map_err(|e| Error::Download(format!("http client init failed: {e}")))?,
             base: base.trim_end_matches('/').to_string(),

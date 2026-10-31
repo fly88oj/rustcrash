@@ -40,7 +40,7 @@ use std::task::{ready, Context, Poll};
 
 use base64::Engine;
 use bytes::{Buf, BytesMut};
-use rand::{Rng, RngCore};
+use rand::RngExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::error::{Error, Result};
@@ -126,17 +126,17 @@ impl ObfsSettings {
 /// paths — the shapes upstream uses in the request line.
 fn random_request_uri() -> String {
     const ALNUM: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let mut rng = rand::rngs::OsRng;
-    if rng.gen_ratio(1, 2) {
-        let len = rng.gen_range(4..=8);
+    let mut rng = rand::rng();
+    if rng.random_ratio(1, 2) {
+        let len = rng.random_range(4..=8);
         let mut uri = String::with_capacity(1 + len);
         uri.push('/');
         for _ in 0..len {
-            uri.push(ALNUM[rng.gen_range(0..ALNUM.len())] as char);
+            uri.push(ALNUM[rng.random_range(0..ALNUM.len())] as char);
         }
         uri
     } else {
-        REQUEST_PATHS[rng.gen_range(0..REQUEST_PATHS.len())].to_string()
+        REQUEST_PATHS[rng.random_range(0..REQUEST_PATHS.len())].to_string()
     }
 }
 
@@ -150,11 +150,11 @@ fn random_request_uri() -> String {
 /// canonical spelling) and `Upgrade`. The first payload write is the body.
 fn http_request_head(settings: &ObfsSettings, body_len: usize) -> String {
     let mut key = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut key);
+    rand::fill(&mut key);
     let key = base64::engine::general_purpose::URL_SAFE.encode(key);
     let (major, minor) = {
-        let mut rng = rand::rngs::OsRng;
-        (rng.gen_range(0..54), rng.gen_range(0..2))
+        let mut rng = rand::rng();
+        (rng.random_range(0..54), rng.random_range(0..2))
     };
     format!(
         "GET {uri} HTTP/1.1\r\n\
@@ -383,8 +383,8 @@ fn client_hello(data: &[u8], host: &str) -> Vec<u8> {
 
     let mut random = [0u8; 28];
     let mut session_id = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut random);
-    rand::rngs::OsRng.fill_bytes(&mut session_id);
+    rand::fill(&mut random);
+    rand::fill(&mut session_id);
 
     let data_len = data.len() as u16;
     let host_len = host.len() as u16;

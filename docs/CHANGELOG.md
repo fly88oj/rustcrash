@@ -6,6 +6,59 @@ All notable changes to RustCrash. Format based on
 
 ## [Unreleased]
 
+### Dependencies — 2026-10 refresh (every direct dep at latest)
+
+- **serde_yaml → yaml_serde 0.10** (package rename, zero code churn):
+  dtolnay's serde_yaml is archived; yaml_serde is the official YAML-org
+  continuation (maintained by Ingy döt Net et al.) with the identical
+  0.9 API and a maintained libyaml-rs backend — dodging the
+  RUSTSEC-2024-0449 advisory that shadows every fork still on
+  unsafe-libyaml. clash-rs made the same move.
+- **reqwest 0.13** with `rustls-no-provider`: reqwest's `rustls`
+  feature now pins aws-lc-rs (cmake-dependent, breaks our musl cross
+  builds), so core installs the ring provider itself
+  (`core::http::ensure_ring_provider`, also called from `crash`
+  startup — reqwest 0.13 refuses to build ANY client, even plain-HTTP,
+  without a process-default provider) and preconfigures a rustls
+  `ClientConfig` with the bundled Mozilla roots — verification matches
+  0.12's `rustls-tls` exactly (bare containers without a system trust
+  store keep working).
+- **RustCrypto 0.11 wave** (lockstep: sha1/sha2/md-5 0.11 + hmac/hkdf
+  0.13 share digest 0.11; aes-gcm/chacha20poly1305 0.11 on aead 0.6;
+  aes 0.9 on cipher 0.5): `Nonce::from_slice` → `from`/`try_from`
+  (hybrid-array), `BlockEncrypt/Decrypt` → `BlockCipherEncrypt/Decrypt`,
+  hmac `new_from_slice` moved to `KeyInit`, GenericArray → Array (no
+  LowerHex — hand-rolled hex helper in anytls). aes-gcm 0.11 also
+  enforces the GCM P_MAX/A_MAX bounds (security-relevant fix).
+- **rand 0.10**: `SysRng` is fallible (`TryRng` only) — the old
+  panic-on-failure `OsRng.fill_bytes` semantics now go through the
+  top-level `rand::fill`/`rand::random_range`/`rand::random`; extension
+  trait renamed `RngExt`; `rand::random::<usize>()` no longer exists
+  (u64 + cast).
+- **maxminddb 0.32**: lazy `LookupResult` decoding (`lookup()` then
+  `.decode::<T>()`); the 0.24 `Err(AddressNotFound)` vs 0.26+
+  `Ok(None)` split is normalized in `rule.rs`. 0.27+ deserializes
+  metadata with strict integer widths (node_count must be wire-type
+  uint32, build_epoch uint64) — verified all real-world producers
+  (MaxMind official files, mmdbwriter: MetaCubeX/geo's GeoIP.metadb,
+  Loyalsoldier) already emit exactly that; the hand-rolled matrix
+  fixture generator was the nonconforming one and now follows the
+  mmdbwriter convention (fixed type, minimized payload, proper
+  extended-type encoding).
+- **russh 0.64** (drops the legacy-ed25519-pkcs8 parser; brings the
+  GHSA-j7h2-66j4-ghjf signature-algorithm check and the GHSA-4wc5-
+  f2rc-q74m agent allocation bound), **rustls 0.23.46** /
+  **tokio-rustls 0.26.6** / ring 0.17.14, **thiserror 2**, **base64
+  0.23**, **socket2 0.6**, **crossterm 0.29**, **dirs 7**,
+  **webpki-roots 1.0**, **rustls-native-certs 0.8** (hard-fails on
+  partial store errors, same as before), **rcgen 0.14**
+  (`CertifiedKey::signing_key`, `CertifiedIssuer` for CA chains),
+  quinn-proto relaxed to the 0.11 line, plus the semver-compatible
+  refresh (tokio 1.53, clap 4.6, ratatui 0.30.2, ruzstd 0.9.1 …).
+- `nix` removed — declared in the workspace but never imported by any
+  crate. `portable-pty` stays 0.8 on purpose: ratatui-testlib 0.1
+  hard-depends on it and consumes its `CommandBuilder` type directly.
+
 ### Engine — upstream drift sync 2026-09-23 → 2026-10-08
 
 Ported from mihomo Alpha `e4dd968` and sing-box testing `fe92ab3`

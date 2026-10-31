@@ -880,12 +880,12 @@ eth1\t0002A8C0\t00000000\t\t0001\t\t0\t0\t0\t00FFFFFF\n";
         let ca_key = rcgen::KeyPair::generate().expect("ca key");
         let mut ca_params = rcgen::CertificateParams::new(Vec::new()).expect("ca params");
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let ca = ca_params.self_signed(&ca_key).expect("ca cert");
+        let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).expect("ca cert");
         let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
         let leaf_params =
             rcgen::CertificateParams::new(vec![san.to_string()]).expect("leaf params");
         let leaf = leaf_params
-            .signed_by(&leaf_key, &ca, &ca_key)
+            .signed_by(&leaf_key, &ca)
             .expect("leaf cert");
         TestPki {
             ca_pem: ca.pem().to_string(),

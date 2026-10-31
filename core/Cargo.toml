@@ -20,7 +20,6 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-nix = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -34,7 +33,12 @@ libc = { workspace = true }
 sha2 = { workspace = true }
 tempfile = "3"
 tar = "0.4"
-dirs = "5"
+dirs = "7"
+# reqwest 0.13 runs rustls without a bundled provider; core installs the
+# ring one itself (aws-lc-rs, reqwest's new default, needs cmake for the
+# musl cross targets) and pins the bundled webpki roots like 0.12 did.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
 
 [dev-dependencies]
 wiremock = "0.6"

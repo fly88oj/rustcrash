@@ -65,10 +65,15 @@ use std::time::{Duration, Instant};
 
 use bytes::{Buf, BytesMut};
 use md5::Md5;
-use rand::Rng;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{mpsc, oneshot, watch};
+
+/// Lowercase hex of a byte slice (replaces GenericArray's LowerHex, which
+/// hybrid-array does not implement).
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
 use tracing::{debug, error, warn};
 
 use crate::addr::{encode_socks_addr, Host, NetAddr};
@@ -165,7 +170,7 @@ impl PaddingFactory {
         Some(PaddingFactory {
             raw: raw.to_vec(),
             stop: stop?,
-            md5: format!("{:x}", Md5::digest(raw)),
+            md5: hex(&Md5::digest(raw)),
         })
     }
 
@@ -205,7 +210,7 @@ impl PaddingFactory {
                 } else {
                     // Go: rand.Int(reader, max-min) + min — half-open range.
                     let span = (max - min) as u64;
-                    let v = rand::rngs::OsRng.gen_range(0..span) + min as u64;
+                    let v = rand::random_range(0..span) + min as u64;
                     sizes.push(v as isize);
                 }
             }
@@ -2304,7 +2309,7 @@ mod tests {
         }
         assert!(p.generate(8).is_empty());
         // The md5 matches an independent hex digest of the raw scheme.
-        assert_eq!(p.md5, format!("{:x}", Md5::digest(DEFAULT_PADDING_SCHEME)));
+        assert_eq!(p.md5, hex(&Md5::digest(DEFAULT_PADDING_SCHEME)));
     }
 
     #[test]
@@ -2369,7 +2374,7 @@ mod tests {
         let certified = rcgen::generate_simple_self_signed(vec!["anytls.test".to_string()])
             .expect("rcgen self-signed cert");
         let cert = CertificateDer::from(certified.cert.der().to_vec());
-        let key = PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let key = PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into());
         let provider = Arc::new(ring_provider::default_provider());
         Arc::new(
             rustls::ServerConfig::builder_with_provider(provider)
@@ -2442,7 +2447,7 @@ mod tests {
             .expect("padding-md5 entry");
 
         if let Some(scheme) = opts.push_scheme {
-            let scheme_md5 = format!("{:x}", Md5::digest(scheme));
+            let scheme_md5 = hex(&Md5::digest(scheme));
             if scheme_md5 != client_md5 {
                 let mut frame = Vec::new();
                 frame_into(&mut frame, CMD_UPDATE_PADDING, 0, scheme);
@@ -2643,7 +2648,7 @@ mod tests {
         read_timeout(&mut stream, &mut buf).await.unwrap();
         assert_eq!(&buf, b"hello");
         // The client adopted the server's scheme (session.go:315-329).
-        assert_eq!(stream.padding_md5(), format!("{:x}", Md5::digest(scheme)));
+        assert_eq!(stream.padding_md5(), hex(&Md5::digest(scheme)));
     }
 
     #[tokio::test]
@@ -3139,7 +3144,7 @@ mod tests {
         assert_eq!(&buf, b"hello");
         assert_eq!(
             stream.padding_md5(),
-            format!("{:x}", Md5::digest(scheme)),
+            hex(&Md5::digest(scheme)),
             "the client adopted the server's scheme"
         );
     }

@@ -89,7 +89,6 @@ use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
 use hkdf::Hkdf;
-use rand::{Rng, RngCore};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{ring as ring_provider, CryptoProvider};
 use rustls::{
@@ -134,7 +133,7 @@ impl TimeSpec {
     fn duration(&self) -> Duration {
         let mut delay = self.base_nanoseconds;
         if self.uniform_random_multiplier_nanoseconds > 0 {
-            delay += rand::rngs::OsRng.gen_range(0..self.uniform_random_multiplier_nanoseconds);
+            delay += rand::random_range(0..self.uniform_random_multiplier_nanoseconds);
         }
         Duration::from_nanos(delay)
     }
@@ -239,7 +238,7 @@ fn decode_primary_key(value: &str) -> Result<[u8; 32]> {
 pub fn generate_primary_key() -> String {
     use base64::Engine;
     let mut key = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut key);
+    rand::fill(&mut key);
     base64::engine::general_purpose::STANDARD.encode(key)
 }
 
@@ -1083,7 +1082,7 @@ fn choose_next_traffic_step(step: &TrafficStep, current: usize) -> Result<(usize
         )));
     }
     let selected = if total > 0 {
-        rand::rngs::OsRng.gen_range(0..total as u32) as i32
+        rand::random_range(0..total as u32) as i32
     } else {
         0
     };
@@ -2847,7 +2846,7 @@ mod tests {
         let nonce = [9u8; 12];
         let mut stream = ChaCha20Stream::new(&key, &nonce);
         let mut data = vec![0u8; 200];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut data);
+        rand::fill(&mut data);
         let original = data.clone();
         stream.xor(&mut data);
         assert_ne!(data, original);
@@ -3038,7 +3037,7 @@ mod tests {
             .expect("rcgen self-signed cert");
         let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
         let key =
-            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into());
         let provider = Arc::new(ring_provider::default_provider());
         let versions: &[&'static rustls::SupportedProtocolVersion] = if tls12_only {
             &[&rustls::version::TLS12]
@@ -3504,7 +3503,7 @@ mod tests {
             .expect("rcgen self-signed cert");
         let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
         let key =
-            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into());
         let provider = Arc::new(ring_provider::default_provider());
         let mut config = rustls::ServerConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13])

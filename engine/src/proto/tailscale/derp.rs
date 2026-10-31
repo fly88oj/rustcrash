@@ -20,7 +20,6 @@
 //! C-NaCl cross-checked `TestBox` vector from
 //! `golang.org/x/crypto/nacl/box/box_test.go`.
 
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -369,7 +368,7 @@ pub(crate) fn box_seal(
     plaintext: &[u8],
 ) -> Result<Vec<u8>> {
     let mut nonce = [0u8; 24];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    rand::fill(&mut nonce);
     let shared = box_shared(my_secret, peer_public)?;
     let mut ct = vec![0u8; plaintext.len()];
     let mac_key = xsalsa20_xor(&shared, &nonce, plaintext, &mut ct);
@@ -429,7 +428,7 @@ impl NodePrivateKey {
     /// `key.NewNode()` — fresh random key.
     pub fn generate() -> Self {
         let mut sk = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut sk);
+        rand::fill(&mut sk);
         NodePrivateKey(sk)
     }
 

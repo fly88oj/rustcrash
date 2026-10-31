@@ -96,13 +96,12 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
+use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use aes::{Aes128, Aes192, Aes256};
 use base64::Engine as _;
 use chacha20poly1305::aead::{Aead, Payload};
 use hmac::{Hmac, Mac};
 use md5::Md5;
-use rand::RngCore;
 use sha1::Sha1;
 use sha2::{Sha256, Sha384, Sha512};
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
@@ -821,7 +820,7 @@ impl AuthDigest {
         // Monomorphic per digest: the tree carries two crypto-common
         // versions, so a generic `Hmac<M>: Mac` bound is ambiguous.
         let md5 = |key: &[u8], parts: &[&[u8]]| {
-            let mut mac = <Hmac<Md5> as Mac>::new_from_slice(key).expect("hmac key");
+            let mut mac = <Hmac<Md5> as KeyInit>::new_from_slice(key).expect("hmac key");
             for p in parts {
                 mac.update(p);
             }
@@ -830,28 +829,28 @@ impl AuthDigest {
         match self {
             AuthDigest::Md5 => md5(key, parts),
             AuthDigest::Sha1 => {
-                let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(key).expect("hmac key");
+                let mut mac = <Hmac<Sha1> as KeyInit>::new_from_slice(key).expect("hmac key");
                 for p in parts {
                     mac.update(p);
                 }
                 mac.finalize().into_bytes().to_vec()
             }
             AuthDigest::Sha256 => {
-                let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("hmac key");
+                let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("hmac key");
                 for p in parts {
                     mac.update(p);
                 }
                 mac.finalize().into_bytes().to_vec()
             }
             AuthDigest::Sha384 => {
-                let mut mac = <Hmac<Sha384> as Mac>::new_from_slice(key).expect("hmac key");
+                let mut mac = <Hmac<Sha384> as KeyInit>::new_from_slice(key).expect("hmac key");
                 for p in parts {
                     mac.update(p);
                 }
                 mac.finalize().into_bytes().to_vec()
             }
             AuthDigest::Sha512 => {
-                let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(key).expect("hmac key");
+                let mut mac = <Hmac<Sha512> as KeyInit>::new_from_slice(key).expect("hmac key");
                 for p in parts {
                     mac.update(p);
                 }
@@ -1094,10 +1093,10 @@ fn tls_crypt_unwrap(keys: &TlsCryptKeys, packet: &[u8]) -> Result<(Vec<u8>, u32,
 /// expose; built on the `aes` crate block cipher.
 fn aes256_ctr(key: &[u8; 32], iv: &[u8; 16], data: &mut [u8]) {
     let cipher = Aes256::new(key.into());
-    use aes::cipher::generic_array::GenericArray;
+    use aes::cipher::Array;
     let mut counter = *iv;
     for chunk in data.chunks_mut(16) {
-        let mut keystream = GenericArray::from(counter);
+        let mut keystream = Array::from(counter);
         cipher.encrypt_block(&mut keystream);
         for (b, k) in chunk.iter_mut().zip(keystream.iter()) {
             *b ^= k;
@@ -1156,9 +1155,9 @@ fn client_km2_record(
         random1: [0; KEY_SOURCE_RANDOM_SIZE],
         random2: [0; KEY_SOURCE_RANDOM_SIZE],
     };
-    rand::rngs::OsRng.fill_bytes(&mut client.pre_master);
-    rand::rngs::OsRng.fill_bytes(&mut client.random1);
-    rand::rngs::OsRng.fill_bytes(&mut client.random2);
+    rand::fill(&mut client.pre_master);
+    rand::fill(&mut client.random1);
+    rand::fill(&mut client.random2);
 
     let mut out = Vec::with_capacity(5 + 48 + 64 + options.len() + 16);
     out.extend_from_slice(&0u32.to_be_bytes());
@@ -1390,7 +1389,7 @@ fn openvpn_prf(
 
 /// pHash (keymethod.go:368-379): the TLS A(n) expansion, HMAC-MD5 half.
 fn p_hash_md5(secret: &[u8], seed: &[u8], size: usize) -> Vec<u8> {
-    let new = || <Hmac<Md5> as Mac>::new_from_slice(secret).expect("hmac key");
+    let new = || <Hmac<Md5> as KeyInit>::new_from_slice(secret).expect("hmac key");
     let mut mac = new();
     mac.update(seed);
     let mut a = mac.finalize().into_bytes().to_vec();
@@ -1410,7 +1409,7 @@ fn p_hash_md5(secret: &[u8], seed: &[u8], size: usize) -> Vec<u8> {
 
 /// pHash, HMAC-SHA1 half.
 fn p_hash_sha1(secret: &[u8], seed: &[u8], size: usize) -> Vec<u8> {
-    let new = || <Hmac<Sha1> as Mac>::new_from_slice(secret).expect("hmac key");
+    let new = || <Hmac<Sha1> as KeyInit>::new_from_slice(secret).expect("hmac key");
     let mut mac = new();
     mac.update(seed);
     let mut a = mac.finalize().into_bytes().to_vec();
@@ -1499,7 +1498,7 @@ const OPENVPN_PING_PACKET: [u8; 16] = [
 ];
 
 type AesBlock16 =
-    aes::cipher::generic_array::GenericArray<u8, aes::cipher::generic_array::typenum::U16>;
+    aes::cipher::Array<u8, aes::cipher::typenum::U16>;
 
 enum AesBlock {
     A128(Aes128),
@@ -1510,9 +1509,9 @@ enum AesBlock {
 impl AesBlock {
     fn new(key: &[u8]) -> Result<Self> {
         match key.len() {
-            16 => Ok(AesBlock::A128(Aes128::new(key.into()))),
-            24 => Ok(AesBlock::A192(Aes192::new(key.into()))),
-            32 => Ok(AesBlock::A256(Aes256::new(key.into()))),
+            16 => Ok(AesBlock::A128(Aes128::new(key.try_into().expect("16-byte key")))),
+            24 => Ok(AesBlock::A192(Aes192::new(key.try_into().expect("24-byte key")))),
+            32 => Ok(AesBlock::A256(Aes256::new(key.try_into().expect("32-byte key")))),
             n => Err(Error::crypto(format!("invalid AES key length {n}"))),
         }
     }
@@ -1536,7 +1535,7 @@ impl AesBlock {
 
 enum DataAead {
     A128(aes_gcm::Aes128Gcm),
-    A192(aes_gcm::AesGcm<Aes192, aes::cipher::generic_array::typenum::U12>),
+    A192(aes_gcm::AesGcm<Aes192, aes::cipher::typenum::U12>),
     A256(aes_gcm::Aes256Gcm),
     Chacha(chacha20poly1305::ChaCha20Poly1305),
 }
@@ -1603,14 +1602,14 @@ impl DataChannel {
         let digest = AuthDigest::parse(auth_name)?;
         let mk_aead = |key: &[u8]| -> Result<DataAead> {
             match cipher_name {
-                CIPHER_AES128GCM => Ok(DataAead::A128(aes_gcm::Aes128Gcm::new(key.into()))),
+                CIPHER_AES128GCM => Ok(DataAead::A128(aes_gcm::Aes128Gcm::new(key.try_into().expect("16-byte key")))),
                 CIPHER_AES192GCM => Ok(DataAead::A192(<aes_gcm::AesGcm<
                     Aes192,
-                    aes::cipher::generic_array::typenum::U12,
-                >>::new(key.into()))),
-                CIPHER_AES256GCM => Ok(DataAead::A256(aes_gcm::Aes256Gcm::new(key.into()))),
+                    aes::cipher::typenum::U12,
+                >>::new(key.try_into().expect("24-byte key")))),
+                CIPHER_AES256GCM => Ok(DataAead::A256(aes_gcm::Aes256Gcm::new(key.try_into().expect("32-byte key")))),
                 CIPHER_CHACHA20POLY1305 => Ok(DataAead::Chacha(
-                    chacha20poly1305::ChaCha20Poly1305::new(key.into()),
+                    chacha20poly1305::ChaCha20Poly1305::new(key.try_into().expect("32-byte key")),
                 )),
                 other => Err(Error::protocol(format!(
                     "unsupported openvpn cipher {other:?}"
@@ -1714,7 +1713,7 @@ impl DataChannel {
                 out[..self.header.len()].copy_from_slice(&self.header);
                 let authenticated = &mut out[self.header.len() + mac.size()..];
                 let (iv, ciphertext) = authenticated.split_at_mut(block_size);
-                rand::rngs::OsRng.fill_bytes(iv);
+                rand::fill(iv);
                 ciphertext[..4].copy_from_slice(&packet_id.to_be_bytes());
                 ciphertext[4..4 + packet.len()].copy_from_slice(packet);
                 for b in &mut ciphertext[plain_len..] {
@@ -1882,21 +1881,21 @@ fn data_header(peer_id: u32, key_id: u8) -> Vec<u8> {
 }
 
 fn cbc_encrypt_blocks(block: &AesBlock, iv: &[u8], data: &mut [u8]) {
-    let mut prev = AesBlock16::clone_from_slice(iv);
+    let mut prev = AesBlock16::try_from(iv).expect("16-byte IV");
     for chunk in data.chunks_mut(16) {
         for (b, p) in chunk.iter_mut().zip(prev.iter()) {
             *b ^= p;
         }
-        let g = AesBlock16::from_mut_slice(chunk);
+        let g: &mut AesBlock16 = chunk.try_into().expect("16-byte chunk");
         block.encrypt_block(g);
         prev = *g;
     }
 }
 
 fn cbc_decrypt_blocks(block: &AesBlock, iv: &[u8], data: &mut [u8]) {
-    let mut prev = AesBlock16::clone_from_slice(iv);
+    let mut prev = AesBlock16::try_from(iv).expect("16-byte IV");
     for chunk in data.chunks_mut(16) {
-        let g = AesBlock16::from_mut_slice(chunk);
+        let g: &mut AesBlock16 = chunk.try_into().expect("16-byte chunk");
         let old = *g;
         block.decrypt_block(g);
         for (b, p) in g.iter_mut().zip(prev.iter()) {
@@ -2848,7 +2847,7 @@ impl Client {
     fn new(settings: Settings, wake: Arc<Notify>) -> Result<Self> {
         let crypt = ControlCrypt::new(&settings)?;
         let mut local = [0u8; SESSION_ID_SIZE];
-        rand::rngs::OsRng.fill_bytes(&mut local);
+        rand::fill(&mut local);
         let reliable = Reliable::new(local);
         let mut shim = Shim::new(settings.mtu);
         let mut iface_cfg = IfaceConfig::new(HardwareAddress::Ip);
@@ -4988,7 +4987,7 @@ mod tests {
 
     fn random_static_key() -> [u8; 256] {
         let mut key = [0u8; 256];
-        rand::rngs::OsRng.fill_bytes(&mut key);
+        rand::fill(&mut key);
         key
     }
 
@@ -5383,7 +5382,7 @@ mod tests {
             rcgen::generate_simple_self_signed(vec!["openvpn.test".to_string()]).expect("rcgen");
         let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
         let key =
-            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into());
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let server_config = Arc::new(
             rustls::ServerConfig::builder_with_provider(provider)
@@ -5419,7 +5418,7 @@ mod tests {
         fn new(opts: MimicOpts, server_config: Arc<rustls::ServerConfig>) -> Self {
             let crypt = opts.server_crypt();
             let mut local = [0u8; SESSION_ID_SIZE];
-            rand::rngs::OsRng.fill_bytes(&mut local);
+            rand::fill(&mut local);
             let mut stack = ServerStack::new();
             stack.reset_after_bytes = opts.reset_after_bytes;
             Mimic {
@@ -5677,8 +5676,8 @@ mod tests {
 
             let mut server_random1 = [0u8; 32];
             let mut server_random2 = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut server_random1);
-            rand::rngs::OsRng.fill_bytes(&mut server_random2);
+            rand::fill(&mut server_random1);
+            rand::fill(&mut server_random2);
             let mut server_record = Vec::with_capacity(128);
             server_record.extend_from_slice(&0u32.to_be_bytes());
             server_record.push(2);
@@ -6000,7 +5999,7 @@ mod tests {
         // tls-crypt-v2 PEM decode + selection.
         let material = random_static_key();
         let mut wrapped_key = vec![0x51u8; 72];
-        rand::rngs::OsRng.fill_bytes(&mut wrapped_key);
+        rand::fill(&mut wrapped_key);
         let pem = tls_crypt_v2_client_pem(&material, &wrapped_key);
         let (m2, w2) = decode_tls_crypt_v2_client_key(pem.as_bytes()).unwrap();
         assert_eq!(m2, material);
@@ -6653,7 +6652,7 @@ mod tests {
     async fn tcp_echo_with_tls_crypt_v2() {
         let material = random_static_key();
         let mut wrapped = vec![0u8; 72];
-        rand::rngs::OsRng.fill_bytes(&mut wrapped);
+        rand::fill(&mut wrapped);
         let mut opts = MimicOpts::plain("tcp");
         opts.tls_crypt_v2 = Some((material, wrapped));
         tunnel_roundtrip("tcp", opts, |_| {}).await;
@@ -6973,7 +6972,7 @@ mod tests {
     #[tokio::test]
     async fn tls_crypt_v2_wrong_key_fails() {
         let mut wrapped = vec![0u8; 72];
-        rand::rngs::OsRng.fill_bytes(&mut wrapped);
+        rand::fill(&mut wrapped);
         let mut opts = MimicOpts::plain("tcp");
         opts.tls_crypt_v2 = Some((random_static_key(), wrapped.clone()));
         let mut cfg = test_cfg(

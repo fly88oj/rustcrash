@@ -746,14 +746,13 @@ mod tests {
     use crate::inbound::proxy_server::test_support::{self_signed_tls, Capture};
     use crate::proto::tuic as client;
     use crate::proto::tuic::TuicCfg;
-    use rand::RngCore;
     use std::net::Ipv4Addr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Fresh per-run credential: nothing usable is ever committed.
     fn fresh_password() -> String {
         let mut b = [0u8; 12];
-        rand::rngs::OsRng.fill_bytes(&mut b);
+        rand::fill(&mut b);
         b.iter().map(|x| format!("{x:02x}")).collect()
     }
 

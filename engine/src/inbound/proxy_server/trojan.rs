@@ -126,14 +126,13 @@ mod tests {
     };
     use crate::proto::trojan::TrojanOut;
     use crate::transport::{tls_connect, TlsSettings};
-    use rand::RngCore;
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
 
     fn fresh_password() -> String {
         let mut b = [0u8; 12];
-        rand::rngs::OsRng.fill_bytes(&mut b);
+        rand::fill(&mut b);
         b.iter().map(|x| format!("{x:02x}")).collect()
     }
 

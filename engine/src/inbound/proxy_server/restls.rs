@@ -119,7 +119,7 @@ mod tests {
             rcgen::generate_simple_self_signed(vec!["restls.test".to_string()]).expect("rcgen");
         let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
         let key =
-            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into());
         let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
         let config = std::sync::Arc::new(
             rustls::ServerConfig::builder_with_provider(provider)

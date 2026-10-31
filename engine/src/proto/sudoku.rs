@@ -107,7 +107,6 @@ use bytes::{Buf, BytesMut};
 use curve25519_dalek::constants::ED25519_BASEPOINT_POINT;
 use curve25519_dalek::scalar::Scalar;
 use hkdf::Hkdf;
-use rand::RngCore;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tracing::debug;
@@ -1524,7 +1523,7 @@ impl SudokuRng {
     /// `newSeededRand`: 8 OS-random bytes as the state.
     fn new_seeded() -> Self {
         let mut b = [0u8; 8];
-        rand::rngs::OsRng.fill_bytes(&mut b);
+        rand::fill(&mut b);
         SudokuRng::new_with_seed(i64::from_be_bytes(b))
     }
 
@@ -2033,8 +2032,8 @@ impl RecordMethod {
 /// `deriveEpochKey` (record_conn.go:260):
 /// `HMAC-SHA256(base, "sudoku-record:" || method || epoch_be32)`.
 fn derive_epoch_key(base: &[u8], epoch: u32, method: &str) -> [u8; 32] {
-    use hmac::{Hmac, Mac};
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(base).expect("hmac accepts any key");
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(base).expect("hmac accepts any key");
     mac.update(b"sudoku-record:");
     mac.update(method.as_bytes());
     mac.update(&epoch.to_be_bytes());
@@ -2044,7 +2043,7 @@ fn derive_epoch_key(base: &[u8], epoch: u32, method: &str) -> [u8; 32] {
 fn random_non_zero_u32() -> u32 {
     loop {
         let mut b = [0u8; 4];
-        rand::rngs::OsRng.fill_bytes(&mut b);
+        rand::fill(&mut b);
         let v = u32::from_be_bytes(b);
         if v != 0 && v != u32::MAX {
             return v;
@@ -2055,7 +2054,7 @@ fn random_non_zero_u32() -> u32 {
 fn random_non_zero_u64() -> u64 {
     loop {
         let mut b = [0u8; 8];
-        rand::rngs::OsRng.fill_bytes(&mut b);
+        rand::fill(&mut b);
         let v = u64::from_be_bytes(b);
         if v != 0 && v != u64::MAX {
             return v;
@@ -2869,7 +2868,7 @@ async fn write_random_request_header(
         // WebSocket-like upgrade (~20%).
         let host_no_port = trim_port_for_host(host);
         let mut key_bytes = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut key_bytes);
+        rand::fill(&mut key_bytes);
         use base64::Engine;
         let ws_key = base64::engine::general_purpose::STANDARD.encode(key_bytes);
         buf.extend_from_slice(b"GET ");
@@ -3214,10 +3213,10 @@ async fn kip_handshake_client(
     conn.base_recv = psk_s2c;
 
     let mut scalar = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut scalar);
+    rand::fill(&mut scalar);
     let client_pub = curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(scalar).0;
     let mut nonce = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    rand::fill(&mut nonce);
     let user_hash = kip_user_hash_from_key(&rc.seed);
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3906,10 +3905,10 @@ impl EarlyClientState {
         let (psk_c2s, psk_s2c) = derive_psk_directional_bases(&seed);
         let mut conn = RecordConn::new(obfs, rc.method, psk_c2s, psk_s2c);
         let mut scalar = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut scalar);
+        rand::fill(&mut scalar);
         let client_pub = curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(scalar).0;
         let mut nonce = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        rand::fill(&mut nonce);
         let user_hash = kip_user_hash_from_key(&rc.seed);
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -4430,9 +4429,12 @@ fn mask_tls_config(insecure: bool) -> Result<Arc<rustls::ClientConfig>> {
             .with_no_client_auth()
     } else {
         let mut roots = rustls::RootCertStore::empty();
-        let certs = rustls_native_certs::load_native_certs()
-            .map_err(|e| Error::config(format!("sudoku: native cert store: {e}")))?;
-        for cert in certs {
+        let certs = rustls_native_certs::load_native_certs();
+            // 0.8: partial failures surface in `.errors`; keep the old hard-fail.
+            if let Some(e) = certs.errors.first() {
+                return Err(Error::config(format!("sudoku: native cert store: {e}")));
+            }
+        for cert in certs.certs {
             roots
                 .add(cert)
                 .map_err(|e| Error::config(format!("sudoku: bad native cert: {e}")))?;
@@ -5809,7 +5811,7 @@ async fn poll_push_loop(
 /// base64 RawURL, HMAC key = `sha256("sudoku-httpmask-auth-v1:" || key)`.
 fn tunnel_auth_token(auth_key: &str, mode: &str, method: &str, path: &str) -> String {
     use base64::Engine;
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     let key_material = Sha256::new_with_prefix(b"sudoku-httpmask-auth-v1:")
         .chain_update(auth_key.as_bytes())
         .finalize();
@@ -5823,7 +5825,7 @@ fn tunnel_auth_token(auth_key: &str, mode: &str, method: &str, path: &str) -> St
     } else {
         method.to_uppercase()
     };
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key).expect("hmac accepts any key");
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&key).expect("hmac accepts any key");
     mac.update(mode.as_bytes());
     mac.update(&[0]);
     mac.update(method.as_bytes());
@@ -5866,7 +5868,7 @@ fn ws_build_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
         frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
     }
     let mut mask = [0u8; 4];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut mask);
+    rand::fill(&mut mask);
     frame.extend_from_slice(&mask);
     for (i, b) in payload.iter().enumerate() {
         frame.push(b ^ mask[i % 4]);
@@ -6047,7 +6049,7 @@ async fn dial_ws(
     headers.push(("Sec-WebSocket-Version".into(), "13".into()));
     use base64::Engine;
     let mut key_bytes = [0u8; 16];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key_bytes);
+    rand::fill(&mut key_bytes);
     headers.push((
         "Sec-WebSocket-Key".into(),
         base64::engine::general_purpose::STANDARD.encode(key_bytes),
@@ -7479,7 +7481,7 @@ mod tests {
         let _ = user_hash;
         let _ = hint;
         let mut scalar = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut scalar);
+        rand::fill(&mut scalar);
         let server_pub = curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(scalar).0;
         let mut sh = Vec::with_capacity(52);
         sh.extend_from_slice(&nonce);
@@ -8012,7 +8014,7 @@ mod tests {
                 None => uplink.clone(),
             };
             let mut scalar = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut scalar);
+            rand::fill(&mut scalar);
             let server_pub =
                 curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(scalar).0;
             let mut sh = Vec::with_capacity(52);
@@ -8562,7 +8564,7 @@ mod tests {
     /// Verify a ws auth token ±60s (ws_auth.go verifyValue).
     fn tunnel_auth_verify(token: &str, auth_key: &str) -> bool {
         use base64::Engine;
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         let Ok(raw) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token) else {
             return false;
         };
@@ -8581,7 +8583,7 @@ mod tests {
         if (now - ts as i64).abs() > 60 {
             return false;
         }
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key).unwrap();
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&key).unwrap();
         mac.update(b"ws");
         mac.update(&[0]);
         mac.update(b"GET");
@@ -8617,7 +8619,7 @@ mod tests {
                 .expect("rcgen cert");
             let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
             let key =
-                rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+                rustls::pki_types::PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into());
             let provider = Arc::new(rustls::crypto::ring::default_provider());
             let mut config = rustls::ServerConfig::builder_with_provider(provider)
                 .with_safe_default_protocol_versions()

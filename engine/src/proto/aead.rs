@@ -157,12 +157,12 @@ pub fn ss_subkey_legacy(key: &[u8], salt: &[u8]) -> Vec<u8> {
 
 /// RFC 5869 HKDF with SHA-1: extract-then-derive.
 pub fn hkdf_sha1(ikm: &[u8], salt: &[u8], info: &[u8], out: &mut [u8]) {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha1::Sha1;
     type HmacSha1 = Hmac<Sha1>;
 
     // Extract: PRK = HMAC-SHA1(salt, IKM)
-    let mut mac = <HmacSha1 as Mac>::new_from_slice(salt).expect("hmac accepts any key length");
+    let mut mac = <HmacSha1 as KeyInit>::new_from_slice(salt).expect("hmac accepts any key length");
     mac.update(ikm);
     let prk = mac.finalize().into_bytes();
 
@@ -171,7 +171,7 @@ pub fn hkdf_sha1(ikm: &[u8], salt: &[u8], info: &[u8], out: &mut [u8]) {
     let mut counter: u8 = 1;
     let mut produced = 0usize;
     while produced < out.len() {
-        let mut mac = <HmacSha1 as Mac>::new_from_slice(&prk).expect("hmac accepts any key length");
+        let mut mac = <HmacSha1 as KeyInit>::new_from_slice(&prk).expect("hmac accepts any key length");
         mac.update(&t);
         mac.update(info);
         mac.update(&[counter]);

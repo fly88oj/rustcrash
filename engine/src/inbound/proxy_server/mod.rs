@@ -861,7 +861,7 @@ pub(crate) mod test_support {
         let cert_path = dir.path().join("cert.pem");
         let key_path = dir.path().join("key.pem");
         std::fs::write(&cert_path, cert.cert.pem()).expect("write cert");
-        std::fs::write(&key_path, cert.key_pair.serialize_pem()).expect("write key");
+        std::fs::write(&key_path, cert.signing_key.serialize_pem()).expect("write key");
         (
             ServerTls {
                 cert_pem: cert_path.to_string_lossy().into_owned(),

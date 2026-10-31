@@ -1920,7 +1920,7 @@ mod tests {
             rcgen::generate_simple_self_signed(vec!["tt.example".to_string()]).expect("rcgen cert");
         let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
         let key =
-            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into());
         let provider = Arc::new(ring_provider::default_provider());
         let mut config = rustls::ServerConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
@@ -2685,7 +2685,7 @@ mod tests {
             rcgen::generate_simple_self_signed(vec!["tt.example".to_string()]).expect("rcgen cert");
         let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
         let key =
-            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into());
         let provider = Arc::new(ring_provider::default_provider());
         let mut tls = rustls::ServerConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()

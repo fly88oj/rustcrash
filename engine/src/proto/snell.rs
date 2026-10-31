@@ -68,8 +68,7 @@ use std::task::{ready, Context, Poll};
 use std::time::Instant;
 
 use bytes::{Buf, BytesMut};
-use rand::Rng;
-use rand::RngCore;
+use rand::RngExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::addr::{Host, NetAddr};
@@ -791,7 +790,7 @@ impl V3Conn {
     fn frame(&mut self, payload: &[u8], wbuf: &mut BytesMut) -> Result<()> {
         if self.writer.is_none() {
             let mut salt = [0u8; 16];
-            rand::rngs::OsRng.fill_bytes(&mut salt);
+            rand::fill(&mut salt);
             wbuf.extend_from_slice(&salt);
             self.writer = Some(V3Crypto {
                 aead: snell_aead(self.kind, &self.psk, &salt)?,
@@ -929,11 +928,11 @@ struct V4Writer {
 impl V4Conn {
     fn new(inner: BoxProxyStream, psk: &[u8]) -> Result<Self> {
         let mut salt = [0u8; V4_SALT_SIZE];
-        rand::rngs::OsRng.fill_bytes(&mut salt);
+        rand::fill(&mut salt);
         // v4AEAD (v4.go:155-157): AES-128-GCM over the snell KDF.
         let aead = snell_aead(AeadKind::Aes128Gcm, psk, &salt)?;
         let padding_delta =
-            rand::rngs::OsRng.gen_range(0..u64::from(V4_INITIAL_PADDING_SPAN)) as u16;
+            rand::random_range(0..u64::from(V4_INITIAL_PADDING_SPAN)) as u16;
         Ok(V4Conn {
             inner,
             psk: psk.to_vec(),
@@ -1179,7 +1178,7 @@ fn make_v4_padding(payload_ct: &[u8], padding_len: usize) -> Vec<u8> {
 /// `makeV4RandomPadding` (v4.go:421-425).
 fn random_padding(len: usize) -> Vec<u8> {
     let mut p = vec![0u8; len];
-    rand::rngs::OsRng.fill_bytes(&mut p);
+    rand::fill(&mut p);
     p
 }
 
@@ -1192,7 +1191,7 @@ fn bit_count_padding(len: usize, one_bits: usize) -> Vec<u8> {
         *b = 1;
     }
     for i in (1..total_bits).rev() {
-        let j = rand::rngs::OsRng.gen_range(0..=i);
+        let j = rand::random_range(0..=i);
         bitset.swap(i, j);
     }
     let mut padding = vec![0u8; len];
@@ -1206,7 +1205,7 @@ fn bit_count_padding(len: usize, one_bits: usize) -> Vec<u8> {
 
 /// `randomUnitFloat64` (v4.go:462-468): uniform n/2^53.
 fn random_unit_float() -> f64 {
-    let n = rand::rngs::OsRng.gen_range(0..(1u64 << 53));
+    let n = rand::random_range(0..(1u64 << 53));
     (n as f64) / 2f64.powi(53)
 }
 
@@ -2852,8 +2851,8 @@ fn nginx_version() -> (u8, u8) {
     use std::sync::OnceLock;
     static V: OnceLock<(u8, u8)> = OnceLock::new();
     *V.get_or_init(|| {
-        let mut rng = rand::rngs::OsRng;
-        (rng.gen_range(0..11), rng.gen_range(0..12))
+        let mut rng = rand::rng();
+        (rng.random_range(0..11), rng.random_range(0..12))
     })
 }
 
@@ -2899,7 +2898,7 @@ fn rfc1123_now() -> String {
 /// http_server.go:68-92), prefixing the server's first write.
 fn http_response_head() -> String {
     let mut accept = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut accept);
+    rand::fill(&mut accept);
     let (major, minor) = nginx_version();
     format!(
         "HTTP/1.1 101 Switching Protocols\r\n\
@@ -3440,7 +3439,7 @@ mod tests {
         assert_eq!((host.as_str(), port), ("echo.example", 443));
 
         let mut out_salt = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut out_salt);
+        rand::fill(&mut out_salt);
         let mut enc = V3Mimic::new(AeadKind::Aes128Gcm, &psk, &out_salt);
         let mut wire = out_salt.to_vec();
         enc.frame_chunk(&[CMD_TUNNEL], &mut wire);
@@ -3603,7 +3602,7 @@ mod tests {
         }
 
         let mut out_salt = [0u8; V4_SALT_SIZE];
-        rand::rngs::OsRng.fill_bytes(&mut out_salt);
+        rand::fill(&mut out_salt);
         let mut enc = V4Mimic::new(&psk, &out_salt);
         let mut wire = out_salt.to_vec();
         enc.frame(&[CMD_TUNNEL], &mut wire);
@@ -3806,7 +3805,7 @@ mod tests {
                 let header = dec.read_chunk(&mut rd).await.map_err(Error::from)?;
                 assert_eq!(header, vec![PROTOCOL_VERSION, CMD_UDP, 0x00]);
                 let mut out_salt = [0u8; 16];
-                rand::rngs::OsRng.fill_bytes(&mut out_salt);
+                rand::fill(&mut out_salt);
                 let mut enc = V3Mimic::new(AeadKind::Aes128Gcm, &psk, &out_salt);
                 let mut wire = out_salt.to_vec();
                 enc.frame_chunk(&[CMD_TUNNEL], &mut wire);
@@ -3832,7 +3831,7 @@ mod tests {
                 let header = dec.read_frame(&mut rd).await.map_err(Error::from)?;
                 assert_eq!(header, vec![PROTOCOL_VERSION, CMD_UDP, 0x00]);
                 let mut out_salt = [0u8; V4_SALT_SIZE];
-                rand::rngs::OsRng.fill_bytes(&mut out_salt);
+                rand::fill(&mut out_salt);
                 let mut enc = V4Mimic::new(&psk, &out_salt);
                 let mut wire = out_salt.to_vec();
                 enc.frame(&[CMD_TUNNEL], &mut wire);
@@ -4090,7 +4089,7 @@ mod tests {
         // One AEAD writer for the whole conn — the salt prefixes the
         // first server write only (stream.go initWriter).
         let mut out_salt = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut out_salt);
+        rand::fill(&mut out_salt);
         let mut enc = V3Mimic::new(kind, &psk, &out_salt);
         let mut reply_wire = out_salt.to_vec();
         enc.frame_chunk(&[CMD_TUNNEL], &mut reply_wire);
@@ -4260,7 +4259,7 @@ mod tests {
         // One AEAD writer for the whole conn — the salt prefixes the
         // first server frame only (v4.go initWriter).
         let mut out_salt = [0u8; V4_SALT_SIZE];
-        rand::rngs::OsRng.fill_bytes(&mut out_salt);
+        rand::fill(&mut out_salt);
         let mut enc = V4Mimic::new(&psk, &out_salt);
         let mut tunnel_wire = out_salt.to_vec();
         enc.frame(&[CMD_TUNNEL], &mut tunnel_wire);
@@ -4850,7 +4849,7 @@ mod tests {
         });
         // Client side: salt + one chunk holding [Version, CommandPing].
         let mut out_salt = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut out_salt);
+        rand::fill(&mut out_salt);
         client.write_all(&out_salt).await.unwrap();
         let mut enc = V3Mimic::new(AeadKind::Aes128Gcm, psk.as_bytes(), &out_salt);
         let mut wire = Vec::new();

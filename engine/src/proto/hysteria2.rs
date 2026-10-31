@@ -16,8 +16,6 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use rand::rngs::OsRng;
-use rand::{Rng, RngCore};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::addr::NetAddr;
@@ -1111,9 +1109,9 @@ fn huffman_decode(data: &[u8]) -> Option<Vec<u8>> {
 /// Random padding string drawn from the upstream alphabet.
 fn random_padding(min: usize, max: usize) -> String {
     const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let n = OsRng.gen_range(min..max);
+    let n = rand::random_range(min..max);
     (0..n)
-        .map(|_| CHARS[OsRng.gen_range(0..CHARS.len())] as char)
+        .map(|_| CHARS[rand::random_range(0..CHARS.len())] as char)
         .collect()
 }
 
@@ -1336,7 +1334,7 @@ pub async fn udp_send(conn: &quinn::Connection, target: &NetAddr, data: &[u8]) -
     if data.len() > MAX_UDP_SIZE {
         return Err(Error::protocol("hysteria2 udp: packet exceeds MaxUDPSize"));
     }
-    let packet_id: u16 = OsRng.gen();
+    let packet_id: u16 = rand::random();
     let mut datagram = udp_message_header(UDP_SESSION_ID, packet_id, 0, 1, &target.to_string());
     datagram.extend_from_slice(data);
     conn.send_datagram(Bytes::from(datagram))
@@ -1484,7 +1482,7 @@ impl quinn::AsyncUdpSocket for SalamanderSocket {
 
     fn try_send(&self, transmit: &quinn::udp::Transmit<'_>) -> io::Result<()> {
         let mut salt = [0u8; SALAMANDER_SALT_LEN];
-        OsRng.fill_bytes(&mut salt);
+        rand::fill(&mut salt);
         let packet = salamander_pad(&self.password, &salt, transmit.contents);
         self.socket
             .try_send_to(&packet, transmit.destination)

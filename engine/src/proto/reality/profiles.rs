@@ -204,7 +204,7 @@ pub struct Grease {
 /// 0x1010`) when a draw collides; we seed the same draw from the hello random
 /// (itself CSPRNG bytes) so a given hello stays byte-reproducible.
 pub fn grease_values(random: &[u8; 32]) -> Grease {
-    use rand::{RngCore, SeedableRng};
+    use rand::{Rng, SeedableRng};
 
     let mut rng = rand::rngs::StdRng::from_seed(*random);
     let mut seeds = [0u8; 10];

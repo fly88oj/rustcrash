@@ -145,8 +145,7 @@ use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
-use rand::RngCore;
+use chacha20poly1305::XChaCha20Poly1305;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::net::UdpSocket;
@@ -361,7 +360,7 @@ fn pick_port(ports: &[u16]) -> Result<u16> {
         ));
     }
     // rand::random usize; modulo bias is negligible for ≤ 65535 ports.
-    Ok(ports[rand::random::<usize>() % ports.len()])
+    Ok(ports[rand::random::<u64>() as usize % ports.len()])
 }
 
 /// `cipher.HashPassword` (pkg/cipher/api.go):
@@ -380,7 +379,7 @@ fn hash_password(password: &[u8], username: &[u8]) -> [u8; 32] {
 fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iterations: u32, out_len: usize) -> Vec<u8> {
     use hmac::Mac;
     let prf = |data: &[u8]| -> [u8; 32] {
-        let mut mac = <hmac::Hmac<Sha256> as Mac>::new_from_slice(password)
+        let mut mac = <hmac::Hmac<Sha256> as KeyInit>::new_from_slice(password)
             .expect("HMAC accepts any key length");
         mac.update(data);
         let out: [u8; 32] = mac.finalize().into_bytes().into();
@@ -502,7 +501,7 @@ struct StatefulCipher {
 impl StatefulCipher {
     fn new(key: &[u8; KEY_LEN], username: &str) -> Self {
         StatefulCipher {
-            aead: XChaCha20Poly1305::new(Key::from_slice(key)),
+            aead: XChaCha20Poly1305::new(key.into()),
             nonce: None,
             nonce_sent: false,
             username: username.to_string(),
@@ -516,7 +515,7 @@ impl StatefulCipher {
         let nonce = match self.nonce {
             None => {
                 let mut n = [0u8; NONCE_SIZE];
-                rand::rngs::OsRng.fill_bytes(&mut n);
+                rand::fill(&mut n);
                 apply_user_hint(self.username.as_bytes(), &mut n);
                 self.nonce = Some(n);
                 n
@@ -529,7 +528,7 @@ impl StatefulCipher {
         };
         let ct = self
             .aead
-            .encrypt(XNonce::from_slice(&nonce), Payload::from(plaintext))
+            .encrypt((&nonce).into(), Payload::from(plaintext))
             .map_err(|_| Error::crypto("mieru: encryption failed"))?;
         if self.nonce_sent {
             Ok(ct)
@@ -563,7 +562,7 @@ impl StatefulCipher {
         };
         let body = &ciphertext[body_offset..];
         self.aead
-            .decrypt(XNonce::from_slice(&nonce), Payload::from(body))
+            .decrypt((&nonce).into(), Payload::from(body))
             .map_err(|_| Error::crypto("mieru: decryption failed (wrong key or corrupted data)"))
     }
 }
@@ -587,7 +586,7 @@ struct StatelessCipher {
 impl StatelessCipher {
     fn new(key: &[u8; KEY_LEN], username: &str) -> Self {
         StatelessCipher {
-            aead: XChaCha20Poly1305::new(Key::from_slice(key)),
+            aead: XChaCha20Poly1305::new(key.into()),
             username: username.to_string(),
         }
     }
@@ -625,7 +624,7 @@ impl StatelessCipher {
 
     fn new_nonce(&self) -> [u8; NONCE_SIZE] {
         let mut nonce = [0u8; NONCE_SIZE];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        rand::fill(&mut nonce);
         apply_user_hint(self.username.as_bytes(), &mut nonce);
         nonce
     }
@@ -633,7 +632,7 @@ impl StatelessCipher {
     fn seal(&self, nonce: &[u8; NONCE_SIZE], plaintext: &[u8], out: &mut Vec<u8>) -> Result<()> {
         let ct = self
             .aead
-            .encrypt(XNonce::from_slice(nonce), Payload::from(plaintext))
+            .encrypt(nonce.into(), Payload::from(plaintext))
             .map_err(|_| Error::crypto("mieru: encryption failed"))?;
         out.extend_from_slice(&ct);
         Ok(())
@@ -641,7 +640,7 @@ impl StatelessCipher {
 
     fn open(&self, nonce: &[u8; NONCE_SIZE], ciphertext: &[u8]) -> Result<Vec<u8>> {
         self.aead
-            .decrypt(XNonce::from_slice(nonce), Payload::from(ciphertext))
+            .decrypt(nonce.into(), Payload::from(ciphertext))
             .map_err(|_| Error::crypto("mieru: decryption failed (wrong key or corrupted data)"))
     }
 }
@@ -738,7 +737,7 @@ fn data_padding_len() -> usize {
 
 fn random_bytes(n: usize) -> Vec<u8> {
     let mut v = vec![0u8; n];
-    rand::rngs::OsRng.fill_bytes(&mut v);
+    rand::fill(&mut v);
     v
 }
 
@@ -2693,7 +2692,7 @@ impl MieruMux {
             return Some(active[0].clone());
         }
         let reuse_factor = active.len() * self.multiplex_factor;
-        let n = rand::random::<usize>() % (reuse_factor + 1);
+        let n = rand::random::<u64>() as usize % (reuse_factor + 1);
         if n < reuse_factor {
             return Some(active[n / self.multiplex_factor].clone());
         }

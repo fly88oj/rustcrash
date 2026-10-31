@@ -169,7 +169,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 
-use rand::Rng;
+use rand::{Rng, RngExt};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::addr::NetAddr;
@@ -324,10 +324,10 @@ pub fn padding_len_from(content_len: usize, long_padding: bool, jitter: usize) -
 /// [`padding_len_from`] with the upstream random draw applied.
 pub fn padding_len(content_len: usize, long_padding: bool, rng: &mut impl Rng) -> usize {
     if content_len < PADDING_SEED_CONTENT && long_padding {
-        let jitter = rng.gen_range(0..PADDING_SEED_JITTER);
+        let jitter = rng.random_range(0..PADDING_SEED_JITTER);
         padding_len_from(content_len, long_padding, jitter)
     } else {
-        let jitter = rng.gen_range(0..PADDING_SEED_SHORT);
+        let jitter = rng.random_range(0..PADDING_SEED_SHORT);
         padding_len_from(content_len, long_padding, jitter)
     }
 }
@@ -980,7 +980,7 @@ impl VisionConn {
         let uuid = self.once_uuid.take().ok_or_else(|| {
             Error::protocol("vision: hide_vless_header called after the first frame was sent")
         })?;
-        let pad = padding_len(0, true, &mut rand::thread_rng());
+        let pad = padding_len(0, true, &mut rand::rng());
         self.pending
             .extend_from_slice(&frame(FrameCommand::Continue, &[], pad, Some(&uuid)));
         self.flush().await.map_err(Error::from)
@@ -1028,7 +1028,7 @@ impl VisionConn {
                 continue;
             }
             let (command, long_padding) = self.decide(piece);
-            let pad = padding_len(piece.len(), long_padding, &mut rand::thread_rng());
+            let pad = padding_len(piece.len(), long_padding, &mut rand::rng());
             let uuid = self.once_uuid.take();
             self.pending
                 .extend_from_slice(&frame(command, piece, pad, uuid.as_ref()));
@@ -1426,7 +1426,7 @@ mod tests {
     /// The random draw stays inside upstream's ranges over many samples.
     #[test]
     fn padding_lengths_stay_in_upstream_ranges() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..2000 {
             let long = padding_len(300, true, &mut rng);
             let total = 300 + long;
@@ -1809,7 +1809,7 @@ mod tests {
             } else {
                 (FrameCommand::Continue, true)
             };
-            let pad = padding_len(data.len(), long_padding, &mut rand::thread_rng());
+            let pad = padding_len(data.len(), long_padding, &mut rand::rng());
             let uuid = if self.sent_uuid {
                 None
             } else {
@@ -1925,7 +1925,7 @@ mod tests {
             .expect("rcgen self-signed cert");
         let cert_der = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
         let key =
-            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into());
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let server = Arc::new(
             rustls::ServerConfig::builder_with_provider(provider)
@@ -2383,7 +2383,6 @@ mod tests {
         use crate::proto::reality::profiles::{build_client_hello, UtslProfile};
         use crate::proto::reality::tls13 as outer_tls;
         use crate::proto::reality::tls13::test_server;
-        use rand::RngCore;
         use tokio::io::AsyncReadExt;
 
         let uuid = uuid_bytes();
@@ -2491,7 +2490,7 @@ mod tests {
         });
 
         let mut random = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut random);
+        rand::fill(&mut random);
         let session_id = [5u8; 32];
         let (secret, public) = outer_tls::x25519_keygen();
         let ch = build_client_hello(

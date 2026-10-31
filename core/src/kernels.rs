@@ -106,7 +106,7 @@ impl KernelManager {
                 format!("https://api.github.com/repos/SagerNet/sing-box/releases?per_page={limit}")
             }
         };
-        let client = reqwest::Client::builder()
+        let client = crate::http::tls_builder()
             .user_agent("RustCrash/1.0")
             .build()
             .map_err(|e| Error::Download(e.to_string()))?;
@@ -150,7 +150,7 @@ impl KernelManager {
             }
         };
 
-        let client = reqwest::Client::builder()
+        let client = crate::http::tls_builder()
             .user_agent("RustCrash/1.0")
             .build()
             .map_err(|e| Error::Download(e.to_string()))?;
@@ -239,7 +239,7 @@ impl KernelManager {
             url
         );
 
-        let client = reqwest::Client::builder()
+        let client = crate::http::tls_builder()
             .user_agent("RustCrash/1.0")
             .build()
             .map_err(|e| Error::Download(e.to_string()))?;
@@ -485,7 +485,7 @@ mod tests {
             "{}/repos/MetaCubeX/mihomo/releases/latest",
             mock_server.uri()
         );
-        let client = reqwest::Client::builder()
+        let client = crate::http::tls_builder()
             .user_agent("RustCrash/1.0")
             .build()
             .unwrap();
@@ -510,7 +510,7 @@ mod tests {
             "{}/repos/SagerNet/sing-box/releases/latest",
             mock_server.uri()
         );
-        let client = reqwest::Client::builder()
+        let client = crate::http::tls_builder()
             .user_agent("RustCrash/1.0")
             .build()
             .unwrap();

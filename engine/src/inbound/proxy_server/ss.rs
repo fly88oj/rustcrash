@@ -66,9 +66,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{ready, Context, Poll};
 use std::time::{Duration, Instant};
 
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
+use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use bytes::{Buf, BytesMut};
-use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -459,7 +458,7 @@ fn subkey_for(method: SsMethod, key: &[u8], salt: &[u8]) -> Vec<u8> {
 
 fn fresh_salt(len: usize) -> Vec<u8> {
     let mut s = vec![0u8; len];
-    rand::rngs::OsRng.fill_bytes(&mut s);
+    rand::fill(&mut s);
     s
 }
 
@@ -515,7 +514,7 @@ impl BlockCipher {
     }
 
     fn encrypt(&self, block: &mut [u8; 16]) {
-        let b = aes::cipher::generic_array::GenericArray::from_mut_slice(&mut block[..]);
+        let b: &mut aes::cipher::Array<u8, _> = (&mut block[..]).try_into().expect("16-byte AES block");
         match self {
             BlockCipher::Aes128(c) => c.encrypt_block(b),
             BlockCipher::Aes256(c) => c.encrypt_block(b),
@@ -523,7 +522,7 @@ impl BlockCipher {
     }
 
     fn decrypt(&self, block: &mut [u8; 16]) {
-        let b = aes::cipher::generic_array::GenericArray::from_mut_slice(&mut block[..]);
+        let b: &mut aes::cipher::Array<u8, _> = (&mut block[..]).try_into().expect("16-byte AES block");
         match self {
             BlockCipher::Aes128(c) => c.decrypt_block(b),
             BlockCipher::Aes256(c) => c.decrypt_block(b),
@@ -1260,14 +1259,14 @@ mod tests {
     /// Fresh per-run credential: nothing usable is ever committed.
     fn fresh_password() -> String {
         let mut b = [0u8; 12];
-        rand::rngs::OsRng.fill_bytes(&mut b);
+        rand::fill(&mut b);
         b.iter().map(|x| format!("{x:02x}")).collect()
     }
 
     /// Fresh base64 PSK for the 2022 methods.
     fn fresh_psk(len: usize) -> String {
         let mut b = vec![0u8; len];
-        rand::rngs::OsRng.fill_bytes(&mut b);
+        rand::fill(&mut b);
         base64::engine::general_purpose::STANDARD.encode(b)
     }
 

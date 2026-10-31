@@ -90,7 +90,6 @@ use std::sync::Arc;
 
 use bytes::BytesMut;
 use hkdf::Hkdf;
-use rand::RngCore;
 use ring::aead;
 use sha2::{Digest, Sha256, Sha384};
 
@@ -227,7 +226,7 @@ impl HashKind {
 
     /// Finished `verify_data` HMAC (reality/tls13.rs:374-410).
     fn hmac(self, key: &[u8], data: &[u8]) -> Vec<u8> {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         match self {
             HashKind::Sha256 => {
                 let mut mac =
@@ -246,7 +245,7 @@ impl HashKind {
 
     /// Constant-time Finished check (reality/tls13.rs:393-410).
     fn hmac_verify(self, key: &[u8], data: &[u8], tag: &[u8]) -> bool {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         match self {
             HashKind::Sha256 => {
                 let mut mac =
@@ -1239,9 +1238,9 @@ fn build_plain_flight(
 ) -> Result<ClientFlight> {
     let (secret, public) = engine_tls13::x25519_keygen();
     let mut random = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut random);
+    rand::fill(&mut random);
     let mut session_id = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut session_id);
+    rand::fill(&mut session_id);
     let hello =
         profiles::build_client_hello_alpn(profile, sni, &random, &session_id, &public, Some(alpn));
     let hello = insert_extension(&hello, EXT_TRANSPORT_PARAMETERS, transport_params)?;
@@ -1271,9 +1270,9 @@ fn build_jls_flight(
     const RANDOM_LEN: usize = 32;
     let (secret, public) = engine_tls13::x25519_keygen();
     let mut random = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut random);
+    rand::fill(&mut random);
     let mut session_id = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut session_id);
+    rand::fill(&mut session_id);
     let alps = alpn.iter().any(|a| a == "h2");
     let hello1 = profiles::build_client_hello_opts(
         profile,
@@ -1340,14 +1339,14 @@ fn build_ech_flight(
         .try_into()
         .map_err(|_| Error::config("quic-tls13: ECH public key is not 32 bytes"))?;
     let mut inner_random = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut inner_random);
+    rand::fill(&mut inner_random);
     let mut outer_random = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut outer_random);
+    rand::fill(&mut outer_random);
     let mut session_id = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut session_id);
+    rand::fill(&mut session_id);
     let (x25519_secret, public_share) = engine_tls13::x25519_keygen();
     let mut hpke_secret = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut hpke_secret);
+    rand::fill(&mut hpke_secret);
 
     // Base template under the REAL server name.
     let base = profiles::build_client_hello_alpn(
@@ -3042,7 +3041,7 @@ pub(crate) mod test_server {
                 // ServerHello (the shape of reality test_server::accept
                 // 3106-3134).
                 let mut server_random = [0u8; 32];
-                rand::rngs::OsRng.fill_bytes(&mut server_random);
+                rand::fill(&mut server_random);
                 let (server_secret, server_public) = engine_tls13::x25519_keygen();
                 let mut sh_body = Vec::with_capacity(96);
                 sh_body.extend_from_slice(&VERSION_TLS12.to_be_bytes());
@@ -3307,7 +3306,7 @@ pub(crate) mod test_server {
         let certified = rcgen::generate_simple_self_signed(vec!["sq.test".to_string()])
             .expect("rcgen self-signed cert");
         let cert_der = certified.cert.der().to_vec();
-        let key_der = certified.key_pair.serialize_der();
+        let key_der = certified.signing_key.serialize_der();
         let signing_key = rustls::crypto::ring::sign::any_supported_type(
             &rustls::pki_types::PrivateKeyDer::Pkcs8(key_der.into()),
         )
@@ -3393,7 +3392,7 @@ mod tests {
             .expect("rcgen self-signed cert");
         let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
         let key =
-            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into());
         let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))

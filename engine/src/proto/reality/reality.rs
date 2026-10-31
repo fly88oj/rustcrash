@@ -40,7 +40,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use hkdf::Hkdf;
-use rand::RngCore;
 use sha2::Sha256;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
@@ -194,7 +193,7 @@ pub fn seal_session_id(
 /// certificate must be Ed25519 and its outer signature field must equal
 /// `HMAC-SHA512(auth_key, ed25519_public_key)`.
 pub fn verify_temp_auth(auth_key: &[u8; 32], cert_der: &[u8]) -> Result<bool> {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha512;
 
     let key = match tls13::der::public_key(cert_der) {
@@ -292,7 +291,7 @@ pub async fn connect_stream(cfg: &RealityCfg, transport: BoxProxyStream) -> Resu
 
     let (eph_secret, eph_public) = tls13::x25519_keygen();
     let mut random = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut random);
+    rand::fill(&mut random);
 
     let shared = tls13::x25519(&eph_secret, &server_public_key)?;
     let auth_key = auth_key(&shared, &random)?;
@@ -587,7 +586,7 @@ mod tests {
     /// Ed25519 certificate whose signature field is replaced by the HMAC
     /// (`reality/handshake_server_tls13.go` L147-160).
     fn temp_auth_cert(auth_key: &[u8; 32]) -> (Vec<u8>, rustls::pki_types::PrivateKeyDer<'static>) {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha512;
 
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
@@ -656,7 +655,7 @@ mod tests {
             tls13::der::PublicKey::Ed25519(k) => k,
             _ => unreachable!(),
         };
-        use hmac::Mac as _;
+        use hmac::{KeyInit as _, Mac as _};
         let mut mac = hmac::Hmac::<sha2::Sha512>::new_from_slice(&auth).unwrap();
         mac.update(&pubkey);
         let expect: [u8; 64] = mac.finalize().into_bytes().into();

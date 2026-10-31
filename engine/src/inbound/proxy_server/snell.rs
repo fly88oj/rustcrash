@@ -74,7 +74,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::{Buf, BytesMut};
-use hmac::Mac;
+use hmac::{KeyInit as _, Mac};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::error::{Error, Result};
@@ -642,8 +642,7 @@ fn stls_alert() -> Vec<u8> {
     record[2] = 3;
     record[3] = 0;
     record[4] = 26;
-    use rand::RngCore;
-    rand::rngs::OsRng.fill_bytes(&mut record[STLS_HEADER..]);
+    rand::fill(&mut record[STLS_HEADER..]);
     record
 }
 
@@ -1431,7 +1430,7 @@ mod tests {
             .expect("rcgen self-signed cert");
         let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
         let key =
-            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into());
         let config = std::sync::Arc::new(
             rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
                 rustls::crypto::ring::default_provider(),

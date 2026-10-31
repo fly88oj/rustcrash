@@ -6,10 +6,9 @@ use std::io;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 
-use aes::cipher::{BlockEncrypt, KeyInit};
+use aes::cipher::{BlockCipherEncrypt, KeyInit};
 use bytes::{Buf, BytesMut};
 use md5::{Digest, Md5};
-use rand::RngCore;
 use sha2::Sha256;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
@@ -126,9 +125,9 @@ fn evaluate_chain(chain: &[&[u8]], message: &[u8]) -> [u8; 32] {
 
 /// Plain HMAC-SHA256 (key, message) -> 32 bytes.
 fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     type HmacSha256 = Hmac<Sha256>;
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("any key length");
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(key).expect("any key length");
     mac.update(msg);
     mac.finalize().into_bytes().into()
 }
@@ -189,13 +188,13 @@ impl ChunkNonce {
 fn create_auth_id(cmd_key: &[u8; 16], ts: i64) -> [u8; 16] {
     let mut body = [0u8; 16];
     body[..8].copy_from_slice(&ts.to_be_bytes());
-    rand::rngs::OsRng.fill_bytes(&mut body[8..12]);
+    rand::fill(&mut body[8..12]);
     let crc = crc32fast::hash(&body[..12]);
     body[12..].copy_from_slice(&crc.to_be_bytes());
 
     let key = &vmess_kdf(cmd_key, &[KDF_AUTH_ID_ENC_KEY])[..16];
     let cipher = aes::Aes128::new_from_slice(key).unwrap();
-    let block = aes::cipher::generic_array::GenericArray::from_mut_slice(&mut body[..]);
+    let block: &mut aes::cipher::Array<u8, _> = (&mut body[..]).try_into().expect("16-byte AES block");
     cipher.encrypt_block(block);
     body
 }
@@ -208,7 +207,7 @@ fn seal_aead_header(cmd_key: &[u8; 16], header: &[u8]) -> io::Result<Vec<u8>> {
         .unwrap_or(0);
     let auth_id = create_auth_id(cmd_key, ts);
     let mut nonce = [0u8; 8];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    rand::fill(&mut nonce);
 
     let aead = crate::proto::aead::Aead::new(AeadKind::Aes128Gcm, &{
         let mut k = [0u8; 16];
@@ -350,7 +349,7 @@ impl VmessStream {
     ) -> Result<Self> {
         let key = cmd_key(cfg.uuid);
         let mut rnd = [0u8; 33];
-        rand::rngs::OsRng.fill_bytes(&mut rnd);
+        rand::fill(&mut rnd);
         let mut req_key = [0u8; 16];
         req_key.copy_from_slice(&rnd[..16]);
         let mut req_iv = [0u8; 16];
@@ -688,8 +687,8 @@ mod tests {
         // Auth id decrypts and CRC-checks.
         let aes_key = &vmess_kdf(&key, &[KDF_AUTH_ID_ENC_KEY])[..16];
         let cipher = aes::Aes128::new_from_slice(aes_key).unwrap();
-        use aes::cipher::BlockDecrypt;
-        let mut block = aes::cipher::generic_array::GenericArray::clone_from_slice(&auth_id);
+        use aes::cipher::BlockCipherDecrypt;
+        let mut block = aes::cipher::Array::from(auth_id);
         cipher.decrypt_block(&mut block);
         let decrypted: [u8; 16] = block.into();
         assert_eq!(

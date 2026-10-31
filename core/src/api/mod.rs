@@ -472,7 +472,7 @@ mod tests {
     }
 
     async fn get(port: u16, path: &str, token: Option<&str>) -> (u16, serde_json::Value) {
-        let mut req = reqwest::Client::new().get(format!("http://127.0.0.1:{port}{path}"));
+        let mut req = crate::http::plain_client().get(format!("http://127.0.0.1:{port}{path}"));
         if let Some(t) = token {
             req = req.header("x-api-token", t);
         }
@@ -557,7 +557,7 @@ mod tests {
         let mut new_cfg = cfg.clone();
         new_cfg.tgbot_token = None;
         new_cfg.proxy_port = 1234;
-        let resp = reqwest::Client::new()
+        let resp = crate::http::plain_client()
             .post(format!("http://127.0.0.1:{port}/api/config"))
             .json(&new_cfg)
             .send()
@@ -571,7 +571,7 @@ mod tests {
     #[tokio::test]
     async fn post_invalid_config_is_400() {
         let (port, _tmp) = start_test_server(None).await;
-        let resp = reqwest::Client::new()
+        let resp = crate::http::plain_client()
             .post(format!("http://127.0.0.1:{port}/api/config"))
             .body("this is not json")
             .header("content-type", "application/json")

@@ -572,7 +572,7 @@ impl SubscriptionManager {
             validation.host.as_deref()
         );
 
-        let client = reqwest::Client::builder()
+        let client = crate::http::tls_builder()
             .user_agent("Mozilla/5.0 (compatible; RustCrash/1.0)")
             .timeout(std::time::Duration::from_secs(30))
             // Redirect chains (CDN hops, short-links) are followed, but

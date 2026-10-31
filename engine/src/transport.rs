@@ -8,7 +8,6 @@ use std::task::{ready, Context, Poll};
 
 use base64::Engine;
 use bytes::{Buf, BytesMut};
-use rand::RngCore;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::ring as ring_provider;
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
@@ -191,9 +190,12 @@ impl ServerCertVerifier for NoVerify {
 pub(crate) fn root_store() -> Result<RootCertStore> {
     let mut roots = RootCertStore::empty();
     let mut loaded = 0usize;
-    let certs = rustls_native_certs::load_native_certs()
-        .map_err(|e| Error::config(format!("native cert store: {e}")))?;
-    for cert in certs {
+    let certs = rustls_native_certs::load_native_certs();
+    // 0.8: partial failures surface in `.errors`; keep the old hard-fail.
+    if let Some(e) = certs.errors.first() {
+        return Err(Error::config(format!("transport: native cert store: {e}")));
+    }
+    for cert in certs.certs {
         roots
             .add(cert)
             .map_err(|e| Error::config(format!("bad native cert: {e}")))?;
@@ -595,7 +597,7 @@ pub async fn ws_connect_early(
         .clone()
         .unwrap_or_else(|| default_host.to_string());
     let mut key_bytes = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut key_bytes);
+    rand::fill(&mut key_bytes);
     let key = base64::engine::general_purpose::STANDARD.encode(key_bytes);
     let early_header = if early.is_empty() {
         String::new()
@@ -689,7 +691,7 @@ impl WsStream {
             }
         }
         let mut mask = [0u8; 4];
-        rand::rngs::OsRng.fill_bytes(&mut mask);
+        rand::fill(&mut mask);
         out.extend_from_slice(&mask);
         for (i, b) in payload.iter().enumerate() {
             out.push(b ^ mask[i % 4]);
@@ -1152,7 +1154,7 @@ mod tests {
     async fn pinned_cert_verifier_accepts_cert_or_spki_pins() {
         let certified = rcgen::generate_simple_self_signed(vec!["pin.test".to_string()]).unwrap();
         let leaf = certified.cert.der().clone();
-        let key_der = certified.key_pair.serialize_der();
+        let key_der = certified.signing_key.serialize_der();
         let cert_hash: [u8; 32] = Sha256::digest(leaf.as_ref()).into();
         let spki_hash: [u8; 32] =
             Sha256::digest(cert_spki_der(leaf.as_ref()).expect("spki extract")).into();

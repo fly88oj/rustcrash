@@ -30,7 +30,6 @@
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::ChaCha20Poly1305;
-use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::{Error, Result};
@@ -276,7 +275,7 @@ impl MachinePrivateKey {
     /// `key.NewMachine()` — a fresh random machine key.
     pub fn generate() -> Self {
         let mut sk = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut sk);
+        rand::fill(&mut sk);
         MachinePrivateKey(sk)
     }
 

@@ -15,6 +15,9 @@ path = "tests/tui_test.rs"
 
 [dev-dependencies]
 ratatui-testlib = { version = "0.1", features = ["mvp"] }
+# Pinned to 0.8: ratatui-testlib 0.1 hard-depends on portable-pty 0.8 and
+# passes its CommandBuilder straight into the harness — a 0.9 bump here is
+# a type mismatch until the testlib publishes an update.
 portable-pty = "0.8"
 tempfile = { workspace = true }
 

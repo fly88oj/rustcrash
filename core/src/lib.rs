@@ -8,6 +8,7 @@ pub mod engine;
 pub mod error;
 pub mod firewall;
 pub mod geo;
+pub mod http;
 pub mod init;
 pub mod kernels;
 pub mod logging;

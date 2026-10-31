@@ -1322,7 +1322,7 @@ fn backend_log_id() -> String {
     // id serves the same purpose (log correlation) without dragging in
     // logtail.
     let mut b = [0u8; 8];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);
+    rand::fill(&mut b);
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
@@ -1467,7 +1467,7 @@ mod tests {
     /// echoes it back for comparison).
     fn generated_auth_key() -> String {
         let mut b = [0u8; 12];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);
+        rand::fill(&mut b);
         format!(
             "tskey-auth-{}",
             b.iter().map(|x| format!("{x:02x}")).collect::<String>()

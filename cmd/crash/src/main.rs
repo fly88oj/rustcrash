@@ -560,6 +560,11 @@ fn detect_kernel_flavor(path: &str) -> rustcrash_core::engine::EngineFlavor {
 }
 
 fn main() {
+    // reqwest 0.13 builds rustls without a bundled provider; install
+    // the ring one process-wide before any HTTP client exists (the
+    // engine passes its provider explicitly and is unaffected).
+    rustcrash_core::http::ensure_ring_provider();
+
     // mihomo kernel CLI compat layer (the RAW drop-in story): proxy
     // managers — ShellCrash above all — invoke their kernel binary with
     // mihomo's flag grammar, hardcoded in their own scripts:

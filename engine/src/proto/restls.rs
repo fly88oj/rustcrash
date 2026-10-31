@@ -93,7 +93,6 @@ use std::sync::{Arc, OnceLock};
 use std::task::{ready, Context, Poll};
 
 use bytes::{Buf, BytesMut};
-use rand::RngCore;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::ring as ring_provider;
 use rustls::crypto::{CryptoProvider, GetRandomFailed, SecureRandom};
@@ -581,9 +580,12 @@ fn restls_config(cfg: &RestlsOut) -> Result<Arc<ClientConfig>> {
         // Same policy as transport::tls_client_config.
         let mut roots = RootCertStore::empty();
         let mut loaded = 0usize;
-        let certs = rustls_native_certs::load_native_certs()
-            .map_err(|e| Error::config(format!("restls: native cert store: {e}")))?;
-        for cert in certs {
+        let certs = rustls_native_certs::load_native_certs();
+            // 0.8: partial failures surface in `.errors`; keep the old hard-fail.
+            if let Some(e) = certs.errors.first() {
+                return Err(Error::config(format!("restls: native cert store: {e}")));
+            }
+        for cert in certs.certs {
             roots
                 .add(cert)
                 .map_err(|e| Error::config(format!("restls: bad native cert: {e}")))?;
@@ -621,7 +623,7 @@ fn restls_client_hello(
 ) -> Result<(ClientConnection, Vec<u8>)> {
     // A fixed X25519 pair: its public key is the MAC input, known upfront.
     let mut scalar = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut scalar);
+    rand::fill(&mut scalar);
     let public = curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(scalar).0;
     FIXED_KEY.with(|k| k.set(Some((scalar, public))));
     let mut mac_input = GROUP_X25519.to_be_bytes().to_vec();
@@ -752,7 +754,7 @@ impl RestlsStream {
         }
         let data = &data[..data_len];
         let mut padding = vec![0u8; padding_len];
-        rand::rngs::OsRng.fill_bytes(&mut padding);
+        rand::fill(&mut padding);
 
         let mut rec = Vec::with_capacity(RECORD_HEADER_LEN + payload_len);
         rec.extend_from_slice(&[REC_APP_DATA, 0x03, 0x03]);
@@ -1692,7 +1694,7 @@ impl RestlsServerStream {
         rec.extend_from_slice(&[0u8; AUTH_HEADER_LEN]);
         rec.extend_from_slice(&data[..data_len]);
         let mut padding = vec![0u8; padding_len];
-        rand::rngs::OsRng.fill_bytes(&mut padding);
+        rand::fill(&mut padding);
         rec.extend_from_slice(&padding);
 
         let body = &rec[auth_off + AUTH_HEADER_LEN..];
@@ -2510,7 +2512,7 @@ mod tests {
         let certified = rcgen::generate_simple_self_signed(vec!["restls.test".to_string()])
             .expect("rcgen self-signed cert");
         let cert = CertificateDer::from(certified.cert.der().to_vec());
-        let key = PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let key = PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into());
         let provider = Arc::new(ring_provider::default_provider());
         Arc::new(
             rustls::ServerConfig::builder_with_provider(provider)
@@ -2551,7 +2553,7 @@ mod tests {
         let data_len = payload_len - AUTH_HEADER_LEN - padding_len;
         let data = &data[..data_len];
         let mut padding = vec![0u8; padding_len];
-        rand::rngs::OsRng.fill_bytes(&mut padding);
+        rand::fill(&mut padding);
 
         let mut rec = Vec::with_capacity(RECORD_HEADER_LEN + payload_len);
         rec.extend_from_slice(&[REC_APP_DATA, 0x03, 0x03]);
