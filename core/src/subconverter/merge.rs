@@ -420,7 +420,10 @@ mod tests {
         // Servers preserved verbatim — no node was dropped as a
         // "duplicate".
         let servers: Vec<_> = result.nodes.iter().map(|n| n.server.as_str()).collect();
-        assert_eq!(servers, vec!["a.example.com", "b.example.com", "c.example.com"]);
+        assert_eq!(
+            servers,
+            vec!["a.example.com", "b.example.com", "c.example.com"]
+        );
         assert_all_unique(&result);
     }
 
@@ -470,7 +473,10 @@ mod tests {
     #[test]
     fn merge_preserves_subscription_order() {
         let lists = vec![
-            vec![node("A1", "a1.example.com", 1), node("A2", "a2.example.com", 2)],
+            vec![
+                node("A1", "a1.example.com", 1),
+                node("A2", "a2.example.com", 2),
+            ],
             vec![node("B1", "b1.example.com", 3)],
         ];
         let result = merge_nodes(&lists);

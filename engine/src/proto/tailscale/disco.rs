@@ -42,7 +42,6 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-
 use super::derp::{box_shared, poly1305, xsalsa20_xor};
 use crate::error::{Error, Result};
 

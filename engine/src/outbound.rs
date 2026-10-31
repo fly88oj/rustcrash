@@ -2247,6 +2247,16 @@ impl GroupState {
     }
 }
 
+/// The group resolutions behind one routed connection (the upstream
+/// `metadata.OutboundChain` shape): the picked members, plus whether any
+/// traversed group was url-test — the policy upstream's dial-failure
+/// failover keys on.
+#[derive(Default)]
+pub struct ChainPick {
+    pub members: Vec<String>,
+    pub url_test_seen: bool,
+}
+
 /// The per-connection data load-balance strategies hash on (mihomo
 /// Unwrap(metadata) → getKey / getKeyWithSrcAndDst / getKeyWithInUser).
 pub struct LbKey<'a> {
@@ -2364,6 +2374,18 @@ impl Registry {
             if cfg.members.is_empty() {
                 return Err(Error::config(format!("group {} has no members", cfg.name)));
             }
+            // A tag listed twice skews url-test probing and load-balance
+            // weighting — upstream rejects duplicates in the selector/
+            // urltest constructors (sing-box c90ccd7).
+            let mut seen = std::collections::HashSet::new();
+            for m in &cfg.members {
+                if !seen.insert(m) {
+                    return Err(Error::config(format!(
+                        "group {}: duplicate member {m:?}",
+                        cfg.name
+                    )));
+                }
+            }
             group_index.insert(cfg.name.clone(), group_states.len());
             group_states.push(GroupState {
                 cfg,
@@ -2430,18 +2452,52 @@ impl Registry {
     /// on (mihomo Unwrap(metadata)): destination host (IP-literal or
     /// eTLD+1), source IP, inbound-authenticated user.
     pub async fn resolve_with(&self, name: &str, lb: Option<&LbKey<'_>>) -> Result<&Outbound> {
+        self.resolve_with_chain(name, lb).await.map(|(o, _)| o)
+    }
+
+    /// [`Registry::resolve_with`] that also reports the picked member
+    /// chain (one entry per group traversed, outermost first — the
+    /// upstream `metadata.OutboundChain` shape, route/conn.go).
+    pub async fn resolve_with_chain(
+        &self,
+        name: &str,
+        lb: Option<&LbKey<'_>>,
+    ) -> Result<(&Outbound, ChainPick)> {
+        let mut pick = ChainPick::default();
         let mut current: std::borrow::Cow<'_, str> = std::borrow::Cow::Borrowed(name);
         for _ in 0..16 {
             if let Some(i) = self.index.get(current.as_ref()) {
-                return Ok(&self.outbounds[*i]);
+                return Ok((&self.outbounds[*i], pick));
             }
             let Some(gi) = self.group_index.get(current.as_ref()).copied() else {
                 return Err(Error::config(format!("unknown proxy {current:?}")));
             };
             let group = &self.groups[gi];
-            current = std::borrow::Cow::Owned(self.pick_member(group, lb).await?);
+            if group.cfg.policy == GroupPolicy::UrlTest {
+                pick.url_test_seen = true;
+            }
+            let member = self.pick_member(group, lb).await?;
+            pick.members.push(member.clone());
+            current = std::borrow::Cow::Owned(member);
         }
         Err(Error::config(format!("proxy group cycle at {current:?}")))
+    }
+
+    /// A routed connection's dial failed: drop the LEAF member's latest
+    /// sample so a url-test group fails over on the NEXT connection
+    /// instead of waiting out the health interval (upstream
+    /// deleteURLTestHistory — route/conn.go:303-308 deletes ONLY the
+    /// chain leaf and ONLY when the chain contains a URLTest group;
+    /// fallback keeps its config priority order and load-balance its
+    /// rotation across transient dial errors). `record_latency(None)`
+    /// is our delete: the member stops competing until the next probe.
+    pub async fn evict_on_dial_failure(&self, pick: &ChainPick) {
+        if !pick.url_test_seen {
+            return;
+        }
+        if let Some(leaf) = pick.members.last() {
+            self.record_latency(leaf, None).await;
+        }
     }
 
     /// Select the active member for a group per its policy.
@@ -2651,11 +2707,18 @@ impl Registry {
                 }
                 let started = std::time::Instant::now();
                 let probe = probe_expect(&url, outbound, expected).await;
-                let sample = probe.ok().map(|_| started.elapsed().as_millis() as u32);
+                let sample = probe.ok().map(|_| probe_ms(started));
                 self.record_latency(m, sample).await;
             }
         }
     }
+}
+
+/// A health/delay probe's elapsed milliseconds, floored at 1: a
+/// sub-millisecond success must not report 0 — the API and dashboards
+/// treat 0 as failure (mihomo df1b07a clamps at the source).
+pub(crate) fn probe_ms(started: std::time::Instant) -> u32 {
+    (started.elapsed().as_millis() as u32).max(1)
 }
 
 /// Fetch a URL through an outbound (GET via a minimal HTTP/1.1 request),
@@ -3018,6 +3081,76 @@ mod tests {
         }
         assert_eq!(jump_hash(0, 1), 0);
         assert_eq!(jump_hash(1987654321, 1), 0);
+    }
+
+    /// sing-box c90ccd7: a tag listed twice in a group's members skews
+    /// probing/weighting — the registry rejects it at build.
+    #[test]
+    fn duplicate_group_members_rejected() {
+        let groups = vec![GroupConfig {
+            name: "G".into(),
+            members: vec!["A".into(), "A".into(), "B".into()],
+            policy: GroupPolicy::Select,
+            url: None,
+            interval: 0,
+            tolerance: 0,
+            lb_strategy: Default::default(),
+            lb_hash_key_in_user: false,
+        }];
+        let err = match Registry::build(vec![direct("A"), direct("B")], groups, None) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("duplicate member must fail the build"),
+        };
+        assert!(err.contains("duplicate member"), "{err}");
+        assert!(err.contains("\"A\""), "{err}");
+    }
+
+    /// sing-box 5372a19 (deleteURLTestHistory over the outbound chain):
+    /// a routed dial failure must fail the group over IMMEDIATELY —
+    /// evicting the picked member drops it from url-test scoring until
+    /// the next health round re-proves it.
+    #[tokio::test]
+    async fn dial_failure_evicts_the_picked_member() {
+        let groups = vec![GroupConfig {
+            name: "UT".into(),
+            members: vec!["A".into(), "B".into()],
+            policy: GroupPolicy::UrlTest,
+            url: None,
+            interval: 0,
+            tolerance: 0,
+            lb_strategy: Default::default(),
+            lb_hash_key_in_user: false,
+        }];
+        let reg = Registry::build(vec![direct("A"), direct("B")], groups, None).unwrap();
+        reg.record_latency("A", Some(5)).await;
+        reg.record_latency("B", Some(50)).await;
+        let (outbound, pick) = reg.resolve_with_chain("UT", None).await.unwrap();
+        assert_eq!(outbound.name, "A");
+        assert_eq!(pick.members, vec!["A".to_string()]);
+        assert!(pick.url_test_seen, "the group is url-test");
+        reg.evict_on_dial_failure(&pick).await;
+        let outbound = reg.resolve("UT").await.unwrap();
+        assert_eq!(outbound.name, "B", "failed member must lose the next pick");
+        // A non-url-test chain must NOT evict (upstream deletes only
+        // under url-test chains): a select group keeps its pick.
+        let groups = vec![GroupConfig {
+            name: "SEL".into(),
+            members: vec!["A".into(), "B".into()],
+            policy: GroupPolicy::Select,
+            url: None,
+            interval: 0,
+            tolerance: 0,
+            lb_strategy: Default::default(),
+            lb_hash_key_in_user: false,
+        }];
+        let reg2 = Registry::build(vec![direct("A"), direct("B")], groups, None).unwrap();
+        let (_, pick2) = reg2.resolve_with_chain("SEL", None).await.unwrap();
+        assert!(!pick2.url_test_seen);
+        reg2.record_latency("A", Some(5)).await;
+        reg2.record_latency("B", Some(50)).await;
+        reg2.evict_on_dial_failure(&pick2).await;
+        // Selector: the selected member (first) is picked regardless.
+        assert_eq!(reg2.resolve("SEL").await.unwrap().name, "A");
     }
 
     /// mihomo #1298 (load-balance continuous-fail): a member whose latest

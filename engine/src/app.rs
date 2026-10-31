@@ -667,9 +667,9 @@ impl Engine {
             Some(meta.source.ip()),
             meta.in_user.as_deref(),
         );
-        let outbound = match self
+        let (outbound, pick) = match self
             .registry
-            .resolve_with(&outbound_name, Some(&lb_key))
+            .resolve_with_chain(&outbound_name, Some(&lb_key))
             .await
         {
             Ok(o) => o,
@@ -717,11 +717,13 @@ impl Engine {
             Ok(Err(e)) => {
                 tracing::warn!(target: "engine",
                     "connect {} via {}: {e}", target, outbound_name);
+                self.registry.evict_on_dial_failure(&pick).await;
             }
             Err(_) => {
                 tracing::warn!(target: "engine",
                     "connect {} via {}: timed out after {DIAL_TIMEOUT:?} \
                      (connection released)", target, outbound_name);
+                self.registry.evict_on_dial_failure(&pick).await;
             }
         }
         self.stats.close(id, &counters);
@@ -928,9 +930,9 @@ impl Engine {
             )
             .await;
         let lb_key = crate::outbound::LbKey::from_parts(&effective, Some(source.ip()), None);
-        let Ok(outbound) = self
+        let Ok((outbound, pick)) = self
             .registry
-            .resolve_with(&outbound_name, Some(&lb_key))
+            .resolve_with_chain(&outbound_name, Some(&lb_key))
             .await
         else {
             return;
@@ -960,12 +962,14 @@ impl Engine {
             Ok(Err(e)) => {
                 tracing::debug!(target: "engine",
                     "udp {} via {}: channel failed: {e}", effective, outbound_name);
+                self.registry.evict_on_dial_failure(&pick).await;
                 return;
             }
             Err(_) => {
                 tracing::debug!(target: "engine",
                     "udp {} via {}: associate timed out after {DIAL_TIMEOUT:?}",
                     effective, outbound_name);
+                self.registry.evict_on_dial_failure(&pick).await;
                 return;
             }
         };

@@ -4423,9 +4423,15 @@ impl PacketEncryptor {
     fn aead_seal_detached(&self, nonce: &[u8; 12], payload: &mut Vec<u8>) -> Result<[u8; 16]> {
         let nonce = &Nonce::from(*nonce);
         let tag = match &self.cipher {
-            Cipher::Aes128Gcm(cipher) => cipher.encrypt_inout_detached(nonce, b"", payload.as_mut_slice().into()),
-            Cipher::Aes256Gcm(cipher) => cipher.encrypt_inout_detached(nonce, b"", payload.as_mut_slice().into()),
-            Cipher::ChaCha20(cipher) => cipher.encrypt_inout_detached(nonce, b"", payload.as_mut_slice().into()),
+            Cipher::Aes128Gcm(cipher) => {
+                cipher.encrypt_inout_detached(nonce, b"", payload.as_mut_slice().into())
+            }
+            Cipher::Aes256Gcm(cipher) => {
+                cipher.encrypt_inout_detached(nonce, b"", payload.as_mut_slice().into())
+            }
+            Cipher::ChaCha20(cipher) => {
+                cipher.encrypt_inout_detached(nonce, b"", payload.as_mut_slice().into())
+            }
             Cipher::Null | Cipher::Xor(_) => {
                 return Err(Error::crypto("easytier: cipher is not an AEAD"))
             }
@@ -4444,15 +4450,24 @@ impl PacketEncryptor {
     ) -> Result<()> {
         let nonce = &Nonce::from(*nonce);
         let result = match &self.cipher {
-            Cipher::Aes128Gcm(cipher) => {
-                cipher.decrypt_inout_detached(nonce, b"", (&mut text_and_tag[..]).into(), tag.into())
-            }
-            Cipher::Aes256Gcm(cipher) => {
-                cipher.decrypt_inout_detached(nonce, b"", (&mut text_and_tag[..]).into(), tag.into())
-            }
-            Cipher::ChaCha20(cipher) => {
-                cipher.decrypt_inout_detached(nonce, b"", (&mut text_and_tag[..]).into(), tag.into())
-            }
+            Cipher::Aes128Gcm(cipher) => cipher.decrypt_inout_detached(
+                nonce,
+                b"",
+                (&mut text_and_tag[..]).into(),
+                tag.into(),
+            ),
+            Cipher::Aes256Gcm(cipher) => cipher.decrypt_inout_detached(
+                nonce,
+                b"",
+                (&mut text_and_tag[..]).into(),
+                tag.into(),
+            ),
+            Cipher::ChaCha20(cipher) => cipher.decrypt_inout_detached(
+                nonce,
+                b"",
+                (&mut text_and_tag[..]).into(),
+                tag.into(),
+            ),
             Cipher::Null | Cipher::Xor(_) => {
                 return Err(Error::crypto("easytier: cipher is not an AEAD"))
             }

@@ -8,7 +8,6 @@
 //! verifier rustls uses for its own client, ring backend — we only feed it
 //! the certificate list we parsed out of the handshake).
 
-
 use crate::error::Result;
 use crate::stream::BoxProxyStream;
 

@@ -70,7 +70,9 @@ fn b64_flex(data: &str) -> Option<Vec<u8>> {
     while !buf.len().is_multiple_of(4) {
         buf.push('=');
     }
-    base64::engine::general_purpose::STANDARD.decode(buf.as_bytes()).ok()
+    base64::engine::general_purpose::STANDARD
+        .decode(buf.as_bytes())
+        .ok()
 }
 
 /// Lenient percent-decode: a stray `%` or invalid sequence degrades to the
@@ -327,8 +329,11 @@ fn parse_ss(uri: &str) -> Option<ProxyNode> {
     } else {
         b64_flex(&userinfo).and_then(|b| String::from_utf8(b).ok())
     };
-    let (cipher, password) = plain_userinfo
-        .and_then(|plain| plain.split_once(':').map(|(c, p)| (c.to_string(), p.to_string())))?;
+    let (cipher, password) = plain_userinfo.and_then(|plain| {
+        plain
+            .split_once(':')
+            .map(|(c, p)| (c.to_string(), p.to_string()))
+    })?;
 
     Some(ProxyNode {
         name,
@@ -368,7 +373,12 @@ fn parse_ssr(uri: &str) -> Option<ProxyNode> {
     let method = parts[2].to_string();
     let protocol = parts[3].to_string();
     let port: u16 = parts[4].parse().ok()?;
-    let host = parts[5..].iter().rev().copied().collect::<Vec<_>>().join(":");
+    let host = parts[5..]
+        .iter()
+        .rev()
+        .copied()
+        .collect::<Vec<_>>()
+        .join(":");
 
     let password = b64_flex(password_b64)
         .and_then(|b| String::from_utf8(b).ok())
@@ -521,19 +531,18 @@ fn parse_hysteria2(uri: &str) -> Option<ProxyNode> {
     // Port: plain, port-hop range (first wins), or omitted (443) —
     // mihomo converter.go defaults hysteria2 to 443 and
     // splitHysteria2Ports connects to the FIRST port of a range.
-    let (server, port) = if let Some((h, p)) = split_host_port(parts.hostport) {
-        (h, p)
-    } else if let Some((h, first)) = parts
-        .hostport
-        .rsplit_once(':')
-        .and_then(|(h, tail)| Some((h.to_string(), valid_port(tail.split([',', '-']).next()?)?)))
-    {
-        (h, first)
-    } else if !parts.hostport.is_empty() && !parts.hostport.contains(':') {
-        (parts.hostport.to_string(), 443)
-    } else {
-        return None;
-    };
+    let (server, port) =
+        if let Some((h, p)) = split_host_port(parts.hostport) {
+            (h, p)
+        } else if let Some((h, first)) = parts.hostport.rsplit_once(':').and_then(|(h, tail)| {
+            Some((h.to_string(), valid_port(tail.split([',', '-']).next()?)?))
+        }) {
+            (h, first)
+        } else if !parts.hostport.is_empty() && !parts.hostport.contains(':') {
+            (parts.hostport.to_string(), 443)
+        } else {
+            return None;
+        };
 
     Some(ProxyNode {
         name: fragment_name(parts.fragment, "Hysteria2"),
@@ -1031,7 +1040,10 @@ ss://YmFkYmFkYmQ6cGFzc3dvcmQxMjM=@192.168.1.1:8388#Test-SS
         let node = parse_uri(uri).unwrap();
         assert_eq!(node.server, "1.2.3.4");
         assert_eq!(node.port, 443);
-        assert_eq!(node.extra.cipher.as_deref(), Some("2022-blake3-aes-256-gcm"));
+        assert_eq!(
+            node.extra.cipher.as_deref(),
+            Some("2022-blake3-aes-256-gcm")
+        );
         assert_eq!(node.extra.password.as_deref(), Some("p@ss:word"));
     }
 
@@ -1497,10 +1509,7 @@ ss://YmFkYmFkYmQ6cGFzc3dvcmQxMjM=@192.168.1.1:8388#Test-SS
                     assert_eq!(n.extra.ssr_method.as_deref(), Some("aes-256-cfb"));
                     assert_eq!(n.extra.password.as_deref(), Some("ssrpassword"));
                     assert_eq!(n.extra.ssr_protocol.as_deref(), Some("auth_chain_a"));
-                    assert_eq!(
-                        n.extra.ssr_obfs.as_deref(),
-                        Some("tls1.2-ticket_auth")
-                    );
+                    assert_eq!(n.extra.ssr_obfs.as_deref(), Some("tls1.2-ticket_auth"));
                     assert_eq!(n.extra.ssr_obfs_param.as_deref(), Some("obfsparam1"));
                 }),
             ));
@@ -1589,24 +1598,24 @@ ss://YmFkYmFkYmQ6cGFzc3dvcmQxMjM=@192.168.1.1:8388#Test-SS
             "   ",
             "vmess://",
             "vmess://!!!!not-base64!!!!",
-            "vmess://bnVsbA",                       // valid b64, not JSON ("nul")
-            "vmess://eyJhZGQiOiJ9",                 // JSON without required fields
-            "vmess://eyJpZCI6IngifQ==",             // id but no add
-            "vmess://eyJhZGQiOiJ4In0=",             // add but no id
+            "vmess://bnVsbA",           // valid b64, not JSON ("nul")
+            "vmess://eyJhZGQiOiJ9",     // JSON without required fields
+            "vmess://eyJpZCI6IngifQ==", // id but no add
+            "vmess://eyJhZGQiOiJ4In0=", // add but no id
             "vmess://eyJhZGQiOiJ4IiwiaWQiOiJ5IiwicG9ydCI6Im5vdGFwb3J0In0=", // port NaN
             "ss://",
             "ss://@",
             "ss://@host:0",
             "ss://!!!@1.2.3.4:443",
-            "ss://Y2hhY2hhMjA=@no-port-host",       // SIP002 without port
+            "ss://Y2hhY2hhMjA=@no-port-host", // SIP002 without port
             "ssr://",
             "ssr://!!!",
             // SSR payload with < 6 fields
             "ssr://b25seTp0d28=",
             "trojan://",
-            "trojan://only-password",               // no '@'
+            "trojan://only-password", // no '@'
             "trojan://pw@host:notaport",
-            "trojan://pw@:443",                     // empty host
+            "trojan://pw@:443", // empty host
             "vless://",
             "vless://uuid@no-port",
             "vless://uuid@host:notaport#x",
@@ -1616,7 +1625,7 @@ ss://YmFkYmFkYmQ6cGFzc3dvcmQxMjM=@192.168.1.1:8388#Test-SS
             "tuic://",
             "tuic://uuid@host:notaport",
             "wireguard://",
-            "wireguard://private_key=x",            // no endpoint
+            "wireguard://private_key=x", // no endpoint
             "unknown://whatever",
             "http://example.com/sub",
             "\u{0}\u{1}\u{2}",
@@ -1662,8 +1671,15 @@ ss://YmFkYmFkYmQ6cGFzc3dvcmQxMjM=@192.168.1.1:8388#Test-SS
             s
         };
         for scheme in [
-            "vmess://", "ss://", "ssr://", "trojan://", "vless://",
-            "hysteria2://", "hy2://", "tuic://", "wireguard://",
+            "vmess://",
+            "ss://",
+            "ssr://",
+            "trojan://",
+            "vless://",
+            "hysteria2://",
+            "hy2://",
+            "tuic://",
+            "wireguard://",
         ] {
             for len in [1usize, 5, 20, 100, 500] {
                 let _ = parse_uri(&format!("{scheme}{}", garbage(len)));

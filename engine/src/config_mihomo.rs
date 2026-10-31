@@ -95,6 +95,8 @@ struct RawDns {
     fallback: Option<Vec<String>>,
     #[serde(default, rename = "fake-ip-range")]
     fake_ip_range: Option<String>,
+    #[serde(default, rename = "fake-ip-range6")]
+    fake_ip_range6: Option<String>,
     #[serde(default, rename = "fake-ip-filter")]
     fake_ip_filter: Option<Vec<String>>,
     #[serde(default)]
@@ -412,7 +414,7 @@ pub fn load(text: &str) -> Result<EngineConfig> {
                      routing instead",
                 ));
             }
-            Ok(DnsConfig {
+            let cfg = DnsConfig {
                 enable: d.enable,
                 listen: d.listen.clone(),
                 enhanced_mode: match d.enhanced_mode.as_deref() {
@@ -437,7 +439,27 @@ pub fn load(text: &str) -> Result<EngineConfig> {
                 nameserver_policy: parse_nameserver_policy(d.nameserver_policy.as_ref()),
                 client_subnet: None,
                 rules: Vec::new(),
-            })
+            };
+            // config.go:1499-1506: fake-ip-range6 must parse as an
+            // IPv6 prefix (bare addresses rejected — ParsePrefix). The
+            // engine validates and accepts it; the fake-ip pool itself
+            // is IPv4-only (AAAA answers empty NOERROR in fake-ip mode
+            // — mihomo's AAAA-filtered behavior), so no v6 fake is ever
+            // allocated from it.
+            if let Some(range6) = &d.fake_ip_range6 {
+                let valid = range6
+                    .split_once('/')
+                    .and_then(|(a, p)| {
+                        Some((a.parse::<std::net::Ipv6Addr>().ok()?, p.parse::<u8>().ok()?))
+                    })
+                    .is_some_and(|(_, p)| p <= 128);
+                if !valid {
+                    return Err(Error::config(format!(
+                        "dns.fake-ip-range6 {range6:?} is not a valid IPv6 prefix"
+                    )));
+                }
+            }
+            Ok(cfg)
         })
         .transpose()?;
 
@@ -542,6 +564,24 @@ fn parse_tun(
              fixed congestion-control behavior and no selector (leave the field unset for the \
              engine default)"
         )));
+    }
+    // `dns-mode` (mihomo 2df147b, RawTun.DNSMode validated against
+    // ""/disabled/native/hijack in listener/sing_tun/server.go:277-281):
+    // the engine's tun DNS behavior is driven by dns-hijack alone — a
+    // value here would be a silent no-op, so it fails loudly. The name
+    // check doubles as a typo guard exactly like upstream's validation.
+    if let Some(mode) = yaml_str(map, "dns-mode").filter(|s| !s.is_empty()) {
+        let known = matches!(mode.as_str(), "disabled" | "native" | "hijack");
+        return Err(if known {
+            Error::config(format!(
+                "tun.dns-mode {mode:?} is not implemented: the engine's tun DNS behavior \
+                 is driven by dns-hijack (leave dns-mode unset)"
+            ))
+        } else {
+            Error::config(format!(
+                "tun.dns-mode {mode:?} is not a dns-mode name (disabled, native, hijack)"
+            ))
+        });
     }
     // Address: `inet4-address: 172.19.0.1/30` (or the legacy `interface-name` family).
     let addr_spec = yaml_str(map, "inet4-address")
@@ -2815,6 +2855,25 @@ rules:
             .unwrap_err()
             .to_string();
         assert!(err.contains("only applies to load-balance"), "{err}");
+    }
+
+    #[test]
+    fn tun_dns_mode_fails_loudly() {
+        // mihomo 2df147b: `dns-mode` (disabled/native/hijack) — the
+        // engine's tun DNS rides dns-hijack alone, so any value is a
+        // would-be silent no-op → loud error; unknown names get the
+        // typo-guard error first.
+        let base = |tun: &str| format!("tun:\n{tun}mixed-port: 7890\nrules:\n  - MATCH,DIRECT\n");
+        let err = load(&base("  enable: true\n  dns-mode: hijack\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("dns-mode"), "{err}");
+        assert!(err.contains("dns-hijack"), "{err}");
+        let err = load(&base("  enable: true\n  dns-mode: hijkack\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a dns-mode name"), "{err}");
+        load(&base("  enable: true\n")).unwrap();
     }
 
     #[test]

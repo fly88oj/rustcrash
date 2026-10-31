@@ -91,9 +91,7 @@ use bytes::{Buf, BytesMut};
 use hkdf::Hkdf;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{ring as ring_provider, CryptoProvider};
-use rustls::{
-    ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme,
-};
+use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tracing::debug;

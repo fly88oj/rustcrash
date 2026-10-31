@@ -373,6 +373,57 @@ mod tests {
         );
     }
 
+    /// mihomo 69c1631 (#3382): bytes the proxy sends BEHIND the CONNECT
+    /// response header (same TCP segment) must survive into the tunnel.
+    /// Our reader consumes the head byte-at-a-time, so this pins the
+    /// property the upstream fix restored for their buffered reader.
+    #[tokio::test]
+    async fn bytes_arriving_with_the_connect_response_survive() {
+        let (client, mut server) = tokio::io::duplex(256);
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                server.read_exact(&mut byte).await.unwrap();
+                buf.push(byte[0]);
+                if buf.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            // Header AND early payload in ONE write — a buffered reader
+            // would swallow "early-data".
+            server
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\nearly-data")
+                .await
+                .unwrap();
+        });
+        let cfg = HttpOut {
+            server: "127.0.0.1".into(),
+            port: 1,
+            username: None,
+            password: None,
+            path: None,
+            headers: Vec::new(),
+            strict_200: false,
+        };
+        let mut stream = HttpStream::handshake(
+            Box::new(client),
+            &cfg,
+            &NetAddr::domain("tunnel.test", 443).unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut buf = [0u8; 10];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_exact(&mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&buf, b"early-data");
+    }
+
     /// `path` overrides the CONNECT request target (sing-box `path`).
     #[tokio::test]
     async fn path_overrides_the_connect_target() {

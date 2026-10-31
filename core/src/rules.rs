@@ -118,10 +118,16 @@ pub fn general_section(config: &Config) -> Result<String> {
     s.push_str(&format!(
         "dns:\n  enable: true\n  listen: 0.0.0.0:{dns_port}\n  enhanced-mode: {dns_mode}\n  ipv6: {ipv6}\n"
     ));
-    // ShellCrash 1.9.5: fakeip range moved to 198.18.0.0/15 (the mihomo
-    // default 198.18.0.1/16 overlaps reserved ranges on some devices).
+    // ShellCrash 1.9.5/1.9.6 (get_config.sh 529d16f): the fake-IP ranges
+    // are config variables — fakeip4 (default 198.18.0.0/15; the mihomo
+    // default 198.18.0.1/16 overlaps reserved ranges on some devices)
+    // and fakeip6 (default 2001:2::/64, moved off fc00::/16). Both keys
+    // ride the dns block; mihomo validates range6 as an IPv6 prefix.
     if dns_mode == "fake-ip" {
-        s.push_str("  fake-ip-range: 198.18.0.1/15\n");
+        s.push_str(&format!(
+            "  fake-ip-range: {}\n  fake-ip-range6: {}\n",
+            config.fakeip4, config.fakeip6
+        ));
     }
     if fakeip_filter == Some(true) {
         // CN domains bypass fake-ip (mix-mode semantics). geosite:cn only —
@@ -572,7 +578,8 @@ mod tests {
         // 1.9.5: fake-ip range 198.18.0.0/15; external-ui panel served by
         // the kernel; Mix mode = fake-ip + CN fake-ip-filter.
         let section = general_section(&Config::default()).unwrap();
-        assert!(section.contains("fake-ip-range: 198.18.0.1/15"));
+        assert!(section.contains("fake-ip-range: 198.18.0.0/15"));
+        assert!(section.contains("fake-ip-range6: 2001:2::/64"));
         assert!(section.contains("external-ui: ui"));
         assert!(section.contains("zashboard"));
         assert!(!section.contains("fake-ip-filter:"));

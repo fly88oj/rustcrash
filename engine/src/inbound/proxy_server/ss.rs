@@ -514,7 +514,8 @@ impl BlockCipher {
     }
 
     fn encrypt(&self, block: &mut [u8; 16]) {
-        let b: &mut aes::cipher::Array<u8, _> = (&mut block[..]).try_into().expect("16-byte AES block");
+        let b: &mut aes::cipher::Array<u8, _> =
+            (&mut block[..]).try_into().expect("16-byte AES block");
         match self {
             BlockCipher::Aes128(c) => c.encrypt_block(b),
             BlockCipher::Aes256(c) => c.encrypt_block(b),
@@ -522,7 +523,8 @@ impl BlockCipher {
     }
 
     fn decrypt(&self, block: &mut [u8; 16]) {
-        let b: &mut aes::cipher::Array<u8, _> = (&mut block[..]).try_into().expect("16-byte AES block");
+        let b: &mut aes::cipher::Array<u8, _> =
+            (&mut block[..]).try_into().expect("16-byte AES block");
         match self {
             BlockCipher::Aes128(c) => c.decrypt_block(b),
             BlockCipher::Aes256(c) => c.decrypt_block(b),

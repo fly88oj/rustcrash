@@ -313,15 +313,10 @@ impl ServiceManager {
 
     /// Start whatever the config selects (external kernel or the Rust
     /// engine self-spawn). Returns the new PID.
-    pub async fn start_selection(
-        &self,
-        selection: crate::engine::KernelSelection,
-    ) -> Result<u32> {
+    pub async fn start_selection(&self, selection: crate::engine::KernelSelection) -> Result<u32> {
         match selection {
             crate::engine::KernelSelection::External(kernel) => self.start(kernel).await,
-            crate::engine::KernelSelection::Engine(flavor) => {
-                self.start_engine(flavor, true).await
-            }
+            crate::engine::KernelSelection::Engine(flavor) => self.start_engine(flavor, true).await,
         }
     }
 
@@ -337,8 +332,12 @@ impl ServiceManager {
             .await
             .map_err(|e| Error::Process(format!("restart join failed: {e}")))??;
         let pid = match selection {
-            crate::engine::KernelSelection::External(kernel) => self.start_inner(kernel, false).await?,
-            crate::engine::KernelSelection::Engine(flavor) => self.start_engine(flavor, false).await?,
+            crate::engine::KernelSelection::External(kernel) => {
+                self.start_inner(kernel, false).await?
+            }
+            crate::engine::KernelSelection::Engine(flavor) => {
+                self.start_engine(flavor, false).await?
+            }
         };
         self.notify_best_effort("restart", &format!("kernel restarted (PID {pid})"));
         Ok(pid)
@@ -363,7 +362,8 @@ impl ServiceManager {
         // hide behind at this point).
         #[cfg(any(feature = "engine-mihomo", feature = "engine-singbox"))]
         {
-            let warnings = crate::engine::test(flavor, cfg_path.to_str().unwrap_or(""), &self.platform)?;
+            let warnings =
+                crate::engine::test(flavor, cfg_path.to_str().unwrap_or(""), &self.platform)?;
             for w in warnings {
                 tracing::warn!("engine config: {w}");
             }
@@ -416,9 +416,9 @@ impl ServiceManager {
                 });
             }
         }
-        let child = cmd.spawn().map_err(|e| {
-            Error::Process(format!("failed to start the rust engine: {e}"))
-        })?;
+        let child = cmd
+            .spawn()
+            .map_err(|e| Error::Process(format!("failed to start the rust engine: {e}")))?;
         let pid = child.id();
 
         if let Some(pid) = pid {

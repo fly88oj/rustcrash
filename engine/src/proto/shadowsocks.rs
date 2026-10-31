@@ -391,7 +391,8 @@ enum AesBlock {
 
 impl AesBlock {
     fn encrypt_block(&self, block: &mut [u8; 16]) {
-        let b: &mut aes::cipher::Array<u8, _> = (&mut block[..]).try_into().expect("16-byte AES block");
+        let b: &mut aes::cipher::Array<u8, _> =
+            (&mut block[..]).try_into().expect("16-byte AES block");
         match self {
             AesBlock::Aes128(c) => c.encrypt_block(b),
             AesBlock::Aes256(c) => c.encrypt_block(b),
@@ -399,7 +400,8 @@ impl AesBlock {
     }
 
     fn decrypt_block(&self, block: &mut [u8; 16]) {
-        let b: &mut aes::cipher::Array<u8, _> = (&mut block[..]).try_into().expect("16-byte AES block");
+        let b: &mut aes::cipher::Array<u8, _> =
+            (&mut block[..]).try_into().expect("16-byte AES block");
         match self {
             AesBlock::Aes128(c) => c.decrypt_block(b),
             AesBlock::Aes256(c) => c.decrypt_block(b),

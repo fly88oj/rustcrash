@@ -1497,8 +1497,7 @@ const OPENVPN_PING_PACKET: [u8; 16] = [
     0x2a, 0x18, 0x7b, 0xf3, 0x64, 0x1e, 0xb4, 0xcb, 0x07, 0xed, 0x2d, 0x0a, 0x98, 0x1f, 0xc7, 0x48,
 ];
 
-type AesBlock16 =
-    aes::cipher::Array<u8, aes::cipher::typenum::U16>;
+type AesBlock16 = aes::cipher::Array<u8, aes::cipher::typenum::U16>;
 
 enum AesBlock {
     A128(Aes128),
@@ -1509,9 +1508,15 @@ enum AesBlock {
 impl AesBlock {
     fn new(key: &[u8]) -> Result<Self> {
         match key.len() {
-            16 => Ok(AesBlock::A128(Aes128::new(key.try_into().expect("16-byte key")))),
-            24 => Ok(AesBlock::A192(Aes192::new(key.try_into().expect("24-byte key")))),
-            32 => Ok(AesBlock::A256(Aes256::new(key.try_into().expect("32-byte key")))),
+            16 => Ok(AesBlock::A128(Aes128::new(
+                key.try_into().expect("16-byte key"),
+            ))),
+            24 => Ok(AesBlock::A192(Aes192::new(
+                key.try_into().expect("24-byte key"),
+            ))),
+            32 => Ok(AesBlock::A256(Aes256::new(
+                key.try_into().expect("32-byte key"),
+            ))),
             n => Err(Error::crypto(format!("invalid AES key length {n}"))),
         }
     }
@@ -1602,12 +1607,18 @@ impl DataChannel {
         let digest = AuthDigest::parse(auth_name)?;
         let mk_aead = |key: &[u8]| -> Result<DataAead> {
             match cipher_name {
-                CIPHER_AES128GCM => Ok(DataAead::A128(aes_gcm::Aes128Gcm::new(key.try_into().expect("16-byte key")))),
+                CIPHER_AES128GCM => Ok(DataAead::A128(aes_gcm::Aes128Gcm::new(
+                    key.try_into().expect("16-byte key"),
+                ))),
                 CIPHER_AES192GCM => Ok(DataAead::A192(<aes_gcm::AesGcm<
                     Aes192,
                     aes::cipher::typenum::U12,
-                >>::new(key.try_into().expect("24-byte key")))),
-                CIPHER_AES256GCM => Ok(DataAead::A256(aes_gcm::Aes256Gcm::new(key.try_into().expect("32-byte key")))),
+                >>::new(
+                    key.try_into().expect("24-byte key")
+                ))),
+                CIPHER_AES256GCM => Ok(DataAead::A256(aes_gcm::Aes256Gcm::new(
+                    key.try_into().expect("32-byte key"),
+                ))),
                 CIPHER_CHACHA20POLY1305 => Ok(DataAead::Chacha(
                     chacha20poly1305::ChaCha20Poly1305::new(key.try_into().expect("32-byte key")),
                 )),

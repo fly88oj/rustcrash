@@ -931,8 +931,7 @@ impl V4Conn {
         rand::fill(&mut salt);
         // v4AEAD (v4.go:155-157): AES-128-GCM over the snell KDF.
         let aead = snell_aead(AeadKind::Aes128Gcm, psk, &salt)?;
-        let padding_delta =
-            rand::random_range(0..u64::from(V4_INITIAL_PADDING_SPAN)) as u16;
+        let padding_delta = rand::random_range(0..u64::from(V4_INITIAL_PADDING_SPAN)) as u16;
         Ok(V4Conn {
             inner,
             psk: psk.to_vec(),

@@ -217,8 +217,14 @@ fn clienthello_sni(body: &[u8]) -> Option<String> {
             }
             let name = std::str::from_utf8(&ext[5..5 + name_len]).ok()?;
             let name = name.to_ascii_lowercase();
-            // Sanity: SNI must be a plausible hostname.
+            // Sanity: SNI must be a plausible hostname. IP literals are
+            // NOT hostnames — upstream stores the Fqdn of the parsed
+            // address, which is empty for IPs, i.e. "no sniffed domain"
+            // (sing-box 0d264e4); the QUIC arm shares this parser.
             if name.is_empty() || name.len() > 253 || name.contains(char::is_whitespace) {
+                return None;
+            }
+            if name.parse::<std::net::IpAddr>().is_ok() {
                 return None;
             }
             return Some(name);
@@ -540,6 +546,26 @@ mod tests {
         assert_eq!(
             sniff(&hello, &cfg(), 443),
             SniffResult::Tls("example.com".into())
+        );
+    }
+
+    /// sing-box 0d264e4: an IP-literal SNI is not a domain — the
+    /// sniffer must not store it as the sniffed host (upstream's Fqdn
+    /// of a parsed address is empty, i.e. no result).
+    #[test]
+    fn ip_literal_sni_is_not_a_domain() {
+        assert_eq!(
+            sniff(&client_hello("93.184.216.34"), &cfg(), 443),
+            SniffResult::Unknown
+        );
+        assert_eq!(
+            sniff(&client_hello("2001:db8::1"), &cfg(), 443),
+            SniffResult::Unknown
+        );
+        // Real hostnames still sniff.
+        assert_eq!(
+            sniff(&client_hello("ip.literal.test"), &cfg(), 443),
+            SniffResult::Tls("ip.literal.test".into())
         );
     }
 

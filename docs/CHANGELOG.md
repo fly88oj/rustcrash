@@ -6,6 +6,43 @@ All notable changes to RustCrash. Format based on
 
 ## [Unreleased]
 
+### Upstream drift sync 2026-10-09 → 2026-10-31
+
+mihomo Alpha `69c1631`, sing-box testing `e5d91fa`, ShellCrash dev
+`b6e4c62` (first real ShellCrash drift since 2026-08-27):
+
+- **Engine (mihomo)**: sudoku multiplex ping/pong frames (0x05/0x06,
+  malformed variants close the session — 3f27ef3); tun `dns-mode` fails
+  loudly with a typo guard (2df147b); sub-millisecond URL-test delays
+  report 1 ms, not 0 (df1b07a — the API and dashboards treat 0 as
+  failure).
+- **Engine (sing-box)**: duplicate members in a group are rejected at
+  build (c90ccd7); the TLS sniffer no longer stores IP-literal SNI as a
+  domain (0d264e4); a routed dial failure evicts the picked member from
+  a url-test group's scoring IMMEDIATELY (5372a19 — upstream's
+  deleteURLTestHistory over the outbound chain; only url-test chains,
+  only the leaf, fallback/load-balance untouched).
+- **Engine alignment**: the SOCKS inbound domain parser matches
+  mihomo's parseSocksAddr exactly (6780eee) — any length 0..=255, ALL
+  trailing FQDN dots trimmed, no validation, no case fold; a regression
+  test pins that bytes arriving WITH the HTTP CONNECT response survive
+  into the tunnel (69c1631 — our byte-exact reader was already safe).
+- **Manager (ShellCrash)**: crontab writes can no longer silently wipe
+  the table (legal-empty vs unreadable distinction + `crontab -` reads
+  its new tab from stdin — both were data-loss bugs in our port, found
+  by the drift audit even though the functions are not yet wired);
+  task descriptors quoted in cron lines (6951f24); fakeip4/fakeip6
+  become config variables with upstream defaults (198.18.0.0/15,
+  2001:2::/64) and both ranges ride the generated config
+  (529d16f — mihomo validates `fake-ip-range6` and so does the engine
+  loader); the nftables IPv6 hijack gate uses a `lan_ip6` set with the
+  ULA/link-local baselines PLUS the LAN's detected global prefixes
+  instead of a hardcoded fd00::/8 (PR #1345), detected inside the
+  script generator through a hermetic rendering core.
+- Testing: hermetic rewrite of the black-holed-DNS-upstream test (the
+  old TEST-NET-1 dial is answered by transparent-TUN hosts); the
+  firewall v6 script test now pins the set declared in BOTH nft tables.
+
 ### Dependencies — 2026-10 refresh (every direct dep at latest)
 
 - **serde_yaml → yaml_serde 0.10** (package rename, zero code churn):

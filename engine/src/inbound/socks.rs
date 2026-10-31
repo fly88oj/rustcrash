@@ -220,7 +220,13 @@ async fn read_socks_target(stream: &mut BoxProxyStream, atyp: u8) -> Result<NetA
             stream.read_exact(&mut name).await?;
             let s =
                 String::from_utf8(name).map_err(|_| Error::protocol("socks5: domain not utf-8"))?;
-            Host::parse(&s)?
+            // parseSocksAddr (adapter/inbound/util.go) does NO domain
+            // validation and NO case fold: any length 0..=255 parses
+            // (mihomo's sweep pins exactly that), an over-long or empty
+            // host failing later at resolve time like upstream. ALL
+            // trailing FQDN dots are trimmed (util.go:24 TrimRight ".").
+            let s = s.trim_end_matches('.');
+            Host::Domain(s.to_string())
         }
         0x04 => {
             let mut b = [0u8; 16];
@@ -387,6 +393,27 @@ mod tests {
         let capture = Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
         let _ = serve(&cfg, &[], capture.clone()).await;
         (capture, cfg)
+    }
+
+    /// mihomo 6780eee (#3359): every domain length 0..=255 must parse
+    /// without arithmetic overflow (upstream's length sweep) — exact
+    /// allocations, no len arithmetic beyond the u8 itself.
+    #[tokio::test]
+    async fn socks_domain_length_sweep() {
+        for len in 0u8..=255u8 {
+            // atyp was consumed by the caller; the stream starts at the
+            // length byte.
+            let mut req = vec![len];
+            req.extend(std::iter::repeat_n(b'a', len as usize));
+            req.extend_from_slice(&443u16.to_be_bytes());
+            let mut stream: BoxProxyStream = Box::new(std::io::Cursor::new(req));
+            let target = read_socks_target(&mut stream, 0x03).await.unwrap();
+            let Host::Domain(d) = target.host else {
+                panic!("len {len}: not a domain");
+            };
+            assert_eq!(d.len(), len as usize, "len {len}");
+            assert_eq!(target.port, 443, "len {len}");
+        }
     }
 
     #[tokio::test]

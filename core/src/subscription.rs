@@ -1582,13 +1582,19 @@ proxies:
             }
         );
         // Floats truncate (upstream's parseValue ParseFloat fallback).
-        assert_eq!(parse_subscription_userinfo("total=1073741824.9").total, 1073741824);
+        assert_eq!(
+            parse_subscription_userinfo("total=1073741824.9").total,
+            1073741824
+        );
         // Garbage never fails the fetch: bad values and fields without
         // `=` drop out, unknown keys are ignored.
         let partial = parse_subscription_userinfo("upload=abc; total=5; noequals; odd=1");
         assert_eq!(partial.upload, 0);
         assert_eq!(partial.total, 5);
-        assert_eq!(parse_subscription_userinfo(""), SubscriptionUserInfo::default());
+        assert_eq!(
+            parse_subscription_userinfo(""),
+            SubscriptionUserInfo::default()
+        );
     }
 
     // ==================================================================
@@ -1636,7 +1642,8 @@ proxies:
         }
 
         fn plain_response(status_line: &str, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
-            let mut r = format!("{status_line}\r\nServer: probe17\r\nConnection: close\r\n").into_bytes();
+            let mut r =
+                format!("{status_line}\r\nServer: probe17\r\nConnection: close\r\n").into_bytes();
             for (k, v) in headers {
                 r.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
             }
@@ -1676,7 +1683,8 @@ proxies:
         /// byte-exact or the node is garbage.
         #[tokio::test]
         async fn fetch_decodes_chunked_transfer_encoding() {
-            let body = format!("{VMESS_URI}\ntrojan://pw@chunk.example.com:443#%E9%A6%99%E6%B8%AF\n");
+            let body =
+                format!("{VMESS_URI}\ntrojan://pw@chunk.example.com:443#%E9%A6%99%E6%B8%AF\n");
             let bytes = body.as_bytes();
             // 1/3, 1/3, 1/3 — cuts mid-payload and mid-multibyte-name.
             let a = &bytes[..bytes.len() / 3];
@@ -1684,7 +1692,9 @@ proxies:
             let c = &bytes[2 * bytes.len() / 3..];
             let base = raw_server(vec![chunked_response(&[a, b, c])]);
 
-            let info = SubscriptionManager::fetch(&format!("{base}/sub")).await.unwrap();
+            let info = SubscriptionManager::fetch(&format!("{base}/sub"))
+                .await
+                .unwrap();
             assert_eq!(info.format, SubscriptionFormat::UriList);
             // decode_content trims surrounding whitespace — everything
             // else must be byte-exact.
@@ -1715,7 +1725,9 @@ proxies:
             assert!(chunks.len() > 1000, "many chunks: {}", chunks.len());
             let base = raw_server(vec![chunked_response(&chunks)]);
 
-            let info = SubscriptionManager::fetch(&format!("{base}/big")).await.unwrap();
+            let info = SubscriptionManager::fetch(&format!("{base}/big"))
+                .await
+                .unwrap();
             assert_eq!(info.content.len(), expected.len(), "payload truncated");
             // The FINAL chunk's node must have survived (tail truncation
             // check, since decode_content trims the trailing newline).
@@ -1735,7 +1747,9 @@ proxies:
                 plain_response("HTTP/1.1 200 OK", &[], VMESS_URI.as_bytes()),
             ]);
 
-            let info = SubscriptionManager::fetch(&format!("{base}/start")).await.unwrap();
+            let info = SubscriptionManager::fetch(&format!("{base}/start"))
+                .await
+                .unwrap();
             assert_eq!(info.format, SubscriptionFormat::UriList);
             assert!(info.content.starts_with("vmess://"));
             // The node inside the final body must actually parse.
@@ -1767,7 +1781,11 @@ proxies:
         /// Non-2xx statuses surface as errors carrying the status code.
         #[tokio::test]
         async fn fetch_non_200_status_is_an_error() {
-            for status in ["503 Service Unavailable", "404 Not Found", "500 Internal Server Error"] {
+            for status in [
+                "503 Service Unavailable",
+                "404 Not Found",
+                "500 Internal Server Error",
+            ] {
                 let base = raw_server(vec![plain_response(
                     &format!("HTTP/1.1 {status}"),
                     &[],
@@ -1820,8 +1838,14 @@ proxies:
                 &gz,
             )]);
 
-            let info = SubscriptionManager::fetch(&format!("{base}/gz")).await.unwrap();
-            assert_eq!(info.content, payload.trim_end(), "gzip body was not inflated");
+            let info = SubscriptionManager::fetch(&format!("{base}/gz"))
+                .await
+                .unwrap();
+            assert_eq!(
+                info.content,
+                payload.trim_end(),
+                "gzip body was not inflated"
+            );
             assert_eq!(info.format, SubscriptionFormat::UriList);
         }
 
@@ -1844,7 +1868,9 @@ proxies:
                 expected.as_bytes(),
             )]);
 
-            let info = SubscriptionManager::fetch(&format!("{base}/cl")).await.unwrap();
+            let info = SubscriptionManager::fetch(&format!("{base}/cl"))
+                .await
+                .unwrap();
             assert_eq!(
                 info.content.len(),
                 expected.trim_end().len(),
@@ -1857,13 +1883,16 @@ proxies:
         /// with the upstream tolerance, None when the server sends none.
         #[tokio::test]
         async fn fetch_surfaces_subscription_userinfo_header() {
-            let header = "upload=453211024; download=7423116545; total=107374182400; expire=1735689600";
+            let header =
+                "upload=453211024; download=7423116545; total=107374182400; expire=1735689600";
             let base = raw_server(vec![plain_response(
                 "HTTP/1.1 200 OK",
                 &[("subscription-userinfo", header)],
                 VMESS_URI.as_bytes(),
             )]);
-            let info = SubscriptionManager::fetch(&format!("{base}/sub")).await.unwrap();
+            let info = SubscriptionManager::fetch(&format!("{base}/sub"))
+                .await
+                .unwrap();
             assert_eq!(
                 info.userinfo.as_ref().unwrap(),
                 &SubscriptionUserInfo {
@@ -1880,7 +1909,9 @@ proxies:
                 &[],
                 VMESS_URI.as_bytes(),
             )]);
-            let info = SubscriptionManager::fetch(&format!("{base}/sub")).await.unwrap();
+            let info = SubscriptionManager::fetch(&format!("{base}/sub"))
+                .await
+                .unwrap();
             assert!(info.userinfo.is_none(), "userinfo: {:?}", info.userinfo);
         }
 
@@ -1897,7 +1928,9 @@ proxies:
                     VMESS_URI.as_bytes(),
                 ),
             ]);
-            let info = SubscriptionManager::fetch(&format!("{base}/start")).await.unwrap();
+            let info = SubscriptionManager::fetch(&format!("{base}/start"))
+                .await
+                .unwrap();
             let info = info.userinfo.unwrap();
             assert_eq!(info.upload, 7);
             assert_eq!(info.total, 9);

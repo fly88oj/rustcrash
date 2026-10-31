@@ -194,7 +194,8 @@ fn create_auth_id(cmd_key: &[u8; 16], ts: i64) -> [u8; 16] {
 
     let key = &vmess_kdf(cmd_key, &[KDF_AUTH_ID_ENC_KEY])[..16];
     let cipher = aes::Aes128::new_from_slice(key).unwrap();
-    let block: &mut aes::cipher::Array<u8, _> = (&mut body[..]).try_into().expect("16-byte AES block");
+    let block: &mut aes::cipher::Array<u8, _> =
+        (&mut body[..]).try_into().expect("16-byte AES block");
     cipher.encrypt_block(block);
     body
 }

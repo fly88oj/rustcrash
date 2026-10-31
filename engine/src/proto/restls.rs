@@ -581,10 +581,10 @@ fn restls_config(cfg: &RestlsOut) -> Result<Arc<ClientConfig>> {
         let mut roots = RootCertStore::empty();
         let mut loaded = 0usize;
         let certs = rustls_native_certs::load_native_certs();
-            // 0.8: partial failures surface in `.errors`; keep the old hard-fail.
-            if let Some(e) = certs.errors.first() {
-                return Err(Error::config(format!("restls: native cert store: {e}")));
-            }
+        // 0.8: partial failures surface in `.errors`; keep the old hard-fail.
+        if let Some(e) = certs.errors.first() {
+            return Err(Error::config(format!("restls: native cert store: {e}")));
+        }
         for cert in certs.certs {
             roots
                 .add(cert)

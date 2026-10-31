@@ -884,9 +884,7 @@ eth1\t0002A8C0\t00000000\t\t0001\t\t0\t0\t0\t00FFFFFF\n";
         let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
         let leaf_params =
             rcgen::CertificateParams::new(vec![san.to_string()]).expect("leaf params");
-        let leaf = leaf_params
-            .signed_by(&leaf_key, &ca)
-            .expect("leaf cert");
+        let leaf = leaf_params.signed_by(&leaf_key, &ca).expect("leaf cert");
         TestPki {
             ca_pem: ca.pem().to_string(),
             leaf: CertificateDer::from(leaf.der().to_vec()),

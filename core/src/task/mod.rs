@@ -89,8 +89,11 @@ impl CronExpr {
     }
 
     pub fn to_cron_line(&self, crash_dir: &str, task_id: &str, command: &str) -> String {
+        // The descriptor argument is quoted — parens/spaces in it would
+        // otherwise be a shell syntax error in the cron line (upstream
+        // 6951f24 / #1331 quotes the same position).
         format!(
-            "{} {} {}/task/task.sh {} {}",
+            "{} {} {}/task/task.sh {} \"{}\"",
             self.minute, self.hour, crash_dir, task_id, command
         )
     }
@@ -120,6 +123,9 @@ impl Task {
             .parse()
             .map_err(|_| format!("Invalid task ID: {}", parts[0]))?;
 
+        if parts[1].contains('#') {
+            return Err(format!("task command must not contain '#': {}", parts[1]));
+        }
         Ok(Self {
             id,
             command: parts[1].to_string(),
@@ -282,7 +288,15 @@ impl TaskUserManager {
 }
 
 pub fn cronset(crash_dir: &Path, keyword: &str, cron_line: &str) -> std::io::Result<()> {
-    let current = load_crontab()?;
+    let current = match load_crontab() {
+        CronTab::Tab(t) => t,
+        CronTab::Empty => String::new(),
+        // A read/permission failure must abort — writing anyway would
+        // silently wipe every other cron entry (upstream set_cron.sh's
+        // cronload distinguishes exactly these cases; the wipe is the
+        // data-loss bug class their fix guards).
+        CronTab::Unreadable(e) => return Err(e),
+    };
 
     let filtered: String = current
         .lines()
@@ -312,34 +326,76 @@ pub fn cronset(crash_dir: &Path, keyword: &str, cron_line: &str) -> std::io::Res
     Ok(())
 }
 
-fn load_crontab() -> std::io::Result<String> {
-    if let Ok(output) = std::process::Command::new("crontab").arg("-l").output() {
-        if output.status.success() {
-            return Ok(String::from_utf8_lossy(&output.stdout).to_string());
-        }
-    }
+/// The current crontab, distinguishing the three load outcomes
+/// upstream's `cronload` separates (set_cron.sh:50-60): a real tab,
+/// LEGALLY absent, or unreadable (must abort, never write). Legal-empty
+/// is exactly the two upstream messages — "no crontab for $user" and
+/// "crontab: can't open '$user': No such file or directory" — anything
+/// else is a real failure and falls through to the spool file, whose
+/// own read errors abort.
+enum CronTab {
+    Tab(String),
+    Empty,
+    Unreadable(std::io::Error),
+}
 
-    let cron_dir = TaskManager::cron_dir()?;
+fn load_crontab() -> CronTab {
+    let crontab_failed =
+        if let Ok(output) = std::process::Command::new("crontab").arg("-l").output() {
+            if output.status.success() {
+                return CronTab::Tab(String::from_utf8_lossy(&output.stdout).to_string());
+            }
+            let err = String::from_utf8_lossy(&output.stderr);
+            if err.contains("no crontab") || err.contains("No such file or directory") {
+                return CronTab::Empty;
+            }
+            Some(format!("crontab -l: {err}"))
+        } else {
+            // No crontab binary at all: the spool file is the only source.
+            None
+        };
+    let cron_dir = TaskManager::cron_dir();
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| "root".to_string());
-
-    let cron_file = cron_dir.join(&user);
-    if cron_file.exists() {
-        std::fs::read_to_string(&cron_file)
-    } else {
-        Ok(String::new())
+    let read = cron_dir.and_then(|dir| std::fs::read_to_string(dir.join(&user)));
+    match read {
+        Ok(t) => CronTab::Tab(t),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match crontab_failed {
+            // crontab -l failed for a non-empty reason AND the spool is
+            // missing: treat as unreadable, not legal-empty.
+            Some(reason) => CronTab::Unreadable(std::io::Error::other(reason)),
+            None => CronTab::Empty,
+        },
+        Err(e) => CronTab::Unreadable(e),
     }
 }
 
 fn save_crontab(content: &str) -> std::io::Result<()> {
-    let result = std::process::Command::new("crontab")
+    use std::process::Stdio;
+    // `crontab -` reads the new tab from STDIN — passing the content as
+    // an argument installs an empty tab instead (the old call shape).
+    let child = std::process::Command::new("crontab")
         .arg("-")
-        .arg(content)
-        .output();
-
-    if result.is_ok() && result.as_ref().unwrap().status.success() {
-        return Ok(());
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    if let Ok(mut child) = child {
+        {
+            use std::io::Write as _;
+            if let Some(stdin) = child.stdin.as_mut() {
+                stdin.write_all(content.as_bytes())?;
+                if !content.ends_with('\n') {
+                    stdin.write_all(b"\n")?;
+                }
+            }
+        }
+        if let Ok(out) = child.wait_with_output() {
+            if out.status.success() {
+                return Ok(());
+            }
+        }
     }
 
     let cron_dir = TaskManager::cron_dir()?;

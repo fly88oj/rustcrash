@@ -113,7 +113,6 @@ pub fn init_logging(configured_level: &str) {
 // push onto it; the engine's /logs endpoint subscribes).
 // ---------------------------------------------------------------------------
 
-
 /// A tracing Layer mirroring every enabled event onto the /logs bus.
 pub struct LogBroadcastLayer;
 
@@ -123,7 +122,9 @@ where
 {
     fn on_event(
         &self,
-        #[cfg_attr(not(feature = "engine-mihomo"), allow(unused_variables))] event: &tracing::Event<'_>,
+        #[cfg_attr(not(feature = "engine-mihomo"), allow(unused_variables))] event: &tracing::Event<
+            '_,
+        >,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
         #[cfg(feature = "engine-mihomo")]

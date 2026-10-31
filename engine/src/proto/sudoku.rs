@@ -3301,6 +3301,8 @@ const MUX_FRAME_OPEN: u8 = 0x01;
 const MUX_FRAME_DATA: u8 = 0x02;
 const MUX_FRAME_CLOSE: u8 = 0x03;
 const MUX_FRAME_RESET: u8 = 0x04;
+const MUX_FRAME_PING: u8 = 0x05;
+const MUX_FRAME_PONG: u8 = 0x06;
 const MUX_HEADER_SIZE: usize = 1 + 4 + 4;
 const MUX_MAX_FRAME_SIZE: usize = 256 * 1024;
 const MUX_MAX_DATA_PAYLOAD: usize = 128 * 1024;
@@ -3608,6 +3610,29 @@ async fn mux_reader_task(
                         msg
                     };
                     let _ = h.tx.try_send(StreamEvent::Reset(msg));
+                }
+            }
+            // session.go:435-438: a ping must ride stream 0 with no
+            // payload, answered with a pong. Upstream's `pongPending`
+            // dedup (session.go:330-337) exists because their pong
+            // write can still be IN FLIGHT; our write channel is
+            // unbounded and single-reader, so answering never blocks
+            // and the dedup flag would be state no one observes — the
+            // pong is sent directly.
+            MUX_FRAME_PING => {
+                if stream_id != 0 || !payload.is_empty() {
+                    debug!(target: "engine", "sudoku: invalid mux ping frame");
+                    break;
+                }
+                let _ = shared.write_tx.send((MUX_FRAME_PONG, 0, Vec::new()));
+            }
+            // session.go:442-445: stream 0, no payload; otherwise
+            // malformed → close. Nothing tracks pongs, so valid ones are
+            // simply ignored.
+            MUX_FRAME_PONG => {
+                if stream_id != 0 || !payload.is_empty() {
+                    debug!(target: "engine", "sudoku: invalid mux pong frame");
+                    break;
                 }
             }
             other => {
@@ -4430,10 +4455,10 @@ fn mask_tls_config(insecure: bool) -> Result<Arc<rustls::ClientConfig>> {
     } else {
         let mut roots = rustls::RootCertStore::empty();
         let certs = rustls_native_certs::load_native_certs();
-            // 0.8: partial failures surface in `.errors`; keep the old hard-fail.
-            if let Some(e) = certs.errors.first() {
-                return Err(Error::config(format!("sudoku: native cert store: {e}")));
-            }
+        // 0.8: partial failures surface in `.errors`; keep the old hard-fail.
+        if let Some(e) = certs.errors.first() {
+            return Err(Error::config(format!("sudoku: native cert store: {e}")));
+        }
         for cert in certs.certs {
             roots
                 .add(cert)
@@ -7889,6 +7914,133 @@ mod tests {
         session.close();
     }
 
+    /// session.go:435-445 (3f27ef3): a ping is answered with a pong off
+    /// the read loop; malformed ping/pong (nonzero stream or payload)
+    /// kills the session; unknown frame types still close.
+    #[tokio::test]
+    async fn mux_ping_answered_with_pong() {
+        use tokio::io::AsyncReadExt as _;
+        let (client, server) = tokio::io::duplex(8 * 1024);
+        // Raw mimic: read frames, forward PING to the session side by
+        // writing from the SERVER role — here we drive the SERVER half
+        // as the peer that sends pings and reads pongs.
+        let peer = tokio::spawn(async move {
+            let mut server = server;
+            let ping = {
+                let mut f = vec![MUX_FRAME_PING];
+                f.extend_from_slice(&0u32.to_be_bytes());
+                f.extend_from_slice(&0u32.to_be_bytes());
+                f
+            };
+            server.write_all(&ping).await.unwrap();
+            let mut header = [0u8; MUX_HEADER_SIZE];
+            server.read_exact(&mut header).await.unwrap();
+            (
+                header[0],
+                u32::from_be_bytes([header[1], header[2], header[3], header[4]]),
+            )
+        });
+        let session = SudokuMuxSession::new(Box::new(client));
+        // The ping arriving on stream 0 must produce exactly one pong on
+        // stream 0 while the session tasks run.
+        let (typ, sid) = tokio::time::timeout(Duration::from_secs(5), peer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(typ, MUX_FRAME_PONG, "ping must be answered with a pong");
+        assert_eq!(sid, 0);
+        session.close();
+    }
+
+    #[tokio::test]
+    async fn mux_malformed_ping_closes_session() {
+        use tokio::io::AsyncReadExt as _;
+        let (client, server) = tokio::io::duplex(8 * 1024);
+        let peer = tokio::spawn(async move {
+            let mut server = server;
+            let mut ping = vec![MUX_FRAME_PING];
+            ping.extend_from_slice(&7u32.to_be_bytes()); // nonzero stream
+            ping.extend_from_slice(&0u32.to_be_bytes());
+            server.write_all(&ping).await.unwrap();
+            // The session must close: EOF on our side.
+            let mut buf = [0u8; 8];
+            match server.read(&mut buf).await {
+                Ok(0) | Err(_) => true,
+                Ok(_) => false,
+            }
+        });
+        let session = SudokuMuxSession::new(Box::new(client));
+        let closed = tokio::time::timeout(Duration::from_secs(5), peer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(closed, "malformed ping must close the session");
+        drop(session);
+    }
+
+    #[tokio::test]
+    async fn mux_valid_pong_ignored() {
+        use tokio::io::AsyncReadExt as _;
+        let (client, server) = tokio::io::duplex(8 * 1024);
+        // Peer sends a valid pong, then an OPEN+DATA exchange must still
+        // work — the session survived the ignored pong.
+        let _peer = tokio::spawn(async move {
+            let mut server = server;
+            let pong = {
+                let mut f = vec![MUX_FRAME_PONG];
+                f.extend_from_slice(&0u32.to_be_bytes());
+                f.extend_from_slice(&0u32.to_be_bytes());
+                f
+            };
+            server.write_all(&pong).await.unwrap();
+            // Now act as echo for one stream.
+            let mut streams: HashMap<u32, Vec<u8>> = HashMap::new();
+            loop {
+                let mut header = [0u8; MUX_HEADER_SIZE];
+                if server.read_exact(&mut header).await.is_err() {
+                    return;
+                }
+                let typ = header[0];
+                let id = u32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+                let len = u32::from_be_bytes([header[5], header[6], header[7], header[8]]) as usize;
+                let mut payload = vec![0u8; len];
+                if len > 0 && server.read_exact(&mut payload).await.is_err() {
+                    return;
+                }
+                match typ {
+                    MUX_FRAME_OPEN => {
+                        streams.insert(id, Vec::new());
+                    }
+                    MUX_FRAME_DATA => {
+                        if let Some(buf) = streams.get_mut(&id) {
+                            buf.extend_from_slice(&payload);
+                            let mut out = vec![MUX_FRAME_DATA];
+                            out.extend_from_slice(&id.to_be_bytes());
+                            out.extend_from_slice(&(buf.len() as u32).to_be_bytes());
+                            out.extend_from_slice(buf);
+                            buf.clear();
+                            let _ = server.write_all(&out).await;
+                        }
+                    }
+                    _ => return,
+                }
+            }
+        });
+        let session = SudokuMuxSession::new(Box::new(client));
+        let mut s = session
+            .open_stream(&NetAddr::domain("pong.example", 443).unwrap())
+            .await
+            .unwrap();
+        s.write_all(b"alive").await.unwrap();
+        let mut buf = [0u8; 5];
+        tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf, b"alive");
+        session.close();
+    }
+
     #[test]
     fn mux_stream_ids_increment() {
         // Compile-level API shape + id sequencing without a socket.
@@ -8618,8 +8770,9 @@ mod tests {
             let certified = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()])
                 .expect("rcgen cert");
             let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
-            let key =
-                rustls::pki_types::PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into());
+            let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+                certified.signing_key.serialize_der().into(),
+            );
             let provider = Arc::new(rustls::crypto::ring::default_provider());
             let mut config = rustls::ServerConfig::builder_with_provider(provider)
                 .with_safe_default_protocol_versions()

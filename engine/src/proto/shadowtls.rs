@@ -75,9 +75,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::ring as ring_provider;
 use rustls::crypto::{CryptoProvider, GetRandomFailed, SecureRandom};
-use rustls::{
-    ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme,
-};
+use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};

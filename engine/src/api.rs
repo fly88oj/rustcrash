@@ -395,7 +395,7 @@ async fn proxy_subroute(
                 let started = std::time::Instant::now();
                 match crate::outbound::probe(&url, outbound).await {
                     Ok(()) => {
-                        let delay = started.elapsed().as_millis() as u32;
+                        let delay = crate::outbound::probe_ms(started);
                         registry.record_latency(real, Some(delay)).await;
                         write_json(
                             stream,
@@ -828,7 +828,7 @@ async fn group_delay(
                 Err(_) => false,
             };
             let delay = if ok {
-                started.elapsed().as_millis() as u32
+                crate::outbound::probe_ms(started)
             } else {
                 0
             };

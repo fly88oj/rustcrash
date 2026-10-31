@@ -155,7 +155,11 @@ mod imp {
 
     /// Load and normalize the kernel config for a flavor, wiring geo
     /// database paths from the install directory.
-    pub fn load(flavor: EngineFlavor, path: &str, platform: &Platform) -> Result<rustcrash_engine::EngineConfig> {
+    pub fn load(
+        flavor: EngineFlavor,
+        path: &str,
+        platform: &Platform,
+    ) -> Result<rustcrash_engine::EngineConfig> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| Error::Config(format!("engine config {path}: {e}")))?;
         let mut cfg = match flavor {
@@ -296,8 +300,14 @@ mod tests {
 
     #[test]
     fn flavor_support_matches_features() {
-        assert_eq!(flavor_supported(EngineFlavor::Mihomo), cfg!(feature = "engine-mihomo"));
-        assert_eq!(flavor_supported(EngineFlavor::SingBox), cfg!(feature = "engine-singbox"));
+        assert_eq!(
+            flavor_supported(EngineFlavor::Mihomo),
+            cfg!(feature = "engine-mihomo")
+        );
+        assert_eq!(
+            flavor_supported(EngineFlavor::SingBox),
+            cfg!(feature = "engine-singbox")
+        );
         if !available_flavors().is_empty() {
             for name in available_flavors() {
                 assert!(EngineFlavor::parse(name).is_some());
@@ -310,7 +320,9 @@ mod tests {
         if flavor_supported(EngineFlavor::Mihomo) {
             assert!(ensure_supported(EngineFlavor::Mihomo).is_ok());
         } else {
-            let err = ensure_supported(EngineFlavor::Mihomo).unwrap_err().to_string();
+            let err = ensure_supported(EngineFlavor::Mihomo)
+                .unwrap_err()
+                .to_string();
             assert!(err.contains("engine-mihomo"), "{err}");
         }
     }

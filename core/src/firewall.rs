@@ -26,7 +26,48 @@ pub const IPV6_RESERVED_PREFIXES: &[(&str, u8)] = &[
     ("::ffff:0:0", 96), // IPv4-mapped
 ];
 
-/// Check if IPv6 address is reserved (should not be proxied)
+/// Detect the LAN's GLOBAL IPv6 prefixes from the live routing table
+/// (PR #1345's `get_ipv6_prefixes`): only global unicast destinations
+/// (`2xxx:`/`3xxx:` — fw_getlanip.sh:2-21 filters the same way), `via`
+/// routes and non-routable scopes excluded. ULA/link-local baselines are
+/// NOT detected — the generator always includes them (build_host_ipv6:
+/// `fe80::/10 fd00::/8 …`).
+fn detect_lan_ipv6_prefixes() -> Vec<String> {
+    let Ok(out) = std::process::Command::new("ip")
+        .args(["-6", "route", "show"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut prefixes = Vec::new();
+    for line in text.lines() {
+        let dest = line.split_whitespace().next().unwrap_or_default();
+        let Some((addr, prefix)) = dest.split_once('/') else {
+            continue;
+        };
+        let segments = addr.split(':').collect::<Vec<_>>();
+        let global = matches!(
+            segments[0].get(0..1).and_then(|h| h.parse::<u32>().ok()),
+            Some(2 | 3)
+        ) && segments.len() >= 2;
+        // `via` routes point at gateways, not local LANs.
+        if !global || line.split_whitespace().any(|t| t == "via") {
+            continue;
+        }
+        if addr.parse::<std::net::Ipv6Addr>().is_err()
+            || prefix.parse::<u8>().map(|p| p > 128).unwrap_or(true)
+        {
+            continue;
+        }
+        if !prefixes.contains(&dest.to_string()) {
+            prefixes.push(dest.to_string());
+        }
+    }
+    prefixes
+}
+
+/// Check if an IPv6 address is reserved (should not be proxied).
 pub fn is_ipv6_reserved(ip: &str) -> bool {
     // Handle special cases first
     if ip == "::1" || ip.starts_with("::1/") || ip.starts_with("::1/") {
@@ -383,9 +424,7 @@ pub fn clean_foreign_shellcrash() -> Vec<String> {
             }
             for chain in foreign_chains_in(&dump) {
                 for op in ["-F", "-X"] {
-                    let _ = Command::new(tool)
-                        .args(["-t", table, op, &chain])
-                        .output();
+                    let _ = Command::new(tool).args(["-t", table, op, &chain]).output();
                 }
                 removed.push(format!("{tool} -t {table}: deleted chain {chain}"));
             }
@@ -801,7 +840,20 @@ table ip filter {{
         )
     }
 
+    /// Production entry: detects the LAN's global v6 prefixes NOW (the
+    /// apply path runs this inside its blocking context) and renders.
     pub fn generate_nft_dual_stack_script(&self, config: &FirewallConfig) -> String {
+        let detected = detect_lan_ipv6_prefixes();
+        self.generate_nft_dual_stack_script_with(&detected, config)
+    }
+
+    /// [`generate_nft_dual_stack_script`] with the detected prefixes
+    /// injected — the hermetic rendering core the tests drive.
+    fn generate_nft_dual_stack_script_with(
+        &self,
+        detected: &[String],
+        config: &FirewallConfig,
+    ) -> String {
         let local_dns = config.dns_port;
         // v4 hijack lives in the (gated) full script's nat table — the
         // dual-stack companion only handles v6, source-gated like the v4
@@ -819,6 +871,14 @@ table ip filter {{
             candidate
         });
 
+        // The LAN gate (PR #1345): the ULA/link-local baselines PLUS the
+        // LAN's detected global prefixes — detection runs HERE, at
+        // generation time inside the apply path's blocking context, so a
+        // regenerated script can never carry stale prefixes and callers
+        // stay hermetic.
+        let mut lan_gate: Vec<&str> = vec!["fe80::/10", "fd00::/8"];
+        lan_gate.extend(detected.iter().map(String::as_str));
+        let lan_set = lan_gate.join(", ");
         format!(
             r#"#!/usr/sbin/nft -f
 # IPv6 companion to the full firewall: v6-only, LAN-source-gated. The
@@ -826,17 +886,31 @@ table ip filter {{
 # gated v4 chains and re-open the WAN exposure).
 
 table ip6 nat {{
+    # nft sets are table-scoped: each table referencing lan_ip6 declares
+    # its own copy (the mangle table below repeats it).
+    set lan_ip6 {{
+        type ipv6_addr
+        flags interval
+        elements = {{ {lan_set} }}
+    }}
+
     chain prerouting {{
         type nat hook prerouting priority -100; policy accept;
-        # ULA + link-local are the v6 LAN analog of RFC1918.
+        # Link-local clients always hijack; routed LAN prefixes ride the
+        # lan_ip6 set (PR #1345 — the v6 analog of the RFC1918 v4 gate).
         ip6 saddr fe80::/10 counter udp dport 53 redirect to {local_dns}
-        ip6 saddr fd00::/8 counter udp dport 53 redirect to {local_dns}
+        ip6 saddr @lan_ip6 counter udp dport 53 redirect to {local_dns}
     }}
 }}
 
 table ip6 mangle {{
     # nft sets are table-scoped: the set must be declared in the same
-    # table whose chains reference it.
+    # table whose chains reference it — hence a second lan_ip6 copy.
+    set lan_ip6 {{
+        type ipv6_addr
+        flags interval
+        elements = {{ {lan_set} }}
+    }}
     set ipv6_reserved {{
         type ipv6_addr
         flags interval
@@ -846,8 +920,8 @@ table ip6 mangle {{
     chain prerouting {{
         type filter hook prerouting priority -150; policy accept;
         ip6 daddr @ipv6_reserved return
-        ip6 saddr fd00::/8 counter udp dport 53 meta mark set {FWMARK} tproxy to :{tproxy_port}
-        ip6 saddr fd00::/8 counter udp dport 443 meta mark set {FWMARK} tproxy to :{tproxy_port}
+        ip6 saddr @lan_ip6 counter udp dport 53 meta mark set {FWMARK} tproxy to :{tproxy_port}
+        ip6 saddr @lan_ip6 counter udp dport 443 meta mark set {FWMARK} tproxy to :{tproxy_port}
     }}
     chain output {{
         type filter hook output priority -150; policy accept;
@@ -1781,13 +1855,22 @@ mod tests {
         // cleanup deleted a rule nothing created. Marks now use FWMARK
         // and the v6 routing pair is generated for the apply path.
         let fw = Firewall::new(&test_platform());
-        let dual = fw.generate_nft_dual_stack_script(&FirewallConfig::default());
+        // Hermetic: drive the rendering core with no detected prefixes —
+        // the gate set degrades to the ULA/link-local baselines.
+        let dual = fw.generate_nft_dual_stack_script_with(&[], &FirewallConfig::default());
         assert!(
             dual.contains("meta mark set 524288"),
             "v6 mark must be FWMARK"
         );
         // v6 tproxy is source-gated and targets the tproxy port.
-        assert!(dual.contains("ip6 saddr fd00::/8 counter udp dport 53"));
+        assert!(dual.contains("ip6 saddr @lan_ip6 counter udp dport 53"));
+        // Baselines present, and the set is declared in BOTH tables
+        // (nft sets are table-scoped — a nat-only declaration made the
+        // mangle references unloadable).
+        assert_eq!(
+            dual.matches("elements = { fe80::/10, fd00::/8 }").count(),
+            2
+        );
         assert!(!dual.contains("mark set 0x1"));
 
         let v6 = fw.generate_ipv6_routing_script();
@@ -2056,15 +2139,15 @@ mod tests {
         assert_eq!(residue.wrapper_scripts, vec!["/usr/bin/crash".to_string()]);
         assert_eq!(residue.profile_aliases, vec!["/etc/profile".to_string()]);
         let lines = residue.summary_lines();
-        assert!(lines.iter().any(|l| l.contains("/etc/ShellCrash")), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("/etc/ShellCrash")),
+            "{lines:?}"
+        );
         assert!(
             lines.iter().any(|l| l.contains("PATH-order conflict")),
             "{lines:?}"
         );
-        assert!(
-            lines.iter().any(|l| l.contains("alias wins")),
-            "{lines:?}"
-        );
+        assert!(lines.iter().any(|l| l.contains("alias wins")), "{lines:?}");
     }
 
     #[test]

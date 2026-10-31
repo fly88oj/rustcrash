@@ -797,18 +797,40 @@ mod tests {
     /// builds shrink the cap; see the const.)
     #[tokio::test]
     async fn blackholed_upstream_is_capped_by_the_total_timeout() {
+        // Hermetic black hole: a loopback listener that ACCEPTS the TCP
+        // connect but never writes a byte — the exchange parks in the
+        // response read, a phase with no internal timeout of its own,
+        // exactly the shape the total cap exists for. (The old
+        // TEST-NET-1 dial was environment-sensitive: on hosts with a
+        // transparent TUN default route 192.0.2.1:53 gets intercepted
+        // and ANSWERED, so "black-holed" was false there.)
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = silent.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((conn, _)) = silent.accept().await {
+                // Hold the connection open, read-drain, never answer.
+                let (mut rd, _wr) = tokio::io::split(conn);
+                let mut sink = [0u8; 512];
+                let _ = tokio::io::AsyncReadExt::read(&mut rd, &mut sink).await;
+            }
+        });
         let engine = DnsEngine::new(
             DnsConfig {
                 enhanced_mode: crate::config::EnhancedMode::RedirHost,
-                // TEST-NET-1: guaranteed not to answer anywhere.
-                nameservers: vec!["tcp://192.0.2.1:53".into()],
+                nameservers: vec![format!("tcp://127.0.0.1:{port}")],
                 ..dns_config()
             },
             DomainMatcher::default(),
         )
         .unwrap();
         let query = wire::build_query(5, "blackhole.test", wire::TYPE_A);
+        let started = std::time::Instant::now();
         let resp = engine.handle(&query).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "query must give up within the total exchange cap, took {:?}",
+            started.elapsed()
+        );
         let msg = wire::parse(&resp).unwrap();
         assert_eq!(msg.id, 5);
         assert_eq!(msg.rcode, wire::RCODE_NXDOMAIN, "all upstreams failed");

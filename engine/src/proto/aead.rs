@@ -171,7 +171,8 @@ pub fn hkdf_sha1(ikm: &[u8], salt: &[u8], info: &[u8], out: &mut [u8]) {
     let mut counter: u8 = 1;
     let mut produced = 0usize;
     while produced < out.len() {
-        let mut mac = <HmacSha1 as KeyInit>::new_from_slice(&prk).expect("hmac accepts any key length");
+        let mut mac =
+            <HmacSha1 as KeyInit>::new_from_slice(&prk).expect("hmac accepts any key length");
         mac.update(&t);
         mac.update(info);
         mac.update(&[counter]);

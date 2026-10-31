@@ -85,6 +85,11 @@ pub struct Config {
     pub variant: String,
     pub mode: String,
     pub dns_mode: String,
+    /// Fake-IP ranges as ShellCrash variables (get_config.sh 529d16f):
+    /// defaults follow upstream — `fakeip4=198.18.0.0/15`,
+    /// `fakeip6=2001:2::/64` (v6 default moved off fc00::/16).
+    pub fakeip4: String,
+    pub fakeip6: String,
     pub proxy_port: u16,
     pub dns_port: u16,
     pub tun_port: Option<u16>,
@@ -175,6 +180,8 @@ impl Default for Config {
             variant: "Lite".to_string(),
             mode: "Router".to_string(),
             dns_mode: "FakeIp".to_string(),
+            fakeip4: "198.18.0.0/15".to_string(),
+            fakeip6: "2001:2::/64".to_string(),
             proxy_port: DEFAULT_PROXY_PORT,
             dns_port: DEFAULT_DNS_PORT,
             tun_port: None,
@@ -442,8 +449,14 @@ fn looks_like_kernel_config(content: &str) -> bool {
         }
         matches!(
             l.split(':').next().unwrap_or_default().trim(),
-            "proxies" | "proxy-groups" | "mixed-port" | "tproxy-port" | "redir-port"
-                | "inbounds" | "listeners" | "tun"
+            "proxies"
+                | "proxy-groups"
+                | "mixed-port"
+                | "tproxy-port"
+                | "redir-port"
+                | "inbounds"
+                | "listeners"
+                | "tun"
         )
     })
 }
@@ -467,14 +480,20 @@ mod tests {
             "mixed-port: 7890\ntproxy-port: 7893\nproxies:\n  - name: a\n",
         )
         .unwrap();
-        let err = ConfigManager::new(&platform).load().unwrap_err().to_string();
+        let err = ConfigManager::new(&platform)
+            .load()
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("KERNEL config"), "{err}");
         assert!(err.contains("ShellCrash"), "{err}");
         assert!(!err.contains("missing field"), "{err}");
 
         // A genuinely broken manager config keeps the plain parse error.
         std::fs::write(dir.path().join("config.yaml"), "kernel: [not, a, scalar]\n").unwrap();
-        let err = ConfigManager::new(&platform).load().unwrap_err().to_string();
+        let err = ConfigManager::new(&platform)
+            .load()
+            .unwrap_err()
+            .to_string();
         assert!(!err.contains("KERNEL config"), "{err}");
 
         // And a file that carries `kernel:` is manager-dialect by
@@ -485,7 +504,10 @@ mod tests {
             "kernel: mihomo\nproxies: []\n",
         )
         .unwrap();
-        let err = ConfigManager::new(&platform).load().unwrap_err().to_string();
+        let err = ConfigManager::new(&platform)
+            .load()
+            .unwrap_err()
+            .to_string();
         assert!(!err.contains("KERNEL config"), "{err}");
     }
 
