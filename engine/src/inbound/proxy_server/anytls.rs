@@ -312,12 +312,15 @@ mod tests {
         assert_eq!(capture.targets(), vec![target]);
     }
 
-    // The wrong-credential tests below observe the server's close
-    // THROUGH the client's session tasks (channel-mediated reads); on a
-    // current-thread test runtime the channel wakeups around the
-    // socket close starve, so they run on a small multi-thread runtime
-    // — the relay assertions are identical either way.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // The wrong-credential tests below MUST stay on the default
+    // current_thread flavor: they observe the server's close THROUGH
+    // the client's channel-mediated session tasks, which is exactly
+    // the wakeup path that once starved (a session death signaled
+    // without dropping the stream senders parked the read forever —
+    // deterministic on a single-threaded runtime, rare under load).
+    // Single-threaded scheduling is the sharpest regression sentinel
+    // for that class of bug.
+    #[tokio::test]
     async fn multi_user_roundtrip_and_wrong_user_rejected() {
         // users-mode: a listed user's password works, an unlisted one is
         // closed silently.
@@ -355,10 +358,7 @@ mod tests {
         };
         let _ = stream.write_all(b"x").await;
         let mut buf = [0u8; 8];
-        // 20s, not 5s: the close is observed through channel-mediated session
-        // tasks whose wakeups starve under heavy test parallelism; the
-        // assertion (server MUST close) is unchanged, only the patience.
-        let read = tokio::time::timeout(Duration::from_secs(20), stream.read(&mut buf)).await;
+        let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await;
         match read {
             Ok(Ok(0)) | Ok(Err(_)) => {}
             Ok(Ok(n)) => panic!("unexpected {n} bytes from a rejected client"),
@@ -367,8 +367,7 @@ mod tests {
         assert_eq!(capture.relayed(), 1, "only alice's stream relayed");
     }
 
-    // See the note on multi_user_roundtrip_and_wrong_user_rejected.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn wrong_password_relays_nothing() {
         let (capture, addr) = spawn_server(&fresh_password()).await;
         let tcp = TcpStream::connect(addr).await.unwrap();
@@ -388,10 +387,7 @@ mod tests {
         };
         let _ = stream.write_all(b"ping").await;
         let mut buf = [0u8; 8];
-        // 20s, not 5s: the close is observed through channel-mediated session
-        // tasks whose wakeups starve under heavy test parallelism; the
-        // assertion (server MUST close) is unchanged, only the patience.
-        let read = tokio::time::timeout(Duration::from_secs(20), stream.read(&mut buf)).await;
+        let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await;
         match read {
             Ok(Ok(0)) | Ok(Err(_)) => {}
             Ok(Ok(n)) => panic!("unexpected {n} bytes from a rejected client"),

@@ -15,17 +15,6 @@ slow-timeout = { period = "60s", terminate-after = 8 }
 # hygiene depends on. Investigate, don't re-roll.
 retries = 0
 
-# The ONE exception, narrowly scoped: the two anytls wrong-credential
-# tests observe the server's close through channel-mediated session
-# tasks whose wakeups starve under heavy parallel load (the engine-side
-# limitation is documented on the tests themselves — see the comment on
-# multi_user_roundtrip_and_wrong_user_rejected). The close always
-# arrives given time or a second attempt; retrying just these two keeps
-# the signal for everything else honest.
-[[profile.default.overrides]]
-filter = 'test(wrong_password_relays_nothing) | test(multi_user_roundtrip_and_wrong_user_rejected)'
-retries = 2
-
 [profile.ci]
 # CI mirrors local: no retries, just compact final reporting.
 final-status-level = "flaky"

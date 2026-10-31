@@ -305,6 +305,12 @@ struct SessionCore {
     active: AtomicUsize,
     dead: watch::Sender<bool>,
     dead_rx: watch::Receiver<bool>,
+    /// Whether `Session.Close` has RUN — a once-guard DISTINCT from the
+    /// `dead` signal: the writer task raises `dead` on a transport write
+    /// error before the full close runs, and that early signal must not
+    /// suppress the cleanup (`dead == true` with live stream senders is
+    /// exactly the state that parks user reads forever).
+    closed: AtomicBool,
     /// The padding factory shared with the writer task (server updates
     /// land here, session.go:315-329).
     padding: Arc<StdMutex<PaddingFactory>>,
@@ -329,12 +335,20 @@ impl SessionCore {
     }
 
     /// `Session.Close` (session.go:110-132): idempotent; every stream is
-    /// closed locally (their pipes end) and the transport shuts down.
+    /// closed locally (their pipes end — dropping the senders wakes
+    /// every parked stream read) and the transport shuts down. Guarded
+    /// by `closed`, not the `dead` flag: `dead` may already be true from
+    /// the writer task's failure signal, and skipping the cleanup then
+    /// would leave stream senders alive with nobody left to drop them.
     fn kill(&self, reason: &str) {
-        if self.is_dead() {
+        if self.closed.swap(true, Ordering::Relaxed) {
             return;
         }
-        *self.die_reason.lock().unwrap() = reason.to_string();
+        let mut die = self.die_reason.lock().unwrap();
+        if die.is_empty() {
+            *die = reason.to_string();
+        }
+        drop(die);
         let _ = self.dead.send(true);
         self.streams.lock().unwrap().clear();
         let _ = self.tx.send(WriteCmd::Shutdown);
@@ -343,7 +357,10 @@ impl SessionCore {
 
 /// The writer task's private state — `sendPadding`, `pktCounter`,
 /// `buffering`/`buffer` (session.go:44-49) plus the transport's write
-/// half (connLock).
+/// half (connLock). Holds the core so a write failure can run the FULL
+/// `Session.Close` (writeControlFrame → `s.Close`, session.go:431-439)
+/// — signaling `dead` alone would leave every stream sender alive and
+/// park user reads forever.
 struct WriterState {
     conn: tokio::io::WriteHalf<BoxProxyStream>,
     send_padding: bool,
@@ -351,8 +368,7 @@ struct WriterState {
     buffer: Vec<u8>,
     buffering: bool,
     padding: Arc<StdMutex<PaddingFactory>>,
-    dead: watch::Sender<bool>,
-    die_reason: Arc<StdMutex<String>>,
+    core: Arc<SessionCore>,
 }
 
 /// `writeConn`'s padding split (session.go:457-518): the first `stop`
@@ -425,10 +441,11 @@ impl WriterState {
         self.conn.flush().await
     }
 
-    async fn fail(self, reason: String) {
-        *self.die_reason.lock().unwrap() = reason;
-        let _ = self.dead.send(true);
-        // The recv task observes the flag and finishes Session.Close.
+    /// A transport write error ends the session with the full close —
+    /// every stream pipe ends (parks wake) and the transport shuts
+    /// down. `kill` keeps the first death reason (ours).
+    fn fail(self, reason: String) {
+        self.core.kill(&reason);
     }
 }
 
@@ -449,7 +466,7 @@ async fn writer_loop(mut rx: mpsc::UnboundedReceiver<WriteCmd>, mut st: WriterSt
                 let mut b = std::mem::take(&mut st.buffer); // 452-455
                 b.extend_from_slice(&frames);
                 if let Err(e) = st.write_conn(&b).await {
-                    st.fail(format!("anytls: session write error: {e}")).await;
+                    st.fail(format!("anytls: session write error: {e}"));
                     return;
                 }
             }
@@ -468,7 +485,7 @@ async fn writer_loop(mut rx: mpsc::UnboundedReceiver<WriteCmd>, mut st: WriterSt
                             io::ErrorKind::BrokenPipe,
                             e.to_string(),
                         )));
-                        st.fail(format!("anytls: session write error: {e}")).await;
+                        st.fail(format!("anytls: session write error: {e}"));
                         return;
                     }
                 }
@@ -587,6 +604,12 @@ async fn recv_loop(
         tokio::select! {
             changed = dead_rx.changed() => {
                 if changed.is_ok() && *dead_rx.borrow() {
+                    // The session died outside this loop (a writer-task
+                    // write failure). FINISH Session.Close here — just
+                    // breaking would leave the stream senders alive and
+                    // park user reads forever. Idempotent: a death that
+                    // already ran the close is a no-op.
+                    core.kill("anytls: session closed");
                     break 'session;
                 }
             }
@@ -642,6 +665,7 @@ impl AnyTlsSession {
             active: AtomicUsize::new(0),
             dead: dead.clone(),
             dead_rx: dead_rx.clone(),
+            closed: AtomicBool::new(false),
             padding: padding.clone(),
             peer_version: AtomicU32::new(0),
             die_reason: Arc::new(StdMutex::new(String::new())),
@@ -661,8 +685,7 @@ impl AnyTlsSession {
             buffer: Vec::new(),
             buffering: true,
             padding,
-            dead,
-            die_reason: core.die_reason.clone(),
+            core: core.clone(),
         };
         tokio::spawn(writer_loop(rx, writer));
         tokio::spawn(recv_loop(r, core.clone(), dead_rx));
@@ -817,7 +840,24 @@ impl AsyncRead for AnyTlsStream {
                     }
                     this.fin = true;
                 }
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    // Session death is also a terminal condition for
+                    // this read (Go's Stream.Read fails with
+                    // net.ErrClosed once the session closed, stream.go:
+                    // 41-47): if the death signal is already up but the
+                    // sender drop is still in flight, answer now instead
+                    // of parking until the drop wakes us.
+                    if this.core.is_dead() {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            format!(
+                                "anytls: session closed: {}",
+                                this.core.death_reason()
+                            ),
+                        )));
+                    }
+                    return Poll::Pending;
+                }
             }
         }
     }
@@ -1604,6 +1644,10 @@ struct ServerCore {
     received_settings: AtomicBool,
     dead: watch::Sender<bool>,
     dead_rx: watch::Receiver<bool>,
+    /// Whether the session close has RUN — distinct from `dead` (see
+    /// the field on [`SessionCore`]): the writer task raises `dead` on
+    /// a write error before the full close, which must still run.
+    closed: AtomicBool,
     die_reason: Arc<StdMutex<String>>,
     /// The authenticated user (auth.ContextWithUser, server.go:225-228).
     user: String,
@@ -1615,13 +1659,19 @@ impl ServerCore {
         *self.dead_rx.borrow()
     }
 
-    /// `Session.Close` for the server role: end every stream pipe, shut
-    /// the transport down.
+    /// `Session.Close` for the server role: end every stream pipe
+    /// (dropping the senders wakes every parked stream read), shut the
+    /// transport down. Guarded by `closed`, not the `dead` flag — a
+    /// `dead` signal from the writer must not suppress the cleanup.
     fn kill(&self, reason: &str) {
-        if self.is_dead() {
+        if self.closed.swap(true, Ordering::Relaxed) {
             return;
         }
-        *self.die_reason.lock().unwrap() = reason.to_string();
+        let mut die = self.die_reason.lock().unwrap();
+        if die.is_empty() {
+            *die = reason.to_string();
+        }
+        drop(die);
         self.streams.lock().unwrap().clear();
         let _ = self.dead.send(true);
         let _ = self.tx.send(WriteCmd::Shutdown);
@@ -1631,19 +1681,20 @@ impl ServerCore {
 /// The server writer task — `writeControlFrame`/`writeDataFrame` under
 /// `connLock`, server side: `sendPadding` is a client-only flag
 /// (session.go:45-48, 56-66), so the server writes are plain
-/// write+flush sequences.
+/// write+flush sequences. A write failure runs the FULL session close
+/// (writeControlFrame → `s.Close`, session.go:431-439) — signaling
+/// `dead` alone would leave stream senders alive and park reads
+/// forever.
 async fn server_writer_loop(
     mut rx: mpsc::UnboundedReceiver<WriteCmd>,
     mut conn: tokio::io::WriteHalf<BoxProxyStream>,
-    dead: watch::Sender<bool>,
-    die_reason: Arc<StdMutex<String>>,
+    core: Arc<ServerCore>,
 ) {
     while let Some(cmd) = rx.recv().await {
         match cmd {
             WriteCmd::Bytes(frames) => {
                 if conn.write_all(&frames).await.is_err() || conn.flush().await.is_err() {
-                    *die_reason.lock().unwrap() = "anytls: server session write error".to_string();
-                    let _ = dead.send(true);
+                    core.kill("anytls: server session write error");
                     return;
                 }
             }
@@ -1786,6 +1837,10 @@ async fn server_recv_loop(
         tokio::select! {
             changed = dead_rx.changed() => {
                 if changed.is_ok() && *dead_rx.borrow() {
+                    // The session died outside this loop (a writer-task
+                    // write failure): FINISH the close so every stream
+                    // read observes it. Idempotent.
+                    core.kill("anytls: session closed");
                     break 'session;
                 }
             }
@@ -1961,7 +2016,22 @@ impl AsyncRead for AnyTlsServerStream {
                     }
                     this.fin = true;
                 }
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    // Session death is terminal for this read as well
+                    // (net.ErrClosed, stream.go:41-47): answer instead of
+                    // parking when the signal is already up but the
+                    // sender drop is still in flight.
+                    if this.core.is_dead() {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            format!(
+                                "anytls: session closed: {}",
+                                this.core.die_reason.lock().unwrap()
+                            ),
+                        )));
+                    }
+                    return Poll::Pending;
+                }
             }
         }
     }
@@ -2088,11 +2158,12 @@ pub async fn run_server_session(
         received_settings: AtomicBool::new(false),
         dead: dead.clone(),
         dead_rx: dead_rx.clone(),
+        closed: AtomicBool::new(false),
         die_reason: Arc::new(StdMutex::new(String::new())),
         user,
         on_stream,
     });
-    tokio::spawn(server_writer_loop(rx, w, dead, core.die_reason.clone()));
+    tokio::spawn(server_writer_loop(rx, w, core.clone()));
     server_recv_loop(r, core, dead_rx).await;
 }
 
