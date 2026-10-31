@@ -11282,21 +11282,19 @@ impl EasyTierUdp {
 #[cfg(test)]
 mod tests {
     /// Sequentially-unique listener port for tests, drawn from
-    /// 21000-29000 — deliberately BELOW the Linux ephemeral port range
+    /// 21000-32699 — deliberately BELOW the Linux ephemeral port range
     /// (ip_local_port_range, typically 32768-60999): the old random
     /// draw inside 31000-50999 could collide with the kernel handing
     /// the same number to a concurrent test's outgoing-connection
     /// source port, which blocks the listener bind (an active socket
     /// ignores SO_REUSEADDR), and two random draws can also collide
     /// with each other (observed on CI: two-node relay serve() died
-    /// with Address already in use). The atomic counter makes
-    /// in-process collisions impossible; the random base keeps
-    /// parallel test binaries apart.
+    /// with Address already in use). The host-wide file-locked counter
+    /// makes collisions impossible across processes too — the random
+    /// base + atomic counter it replaces still let two test processes
+    /// (cargo-nextest runs one per test) land overlapping ranges.
     fn unique_test_port() -> u16 {
-        static BASE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let base = *BASE.get_or_init(|| 21000 + rand::random::<u32>() % 8000);
-        u16::try_from(base + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)).unwrap()
+        crate::test_support::unique_test_port()
     }
 
     use super::*;
@@ -12334,7 +12332,15 @@ mod tests {
         let secret = format!("et-{}", rand::random::<u64>());
         let network = "hand-rolled-net";
         let digest = network_secret_digest(network, &secret);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // Below-ephemeral port, NOT :0: a :0 bind lands the listener in
+        // the kernel's ephemeral range, where a concurrent process's
+        // outbound connect can draw the same number as its source port
+        // and the handshake eats a stray RST (reproduced under
+        // source-port churn; ~16%/run at high test parallelism).
+        let port = unique_test_port();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .unwrap();
         let addr = listener.local_addr().unwrap();
         let checker = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -12356,8 +12362,19 @@ mod tests {
                                                                            // only on identity match — here it matches).
             let reply = build_handshake(0xfeed_face, network, Some(&digest));
             write_frame(&mut stream, &reply).await.unwrap();
-            // Echo pings as pongs (peer_conn.rs:1334-1341).
-            while let Some(p) = read_frame(&mut stream).await.unwrap() {
+            // Echo pings as pongs (peer_conn.rs:1334-1341). A reset on
+            // read is a normal ending: the client's close() drops the
+            // socket with the pong it stopped reading still queued, and
+            // the kernel turns that close into an RST (verified by
+            // strace under load — the handshake and pings all
+            // succeeded first). FIN and RST both mean "peer went away".
+            loop {
+                let p = match read_frame(&mut stream).await {
+                    Ok(Some(p)) => p,
+                    Ok(None) => break,                       // clean FIN
+                    Err(e) if e.to_string().contains("reset") => break,
+                    Err(e) => panic!("mimic read: {e}"),
+                };
                 if p.hdr.packet_type != packet_type::PING {
                     continue;
                 }

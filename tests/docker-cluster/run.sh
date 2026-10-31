@@ -11,6 +11,10 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/resource-guard.sh"
 guard_run
 
+# Content-addressed engine-image tag, shared with the parallel e2e
+# suites (scripts/e2e-image-tag.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/e2e-image-tag.sh"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 
@@ -35,12 +39,13 @@ if [ ! -f "$CERT_DIR/server.crt" ]; then
 fi
 
 echo "=== Building cluster image ==="
-if [ "${E2E_FORCE_BUILD:-0}" = "1" ] \
-    || ! docker image inspect rustcrash-cluster >/dev/null 2>&1; then
-    docker compose -f "$COMPOSE_FILE" build >/dev/null 2>&1 || {
-        echo "image build failed"; exit 1;
-    }
-fi
+# Same content-addressed scheme as the engine-family suites, under this
+# suite's own image name (worktree builds: this suite's historical
+# default). The four services share one image; building one builds it.
+E2E_IMAGE_NAME=rustcrash-cluster
+E2E_IMAGE_DOCKERFILE=tests/docker-cluster/Dockerfile.cluster
+E2E_IMAGE_SERVICE=server
+ensure_engine_image worktree || exit 1
 
 echo "=== Starting cluster (client / edge1 / edge2 / server) ==="
 docker compose -f "$COMPOSE_FILE" up -d >/dev/null

@@ -27,6 +27,10 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/resource-guard.sh"
 guard_run
 
+# Content-addressed engine-image tag, shared with the parallel e2e
+# suites (scripts/e2e-image-tag.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/e2e-image-tag.sh"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 
@@ -65,12 +69,9 @@ CAMO_BODY="camo-page"
 echo "=== Building/reusing the engine image (shared with tests/docker-engine) ==="
 # The REALITY suite needs no extra image content: the engine binary is the
 # workspace build, and the real Xray binary is fetched inside the container.
-if [ "${E2E_FORCE_BUILD:-0}" = "1" ] \
-    || ! docker image inspect docker-engine-rustcrash >/dev/null 2>&1; then
-    docker compose -f "$COMPOSE_FILE" build rustcrash --quiet || {
-        echo "image build failed"; exit 1;
-    }
-fi
+# Content-addressed tag (scripts/e2e-image-tag.sh): shared cleanly with
+# the parallel suites, never stale.
+ensure_engine_image || exit 1
 
 echo "=== Starting container ==="
 docker compose -f "$COMPOSE_FILE" up -d >/dev/null

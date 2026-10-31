@@ -10,6 +10,10 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/resource-guard.sh"
 guard_run
 
+# Content-addressed engine-image tag, shared with the parallel e2e
+# suites (scripts/e2e-image-tag.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/e2e-image-tag.sh"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 
@@ -34,14 +38,9 @@ if [ ! -f "$CERT_DIR/server.crt" ]; then
 fi
 
 echo "=== Building engine interop image ==="
-# Reuse the cached image unless missing or E2E_FORCE_BUILD=1 (offline /
-# rerun-friendly; the image embeds the engine binary under test).
-if [ "${E2E_FORCE_BUILD:-0}" = "1" ] \
-    || ! docker image inspect docker-engine-rustcrash >/dev/null 2>&1; then
-    docker compose -f "$COMPOSE_FILE" build rustcrash --quiet || {
-        echo "image build failed"; exit 1;
-    }
-fi
+# Content-addressed: rebuild exactly when the tree content changed,
+# share the one build with parallel suites, never run a stale engine.
+ensure_engine_image worktree || exit 1
 
 echo "=== Starting container ==="
 docker compose -f "$COMPOSE_FILE" up -d >/dev/null

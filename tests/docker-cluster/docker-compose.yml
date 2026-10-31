@@ -14,7 +14,8 @@ x-base: &base
   build:
     context: ../..
     dockerfile: tests/docker-cluster/Dockerfile.cluster
-  image: rustcrash-cluster
+  # Content-addressed tag from scripts/e2e-image-tag.sh.
+  image: ${ENGINE_IMAGE_TAG:-rustcrash-cluster:latest}
   networks:
     - clnet
 

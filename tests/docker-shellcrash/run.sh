@@ -34,6 +34,10 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/resource-guard.sh"
 guard_run
 
+# Content-addressed engine-image tag, shared with the parallel e2e
+# suites (scripts/e2e-image-tag.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/e2e-image-tag.sh"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 
@@ -87,27 +91,10 @@ echo "=== Building/reusing the engine image (shared with tests/docker-engine) ==
 # Built from the last COMMIT (git archive HEAD), not the working tree —
 # same policy as tests/docker-interop (parallel agents share this repo).
 # E2E_WORKING_TREE_BUILD=1 restores the direct compose build for local use.
-if [ "${E2E_FORCE_BUILD:-0}" = "1" ] \
-    || ! docker image inspect docker-engine-rustcrash >/dev/null 2>&1; then
-    if [ "${E2E_WORKING_TREE_BUILD:-0}" = "1" ]; then
-        docker compose -f "$COMPOSE_FILE" build rustcrash --quiet \
-            || { echo "image build failed"; exit 1; }
-    else
-        EXPORT_DIR=$(mktemp -d /tmp/rustcrash-sc-export.XXXXXX)
-        if git -C "$SCRIPT_DIR/../.." archive HEAD | tar -x -C "$EXPORT_DIR" 2>/dev/null; then
-            HEAD_DESC=$(git -C "$SCRIPT_DIR/../.." describe --always --dirty 2>/dev/null || echo HEAD)
-            echo "  building from committed tree ($HEAD_DESC)"
-            docker build --quiet -t docker-engine-rustcrash \
-                -f "$SCRIPT_DIR/../docker-engine/Dockerfile.engine" "$EXPORT_DIR" \
-                || { echo "image build failed (from $EXPORT_DIR)"; rm -rf "$EXPORT_DIR"; exit 1; }
-            rm -rf "$EXPORT_DIR"
-        else
-            rm -rf "$EXPORT_DIR"
-            docker compose -f "$COMPOSE_FILE" build rustcrash --quiet \
-                || { echo "image build failed"; exit 1; }
-        fi
-    fi
-fi
+# The tag is content-addressed (scripts/e2e-image-tag.sh), so the
+# committed tree and a parallel suite's identical build share one image
+# while a dirty worktree gets its own.
+ensure_engine_image || exit 1
 
 echo "=== Starting container ==="
 # This suite INSTALLS ShellCrash: install.sh interacts differently when

@@ -11,7 +11,8 @@
 # is hermetic too.
 services:
   rustcrash:
-    image: docker-engine-rustcrash
+    # Content-addressed tag from scripts/e2e-image-tag.sh (shared image).
+    image: ${ENGINE_IMAGE_TAG:-docker-engine-rustcrash:latest}
     networks:
       - matrixnet
     cap_add:

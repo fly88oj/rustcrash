@@ -25,6 +25,10 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/resource-guard.sh"
 guard_run
 
+# Content-addressed engine-image tag, shared with the parallel e2e
+# suites (scripts/e2e-image-tag.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/e2e-image-tag.sh"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
@@ -53,58 +57,64 @@ echo "=== Feature-matrix e2e: 3 platforms x every feature ==="
 #    cross-rs arm64 build, and the qemu-user runner.
 # ---------------------------------------------------------------------------
 echo "--- engine image (shared with tests/docker-engine) ---"
-if ! docker image inspect docker-engine-rustcrash >/dev/null 2>&1 \
-    || [ "${E2E_FORCE_BUILD:-0}" = "1" ]; then
-    EXPORT_DIR=$(mktemp -d /tmp/rustcrash-matrix-export.XXXXXX)
-    if git -C "$PROJECT_ROOT" archive HEAD | tar -x -C "$EXPORT_DIR" 2>/dev/null; then
-        echo "  building from committed tree ($(git -C "$PROJECT_ROOT" describe --always --dirty 2>/dev/null || echo HEAD))"
-        docker build --quiet -t docker-engine-rustcrash \
-            -f "$PROJECT_ROOT/tests/docker-engine/Dockerfile.engine" "$EXPORT_DIR" \
-            || { echo "image build failed"; exit 1; }
-    else
-        docker build --quiet -t docker-engine-rustcrash \
-            -f "$PROJECT_ROOT/tests/docker-engine/Dockerfile.engine" "$PROJECT_ROOT" \
-            || { echo "image build failed"; exit 1; }
-    fi
-    rm -rf "$EXPORT_DIR"
-fi
+# Content-addressed tag; archive of HEAD by default (see
+# scripts/e2e-image-tag.sh), so parallel suites share the one build and
+# a stale image is impossible.
+ensure_engine_image || exit 1
 
 echo "--- x86_64-musl static binary ---"
+# /tmp/rustcrash-musl is SHARED with tests/musl-verify (whichever runs
+# first builds it, the other reuses); the flock makes concurrent runs
+# safe instead of racing the binary in place. The tag stamp records the
+# tree content the binary was built from — a stale artifact is rebuilt,
+# never silently reused (same content-addressing as the image tags).
 mkdir -p "$MUSL_DIR"
-if [ ! -x "$MUSL_DIR/crash" ] || [ "${E2E_FORCE_BUILD:-0}" = "1" ]; then
-    rm -f "$MUSL_DIR/crash"
-    docker run --rm \
-        -v "$PROJECT_ROOT":/src:ro \
-        -v "$MUSL_DIR":/src/target \
-        -w /src \
-        rust:1.98-slim \
-        bash -c '
+(
+    flock 9
+    MUSL_WANT_TAG=$(_e2e_content_hash "$PROJECT_ROOT")
+    if [ ! -x "$MUSL_DIR/crash" ] || [ "${E2E_FORCE_BUILD:-0}" = "1" ] \
+        || [ "$(cat "$MUSL_DIR/crash.tag" 2>/dev/null)" != "$MUSL_WANT_TAG" ]; then
+        rm -f "$MUSL_DIR/crash"
+        docker run --rm \
+            -v "$PROJECT_ROOT":/src:ro \
+            -v "$MUSL_DIR":/src/target \
+            -w /src \
+            rust:1.98-slim \
+            bash -c "
 rustup target add x86_64-unknown-linux-musl 2>/dev/null
 apt-get update -qq && apt-get install -y -qq musl-tools >/dev/null 2>&1
-cargo build --release --target x86_64-unknown-linux-musl --bin crash --features engine-full 2>&1 | grep "^error" && exit 1
+cargo build --release --target x86_64-unknown-linux-musl --bin crash --features engine-full -j \"${E2E_DOCKER_JOBS:-16}\" 2>&1 | grep '^error' && exit 1
 exit 0
-' | tail -3
-    [ -x "$MUSL_DIR/x86_64-unknown-linux-musl/release/crash" ] || { echo "FATAL: musl build failed"; exit 1; }
-    cp "$MUSL_DIR/x86_64-unknown-linux-musl/release/crash" "$MUSL_DIR/crash"
-    chmod +x "$MUSL_DIR/crash"
-fi
+" | tail -3
+        [ -x "$MUSL_DIR/x86_64-unknown-linux-musl/release/crash" ] || { echo "FATAL: musl build failed"; exit 1; }
+        cp "$MUSL_DIR/x86_64-unknown-linux-musl/release/crash" "$MUSL_DIR/crash"
+        chmod +x "$MUSL_DIR/crash"
+        echo "$MUSL_WANT_TAG" > "$MUSL_DIR/crash.tag"
+    fi
+) 9>/tmp/rustcrash-musl.lock || exit 1
 echo "  musl binary: $(ls -la "$MUSL_DIR/crash" 2>/dev/null | awk '{print $5}') bytes"
 
 echo "--- aarch64-musl cross build + qemu-user ---"
 if command -v cross >/dev/null 2>&1; then
-    (cd "$PROJECT_ROOT" && cross build --release --target aarch64-unknown-linux-musl --bin crash --features engine-full >/tmp/rustcrash-matrix-cross.log 2>&1) \
+    (cd "$PROJECT_ROOT" && cross build --release --target aarch64-unknown-linux-musl --bin crash --features engine-full -j "${E2E_CROSS_JOBS:-16}" >/tmp/rustcrash-matrix-cross.log 2>&1) \
         || tail -5 /tmp/rustcrash-matrix-cross.log
     [ -x "$ARM64_BIN" ] || { echo "FATAL: arm64 cross build failed (see /tmp/rustcrash-matrix-cross.log)"; exit 1; }
 else
     [ -x "$ARM64_BIN" ] || { echo "FATAL: cross CLI missing and no cached arm64 binary"; exit 1; }
     echo "  cross CLI absent; using cached arm64 binary"
 fi
-if [ ! -x "$QEMU_BIN" ]; then
-    docker create --name qemu-extract-matrix ghcr.io/cross-rs/aarch64-unknown-linux-musl:0.2.5 >/dev/null 2>&1
-    docker cp qemu-extract-matrix:/usr/local/bin/qemu-aarch64 "$QEMU_BIN" >/dev/null 2>&1
-    docker rm qemu-extract-matrix >/dev/null 2>&1
-    chmod +x "$QEMU_BIN"
-fi
+# /tmp/qemu-aarch64 is shared with tests/musl-verify: extract under an
+# flock, and clear a leftover extraction container from a crashed run.
+(
+    flock 9
+    if [ ! -x "$QEMU_BIN" ]; then
+        docker rm qemu-extract-matrix >/dev/null 2>&1 || true
+        docker create --name qemu-extract-matrix ghcr.io/cross-rs/aarch64-unknown-linux-musl:0.2.5 >/dev/null 2>&1
+        docker cp qemu-extract-matrix:/usr/local/bin/qemu-aarch64 "$QEMU_BIN" >/dev/null 2>&1
+        docker rm qemu-extract-matrix >/dev/null 2>&1
+        chmod +x "$QEMU_BIN"
+    fi
+) 9>/tmp/rustcrash-qemu.lock
 [ -x "$QEMU_BIN" ] || { echo "FATAL: qemu-aarch64 unavailable"; exit 1; }
 echo "  arm64: $(du -h "$ARM64_BIN" | cut -f1), qemu: $QEMU_BIN"
 

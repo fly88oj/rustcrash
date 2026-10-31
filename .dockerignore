@@ -1,8 +1,5 @@
-target/
-.git/
-*.md
-scripts/
-.env
-*.log
-.mimosa/
-.planning/
+# Tooling state that must not bust COPY layers (or enter images):
+# the Mimosa git-hook writes per-session JSON under tests/. The
+# content-hash in scripts/e2e-image-tag.sh excludes it for the same
+# reason.
+**/.mimosa/

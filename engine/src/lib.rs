@@ -25,6 +25,8 @@ pub mod ruleset_bin;
 pub mod sniffer;
 pub mod stats;
 pub mod stream;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod transport;
 
 pub use app::Engine;

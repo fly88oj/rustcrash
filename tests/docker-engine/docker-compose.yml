@@ -10,6 +10,10 @@ services:
     build:
       context: ../..
       dockerfile: tests/docker-engine/Dockerfile.engine
+    # Content-addressed tag exported by scripts/e2e-image-tag.sh: five
+    # parallel suites share this image, and the tag encodes the tree it
+    # was built from so a stale build can never be picked up.
+    image: ${ENGINE_IMAGE_TAG:-docker-engine-rustcrash:latest}
     networks:
       - engnet
     cap_add:

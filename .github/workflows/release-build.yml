@@ -90,11 +90,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: cargo test --workspace
+      # nextest: per-test process isolation, so env-var/global-state
+      # mutations in a few tests cannot flake the parallel run (see
+      # .config/nextest.toml). Doctests stay on plain cargo.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --workspace --profile ci
       # The integrated engine: unit tests for both dialects, then clippy on
       # the engine-full feature set (default build is covered above).
-      - run: cargo test -p rustcrash-engine --features mihomo,singbox
-      - run: cargo test -p rustcrash-core --features engine-mihomo,engine-singbox
+      - run: cargo nextest run -p rustcrash-engine --features mihomo,singbox --profile ci
+      - run: cargo nextest run -p rustcrash-core --features engine-mihomo,engine-singbox --profile ci
+      - run: cargo test --workspace --doc
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p rustcrash-crash --features engine-full -- -D warnings
 

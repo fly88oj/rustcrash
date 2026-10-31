@@ -355,7 +355,10 @@ mod tests {
         };
         let _ = stream.write_all(b"x").await;
         let mut buf = [0u8; 8];
-        let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await;
+        // 20s, not 5s: the close is observed through channel-mediated session
+        // tasks whose wakeups starve under heavy test parallelism; the
+        // assertion (server MUST close) is unchanged, only the patience.
+        let read = tokio::time::timeout(Duration::from_secs(20), stream.read(&mut buf)).await;
         match read {
             Ok(Ok(0)) | Ok(Err(_)) => {}
             Ok(Ok(n)) => panic!("unexpected {n} bytes from a rejected client"),
@@ -385,7 +388,10 @@ mod tests {
         };
         let _ = stream.write_all(b"ping").await;
         let mut buf = [0u8; 8];
-        let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await;
+        // 20s, not 5s: the close is observed through channel-mediated session
+        // tasks whose wakeups starve under heavy test parallelism; the
+        // assertion (server MUST close) is unchanged, only the patience.
+        let read = tokio::time::timeout(Duration::from_secs(20), stream.read(&mut buf)).await;
         match read {
             Ok(Ok(0)) | Ok(Err(_)) => {}
             Ok(Ok(n)) => panic!("unexpected {n} bytes from a rejected client"),

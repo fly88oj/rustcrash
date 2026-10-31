@@ -16,7 +16,8 @@ services:
     build:
       context: ../..
       dockerfile: tests/docker-engine/Dockerfile.engine
-    image: docker-engine-rustcrash
+    # Content-addressed tag from scripts/e2e-image-tag.sh (shared image).
+    image: ${ENGINE_IMAGE_TAG:-docker-engine-rustcrash:latest}
     networks:
       - scnet
     cap_add:

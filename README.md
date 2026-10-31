@@ -121,8 +121,9 @@ secrets from config/env only. See [docs/SECURITY.md](docs/SECURITY.md).
 ## Building & testing
 
 ```bash
-cargo test --workspace                 # 600+ tests, no network required
+cargo nextest run --workspace          # 1800+ tests (cargo test works too)
 cargo clippy --workspace --all-targets
+scripts/run-all-tests.sh              # everything: unit + docker e2e, parallel lanes
 bash scripts/cross-compile.sh          # 6 targets: ARM/ARM64/MIPS routers, Pi, x86
 bash scripts/release.sh                # release dir: tar.gz per target + SHA256SUMS
 bash tests/docker/run.sh               # external-kernel e2e (35 checks)
