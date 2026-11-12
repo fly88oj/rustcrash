@@ -66,6 +66,8 @@ libc = "0.2"
 
 # Hashing (integrity verification)
 sha2 = "0.11"
+# BLAKE2b (snell v6 PSK→profile seed derivation).
+blake2 = "0.10"
 
 # Testing
 tempfile = "3"

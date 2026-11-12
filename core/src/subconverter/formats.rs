@@ -207,7 +207,7 @@ fn clash_proxy_entry(node: &ProxyNode, is_clashr: bool) -> String {
         ProxyProtocol::VMess => {
             let transport = node.extra.transport.as_ref().unwrap_or(&TransportType::Tcp);
             let network = match transport {
-                TransportType::WebSocket => "ws",
+                TransportType::WebSocket | TransportType::HttpUpgrade => "ws",
                 TransportType::Http => "http",
                 TransportType::Grpc => "grpc",
                 TransportType::Tcp => "tcp",
@@ -234,6 +234,11 @@ fn clash_proxy_entry(node: &ProxyNode, is_clashr: bool) -> String {
             match transport {
                 TransportType::WebSocket => {
                     yaml.push_str("\n    ws-opts:\n      path: /");
+                }
+                TransportType::HttpUpgrade => {
+                    // mihomo groups httpupgrade under ws-opts with the
+                    // v2ray-http-upgrade flag (e9b9a1a).
+                    yaml.push_str("\n    ws-opts:\n      path: /\n      v2ray-http-upgrade: true");
                 }
                 TransportType::Http => {
                     yaml.push_str("\n    http-opts:\n      path: /");
@@ -281,6 +286,17 @@ fn clash_proxy_entry(node: &ProxyNode, is_clashr: bool) -> String {
             );
             if is_clashr {
                 yaml.push_str("\n    udp-over-tcp: true");
+            }
+            match node.extra.transport.as_ref().unwrap_or(&TransportType::Tcp) {
+                TransportType::HttpUpgrade => {
+                    yaml.push_str(
+                        "\n    network: ws\n    ws-opts:\n      path: /\n      v2ray-http-upgrade: true",
+                    );
+                }
+                TransportType::WebSocket => {
+                    yaml.push_str("\n    network: ws\n    ws-opts:\n      path: /");
+                }
+                _ => {}
             }
             yaml
         }
@@ -408,6 +424,14 @@ fn singbox_outbound(node: &ProxyNode) -> Value {
                     obj["transport"] = json!({
                         "type": "websocket",
                         "path": "/"
+                    });
+                }
+                TransportType::HttpUpgrade => {
+                    // ws + the v2ray-http-upgrade flag (mihomo e9b9a1a).
+                    obj["transport"] = json!({
+                        "type": "websocket",
+                        "path": "/",
+                        "v2ray-http-upgrade": true
                     });
                 }
                 TransportType::Http => {
@@ -799,7 +823,7 @@ fn v2ray_entry(node: &ProxyNode, _index: usize) -> String {
                 "alterId": node.extra.alter_id.unwrap_or(0),
                 "security": "auto",
                 "network": match node.extra.transport.as_ref().unwrap_or(&TransportType::Tcp) {
-                    TransportType::WebSocket => "ws",
+                    TransportType::WebSocket | TransportType::HttpUpgrade => "ws",
                     TransportType::Http => "http",
                     TransportType::Grpc => "grpc",
                     _ => "tcp",
@@ -1000,7 +1024,7 @@ fn mellow_proxy_entry(node: &ProxyNode) -> String {
         ProxyProtocol::VMess => {
             let transport = node.extra.transport.as_ref().unwrap_or(&TransportType::Tcp);
             let network = match transport {
-                TransportType::WebSocket => "ws",
+                TransportType::WebSocket | TransportType::HttpUpgrade => "ws",
                 TransportType::Http => "http",
                 TransportType::Grpc => "grpc",
                 TransportType::Tcp => "tcp",
@@ -1026,6 +1050,11 @@ fn mellow_proxy_entry(node: &ProxyNode) -> String {
             match transport {
                 TransportType::WebSocket => {
                     yaml.push_str("\n    ws-opts:\n      path: /");
+                }
+                TransportType::HttpUpgrade => {
+                    // mihomo groups httpupgrade under ws-opts with the
+                    // v2ray-http-upgrade flag (e9b9a1a).
+                    yaml.push_str("\n    ws-opts:\n      path: /\n      v2ray-http-upgrade: true");
                 }
                 TransportType::Http => {
                     yaml.push_str("\n    http-opts:\n      path: /");

@@ -274,6 +274,26 @@ impl Outbound {
     /// resolver is attached or it cannot answer; the caller decides
     /// whether the OS resolver is an acceptable fallback (DIRECT dials
     /// say no — mihomo #859).
+    /// IPv6 link-local destinations (fe80::/10) need a scope (zone) or
+    /// connect(2) fails with EINVAL. `SocketAddr` carries scope_id —
+    /// resolve it to the default interface index when unset (sing-box
+    /// 7587087's zone handling, default-interface flavor).
+    fn scope_ipv6_link_local_default() -> u32 {
+        // See scope_default_route_dev for the format walk.
+        let routes = std::fs::read_to_string("/proc/net/ipv6_route").ok();
+        routes
+            .as_deref()
+            .and_then(scope_default_route_dev)
+            .and_then(|dev| {
+                std::fs::read_to_string(format!("/sys/class/net/{dev}/ifindex"))
+                    .ok()?
+                    .trim()
+                    .parse()
+                    .ok()
+            })
+            .unwrap_or(0)
+    }
+
     async fn resolve_via_engine(&self, name: &str) -> Option<std::net::IpAddr> {
         if name.is_empty() {
             return None;
@@ -708,11 +728,22 @@ impl Outbound {
                 // The OS resolver stays only for engines with no DNS
                 // configured (dns.enable: false).
                 let dial_addr = match &target.host {
-                    crate::addr::Host::Ip(ip) => Some(std::net::SocketAddr::new(*ip, target.port)),
-                    crate::addr::Host::Domain(d) => self
-                        .resolve_via_engine(d)
-                        .await
-                        .map(|ip| std::net::SocketAddr::new(ip, target.port)),
+                    crate::addr::Host::Ip(ip) => {
+                        let mut sa = std::net::SocketAddr::new(*ip, target.port);
+                        crate::mark::scope_link_local(
+                            &mut sa,
+                            Self::scope_ipv6_link_local_default(),
+                        );
+                        Some(sa)
+                    }
+                    crate::addr::Host::Domain(d) => self.resolve_via_engine(d).await.map(|ip| {
+                        let mut sa = std::net::SocketAddr::new(ip, target.port);
+                        crate::mark::scope_link_local(
+                            &mut sa,
+                            Self::scope_ipv6_link_local_default(),
+                        );
+                        sa
+                    }),
                 };
                 let tcp = match dial_addr {
                     Some(addr) => crate::mark::tcp_connect_addr(addr).await,
@@ -2717,6 +2748,33 @@ impl Registry {
 /// A health/delay probe's elapsed milliseconds, floored at 1: a
 /// sub-millisecond success must not report 0 — the API and dashboards
 /// treat 0 as failure (mihomo df1b07a clamps at the source).
+/// /proc/net/ipv6_route walk (sing-box 7587087's zone resolution,
+/// default-interface flavor): columns are dst(32hex) plen(2hex) src
+/// slen metric ref use flags dev(NAME). The default route is dst
+/// all-zero + plen 00 — the kernel's `lo` catch-all carries the same
+/// shape, so skip it. No default route at all (v6-less uplink) falls
+/// back to the first non-lo routed interface.
+fn scope_default_route_dev(routes: &str) -> Option<&str> {
+    let mut first_routed: Option<&str> = None;
+    for line in routes.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 10 {
+            continue;
+        }
+        let dev = f[9];
+        if dev == "lo" {
+            continue;
+        }
+        if f[0].chars().all(|c| c == '0') && f[1] == "00" {
+            return Some(dev);
+        }
+        if first_routed.is_none() {
+            first_routed = Some(dev);
+        }
+    }
+    first_routed
+}
+
 pub(crate) fn probe_ms(started: std::time::Instant) -> u32 {
     (started.elapsed().as_millis() as u32).max(1)
 }
@@ -2788,7 +2846,28 @@ fn parse_probe_url(url: &str) -> Result<(String, u16, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dns::resolver::DnsEngine;
+
+    #[test]
+    fn default_route_dev_from_proc_fixture() {
+        // Real /proc/net/ipv6_route shapes: plen is TWO hex chars and the
+        // device column is a NAME — the lo catch-all carries the
+        // default-route shape and must be skipped. (Built by
+        // concatenation: backslash line-continuations in Rust source eat
+        // the leading whitespace that pads the columns.)
+        let lo = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200 lo";
+        let ts = "fd7a115ca1e000000000000000000053 80 00000000000000000000000000000000 00 00000000000000000000000000000000 00000400 00000001 00000000 00000001 tailscale0";
+        let eth = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 000003e8 00000001 00000000 00200200 eth0";
+        let routes = format!("{lo}\n{ts}\n{eth}\n");
+        assert_eq!(scope_default_route_dev(&routes), Some("eth0"));
+        // v6-less uplink: no default route — fall back to the first
+        // non-lo routed interface.
+        let no_default = format!("{lo}\n{ts}\n");
+        assert_eq!(scope_default_route_dev(&no_default), Some("tailscale0"));
+        // Only lo → nothing usable.
+        assert_eq!(scope_default_route_dev(&format!("{lo}\n")), None);
+    }
+
+        use crate::dns::resolver::DnsEngine;
     use crate::proto::shadowsocks::SsMethod;
 
     fn direct(name: &str) -> OutboundConfig {

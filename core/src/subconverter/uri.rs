@@ -168,7 +168,11 @@ fn security_enables_tls(value: &str) -> bool {
 /// node survives instead of being dropped.
 fn transport_from_name(net: &str) -> TransportType {
     match net.to_ascii_lowercase().as_str() {
-        "ws" | "websocket" | "httpupgrade" => TransportType::WebSocket,
+        "ws" | "websocket" => TransportType::WebSocket,
+        // Its own flavor: emitted under ws-opts WITH
+        // `v2ray-http-upgrade: true` (mihomo e9b9a1a — flattening to
+        // plain ws changed the transport semantics).
+        "httpupgrade" => TransportType::HttpUpgrade,
         "h2" | "http" => TransportType::Http,
         "grpc" => TransportType::Grpc,
         _ => TransportType::Tcp,
@@ -431,9 +435,15 @@ fn parse_trojan(uri: &str) -> Option<ProxyNode> {
     let (server, port) = split_host_port(parts.hostport)?;
 
     let mut sni = None;
+    let mut transport = None;
     for (key, value) in parse_query(parts.query) {
-        if key == "sni" && !value.is_empty() {
-            sni = Some(value);
+        match key.as_str() {
+            "sni" if !value.is_empty() => sni = Some(value),
+            // mihomo's trojan share links carry type/net like vless
+            // (converter.go:193,201-204); httpupgrade converts to ws +
+            // the v2ray-http-upgrade flag (e9b9a1a).
+            "type" | "net" => transport = Some(transport_from_name(&value)),
+            _ => {}
         }
     }
 
@@ -445,6 +455,7 @@ fn parse_trojan(uri: &str) -> Option<ProxyNode> {
         extra: ProxyExtra {
             trojan_password: Some(password),
             sni,
+            transport,
             ..Default::default()
         },
     })

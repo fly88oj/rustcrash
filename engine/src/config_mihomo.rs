@@ -678,13 +678,36 @@ fn parse_proxy_servers(
                 .map(str::to_string)
         };
         let protocol = match ltype.as_str() {
-            "shadowsocks" => ServerProtocol::Shadowsocks {
-                method: yaml_str(entry, "cipher").unwrap_or_default(),
-                password: yaml_str(entry, "password").unwrap_or_default(),
-                // SIP023 multi-user `users:` parsing is wired by the
-                // integrator; the single-PSK shape stays as-is.
-                users: Vec::new(),
-            },
+            "shadowsocks" => {
+                // SIP023 multi-user `users:` (listener config
+                // shadowsocks.go:13): 2022-blake3 uses `password` as the
+                // iPSK and each entry as a uPSK; legacy AEAD multi-user
+                // (mihomo 2d1a22e) tries each user's key per packet and
+                // requires an EMPTY `password` — the server errors on
+                // non-2022 multi-user exactly like upstream's
+                // newMultiService for other method families.
+                let mut users = Vec::new();
+                if let Some(Yaml::Mapping(map)) = entry.get("users") {
+                    for (k, v) in map {
+                        let Some(name) = k.as_str() else {
+                            return Err(Error::config(
+                                "shadowsocks listener users keys must be strings",
+                            ));
+                        };
+                        let Some(password) = v.as_str() else {
+                            return Err(Error::config(format!(
+                                "shadowsocks listener users[{name:?}]: password must be a string"
+                            )));
+                        };
+                        users.push((name.to_string(), password.to_string()));
+                    }
+                }
+                ServerProtocol::Shadowsocks {
+                    method: yaml_str(entry, "cipher").unwrap_or_default(),
+                    password: yaml_str(entry, "password").unwrap_or_default(),
+                    users,
+                }
+            }
             "trojan" => ServerProtocol::Trojan {
                 password: user_field("password")
                     .or_else(|| yaml_str(entry, "password"))
@@ -837,6 +860,28 @@ fn parse_proxy_servers(
                     .unwrap_or(0);
                 let version = crate::proto::snell::parse_server_version(raw_version)
                     .map_err(|e| Error::config(format!("listener {tag:?}: {e}")))?;
+                // v6-only `mode:` + New's v6 gates (listener/snell/
+                // server.go:41-72): mode on v1..=5 is rejected, then
+                // for v6 the PSK length (ValidateV6PSK), the obfs
+                // http/tls rejection (v6 replaced simple-obfs with
+                // PSK-derived traffic shaping) and ParseV6Mode.
+                let mode_str = yaml_str(entry, "mode").unwrap_or_default();
+                crate::proto::snell_v6::validate_mode_for_version(version, &mode_str, "inbound")
+                    .map_err(|e| Error::config(format!("listener {tag:?}: {e}")))?;
+                let psk = yaml_str(entry, "psk").unwrap_or_default();
+                let obfs_mode = yaml_str(entry, "obfs-mode").unwrap_or_default();
+                let v6_mode = if version == 6 {
+                    crate::proto::snell_v6::validate_v6_psk(psk.as_bytes()).map_err(|e| {
+                        Error::config(format!("listener {tag:?}: snell inbound {e}"))
+                    })?;
+                    crate::proto::snell_v6::validate_v6_obfs(&obfs_mode, "inbound")
+                        .map_err(|e| Error::config(format!("listener {tag:?}: {e}")))?;
+                    crate::proto::snell_v6::parse_v6_mode(&mode_str).map_err(|e| {
+                        Error::config(format!("listener {tag:?}: snell inbound {e}"))
+                    })?
+                } else {
+                    crate::proto::snell_v6::V6Mode::Default
+                };
                 // Security frontings (listener/config/snell.go):
                 // shadow-tls{enable,password,handshake.dest} /
                 // res-tls{enable,dest,password,restls-script,
@@ -908,9 +953,10 @@ fn parse_proxy_servers(
                     )
                 });
                 ServerProtocol::Snell {
-                    psk: yaml_str(entry, "psk").unwrap_or_default(),
+                    psk,
                     version,
-                    obfs_mode: yaml_str(entry, "obfs-mode").unwrap_or_default(),
+                    v6_mode,
+                    obfs_mode,
                     obfs_host: yaml_str(entry, "obfs-host").unwrap_or_default(),
                     shadow_tls,
                     res_tls,
@@ -2020,6 +2066,26 @@ fn parse_proxy(
                 .map_err(|e| Error::config(format!("proxy {name:?}: {e}")))?;
             crate::proto::snell::validate_udp(version, udp)
                 .map_err(|e| Error::config(format!("proxy {name:?}: {e}")))?;
+            let psk = yaml_str(entry, "psk").unwrap_or_default();
+            // v6-only `mode:` — any mode on v1..=5 is rejected
+            // (adapter/outbound/snell.go:283-285), then NewSnell's
+            // Version6 case applies: ValidateV6PSK, the obfs http/tls
+            // rejection (v6 replaced simple-obfs with PSK-derived
+            // shaping) and ParseV6Mode (adapter snell.go:266-279).
+            let mode_str = yaml_str(entry, "mode").unwrap_or_default();
+            let addr = format!("{server}:{port}");
+            crate::proto::snell_v6::validate_mode_for_version(version, &mode_str, &addr)
+                .map_err(|e| Error::config(format!("proxy {name:?}: {e}")))?;
+            let mut v6_mode = crate::proto::snell_v6::V6Mode::Default;
+            if version == 6 {
+                crate::proto::snell_v6::validate_v6_psk(psk.as_bytes())
+                    .map_err(|e| Error::config(format!("proxy {name:?}: snell {addr} {e}")))?;
+                let obfs_mode = yaml_str(entry, "obfs-mode").unwrap_or_default();
+                crate::proto::snell_v6::validate_v6_obfs(&obfs_mode, &addr)
+                    .map_err(|e| Error::config(format!("proxy {name:?}: {e}")))?;
+                v6_mode = crate::proto::snell_v6::parse_v6_mode(&mode_str)
+                    .map_err(|e| Error::config(format!("proxy {name:?}: snell {addr} {e}")))?;
+            }
             // obfs-mode: http keeps the legacy in-band obfs; the
             // security modes (shadow-tls|res-tls|jls) front the wire
             // (outbound snell.go:183-240) — their options live in
@@ -2072,8 +2138,9 @@ fn parse_proxy(
                 _ => None,
             };
             OutboundKind::Snell(crate::proto::snell::SnellOut {
-                psk: yaml_str(entry, "psk").unwrap_or_default(),
+                psk,
                 version,
+                v6_mode,
                 udp,
                 server,
                 port,
@@ -3563,6 +3630,135 @@ rules:
         }
     }
 
+    /// Snell v6 config surface (adapter/outbound/snell.go:257-285,
+    /// listener/snell/server.go:41-72): `mode:` parses per version 6,
+    /// a mode on v1..=5 is rejected, unknown modes name the three
+    /// values, obfs http/tls is rejected on v6 and the PSK window is
+    /// enforced at load.
+    #[test]
+    fn snell_v6_config_parse() {
+        use crate::proto::snell_v6::V6Mode;
+        let psk = "snell-v6-test-psk";
+        let outbound = |extra: &str| {
+            format!(
+                "mixed-port: 7890\nproxies:\n  - {{name: s, type: snell, server: x, port: 1, \
+                 psk: {psk}, version: 6{extra}}}\nrules:\n  - MATCH,s\n"
+            )
+        };
+        let mode_of = |cfg: &crate::EngineConfig| match &cfg
+            .outbounds
+            .iter()
+            .find(|o| o.name == "s")
+            .unwrap()
+            .kind
+        {
+            crate::outbound::OutboundKind::Snell(c) => c.v6_mode,
+            other => panic!("wrong kind: {other:?}"),
+        };
+        // "" / default / unshaped / unsafe-raw (ParseV6Mode, v6.go:33-44).
+        assert_eq!(mode_of(&load(&outbound("")).unwrap()), V6Mode::Default);
+        assert_eq!(
+            mode_of(&load(&outbound(", mode: default")).unwrap()),
+            V6Mode::Default
+        );
+        assert_eq!(
+            mode_of(&load(&outbound(", mode: unshaped")).unwrap()),
+            V6Mode::Unshaped
+        );
+        assert_eq!(
+            mode_of(&load(&outbound(", mode: unsafe-raw")).unwrap()),
+            V6Mode::UnsafeRaw
+        );
+        // mode on v5 → rejected (adapter snell.go:283-285).
+        let err = load(
+            "mixed-port: 7890\nproxies:\n  - {name: s, type: snell, server: x, port: 1, psk: k, version: 5, mode: default}\nrules:\n  - MATCH,s\n",
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            err.contains("snell x:1 mode is only supported on version 6"),
+            "{err}"
+        );
+        // Unknown mode → rejected listing the three values.
+        let err = load(&outbound(", mode: bogus")).err().unwrap().to_string();
+        assert!(err.contains("snell v6 unknown mode: bogus"), "{err}");
+        for want in ["default", "unshaped", "unsafe-raw"] {
+            assert!(err.contains(want), "{err} must list {want}");
+        }
+        // obfs http/tls on v6 → rejected (adapter snell.go:270-274).
+        let err = load(&outbound(", obfs-mode: http"))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("snell x:1 version 6 does not support obfs mode http"),
+            "{err}"
+        );
+        // PSK window enforced at load (ValidateV6PSK, v6.go:78-83).
+        let err = load(
+            "mixed-port: 7890\nproxies:\n  - {name: s, type: snell, server: x, port: 1, psk: short, version: 6}\nrules:\n  - MATCH,s\n",
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            err.contains("snell v6 psk length must be between 12 and 255 bytes"),
+            "{err}"
+        );
+
+        // Listener arm: the same gates with the inbound wording.
+        let listener = |extra: &str| {
+            format!(
+                "mixed-port: 7890\nlisteners:\n  - {{name: sn, type: snell, listen: 127.0.0.1, \
+                 port: 18446, psk: {psk}, version: 6{extra}}}\nproxies:\n  - {{name: d, \
+                 type: socks5, server: 127.0.0.1, port: 1080}}\nrules:\n  - MATCH,d\n"
+            )
+        };
+        let cfg = load(&listener(", mode: unsafe-raw")).unwrap();
+        let sn = cfg.proxy_servers.iter().find(|l| l.tag == "sn").unwrap();
+        match &sn.protocol {
+            crate::inbound::proxy_server::ServerProtocol::Snell {
+                version, v6_mode, ..
+            } => {
+                assert_eq!(*version, 6);
+                assert_eq!(*v6_mode, V6Mode::UnsafeRaw);
+            }
+            other => panic!("wrong protocol: {other:?}"),
+        }
+        // mode on v4 → rejected (listener server.go:42-45).
+        let err = load(
+            "mixed-port: 7890\nlisteners:\n  - {name: sn, type: snell, listen: 127.0.0.1, port: 18446, psk: k, version: 4, mode: default}\nproxies:\n  - {name: d, type: socks5, server: 127.0.0.1, port: 1080}\nrules:\n  - MATCH,d\n",
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            err.contains("snell inbound mode is only supported on version 6"),
+            "{err}"
+        );
+        // obfs http on v6 → rejected (listener server.go:64-67).
+        let err = load(&listener(", obfs-mode: http"))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("snell inbound version 6 does not support obfs mode http"),
+            "{err}"
+        );
+        // PSK window enforced at load.
+        let err = load(
+            "mixed-port: 7890\nlisteners:\n  - {name: sn, type: snell, listen: 127.0.0.1, port: 18446, psk: short, version: 6}\nproxies:\n  - {name: d, type: socks5, server: 127.0.0.1, port: 1080}\nrules:\n  - MATCH,d\n",
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            err.contains("snell v6 psk length must be between 12 and 255 bytes"),
+            "{err}"
+        );
+    }
+
     /// openvpn parses with its option surface; the restls and
     /// tlsmirror listeners parse into ServerProtocol; ECH conflicts are
     /// rejected at parse time.
@@ -4250,7 +4446,7 @@ rules:
             inbound: "",
             inbound_kind: "",
             inbound_port: None,
-            process: None,
+            processes: None,
             uid: None,
             user: None,
             dscp: None,

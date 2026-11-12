@@ -92,6 +92,11 @@ pub enum TransportType {
     #[default]
     Tcp,
     WebSocket,
+    /// v2ray-http-upgrade: carried under ws-opts with the
+    /// `v2ray-http-upgrade: true` flag in BOTH emitted dialects
+    /// (mihomo e9b9a1a — share links with type/net=httpupgrade convert
+    /// to ws + the flag, not plain WebSocket).
+    HttpUpgrade,
     Http,
     Grpc,
 }

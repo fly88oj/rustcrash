@@ -85,6 +85,15 @@ pub struct Config {
     pub variant: String,
     pub mode: String,
     pub dns_mode: String,
+    /// DNS failover (ShellCrash 1.9.6 PR #1362, dns.sh menu 6): when
+    /// ON, the generated mihomo dns block gains the direct-DNS
+    /// `fallback` list with `fallback-filter: {geoip: false}` and
+    /// `fallback-lazy-query: true` — proxy DNS stays primary and mihomo
+    /// lazily falls back to direct DNS when it fails. Upstream gates
+    /// this on route-mode + leak-protect; our generated block always
+    /// uses DoH nameservers, so the flag alone carries the semantics.
+    #[serde(default)]
+    pub dns_failover: bool,
     /// Fake-IP ranges as ShellCrash variables (get_config.sh 529d16f):
     /// defaults follow upstream — `fakeip4=198.18.0.0/15`,
     /// `fakeip6=2001:2::/64` (v6 default moved off fc00::/16).
@@ -180,6 +189,7 @@ impl Default for Config {
             variant: "Lite".to_string(),
             mode: "Router".to_string(),
             dns_mode: "FakeIp".to_string(),
+            dns_failover: false,
             fakeip4: "198.18.0.0/15".to_string(),
             fakeip6: "2001:2::/64".to_string(),
             proxy_port: DEFAULT_PROXY_PORT,

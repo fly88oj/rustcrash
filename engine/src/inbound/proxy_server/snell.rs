@@ -107,6 +107,9 @@ pub const OBFS_TLS_UNSUPPORTED: &str = concat!(
 struct SnellListenCtx {
     psk: Vec<u8>,
     version: u8,
+    /// v6 traffic-shaping mode (`l.v6Mode`, only used for version 6,
+    /// listener/snell/server.go:34).
+    v6_mode: crate::proto::snell_v6::V6Mode,
     http_obfs: bool,
     fronting: Fronting,
     relay: SharedRelay,
@@ -137,6 +140,7 @@ pub async fn serve(cfg: &ServerConfig, relay: SharedRelay) -> Result<SocketAddr>
     let ServerProtocol::Snell {
         psk,
         version,
+        v6_mode,
         obfs_mode,
         obfs_host: _,
         shadow_tls,
@@ -150,6 +154,14 @@ pub async fn serve(cfg: &ServerConfig, relay: SharedRelay) -> Result<SocketAddr>
     };
     // New()'s gate (listener/snell/server.go:37-52), verbatim messages.
     let version = parse_server_version(*version)?;
+    if version != 6 && *v6_mode != crate::proto::snell_v6::V6Mode::Default {
+        // server.go:42-45 — mode is a v6-only setting (config load
+        // rejects the raw string; a programmatic non-Default value on
+        // v1..=5 gets the same treatment).
+        return Err(Error::config(
+            "snell inbound mode is only supported on version 6",
+        ));
+    }
     if psk.is_empty() {
         return Err(Error::config("snell inbound requires psk"));
     }
@@ -163,10 +175,24 @@ pub async fn serve(cfg: &ServerConfig, relay: SharedRelay) -> Result<SocketAddr>
             )));
         }
     };
+    if version == 6 {
+        // New()'s v6 block (server.go:60-72): ValidateV6PSK, the obfs
+        // rejection (v6 replaced simple-obfs with PSK-derived traffic
+        // shaping), ParseV6Mode — the mode is already parsed upstream
+        // in the enum, so only the first two gates re-run here.
+        crate::proto::snell_v6::validate_v6_psk(psk.as_bytes())
+            .map_err(|e| Error::config(format!("snell inbound {e}")))?;
+        if !obfs_mode.is_empty() {
+            return Err(Error::config(format!(
+                "snell inbound version 6 does not support obfs mode {obfs_mode}"
+            )));
+        }
+    }
     let fronting = build_fronting(shadow_tls, res_tls, jls)?;
     let ctx = SnellListenCtx {
         psk: psk.as_bytes().to_vec(),
         version,
+        v6_mode: *v6_mode,
         http_obfs,
         fronting,
         relay,
@@ -357,7 +383,10 @@ async fn handle_conn(
     } else {
         stream
     };
-    let conn = SnellServerConn::new(stream, &ctx.psk, ctx.version)?;
+    // HandleConn (server.go:184-189): version 6 selects the v6 codec
+    // in the configured mode (ServerStreamConnV6), everything else the
+    // shared v1..v5 path (ServerStreamConn).
+    let conn = SnellServerConn::new(stream, &ctx.psk, ctx.version, ctx.v6_mode)?;
     serve_loop(conn, peer, port, ctx).await;
     Ok(())
 }
@@ -1121,6 +1150,7 @@ mod tests {
             protocol: ServerProtocol::Snell {
                 psk: psk.into(),
                 version,
+                v6_mode: crate::proto::snell_v6::V6Mode::Default,
                 obfs_mode: obfs_mode.into(),
                 obfs_host: "cdn.example".into(),
                 shadow_tls,
@@ -1153,6 +1183,7 @@ mod tests {
             port,
             psk: psk.into(),
             version,
+            v6_mode: crate::proto::snell_v6::V6Mode::Default,
             udp: false,
         }
     }
@@ -1199,6 +1230,96 @@ mod tests {
         let (capture, addr) = spawn_server(0, &psk).await;
         let target = roundtrip(&psk, addr, 4).await;
         assert_eq!(capture.targets(), vec![target]);
+    }
+
+    #[tokio::test]
+    async fn v6_roundtrip_all_modes() {
+        // Version 6 selects the v6 record codec in the configured mode
+        // (ServerStreamConnV6, listener/snell/server.go:185-189) — the
+        // fresh_psk length (20) is inside the v6 12..=255 PSK window.
+        for mode in [
+            crate::proto::snell_v6::V6Mode::Default,
+            crate::proto::snell_v6::V6Mode::Unshaped,
+            crate::proto::snell_v6::V6Mode::UnsafeRaw,
+        ] {
+            let psk = fresh_psk();
+            let capture = Capture::new();
+            let cfg = ServerConfig {
+                tag: "snell-v6-test".into(),
+                bind: "127.0.0.1".into(),
+                port: 0,
+                protocol: ServerProtocol::Snell {
+                    psk: psk.clone(),
+                    version: 6,
+                    v6_mode: mode,
+                    obfs_mode: String::new(),
+                    obfs_host: String::new(),
+                    shadow_tls: None,
+                    res_tls: None,
+                    jls: None,
+                },
+            };
+            let addr = serve(&cfg, capture.clone()).await.unwrap();
+            // The client must speak the SAME mode as the listener
+            // (upstream: "both must match the server's configured
+            // mode", v6.go:22-23).
+            let mut cl = client(&psk, addr.port(), 6);
+            cl.v6_mode = mode;
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let target = NetAddr::domain("echo.test", 443).unwrap();
+            let mut stream = crate::proto::snell::handshake(Box::new(tcp), &cl, &target, false)
+                .await
+                .unwrap();
+            use tokio::io::AsyncWriteExt as _;
+            stream.write_all(b"ping-snell").await.unwrap();
+            let mut buf = [0u8; 10];
+            tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf))
+                .await
+                .expect("echo timeout")
+                .unwrap();
+            assert_eq!(&buf, b"ping-snell", "{mode}");
+            assert_eq!(capture.targets(), vec![target], "{mode}");
+        }
+    }
+
+    #[tokio::test]
+    async fn v6_listener_gates() {
+        // New's v6 block (listener/snell/server.go:60-72): PSK length,
+        // the obfs rejection, and the mode-on-v1..=5 rule.
+        let capture = Capture::new();
+        let err = serve(&cfg(6, "short", ""), capture.clone())
+            .await
+            .unwrap_err()
+            .to_string();
+        // The wrap nests the config error ("snell inbound {e}") —
+        // assert on the upstream message content (server.go:61-63).
+        assert!(
+            err.contains("snell inbound")
+                && err.contains("snell v6 psk length must be between 12 and 255 bytes"),
+            "{err}"
+        );
+        let err = serve(&cfg(6, &"k".repeat(256), ""), capture.clone())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("psk length must be between"), "{err}");
+        let err = serve(&cfg(6, &fresh_psk(), "http"), capture.clone())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "config: snell inbound version 6 does not support obfs mode http"
+        );
+        let mut fronted = cfg(5, &fresh_psk(), "");
+        if let ServerProtocol::Snell { v6_mode, .. } = &mut fronted.protocol {
+            *v6_mode = crate::proto::snell_v6::V6Mode::Unshaped;
+        }
+        let err = serve(&fronted, capture).await.unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "config: snell inbound mode is only supported on version 6"
+        );
     }
 
     #[tokio::test]
@@ -1360,11 +1481,13 @@ mod tests {
     #[tokio::test]
     async fn config_gates_match_upstream() {
         let capture = Capture::new();
-        // Version gate (server.go:43).
-        let err = serve(&cfg(6, "p", ""), capture.clone()).await.unwrap_err();
+        // Version gate (server.go:47-48) — 7 is past every constant;
+        // 6 is a valid wire version since the v6 port (its specific
+        // gates are covered by v6_listener_gates).
+        let err = serve(&cfg(7, "p", ""), capture.clone()).await.unwrap_err();
         assert!(
             err.to_string()
-                .contains("snell inbound version 6 is not supported"),
+                .contains("snell inbound version 7 is not supported"),
             "{err}"
         );
         // PSK gate (server.go:45-47).

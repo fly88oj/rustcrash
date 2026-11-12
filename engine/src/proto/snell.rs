@@ -1,4 +1,5 @@
-//! Snell v1..v4 outbound, ported from mihomo's `transport/snell`
+//! Snell v1..v4 outbound (v6 lives in [`crate::proto::snell_v6`]),
+//! ported from mihomo's `transport/snell`
 //! (`snell.go`, `cipher.go`, `v4.go`, `pool.go`, plus
 //! `adapter/outbound/snell.go` for the version/pool wiring) and the
 //! Shadowsocks-AEAD framing v1..v3 reuse
@@ -74,6 +75,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use crate::addr::{Host, NetAddr};
 use crate::error::{Error, Result};
 use crate::proto::aead::{Aead, AeadKind, SsNonce};
+use crate::proto::snell_v6::{V6Conn, V6Mode};
 use crate::stream::BoxProxyStream;
 use tracing::debug;
 
@@ -159,10 +161,15 @@ pub struct SnellOut {
     pub fronting: Option<SnellFronting>,
     /// Pre-shared key (`psk`).
     pub psk: String,
-    /// Protocol version. Raw config accepts `0..=5` — [`parse_version`]
+    /// Protocol version. Raw config accepts `0..=6` — [`parse_version`]
     /// applies mihomo's defaults/mapping and returns the wire version
-    /// (`1..=4`).
+    /// (`1..=4` or `6`; v5 maps down to 4).
     pub version: u8,
+    /// v6 traffic-shaping mode (`mode:` in the config,
+    /// `snell.ParseV6Mode`, transport/snell/v6.go:33-44). Only read for
+    /// [`SnellOut::version`] 6; Default = the shaped profile layer
+    /// (see [`crate::proto::snell_v6`]).
+    pub v6_mode: V6Mode,
     /// Whether the outbound advertises UDP support.
     pub udp: bool,
 }
@@ -175,13 +182,15 @@ pub struct SnellOut {
 /// * `5` → `4` — "Snell v5 servers are backward-compatible with v4
 ///   clients", so v5 is v4 framing verbatim (`StreamConn` routes every
 ///   `version >= Version4` to `newV4Conn`, snell.go:157-158);
-/// * `1..=4` pass through; anything else is
-///   `snell version error: {v}` (adapter snell.go:260).
+/// * `1..=4` and `6` pass through — v6 is the profile-shaped record
+///   layer (`StreamConn`'s `version >= Version6` route →
+///   `StreamConnV6`, snell.go:158-159); anything else is
+///   `snell version error: {v}` (adapter snell.go:281).
 pub fn parse_version(raw: u8) -> Result<u8> {
     match raw {
         0 => Ok(DEFAULT_SNELL_VERSION),
         5 => Ok(4),
-        1..=4 => Ok(raw),
+        1..=4 | 6 => Ok(raw),
         other => Err(Error::config(format!("snell version error: {other}"))),
     }
 }
@@ -706,8 +715,9 @@ fn snell_kdf(psk: &[u8], salt: &[u8], key_size: usize) -> Result<Vec<u8>> {
 }
 
 /// `snellCipher.Encrypter/Decrypter` (cipher.go:21-27): one AEAD per
-/// direction, keyed by the KDF output for the direction's salt.
-fn snell_aead(kind: AeadKind, psk: &[u8], salt: &[u8]) -> Result<Aead> {
+/// direction, keyed by the KDF output for the direction's salt. Shared
+/// with the v6 record layer (`v6AEAD`, transport/snell/v6.go:253-255).
+pub(crate) fn snell_aead(kind: AeadKind, psk: &[u8], salt: &[u8]) -> Result<Aead> {
     let key_size = kind.key_len();
     Aead::new(kind, &snell_kdf(psk, salt, key_size)?)
 }
@@ -1265,6 +1275,9 @@ impl Reply {
 enum Conn {
     V3(V3Conn),
     V4(V4Conn),
+    /// Boxed: the v6 conn carries its PSK-derived profile inline
+    /// (~700 bytes — clippy's large_enum_variant).
+    V6(Box<V6Conn>),
 }
 
 impl Conn {
@@ -1273,6 +1286,7 @@ impl Conn {
         let out = match self {
             Conn::V3(c) => &mut c.out,
             Conn::V4(c) => &mut c.out,
+            Conn::V6(c) => &mut c.out,
         };
         if out.is_empty() || sink.remaining() == 0 {
             return false;
@@ -1289,6 +1303,7 @@ impl Conn {
         let out = match self {
             Conn::V3(c) => &mut c.out,
             Conn::V4(c) => &mut c.out,
+            Conn::V6(c) => &mut c.out,
         };
         while !reply.resolved() {
             let Some(&byte) = out.first() else { break };
@@ -1304,6 +1319,7 @@ impl Conn {
         match self {
             Conn::V3(c) => c.pending_zero,
             Conn::V4(c) => c.pending_zero,
+            Conn::V6(c) => c.pending_zero,
         }
     }
 
@@ -1314,6 +1330,7 @@ impl Conn {
         match self {
             Conn::V3(c) => c.pending_zero = false,
             Conn::V4(c) => c.pending_zero = false,
+            Conn::V6(c) => c.pending_zero = false,
         }
     }
 
@@ -1325,6 +1342,7 @@ impl Conn {
             let parsed = match self {
                 Conn::V3(c) => c.try_parse(),
                 Conn::V4(c) => c.try_parse(),
+                Conn::V6(c) => c.try_parse(),
             }
             .map_err(io_invalid)?;
             if parsed {
@@ -1333,6 +1351,7 @@ impl Conn {
             let (half_closed, rbuf, inner) = match self {
                 Conn::V3(c) => (c.pending_zero, &mut c.rbuf, &mut c.inner),
                 Conn::V4(c) => (c.pending_zero, &mut c.rbuf, &mut c.inner),
+                Conn::V6(c) => (c.pending_zero, &mut c.rbuf, &mut c.inner),
             };
             if half_closed {
                 return Poll::Ready(Ok(false));
@@ -1351,6 +1370,7 @@ impl Conn {
         match self {
             Conn::V3(c) => &mut c.inner,
             Conn::V4(c) => &mut c.inner,
+            Conn::V6(c) => &mut c.inner,
         }
     }
 }
@@ -1371,14 +1391,16 @@ pub struct SnellStream {
 impl SnellStream {
     fn new(inner: BoxProxyStream, cfg: &SnellOut) -> Result<Self> {
         let psk = cfg.psk.as_bytes();
-        // StreamConn (snell.go:156-168): >= v4 uses the v4 codec; v1 is
+        // StreamConn (snell.go:156-168): >= v6 uses the v6 codec
+        // (StreamConnV6, snell.go:158-159), >= v4 the v4 codec; v1 is
         // Chacha20-Poly1305; v2/v3 are AES-128-GCM over the SS framing.
         let conn = match cfg.version {
             1..=3 => Conn::V3(V3Conn::new(inner, psk, v3_cipher_kind(cfg.version))),
             4 => Conn::V4(V4Conn::new(inner, psk)?),
+            6 => Conn::V6(Box::new(V6Conn::new(inner, psk, cfg.v6_mode)?)),
             other => {
                 return Err(Error::config(format!(
-                    "snell: unsupported version {other} (wire versions are 1..=4; \
+                    "snell: unsupported version {other} (wire versions are 1..=4 and 6; \
                      parse_version maps v5 down to 4)"
                 )))
             }
@@ -1392,11 +1414,12 @@ impl SnellStream {
         })
     }
 
-    /// Frame `buf` into `wbuf` (both the v3 and v4 write paths).
+    /// Frame `buf` into `wbuf` (the v3/v4/v6 write paths).
     fn frame(&mut self, buf: &[u8]) -> Result<()> {
         match &mut self.conn {
             Conn::V3(c) => c.frame(buf, &mut self.wbuf),
             Conn::V4(c) => c.frame(buf, &mut self.wbuf),
+            Conn::V6(c) => c.frame(buf, &mut self.wbuf),
         }
     }
 
@@ -1437,8 +1460,10 @@ impl SnellStream {
     /// Frame one datagram as exactly one AEAD frame (the UDP write path,
     /// snell.go `writePacket` → `WritePacketFrame`, v4.go:81-96): v4 seals
     /// the whole packet with `nextFramePaddingLength` and skips the stream
-    /// chunk ramp; v3 uses the plain stream write (its payload is already
-    /// capped at one chunk by [`snell_udp_frame`]).
+    /// chunk ramp; v6 emits the whole datagram as ONE record regardless
+    /// of the shaped chunk limit (v6.go:651-657); v3 uses the plain
+    /// stream write (its payload is already capped at one chunk by
+    /// [`snell_udp_frame`]).
     fn frame_packet(&mut self, packet: &[u8]) -> Result<()> {
         match &mut self.conn {
             Conn::V3(c) => c.frame(packet, &mut self.wbuf),
@@ -1446,6 +1471,7 @@ impl SnellStream {
                 let padding = c.next_frame_padding_length(packet.len());
                 c.write_frame(packet, padding, &mut self.wbuf)
             }
+            Conn::V6(c) => c.frame_packet(packet, &mut self.wbuf),
         }
     }
 
@@ -1502,6 +1528,7 @@ impl SnellStream {
                     let out = match &mut self.conn {
                         Conn::V3(c) => &mut c.out,
                         Conn::V4(c) => &mut c.out,
+                        Conn::V6(c) => &mut c.out,
                     };
                     if !out.is_empty() {
                         // Bytes left after the reply are the first packet.
@@ -1753,10 +1780,10 @@ impl SnellPoolShared {
 /// (transport/snell/pool.go) as wired by `NewSnell`
 /// (adapter/outbound/snell.go:287-301).
 ///
-/// Upstream pools only when `reuse` is on: v2 always
-/// (`reuse := version == Version2 || (version == Version4 && Reuse)`,
-/// adapter snell.go:252) and v4 with the `reuse` flag — so this pool
-/// accepts versions 2 and 4 only.
+/// Upstream pools only when `reuse` is on: v2 always, v4 and v6 with
+/// the `reuse` flag (`reuse := version == Version2 ||
+/// ((version == Version4 || version == Version6) && Reuse)`,
+/// adapter snell.go:258) — so this pool accepts versions 2, 4 and 6.
 ///
 /// * [`SnellPool::dial`] hands out a cached live conn (age-checked like
 ///   `GetContext`) or dials a fresh transport via the injected dialer,
@@ -1794,11 +1821,12 @@ impl SnellPool {
             return Err(Error::config("snell: psk is required"));
         }
         let version = parse_version(cfg.version)?;
-        if !matches!(version, 2 | 4) {
-            // adapter/outbound/snell.go:252 — reuse exists only for v2
-            // (always) and v4 (`reuse: true`); v5 already mapped to 4.
+        if !matches!(version, 2 | 4 | 6) {
+            // adapter/outbound/snell.go:258 — reuse exists only for v2
+            // (always), v4 and v6 (`reuse: true`); v5 already mapped
+            // to 4.
             return Err(Error::config(format!(
-                "snell: connection reuse requires version 2 or 4, got {version}"
+                "snell: connection reuse requires version 2, 4 or 6, got {version}"
             )));
         }
         Ok(SnellPool {
@@ -1831,16 +1859,53 @@ impl SnellPool {
     /// `reuse=true` — `CommandConnectV2` — and mark the conn reusable so
     /// its later close returns it to this pool.
     pub async fn dial(&self, target: &NetAddr) -> Result<PooledSnell> {
-        let mut snell = match self.shared.get().await {
-            Some(conn) => conn,
-            None => SnellStream::new((self.shared.dialer)().await?, &self.shared.cfg)?,
+        // A pooled session the server killed while IDLE (past the
+        // server's reuse timeout but inside our 15 s max-age) still
+        // accepts the buffered header write; the death only surfaces as
+        // an immediate EOF/reset on the first read. One transparent
+        // re-dial on a FRESH transport covers exactly that class
+        // (sing-snell b56e187's dead-idle-reuse fix); a fresh-transport
+        // failure is a real network error and propagates.
+        let pooled = self.shared.get().await;
+        let (mut snell, was_pooled) = match pooled {
+            Some(conn) => (conn, true),
+            None => (
+                SnellStream::new((self.shared.dialer)().await?, &self.shared.cfg)?,
+                false,
+            ),
         };
-        // WriteHeaderWithReuse(..., version, true) — the header write is
-        // the "MarkReusable" gate (adapter snell.go:97-116).
-        snell
-            .write_all(&request_header(target, self.shared.cfg.version, true)?)
-            .await?;
-        snell.flush().await.map_err(Error::from)?;
+        let header = request_header(target, self.shared.cfg.version, true)?;
+        if was_pooled {
+            let attempt = async {
+                // WriteHeaderWithReuse(..., version, true) — the header
+                // write is the "MarkReusable" gate (adapter
+                // snell.go:97-116).
+                snell.write_all(&header).await?;
+                snell.flush().await.map_err(Error::from)?;
+                Ok::<(), Error>(())
+            };
+            // A server that killed this idle session while it sat in the
+            // pool surfaces as an immediate write/flush failure (RST
+            // pending) — one transparent re-dial on a fresh transport
+            // covers it (sing-snell b56e187's dead-idle-reuse class).
+            // The residual shape — write succeeds buffered, death only
+            // surfaces on the first read — is fenced off by the
+            // write-after-half-close guard (a failed checkout is never
+            // recycled) and the pool's 15 s max-age; a read-probe here
+            // would race the server's legitimate fast reply.
+            if attempt.await.is_err() {
+                let cfg = self.shared.cfg.clone();
+                snell = SnellStream::new((self.shared.dialer)().await?, &cfg)?;
+                snell
+                    .write_all(&request_header(target, cfg.version, true)?)
+                    .await?;
+                snell.flush().await.map_err(Error::from)?;
+            }
+        } else {
+            // Fresh transport: the plain header write.
+            snell.write_all(&header).await?;
+            snell.flush().await.map_err(Error::from)?;
+        }
         Ok(PooledSnell {
             stream: Some(snell),
             shared: self.shared.clone(),
@@ -1888,6 +1953,18 @@ impl AsyncWrite for PooledSnell {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+        // A write after the zero chunk (half-close) would frame data
+        // past end-of-stream, and the Drop path may still recycle the
+        // session — the stale frame then leaks into the NEXT request on
+        // that session (sing-snell 97f996f). Fail the session instead;
+        // Drop checks `failed` and closes rather than recycles.
+        if this.zero_framed || this.half_closed || this.failed {
+            this.failed = true;
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "snell: write after half-close",
+            )));
+        }
         let Some(stream) = this.stream.as_mut() else {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -2269,6 +2346,7 @@ impl Conn {
                     let out = match self {
                         Conn::V3(c) => &mut c.out,
                         Conn::V4(c) => &mut c.out,
+                        Conn::V6(c) => &mut c.out,
                     };
                     while filled < buf.len() && !out.is_empty() {
                         let n = out.len().min(buf.len() - filled);
@@ -2314,6 +2392,7 @@ impl Conn {
         let out = match self {
             Conn::V3(c) => &mut c.out,
             Conn::V4(c) => &mut c.out,
+            Conn::V6(c) => &mut c.out,
         };
         if out.is_empty() {
             None
@@ -2325,7 +2404,9 @@ impl Conn {
     /// Frame `payload` as exactly one AEAD frame (the server's
     /// `WritePacketFrame` path, snell.go:182-187): v4 seals the whole
     /// packet through `writeFrame` with the first-frame padding rule,
-    /// v3 rides the plain chunk writer. Used for UDP response packets.
+    /// v6 emits the whole datagram as ONE record regardless of the
+    /// shaped chunk limit (v6.go:651-657), v3 rides the plain chunk
+    /// writer. Used for UDP response packets.
     fn frame_packet(&mut self, payload: &[u8], wbuf: &mut BytesMut) -> Result<()> {
         match self {
             Conn::V3(c) => c.frame(payload, wbuf),
@@ -2333,6 +2414,7 @@ impl Conn {
                 let padding = c.next_frame_padding_length(payload.len());
                 c.write_frame(payload, padding, wbuf)
             }
+            Conn::V6(c) => c.frame_packet(payload, wbuf),
         }
     }
 
@@ -2341,6 +2423,7 @@ impl Conn {
         match self {
             Conn::V3(c) => c.frame(payload, wbuf),
             Conn::V4(c) => c.frame(payload, wbuf),
+            Conn::V6(c) => c.frame(payload, wbuf),
         }
     }
 }
@@ -2359,13 +2442,15 @@ fn command_error_frame(code: u8, message: &str) -> Vec<u8> {
 }
 
 /// Normalize a listener-configured version exactly like `New`
-/// (listener/snell/server.go:37-44): `0` → Version4; `1..=5` pass (5
-/// rides the v4 codec, like `StreamConn`'s `version >= Version4` route);
-/// anything else is `snell inbound version %d is not supported`.
+/// (listener/snell/server.go:37-49): `0` → Version4; `1..=5` pass (5
+/// rides the v4 codec, like `StreamConn`'s `version >= Version4`
+/// route); `6` passes (the v6 record layer, `ServerStreamConnV6`,
+/// server.go:185-189); anything else is
+/// `snell inbound version %d is not supported`.
 pub fn parse_server_version(raw: u8) -> Result<u8> {
     match raw {
         0 => Ok(SNELL_SERVER_DEFAULT_VERSION),
-        1..=5 => Ok(raw),
+        1..=6 => Ok(raw),
         other => Err(Error::config(format!(
             "snell inbound version {other} is not supported"
         ))),
@@ -2400,21 +2485,27 @@ pub type SnellServerNext = std::sync::Arc<
 
 /// A server-role snell connection over an established (optionally
 /// obfs-wrapped) transport — `ServerStreamConn`
-/// (transport/snell/snell.go:170-174) as driven by
-/// `Listener.HandleConn` (listener/snell/server.go:146-172).
+/// (transport/snell/snell.go:170-174) / `ServerStreamConnV6`
+/// (snell.go:186-190) as driven by `Listener.HandleConn`
+/// (listener/snell/server.go:146-196).
 pub struct SnellServerConn {
     conn: Conn,
     psk: Vec<u8>,
     version: u8,
+    /// The v6 traffic-shaping mode (only read for version 6).
+    v6_mode: V6Mode,
 }
 
 impl SnellServerConn {
     /// Wrap a transport with the server framing for `version` (raw
     /// listener value — [`parse_server_version`] has been applied).
-    pub fn new(stream: BoxProxyStream, psk: &[u8], version: u8) -> Result<Self> {
+    /// `v6_mode` selects the record codec for version 6
+    /// (`ServerStreamConnV6`, snell.go:186-190).
+    pub fn new(stream: BoxProxyStream, psk: &[u8], version: u8, v6_mode: V6Mode) -> Result<Self> {
         let conn = match version {
             1..=3 => Conn::V3(V3Conn::new(stream, psk, v3_cipher_kind(version))),
             4 | 5 => Conn::V4(V4Conn::new(stream, psk)?),
+            6 => Conn::V6(Box::new(V6Conn::new(stream, psk, v6_mode)?)),
             other => {
                 return Err(Error::config(format!(
                     "snell inbound version {other} is not supported"
@@ -2425,6 +2516,7 @@ impl SnellServerConn {
             conn,
             psk: psk.to_vec(),
             version,
+            v6_mode,
         })
     }
 
@@ -2503,6 +2595,7 @@ impl SnellServerConn {
             conn: Some(self.conn),
             psk: Some(self.psk),
             version: self.version,
+            v6_mode: self.v6_mode,
             wbuf: BytesMut::new(),
             pending_plain: 0,
             reply_written: false,
@@ -2542,6 +2635,7 @@ pub struct SnellServerTcp {
     conn: Option<Conn>,
     psk: Option<Vec<u8>>,
     version: u8,
+    v6_mode: V6Mode,
     wbuf: BytesMut,
     pending_plain: usize,
     reply_written: bool,
@@ -2684,6 +2778,7 @@ impl Drop for SnellServerTcp {
         let reuse = self.reuse && !self.failed;
         let psk = self.psk.take();
         let version = self.version;
+        let v6_mode = self.v6_mode;
         let next = self.next.take();
         if tokio::runtime::Handle::try_current().is_err() {
             return; // drop(conn) — closed
@@ -2707,7 +2802,13 @@ impl Drop for SnellServerTcp {
                 conn.reset_zero();
                 if let Some(next) = next {
                     if let Some(psk) = psk {
-                        next(SnellServerConn { conn, psk, version }).await;
+                        next(SnellServerConn {
+                            conn,
+                            psk,
+                            version,
+                            v6_mode,
+                        })
+                        .await;
                     }
                 }
             }
@@ -3271,9 +3372,13 @@ mod tests {
         assert_eq!(parse_version(4).unwrap(), 4);
         // v5 servers accept v4 clients (adapter snell.go:248-251).
         assert_eq!(parse_version(5).unwrap(), 4);
-        let err = parse_version(6).unwrap_err();
-        assert!(err.to_string().contains("snell version error: 6"), "{err}");
-        // UDP gating (adapter snell.go:253-257).
+        // v6 is the profile-shaped record layer and passes through
+        // (StreamConnV6, snell.go:158-159); 7 is past every constant
+        // (adapter snell.go:281).
+        assert_eq!(parse_version(6).unwrap(), 6);
+        let err = parse_version(7).unwrap_err();
+        assert!(err.to_string().contains("snell version error: 7"), "{err}");
+        // UDP gating (adapter snell.go:253-257) — v6 qualifies (v3+).
         assert!(validate_udp(1, true).is_err());
         assert!(validate_udp(2, true).is_err());
         let err = validate_udp(2, true).unwrap_err();
@@ -3283,6 +3388,7 @@ mod tests {
         );
         assert!(validate_udp(2, false).is_ok());
         assert!(validate_udp(3, true).is_ok());
+        assert!(validate_udp(6, true).is_ok());
     }
 
     #[test]
@@ -3476,6 +3582,7 @@ mod tests {
             psk: psk.clone(),
             version: 3,
             udp: false,
+            v6_mode: V6Mode::Default,
         };
         let mut stream = connect_v3(&cfg, &psk).await.unwrap();
         stream.write_all(b"ping-v3").await.unwrap();
@@ -3510,6 +3617,7 @@ mod tests {
             psk: format!("wrong-{psk}"),
             version: 3,
             udp: false,
+            v6_mode: V6Mode::Default,
         };
         // The header write succeeds; the mimic cannot decrypt it, drops
         // the connection, and the client fails before any tunnel data.
@@ -3660,6 +3768,7 @@ mod tests {
             psk: psk.clone(),
             version: 4,
             udp: false,
+            v6_mode: V6Mode::Default,
         };
         let mut stream = connect_v4(&cfg, &psk, false).await.unwrap();
         stream.write_all(b"ping-v4").await.unwrap();
@@ -3699,6 +3808,7 @@ mod tests {
             psk: psk.clone(),
             version: 4,
             udp: false,
+            v6_mode: V6Mode::Default,
         };
         let target = NetAddr::domain("echo.example", 443).unwrap();
         let mut stream = handshake(Box::new(client), &cfg, &target, false)
@@ -3759,6 +3869,7 @@ mod tests {
             psk: psk.clone(),
             version: 4,
             udp: true,
+            v6_mode: V6Mode::Default,
         };
         let mut stream = connect_v4(&cfg, &psk, true).await.unwrap();
         // The v4 UDP handshake already consumed the tunnel reply
@@ -3903,6 +4014,7 @@ mod tests {
             psk: psk.clone(),
             version: 4,
             udp: true,
+            v6_mode: V6Mode::Default,
         };
         // Three response frames ride back-to-back on one transport; each
         // recv_from must return exactly one frame's payload — the frame
@@ -3962,6 +4074,7 @@ mod tests {
             psk: psk.clone(),
             version: 3,
             udp: true,
+            v6_mode: V6Mode::Default,
         };
         // v3 does not await the reply in udp_session; the tunnel byte is
         // consumed lazily by the first recv_from, like packetConn.ReadFrom
@@ -3988,6 +4101,7 @@ mod tests {
             psk: String::new(),
             version: 3,
             udp: true,
+            v6_mode: V6Mode::Default,
         };
         let err = match udp_session(&cfg, Box::new(tokio::io::duplex(16).0)).await {
             Ok(_) => panic!("empty psk must be rejected"),
@@ -4013,6 +4127,7 @@ mod tests {
             psk: format!("wrong-{psk}"),
             version: 4,
             udp: false,
+            v6_mode: V6Mode::Default,
         };
         let mut stream = connect_v4(&cfg, &psk, false).await.unwrap();
         stream.write_all(b"ping").await.unwrap();
@@ -4026,19 +4141,22 @@ mod tests {
 
     #[tokio::test]
     async fn bad_version_rejected() {
-        // Raw version 6 is past every upstream constant
-        // (adapter/outbound/snell.go:259-260).
+        // Raw version 7 is past every upstream constant
+        // (adapter/outbound/snell.go:281). Version 6 is a valid wire
+        // version since the v6 port (checked in version_parsing_matrix
+        // and exercised end to end in proto::snell_v6).
         let cfg = SnellOut {
             fronting: None,
             server: "x".into(),
             port: 1,
             psk: "p".into(),
-            version: 6,
+            version: 7,
             udp: false,
+            v6_mode: V6Mode::Default,
         };
         let target = NetAddr::domain("t.test", 80).unwrap();
         let err = match handshake(Box::new(tokio::io::duplex(16).0), &cfg, &target, false).await {
-            Ok(_) => panic!("version 6 must be rejected"),
+            Ok(_) => panic!("version 7 must be rejected"),
             Err(e) => e,
         };
         assert!(err.to_string().contains("version"), "{err}");
@@ -4055,6 +4173,7 @@ mod tests {
                 psk: "p".into(),
                 version,
                 udp: true,
+                v6_mode: V6Mode::Default,
             };
             let err = match udp_session(&cfg, Box::new(tokio::io::duplex(16).0)).await {
                 Ok(_) => panic!("version {version} UDP must be rejected"),
@@ -4144,6 +4263,7 @@ mod tests {
             psk: psk.clone(),
             version: 1,
             udp: false,
+            v6_mode: V6Mode::Default,
         };
         let (client, server) = tokio::io::duplex(64 * 1024);
         let psk2 = psk.clone();
@@ -4178,6 +4298,7 @@ mod tests {
             psk: psk.clone(),
             version: 2,
             udp: false,
+            v6_mode: V6Mode::Default,
         };
         let (client, server) = tokio::io::duplex(64 * 1024);
         let psk2 = psk.clone();
@@ -4216,6 +4337,7 @@ mod tests {
             psk: psk.clone(),
             version: 5,
             udp: false,
+            v6_mode: V6Mode::Default,
         };
         let mut stream = connect_v4(&cfg, &psk, false).await.unwrap();
         stream.write_all(b"ping-v5").await.unwrap();
@@ -4314,6 +4436,7 @@ mod tests {
                 psk: psk.clone(),
                 version,
                 udp: false,
+                v6_mode: V6Mode::Default,
             },
             move || {
                 let psk = psk.clone();
@@ -4418,6 +4541,7 @@ mod tests {
                 psk,
                 version: 4,
                 udp: false,
+                v6_mode: V6Mode::Default,
             },
             move || {
                 let psk = psk2.clone();
@@ -4513,6 +4637,7 @@ mod tests {
                 psk: psk.clone(),
                 version,
                 udp: false,
+                v6_mode: V6Mode::Default,
             }) {
                 Ok(_) => panic!("version {version} must not pool"),
                 Err(e) => e,
@@ -4527,6 +4652,7 @@ mod tests {
             psk: psk.clone(),
             version: 5,
             udp: false,
+            v6_mode: V6Mode::Default,
         })
         .is_ok());
     }
@@ -4615,7 +4741,8 @@ mod tests {
         let (client, server) = tokio::io::duplex(64 * 1024);
         let psk = psk.as_bytes().to_vec();
         tokio::spawn(async move {
-            let conn = SnellServerConn::new(Box::new(server), &psk, version).unwrap();
+            let conn =
+                SnellServerConn::new(Box::new(server), &psk, version, V6Mode::Default).unwrap();
             if let Err(e) = server_loop(conn).await {
                 panic!("snell server loop failed: {e}");
             }
@@ -4637,6 +4764,7 @@ mod tests {
                 psk: psk.clone(),
                 version,
                 udp: false,
+                v6_mode: V6Mode::Default,
             };
             let target = NetAddr::domain("echo.example", 443).unwrap();
             let mut stream = handshake(Box::new(transport), &cfg, &target, false)
@@ -4663,6 +4791,7 @@ mod tests {
             psk: psk.clone(),
             version: 4,
             udp: false,
+            v6_mode: V6Mode::Default,
         };
         let target = NetAddr::domain("echo.example", 443).unwrap();
         let mut stream = handshake(Box::new(transport), &cfg, &target, false)
@@ -4684,7 +4813,8 @@ mod tests {
         let (client, server) = tokio::io::duplex(64 * 1024);
         let psk2 = psk.clone();
         tokio::spawn(async move {
-            let conn = SnellServerConn::new(Box::new(server), psk2.as_bytes(), 4).unwrap();
+            let conn = SnellServerConn::new(Box::new(server), psk2.as_bytes(), 4, V6Mode::Default)
+                .unwrap();
             if let Err(e) = server_loop(conn).await {
                 panic!("snell server loop failed: {e}");
             }
@@ -4698,6 +4828,7 @@ mod tests {
                 psk,
                 version: 4,
                 udp: false,
+                v6_mode: V6Mode::Default,
             },
             move || {
                 let c = client.lock().unwrap().take().expect("only one transport");
@@ -4738,6 +4869,7 @@ mod tests {
             psk: format!("wrong-{psk}"),
             version: 4,
             udp: false,
+            v6_mode: V6Mode::Default,
         };
         let target = NetAddr::domain("echo.example", 443).unwrap();
         let mut stream = handshake(Box::new(transport), &cfg, &target, false)
@@ -4765,6 +4897,7 @@ mod tests {
                 psk: psk.clone(),
                 version,
                 udp: true,
+                v6_mode: V6Mode::Default,
             };
             let mut udp = udp_session(&cfg, Box::new(transport)).await.unwrap();
             let target = NetAddr::ip("8.8.8.8".parse().unwrap(), 53);
@@ -4794,6 +4927,7 @@ mod tests {
             psk: psk.clone(),
             version: 4,
             udp: true,
+            v6_mode: V6Mode::Default,
         };
         let mut udp = udp_session(&cfg, Box::new(transport)).await.unwrap();
         let target = NetAddr::domain("dns.example", 53).unwrap();
@@ -4811,15 +4945,15 @@ mod tests {
 
     #[test]
     fn server_version_gate_and_error_frames() {
-        // parse_server_version (listener/snell/server.go:37-44).
+        // parse_server_version (listener/snell/server.go:37-49).
         assert_eq!(parse_server_version(0).unwrap(), 4);
-        for v in [1u8, 2, 3, 4, 5] {
+        for v in [1u8, 2, 3, 4, 5, 6] {
             assert_eq!(parse_server_version(v).unwrap(), v);
         }
-        let err = parse_server_version(6).unwrap_err();
+        let err = parse_server_version(7).unwrap_err();
         assert!(
             err.to_string()
-                .contains("snell inbound version 6 is not supported"),
+                .contains("snell inbound version 7 is not supported"),
             "{err}"
         );
         // writeCommandError layout: CommandError || code || msglen || msg.
@@ -4840,7 +4974,9 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(16 * 1024);
         let psk2 = psk.clone();
         tokio::spawn(async move {
-            let mut conn = SnellServerConn::new(Box::new(server), psk2.as_bytes(), 3).unwrap();
+            let mut conn =
+                SnellServerConn::new(Box::new(server), psk2.as_bytes(), 3, V6Mode::Default)
+                    .unwrap();
             match conn.read_request().await {
                 Ok(SnellServerRequest::Ping) => {} // answered inline
                 other => panic!("expected Ping, got {other:?}"),
@@ -4874,7 +5010,7 @@ mod tests {
         let psk2 = psk.clone();
         tokio::spawn(async move {
             let wrapped = http_obfs_server(Box::new(server)).await.unwrap();
-            let conn = SnellServerConn::new(wrapped, psk2.as_bytes(), 4).unwrap();
+            let conn = SnellServerConn::new(wrapped, psk2.as_bytes(), 4, V6Mode::Default).unwrap();
             if let Err(e) = server_loop(conn).await {
                 panic!("obfs server loop failed: {e}");
             }
@@ -4886,6 +5022,7 @@ mod tests {
             psk,
             version: 4,
             udp: false,
+            v6_mode: V6Mode::Default,
         };
         let target = NetAddr::domain("echo.example", 443).unwrap();
         let mut stream = handshake(client, &cfg, &target, false).await.unwrap();

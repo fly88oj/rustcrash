@@ -109,6 +109,22 @@ async fn marked_connect_addr(
 
 /// [`tcp_connect`] over an already-resolved address (DNS upstreams and
 /// other callers that carry a SocketAddr).
+/// Give an IPv6 link-local SocketAddr a scope when it has none —
+/// connect(2) to fe80:: without a zone fails with EINVAL (sing-box
+/// 7587087). The scope comes from the caller (default interface when
+/// unknown); scoped/multicast/global addresses pass through untouched.
+pub fn scope_link_local(addr: &mut std::net::SocketAddr, default_scope: u32) {
+    if let std::net::SocketAddr::V6(v6) = addr {
+        let seg = v6.ip().segments();
+        // unicast link-local fe80::/10, or link/interface-local
+        // multicast ff02::/ff01::
+        let link_scoped = (seg[0] & 0xffc0) == 0xfe80 || seg[0] == 0xff01 || seg[0] == 0xff02;
+        if link_scoped && v6.scope_id() == 0 && default_scope != 0 {
+            *v6 = std::net::SocketAddrV6::new(*v6.ip(), v6.port(), v6.flowinfo(), default_scope);
+        }
+    }
+}
+
 pub async fn tcp_connect_addr(addr: std::net::SocketAddr) -> io::Result<tokio::net::TcpStream> {
     let mark = get();
     if mark == 0 {
@@ -128,6 +144,34 @@ pub async fn udp_bind_ephemeral() -> io::Result<tokio::net::UdpSocket> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_local_gets_default_scope() {
+        // sing-box 7587087: fe80:: destinations without a zone fail
+        // connect(2) with EINVAL — scoping attaches the default
+        // interface index; global and already-scoped addresses pass
+        // through untouched.
+        let mut ll: std::net::SocketAddr = "[fe80::1]:443".parse().unwrap();
+        scope_link_local(&mut ll, 7);
+        assert_eq!(ll.to_string(), "[fe80::1%7]:443");
+
+        let mut scoped: std::net::SocketAddr = "[fe80::1%3]:443".parse().unwrap();
+        scope_link_local(&mut scoped, 7);
+        assert_eq!(scoped.to_string(), "[fe80::1%3]:443");
+
+        let mut global: std::net::SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        scope_link_local(&mut global, 7);
+        assert_eq!(global.to_string(), "[2001:db8::1]:443");
+
+        let mut v4: std::net::SocketAddr = "10.0.0.1:80".parse().unwrap();
+        scope_link_local(&mut v4, 7);
+        assert_eq!(v4.to_string(), "10.0.0.1:80");
+
+        // Zero default scope (no route found) must not attach %0.
+        let mut ll2: std::net::SocketAddr = "[fe80::9]:80".parse().unwrap();
+        scope_link_local(&mut ll2, 0);
+        assert_eq!(ll2.to_string(), "[fe80::9]:80");
+    }
 
     #[test]
     fn mark_store_roundtrip_and_zero_default() {

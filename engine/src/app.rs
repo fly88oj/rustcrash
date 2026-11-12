@@ -467,7 +467,7 @@ impl Engine {
                 inbound: meta.inbound,
                 inbound_kind: meta.inbound_kind,
                 inbound_port: meta.inbound_port,
-                process: meta.proc_info.map(|p| p.exe.as_str()),
+                processes: meta.proc_info.map(|p| p.exes.as_slice()),
                 uid: meta.proc_info.and_then(|p| p.uid),
                 user: meta.in_user,
                 dscp: None,

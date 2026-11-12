@@ -140,6 +140,14 @@ pub fn general_section(config: &Config) -> Result<String> {
     s.push_str(
         "  nameserver:\n    - https://223.5.5.5/dns-query\n    - https://doh.pub/dns-query\n",
     );
+    // ShellCrash PR #1362 (clash_modify.sh:75-82): failover appends the
+    // direct-DNS fallback list with lazy querying and no geoip filter —
+    // proxy DNS primary, direct DNS answers when it fails.
+    if config.dns_failover {
+        s.push_str(
+            "  fallback:\n    - 223.5.5.5\n    - 119.29.29.29\n  fallback-filter:\n    geoip: false\n  fallback-lazy-query: true\n",
+        );
+    }
     Ok(s)
 }
 
@@ -571,6 +579,21 @@ mod tests {
         };
         let section = general_section(&config).unwrap();
         assert!(section.contains("tproxy-port: 7892"));
+    }
+
+    /// ShellCrash PR #1362: the dns-failover toggle appends the
+    /// direct-DNS fallback list; default output has none of it.
+    #[test]
+    fn general_section_dns_failover_toggle() {
+        let mut config = crate::config::Config::default();
+        let base = general_section(&config).unwrap();
+        assert!(!base.contains("fallback:"));
+        assert!(!base.contains("fallback-lazy-query"));
+        config.dns_failover = true;
+        let out = general_section(&config).unwrap();
+        assert!(out.contains("  fallback:\n    - 223.5.5.5"), "{out}");
+        assert!(out.contains("fallback-filter:\n    geoip: false"));
+        assert!(out.contains("fallback-lazy-query: true"));
     }
 
     #[test]

@@ -7,8 +7,11 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 /// Resolved owner of a locally-originated connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessInfo {
-    /// Full executable path of the owning process.
-    pub exe: String,
+    /// Full executable paths of EVERY process sharing the socket
+    /// (after-fork socket sharing, fd-passing: sing-box d9e1440's
+    /// "report every process" semantics — one entry for the usual
+    /// single-owner case).
+    pub exes: Vec<String>,
     /// Owner uid (real) from `/proc/<pid>/status`.
     pub uid: Option<u32>,
     /// Owner username via `getpwuid_r` (None when the uid has no
@@ -19,8 +22,8 @@ pub struct ProcessInfo {
 /// Full executable path of the process holding a connection whose
 /// local address is `source` (the client side of the socket pair).
 /// `tcp` selects the /proc/net/tcp(6) or udp(6) table.
-pub fn find_by_socket(source: SocketAddr, tcp: bool) -> Option<String> {
-    find_info_by_socket(source, tcp).map(|info| info.exe)
+pub fn find_by_socket(source: SocketAddr, tcp: bool) -> Option<Vec<String>> {
+    find_info_by_socket(source, tcp).map(|info| info.exes)
 }
 
 /// Like [`find_by_socket`] but also resolves the owner's uid and
@@ -34,16 +37,39 @@ pub fn find_info_by_socket(source: SocketAddr, tcp: bool) -> Option<ProcessInfo>
     };
     let table = std::fs::read_to_string(table_name).ok()?;
     let inode = inode_from_table(&table, source, tcp)?;
-    let pid = inode_owner_pid(inode)?;
-    let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned())?;
+    let pids = inode_owner_pids(inode);
+    if pids.is_empty() {
+        return None;
+    }
+    // Every sharing process's exe; uid/user come from the first owner
+    // (the lowest pid we encountered — stable enough for UID rules).
+    let mut exes = Vec::with_capacity(pids.len());
+    for pid in &pids {
+        let Some(exe) = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            // A replaced-on-disk binary leaves the kernel reporting the
+            // OLD inode with a " (deleted)" suffix — PROCESS rules must
+            // still match the new path's name (sing-box f5e92e1).
+            .map(|p| {
+                p.to_string_lossy()
+                    .trim_end_matches(" (deleted)")
+                    .to_string()
+            })
+        else {
+            continue;
+        };
+        exes.push(exe);
+    }
+    if exes.is_empty() {
+        return None;
+    }
+    let pid = pids[0];
     let uid = std::fs::read_to_string(format!("/proc/{pid}/status"))
         .ok()
         .as_deref()
         .and_then(parse_uid_from_status);
     let user = uid.and_then(username_from_uid);
-    Some(ProcessInfo { exe, uid, user })
+    Some(ProcessInfo { exes, uid, user })
 }
 
 /// Scan a /proc/net/tcp(6)/udp(6) dump for the socket bound to
@@ -94,9 +120,15 @@ fn parse_proc_addr(field: &str) -> Option<SocketAddr> {
 
 /// Find the pid of the process owning `inode` by walking
 /// `/proc/<pid>/fd` for the matching `socket:[inode]` link.
-fn inode_owner_pid(inode: u32) -> Option<u32> {
+fn inode_owner_pids(inode: u32) -> Vec<u32> {
     let needle = format!("socket:[{inode}]");
-    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+    let mut pids = Vec::new();
+    for entry in std::fs::read_dir("/proc")
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
         let Some(pid) = entry
             .file_name()
             .to_str()
@@ -112,11 +144,12 @@ fn inode_owner_pid(inode: u32) -> Option<u32> {
                 .map(|l| l.to_string_lossy() == needle)
                 .unwrap_or(false)
             {
-                return Some(pid);
+                pids.push(pid);
+                break; // one hit per pid is enough
             }
         }
     }
-    None
+    pids
 }
 
 /// Parse the owner uid from a `/proc/<pid>/status` dump: the `Uid:`

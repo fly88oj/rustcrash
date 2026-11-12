@@ -152,9 +152,10 @@ pub struct ConnContext<'a> {
     pub inbound_kind: &'a str,
     /// Local port of the inbound listener (IN-PORT).
     pub inbound_port: Option<u16>,
-    /// Process name/path for locally-originated connections (PROCESS
-    /// rules, Linux /proc).
-    pub process: Option<&'a str>,
+    /// Executable paths of every process sharing the connection (PROCESS
+    /// rules, Linux /proc; multiple entries after fork/fd-passing —
+    /// sing-box d9e1440).
+    pub processes: Option<&'a [String]>,
     /// Owner uid of the client process (UID rules).
     pub uid: Option<u32>,
     /// The username that authenticated on the inbound listener (mihomo
@@ -644,13 +645,15 @@ impl Rule {
             RuleMatcher::Process {
                 pattern,
                 path: is_path,
-            } => ctx.process.is_some_and(|p| {
-                if *is_path {
-                    // mihomo matches PROCESS-PATH exactly.
-                    p == pattern
-                } else {
-                    p.rsplit('/').next() == Some(pattern)
-                }
+            } => ctx.processes.is_some_and(|paths| {
+                paths.iter().any(|p| {
+                    if *is_path {
+                        // mihomo matches PROCESS-PATH exactly.
+                        p == pattern
+                    } else {
+                        p.rsplit('/').next() == Some(pattern.as_str())
+                    }
+                })
             }),
             RuleMatcher::Logic { mode, sub } => match mode {
                 LogicMode::And => sub.iter().all(|r| r.evaluate(ctx, providers, geo)),
@@ -1162,7 +1165,7 @@ mod tests {
             inbound: "mixed",
             inbound_kind: "mixed",
             inbound_port: Some(7890),
-            process: None,
+            processes: None,
             uid: None,
             user: None,
             dscp: None,
@@ -1232,7 +1235,8 @@ mod tests {
         c.network = Network::Tcp;
         c.inbound = "mixed";
         c.inbound_port = Some(7890);
-        c.process = Some("/usr/bin/curl");
+        let curl_paths = ["/usr/bin/curl".to_string()];
+        c.processes = Some(&curl_paths);
         let sets = RuleSets::default();
         let geo = GeoLookups::default();
 

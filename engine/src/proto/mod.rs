@@ -20,6 +20,7 @@ pub mod shadowsocks;
 pub mod shadowtls;
 pub mod sip003;
 pub mod snell;
+pub mod snell_v6;
 pub mod socks;
 pub mod ssh;
 pub mod sudoku;

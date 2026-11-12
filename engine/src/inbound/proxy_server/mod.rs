@@ -213,12 +213,16 @@ pub enum ServerProtocol {
         rate_limit: u32,
     },
     /// Snell server listener (mihomo `listeners` type `snell`):
-    /// the snell wire server (v2/v3/v4) with optional http-obfs and a
-    /// mutually-exclusive security fronting (shadow-tls / res-tls /
-    /// jls — upstream `security modes are mutually exclusive`).
+    /// the snell wire server (v2..v6) with optional http-obfs (v2..v5
+    /// only — v6 rejects obfs) and a mutually-exclusive security
+    /// fronting (shadow-tls / res-tls / jls — upstream `security modes
+    /// are mutually exclusive`).
     Snell {
         psk: String,
         version: u8,
+        /// v6 traffic-shaping mode (`mode:`, only read for version 6;
+        /// `snell.ParseV6Mode`, transport/snell/v6.go:33-44).
+        v6_mode: crate::proto::snell_v6::V6Mode,
         /// `obfs-mode`: "" | http (tls-mode unsupported server-side →
         /// precise error at serve).
         obfs_mode: String,

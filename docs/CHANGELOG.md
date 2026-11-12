@@ -6,6 +6,40 @@ All notable changes to RustCrash. Format based on
 
 ## [Unreleased]
 
+### Upstream drift sync 2026-10-31 → 2026-11-12
+
+mihomo Alpha `12b81d4`, sing-box testing `a13dbe1`, ShellCrash dev
+`17018b3`:
+
+- **Snell v6** (mihomo f1f640b): the new record layer — three modes
+  (`default` shaped / `unshaped` / `unsafe-raw`), profile-derived salt
+  scatter, per-record AAD prefixes, deterministic padding and
+  chunk-size schedules over the unchanged request/reply wire; PSK
+  12-255 bytes, `http`/`tls` obfs rejected on v6, `mode` rejected on
+  v5 and below; UDP datagrams frame as exactly one record.
+- **Manager (ShellCrash PR #1362)**: `dns_failover` toggle — the
+  generated dns block gains the direct-DNS `fallback` list with
+  `fallback-filter: {geoip: false}` and `fallback-lazy-query: true`.
+- Share links with `type/net=httpupgrade` now convert to
+  `network: ws` + `v2ray-http-upgrade: true` (mihomo e9b9a1a) for
+  vmess/vless AND trojan links (whose `type` was previously ignored
+  entirely).
+- SS listener `users:` (SIP023 multi-user) now reaches the server from
+  the mihomo dialect — 2022 iPSK/uPSK with per-user EIH works end to
+  end; legacy-AEAD multi-user fails loudly naming the boundary.
+- Process search (Linux): every process sharing a socket is reported
+  and PROCESS-NAME/PATH match any-of them (sing-box d9e1440); a
+  replaced-on-disk binary's exe no longer carries the kernel's
+  " (deleted)" suffix (f5e92e1).
+- Snell pool hardening: a write after half-close fails the session
+  instead of leaking a stale frame into the next request
+  (sing-snell 97f996f); a dead pooled session that surfaces at the
+  header write is transparently re-dialed on a fresh transport
+  (b56e187's write-path shape).
+- IPv6 link-local destinations (`fe80::/10`) get a scope from the
+  default route's interface at dial time — connect(2) no longer fails
+  with EINVAL (sing-box 7587087).
+
 ### Upstream drift sync 2026-10-09 → 2026-10-31
 
 mihomo Alpha `69c1631`, sing-box testing `e5d91fa`, ShellCrash dev
